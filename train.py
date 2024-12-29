@@ -12,6 +12,8 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from tqdm import tqdm
 from sklearn.model_selection import train_test_split
 from data_preparation import prepare_data
+from torch.cuda.amp import autocast, GradScaler
+
 
 
 def decode_example(X, Y, tokenizer, index=9):
@@ -153,6 +155,7 @@ def train_with_batches(
     """
     Train the model using batches with masked token prediction strategy.
     Save only the best model based on validation loss.
+    Includes AMP for CUDA, while keeping compatibility with MPS.
 
     Args:
         (same as before)
@@ -161,6 +164,10 @@ def train_with_batches(
     criterion = torch.nn.CrossEntropyLoss(ignore_index=-100)
     global_step = 0  # Track total training steps across epochs
     best_val_loss = float("inf")  # Initialize the best validation loss as infinity
+
+    # Use AMP only if CUDA is available
+    use_amp = device.type == "cuda"
+    scaler = GradScaler(enabled=use_amp)
 
     for epoch in range(start_epoch, start_epoch + epochs):
         # ---------------------
@@ -178,27 +185,30 @@ def train_with_batches(
 
             global_step += 1
 
-            batch_X, batch_Y = batch_X.to(device), batch_Y.to(device)
+            batch_X, batch_Y = batch_X.to(device, non_blocking=True), batch_Y.to(device, non_blocking=True)
 
-            # Forward pass
-            logits = model(batch_X)
-            loss = criterion(logits.view(-1, vocab_size), batch_Y.view(-1))
+            optimizer.zero_grad()
 
-            # Add L1 sparsity regularization
-            l1_regularization = sparsity_alpha * sum(
-                torch.abs(param).sum()
-                for name, param in model.named_parameters()
-                if "weight" in name
-            )
-            total_loss = loss + l1_regularization
+            # Enable mixed precision if using CUDA
+            with autocast(enabled=use_amp):
+                logits = model(batch_X)
+                loss = criterion(logits.view(-1, vocab_size), batch_Y.view(-1))
+
+                # Add L1 sparsity regularization
+                l1_regularization = sparsity_alpha * sum(
+                    torch.abs(param).sum()
+                    for name, param in model.named_parameters()
+                    if "weight" in name
+                )
+                total_loss = loss + l1_regularization
+
+            # Backward pass with gradient scaling
+            scaler.scale(total_loss).backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            scaler.step(optimizer)
+            scaler.update()
 
             train_loss += total_loss.item()
-
-            # Backward pass
-            optimizer.zero_grad()
-            total_loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
 
             train_progress_bar.set_postfix(train_loss=total_loss.item())
 
@@ -206,7 +216,7 @@ def train_with_batches(
             if generate_every is not None and generate_every > 0 and global_step % generate_every == 0:
                 print(f"\n[Step {global_step}] Generating text for prompt:\n{generate_prompt}")
                 sample_output = generate_text(
-                    model, 
+                    model,
                     tokenizer,
                     device,
                     prompt=generate_prompt,
@@ -235,9 +245,8 @@ def train_with_batches(
 
         with torch.no_grad():
             for batch_X, batch_Y in val_progress_bar:
-                batch_X, batch_Y = batch_X.to(device), batch_Y.to(device)
+                batch_X, batch_Y = batch_X.to(device, non_blocking=True), batch_Y.to(device, non_blocking=True)
 
-                # Forward pass
                 logits = model(batch_X)
                 loss = criterion(logits.view(-1, vocab_size), batch_Y.view(-1))
                 val_loss += loss.item()
@@ -362,7 +371,7 @@ if __name__ == "__main__":
     X = torch.cat(combined_X, dim=0)
     Y = torch.cat(combined_Y, dim=0)
 
-    X, Y = X.to(device).to(dtype=torch.int32), Y.to(device).to(dtype=torch.int32)
+    X, Y = X.to(device).to(dtype=torch.float16), Y.to(device).to(dtype=torch.float16)
 
     # Split data into training and validation sets
     X_train, X_val, Y_train, Y_val = train_test_split(X, Y, test_size=0.25, random_state=42)
