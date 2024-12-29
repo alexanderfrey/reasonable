@@ -1,8 +1,181 @@
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+import math
 
-class GPT2WithGroupedAttention(nn.Module):
+
+
+def rotate_half(x: torch.Tensor) -> torch.Tensor:
+    """
+    Split last dim in half and rotate.
+    """
+    x1, x2 = x.chunk(2, dim=-1)
+    return torch.cat([-x2, x1], dim=-1)
+
+def apply_rotary_pos_emb(q, k, sin, cos):
+    """
+    Applies rotary position embedding to query and key.
+    Assumes q, k have shape (B, T, num_heads, head_dim).
+    sin, cos should have shape (1, T, 1, head_dim).
+    """
+    # (B, T, num_heads, head_dim)
+    q_rot = (q * cos) + (rotate_half(q) * sin)
+    k_rot = (k * cos) + (rotate_half(k) * sin)
+    return q_rot, k_rot
+
+
+class RotaryEmbedding(nn.Module):
+    """
+    Precomputes sin/cos for rotary embeddings.
+    By default, this is sized for max_seq_len. If you 
+    need dynamic shapes, you'll need to adapt or 
+    compute sin/cos on the fly.
+    """
+    def __init__(self, head_dim: int, max_seq_len: int = 2048, base: float = 10000.0):
+        super().__init__()
+        self.head_dim = head_dim
+        self.max_seq_len = max_seq_len
+
+        # We assume head_dim is even; if not, you'd need adjustments.
+        # (T, head_dim)
+        freqs = 1.0 / (base ** (torch.arange(0, head_dim, 2).float() / head_dim))
+        # (T, 1, head_dim)
+        t = torch.arange(self.max_seq_len, dtype=torch.float)
+        angles = t[:, None] * freqs[None, :]
+        
+        # shape: (T, head_dim/2)
+        sin = angles.sin()
+        cos = angles.cos()
+
+        # We'll expand these in forward() to match [B, T, num_heads, head_dim]
+        # But store them as buffers.
+        self.register_buffer("sin", sin, persistent=False)
+        self.register_buffer("cos", cos, persistent=False)
+
+    def forward(self, seq_len: int, device: torch.device) -> (torch.Tensor, torch.Tensor):
+        """
+        Return the slice of precomputed sin, cos up to seq_len,
+        reshaped to (1, seq_len, 1, head_dim).
+        """
+        sin = self.sin[:seq_len, :].unsqueeze(0).unsqueeze(2).to(device)
+        cos = self.cos[:seq_len, :].unsqueeze(0).unsqueeze(2).to(device)
+        return sin, cos
+    
+class GroupedMultiHeadAttention(nn.Module):
+    def __init__(self, embed_size, num_heads, num_groups, dropout=0.1, causal=True):
+        super().__init__()
+        self.embed_size = embed_size
+        self.num_heads = num_heads
+        self.num_groups = num_groups
+        self.causal = causal
+
+        # Per-head dimension
+        self.head_dim = embed_size // num_heads
+        assert self.head_dim * num_heads == embed_size, \
+            "embed_size must be divisible by num_heads"
+
+        # Projection layers for Q, K, V
+        self.W_q = nn.Linear(embed_size, embed_size, bias=False)
+        self.W_k = nn.Linear(embed_size, embed_size, bias=False)
+        self.W_v = nn.Linear(embed_size, embed_size, bias=False)
+        self.W_o = nn.Linear(embed_size, embed_size, bias=False)
+        
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x, attn_mask=None, key_padding_mask=None, rotary_emb=None):
+        """
+        x: (B, T, C)
+        attn_mask: (T, T) or None
+        key_padding_mask: (B, T) or None
+        rotary_emb: (sin, cos) used to apply rotary embeddings to Q, K
+        """
+        B, T, C = x.shape
+
+        # 1) Project to Q, K, V
+        q = self.W_q(x)  # (B, T, C)
+        k = self.W_k(x)  # (B, T, C)
+        v = self.W_v(x)  # (B, T, C)
+
+        # 2) Reshape into (B, T, num_heads, head_dim) for multi-head
+        q = q.view(B, T, self.num_heads, self.head_dim)
+        k = k.view(B, T, self.num_heads, self.head_dim)
+        v = v.view(B, T, self.num_heads, self.head_dim)
+
+        # 3) Apply rotary embeddings on Q and K if provided
+        if rotary_emb is not None:
+            sin, cos = rotary_emb  # each shape: (1, T, 1, head_dim)
+            q, k = apply_rotary_pos_emb(q, k, sin, cos)
+
+        # 4) Perform grouped attention (a simplified example).
+        #
+        # In real "grouped" attention, you'd slice or chunk heads
+        # into groups, possibly do separate attention, etc.
+        # Below is just standard multi-head for demonstration.
+        #
+        # a) Compute attention scores: shape (B, num_heads, T, T)
+        scores = torch.matmul(q.transpose(1, 2), k.transpose(1, 2).transpose(-2, -1)) 
+        scores = scores / math.sqrt(self.head_dim)
+
+        # b) Apply causal mask (if any)
+        if self.causal and attn_mask is not None:
+            scores = scores.masked_fill(attn_mask.unsqueeze(0), float('-inf'))
+
+        # c) Apply key padding mask
+        if key_padding_mask is not None:
+            # key_padding_mask: (B, T)
+            # We need to broadcast to (B, num_heads, 1, T)
+            pad = key_padding_mask.unsqueeze(1).unsqueeze(2)  # (B, 1, 1, T)
+            scores = scores.masked_fill(pad, float('-inf'))
+
+        # d) Softmax
+        attn_weights = F.softmax(scores, dim=-1)
+        attn_weights = self.dropout(attn_weights)
+
+        # e) Multiply by V
+        out = torch.matmul(attn_weights, v.transpose(1, 2))  # (B, num_heads, T, head_dim)
+
+        # 5) Reshape back
+        out = out.transpose(1, 2).contiguous()  # (B, T, num_heads, head_dim)
+        out = out.view(B, T, C)
+
+        # 6) Final projection
+        out = self.W_o(out)  # (B, T, C)
+        return out
+    
+class TransformerBlockWithGroupedAttention(nn.Module):
+    def __init__(self, embed_size, num_heads, num_groups, dropout=0.1, causal=True):
+        super().__init__()
+        self.ln1 = nn.LayerNorm(embed_size)
+        self.ln2 = nn.LayerNorm(embed_size)
+        
+        self.attn = GroupedMultiHeadAttention(
+            embed_size=embed_size,
+            num_heads=num_heads,
+            num_groups=num_groups,
+            dropout=dropout,
+            causal=causal
+        )
+        self.ff = nn.Sequential(
+            nn.Linear(embed_size, 4 * embed_size),
+            nn.GeGLU(),
+            nn.Linear(4 * embed_size, embed_size),
+            nn.Dropout(dropout)
+        )
+
+    def forward(self, x, attn_mask=None, key_padding_mask=None, rotary_emb=None):
+        # Pre-norm
+        x_ln = self.ln1(x)
+        # Multi-head attn
+        attn_out = self.attn(x_ln, attn_mask, key_padding_mask, rotary_emb=rotary_emb)
+        x = x + attn_out
+
+        # Feed-forward
+        x_ln = self.ln2(x)
+        ff_out = self.ff(x_ln)
+        x = x + ff_out
+        return x
+
+class GPT2WithGroupedAttentionRotary(nn.Module):
     def __init__(
         self, 
         vocab_size: int, 
@@ -20,12 +193,15 @@ class GPT2WithGroupedAttention(nn.Module):
         self.block_size = block_size
         self.pad_token_id = 0
 
-        # Token & positional embeddings
+        # Token embedding only — no learned positional embedding
         self.token_embedding = nn.Embedding(vocab_size, embed_size)
-        self.position_embedding = nn.Embedding(block_size, embed_size)
+
+        # Rotary embedding for queries and keys
+        # We'll assume each head has embed_size // num_heads dimension
+        self.rotary_emb = RotaryEmbedding(head_dim=embed_size // num_heads, 
+                                          max_seq_len=block_size)
 
         # Transformer blocks with grouped query attention
-        # Pass dropout & causal flags to each block
         self.layers = nn.ModuleList([
             TransformerBlockWithGroupedAttention(
                 embed_size=embed_size,
@@ -54,6 +230,7 @@ class GPT2WithGroupedAttention(nn.Module):
         # 1) Truncate if input is too long
         if T > self.block_size:
             x = x[:, :self.block_size]
+            T = self.block_size
 
         # 2) Pad if input is too short
         if T < self.block_size:
@@ -65,174 +242,34 @@ class GPT2WithGroupedAttention(nn.Module):
                 dtype=x.dtype
             )
             x = torch.cat([x, pad], dim=1)
+            T = self.block_size
 
-        # Update T after truncation/padding
-        T = x.shape[1]
-
-        # 3) Create a key padding mask for padded tokens
-        # shape: (B, T), True means "ignore this position"
+        # 3) Key padding mask
         pad_mask = (x == self.pad_token_id)
-        # If no padding at all, we can pass None to skip overhead
         key_padding_mask = pad_mask if pad_mask.any() else None
 
-        # 4) (Optional) Build a causal mask for [T, T]
-        # True means "block this attention connection"
+        # 4) Causal mask
+        # shape: (T, T), True means block that connection
         causal_mask = torch.triu(
-            torch.ones(T, T, device=x.device, dtype=torch.bool), 
+            torch.ones(T, T, device=x.device, dtype=torch.bool),
             diagonal=1
         ) if T > 1 else None
 
-        # 5) Token + positional embeddings
+        # 5) Token embeddings
         token_emb = self.token_embedding(x)  # (B, T, C)
-        positions = torch.arange(T, device=x.device)
-        pos_emb = self.position_embedding(positions)  # (T, C)
-        pos_emb = pos_emb.unsqueeze(0).expand(B, T, -1)  # (B, T, C)
+        h = token_emb
 
-        # Combine them
-        h = token_emb + pos_emb  # (B, T, C)
+        # 6) Precompute rotary sin, cos up to T
+        sin, cos = self.rotary_emb(seq_len=T, device=x.device)
 
-        # 6) Pass through Transformer layers
+        # 7) Pass through Transformer layers
         for layer in self.layers:
-            # Each layer can handle the causal & key padding mask
-            h = layer(h, attn_mask=causal_mask, key_padding_mask=key_padding_mask)
+            # Provide rotary_emb=(sin, cos) so the attention can apply it to Q,K
+            h = layer(h, attn_mask=causal_mask, 
+                      key_padding_mask=key_padding_mask, 
+                      rotary_emb=(sin, cos))
 
-        # 7) Final LN + output head
+        # 8) Final LN + output head
         h = self.ln_f(h)               # (B, T, C)
         logits = self.head(h)          # (B, T, vocab_size)
         return logits
-
-class TransformerBlock(nn.Module):
-    def __init__(self, embed_size, num_heads):
-        super().__init__()
-        self.attn = nn.MultiheadAttention(embed_dim=embed_size, num_heads=num_heads)
-        self.ln1 = nn.LayerNorm(embed_size)
-        self.ffn = nn.Sequential(
-            nn.Linear(embed_size, 4 * embed_size),
-            nn.GELU(),
-            nn.Linear(4 * embed_size, embed_size)
-        )
-        self.ln2 = nn.LayerNorm(embed_size)
-    
-    def forward(self, x):
-        # Self-attention
-        attn_out, _ = self.attn(x, x, x)
-        x = self.ln1(x + attn_out)
-        
-        # Feed-forward network
-        ffn_out = self.ffn(x)
-        x = self.ln2(x + ffn_out)
-        return x
-    
-
-class TransformerBlockWithGroupedAttention(nn.Module):
-    def __init__(
-        self, 
-        embed_size: int, 
-        num_heads: int, 
-        num_groups: int, 
-        dropout: float = 0.1,
-        causal: bool = True
-    ):
-        """
-        Args:
-            embed_size (int): Total embedding dimension.
-            num_heads (int): Number of attention heads (per group).
-            num_groups (int): Number of groups to split embed_size into.
-            dropout (float): Dropout probability for attention & FF layers.
-            causal (bool): If True, apply a causal mask so each token cannot attend beyond its own position.
-        """
-        super().__init__()
-        self.num_groups = num_groups
-        self.embed_size = embed_size
-        self.group_size = embed_size // num_groups
-        assert self.group_size * num_groups == embed_size, (
-            "Embedding size must be divisible by num_groups"
-        )
-
-        self.causal = causal
-        self.dropout_attn = nn.Dropout(dropout)
-        self.dropout_ffn = nn.Dropout(dropout)
-
-        # Attention within groups
-        self.group_attn = nn.ModuleList([
-            nn.MultiheadAttention(
-                embed_dim=self.group_size, 
-                num_heads=num_heads, 
-                dropout=dropout,   # dropout in MHA
-                batch_first=False  # we’ll permute to (seq, batch, embed)
-            )
-            for _ in range(num_groups)
-        ])
-
-        self.ln1 = nn.LayerNorm(embed_size)
-
-        # Feed-forward network
-        self.ffn = nn.Sequential(
-            nn.Linear(embed_size, 4 * embed_size),
-            nn.GELU(),
-            nn.Linear(4 * embed_size, embed_size)
-        )
-        self.ln2 = nn.LayerNorm(embed_size)
-
-    def forward(
-        self, 
-        x: torch.Tensor,
-        attn_mask: torch.Tensor = None,
-        key_padding_mask: torch.Tensor = None
-    ) -> torch.Tensor:
-        """
-        Args:
-            x (torch.Tensor): Shape (B, T, C) = (batch, seq_len, embed_size)
-            attn_mask (torch.Tensor, optional): 
-                Typically shape (T, T). Causal or other masking for attention.
-            key_padding_mask (torch.Tensor, optional): 
-                Shape (B, T), where True indicates masked (ignored) positions.
-        """
-        B, T, C = x.shape  # Batch, Sequence, Channels
-
-        # 1) Split input into groups: shape -> (num_groups, B, T, group_size)
-        #    each group is processed by a separate MultiheadAttention
-        grouped_x = x.view(B, T, self.num_groups, self.group_size).permute(2, 0, 1, 3)
-        grouped_outputs = []
-
-        # 2) Prepare a causal mask if needed
-        #    If self.causal == True and attn_mask not provided, create an upper-triangular mask
-        #    for MHA to ensure token i only attends to [0..i]
-        #    shape (T, T), True=masked
-        if self.causal and attn_mask is None:
-            causal_mask = torch.triu(
-                torch.ones(T, T, device=x.device, dtype=torch.bool), 
-                diagonal=1
-            )
-        else:
-            causal_mask = attn_mask  # could be None or user-provided
-
-        # 3) Process each group independently
-        for i, attn in enumerate(self.group_attn):
-            # group: (B, T, group_size) -> (T, B, group_size) for MultiheadAttention
-            group = grouped_x[i].permute(1, 0, 2)
-
-            # attn_out shape: (T, B, group_size)
-            attn_out, _ = attn(
-                query=group, 
-                key=group, 
-                value=group,
-                attn_mask=causal_mask,          # shape (T, T)
-                key_padding_mask=key_padding_mask  # shape (B, T) if provided
-            )
-            # Convert back to (B, T, group_size)
-            attn_out = attn_out.permute(1, 0, 2)
-
-            grouped_outputs.append(attn_out)
-
-        # 4) Concatenate group outputs: shape => (B, T, embed_size)
-        attn_output = torch.cat(grouped_outputs, dim=-1)
-
-        # 5) Residual + LayerNorm (with dropout)
-        #    GPT-2 style: x + dropout(attn_out), then LN
-        x = self.ln1(x + self.dropout_attn(attn_output))
-
-        # 6) Feed-forward network with dropout
-        ffn_out = self.ffn(x)                     # (B, T, C)
-        x = self.ln2(x + self.dropout_ffn(ffn_out))
-        return x
