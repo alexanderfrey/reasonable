@@ -371,7 +371,7 @@ if __name__ == "__main__":
     X = torch.cat(combined_X, dim=0)
     Y = torch.cat(combined_Y, dim=0)
 
-    X, Y = X.to(device).to(dtype=torch.float16), Y.to(device).to(dtype=torch.float16)
+    X, Y = X.to(device).to(dtype=torch.long), Y.to(device).to(dtype=torch.long)
 
     # Split data into training and validation sets
     X_train, X_val, Y_train, Y_val = train_test_split(X, Y, test_size=0.25, random_state=42)

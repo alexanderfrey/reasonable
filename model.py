@@ -13,14 +13,27 @@ def rotate_half(x: torch.Tensor) -> torch.Tensor:
     return torch.cat([-x2, x1], dim=-1)
 
 def apply_rotary_pos_emb(q, k, sin, cos):
-    """
-    Applies rotary position embedding to query and key.
-    Assumes q, k have shape (B, T, num_heads, head_dim).
-    sin, cos should have shape (1, T, 1, head_dim).
-    """
-    # (B, T, num_heads, head_dim)
-    q_rot = (q * cos) + (rotate_half(q) * sin)
-    k_rot = (k * cos) + (rotate_half(k) * sin)
+    # q, k: shape (B, T, num_heads, head_dim)
+    # but sin, cos: shape (1, T, 1, head_dim/2)
+
+    # Split each head-dim in half
+    q1, q2 = q.chunk(2, dim=-1)  # each has shape (B, T, num_heads, head_dim/2)
+    k1, k2 = k.chunk(2, dim=-1)
+
+    # Apply rotation
+    # "classic" formula is often:
+    #   q1_rot = q1*cos - q2*sin
+    #   q2_rot = q2*cos + q1*sin
+    #   (and similarly for k)
+    q1_rot = q1 * cos - q2 * sin
+    q2_rot = q2 * cos + q1 * sin
+    k1_rot = k1 * cos - k2 * sin
+    k2_rot = k2 * cos + k1 * sin
+
+    # Recombine
+    q_rot = torch.cat([q1_rot, q2_rot], dim=-1)
+    k_rot = torch.cat([k1_rot, k2_rot], dim=-1)
+
     return q_rot, k_rot
 
 
@@ -157,7 +170,7 @@ class TransformerBlockWithGroupedAttention(nn.Module):
         )
         self.ff = nn.Sequential(
             nn.Linear(embed_size, 4 * embed_size),
-            nn.GeGLU(),
+            nn.GELU(),
             nn.Linear(4 * embed_size, embed_size),
             nn.Dropout(dropout)
         )
