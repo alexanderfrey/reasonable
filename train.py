@@ -5,7 +5,7 @@ import torch
 import torch.nn.functional as F
 from tokenizers import Tokenizer
 from transformers import GPT2Tokenizer
-from model import GPT2WithGroupedAttention  # Import the model from model.py
+from model import GPT2WithGroupedAttentionRotary  # Import the model from model.py
 from torch.utils.data import DataLoader, TensorDataset
 import torch.nn as nn
 from torch.optim.lr_scheduler import CosineAnnealingLR
@@ -397,7 +397,8 @@ if __name__ == "__main__":
     num_groups = 1
 
     vocab_size = tokenizer.get_vocab_size()
-    model = GPT2WithGroupedAttention(vocab_size, embed_size, num_heads, num_layers, block_size, num_groups)
+    model = GPT2WithGroupedAttentionRotary(vocab_size, embed_size, num_heads, num_layers, block_size, num_groups, dropout=0.1, causal=True)
+
 
     model.to(device)
 
