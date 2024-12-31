@@ -39,6 +39,8 @@ class MultiHeadSelfAttention(nn.Module):
         self.proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
         self.dropout = nn.Dropout(config.dropout)
 
+        self.dropout_value = config.dropout
+
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
         if not self.flash:
             print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
@@ -54,7 +56,7 @@ class MultiHeadSelfAttention(nn.Module):
         v = self.value(x).view(B, T, self.n_head, self.head_dim).transpose(1, 2)  # (B, n_head, T, head_dim)
 
         if self.flash:
-            out = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
+            out = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout_value if self.training else 0, is_causal=True)
         else:
             # Compute scaled dot-product attention
             att = (q @ k.transpose(-2, -1)) / self.scale  # (B, n_head, T, T)
