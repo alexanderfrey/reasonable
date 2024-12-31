@@ -13,6 +13,8 @@ from tqdm import tqdm
 from sklearn.model_selection import train_test_split
 from data_preparation import prepare_data
 from torch.cuda.amp import autocast, GradScaler
+import numpy as np
+
 
 
 
@@ -314,6 +316,23 @@ def load_checkpoint(path, model, optimizer=None, scheduler=None):
     print(f"Checkpoint loaded from {path}, resuming at epoch {epoch}")
     return epoch  # Return the exact epoch saved
 
+def get_batch(split, device, data_dir, block_size, batch_size):
+    # We recreate np.memmap every batch to avoid a memory leak, as per
+    # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
+    if split == 'train':
+        data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
+    else:
+        data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
+    ix = torch.randint(len(data) - block_size, (batch_size,))
+    x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
+    y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
+    if device == 'cuda':
+        # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
+        x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
+    else:
+        x, y = x.to(device), y.to(device)
+    return x, y
+
 if __name__ == "__main__":
     # Parse CLI arguments
     parser = argparse.ArgumentParser(description="Train GPT-3 model with CLI parameters.")
@@ -328,19 +347,29 @@ if __name__ == "__main__":
     parser.add_argument("--prompt", type=str, default="My name is", help="Prompt for text generation")
     args = parser.parse_args()
 
-    tokenizer = Tokenizer.from_file("byte_level_bpe.json")
-    # Save the updated tokenizer
-    # tokenizer.save("tokenizer_with_special_tokens.json")
+    from tokenizers import ByteLevelBPETokenizer
 
-    for token in ["<pad>", "<s>", "</s>", "<unk>", "<mask>"]:
+    # Load the trained ByteLevelBPETokenizer
+    tokenizer = ByteLevelBPETokenizer(
+        "./byte_level_bpe/vocab.json",
+        "./byte_level_bpe/merges.txt"
+    )
+
+    # Special tokens to be verified
+    special_tokens = ["<pad>", "<s>", "</s>", "<unk>", "<mask>"]
+
+    # Verify that special tokens are correctly added
+    for token in special_tokens:
         token_id = tokenizer.token_to_id(token)
         if token_id is None:
             print(f"Error: Token {token} was not added to the vocabulary.")
         else:
             print(f"Token {token} has ID: {token_id}")
-        # tokenizer = GPT2Tokenizer.from_pretrained("gpt2")  # GPT-3 uses the GPT-2 tokenizer
-        # tokenizer.pad_token = tokenizer.eos_token  # Ensure padding is handled correctly
-    print("Tokenizer loaded.")
+
+    # Save the updated tokenizer (if required)
+    # tokenizer.save_model("./updated_byte_level_bpe")
+
+    print("Tokenizer loaded and verified.")
 
     if torch.backends.mps.is_available():
         device = torch.device("mps")
@@ -379,11 +408,11 @@ if __name__ == "__main__":
     print(f"Number of training examples: {len(X_train)}")
 
     # Decode the 10th example for inspection
-    for i in range(15):
-        input_seq, target_seq = decode_example(X, Y, tokenizer, index=1000+i)
-        print(f"Input Sequence (X[{i}]): {input_seq}\n")
-        print(f"Target Sequence (Y[{i}]): {target_seq}")
-        print("\n\n\n")
+    # for i in range(15):
+    #     input_seq, target_seq = decode_example(X, Y, tokenizer, index=1000+i)
+    #     print(f"Input Sequence (X[{i}]): {input_seq}\n")
+    #     print(f"Target Sequence (Y[{i}]): {target_seq}")
+    #     print("\n\n\n")
 
 
     # Create DataLoaders for training and validation
@@ -392,7 +421,7 @@ if __name__ == "__main__":
 
     # Model configuration
     embed_size = 768
-    num_heads = 8
+    num_heads = 12
     num_layers = 12
     num_groups = 1
 

@@ -1,42 +1,25 @@
-from tokenizers import Tokenizer
-from tokenizers.models import BPE
-from tokenizers.trainers import BpeTrainer
-from tokenizers.pre_tokenizers import ByteLevel
-import glob
+from tokenizers import ByteLevelBPETokenizer
+import glob, os
 
 # Paths to text files
 text_files_directory = "./text_files/"
 files = glob.glob(f"{text_files_directory}/*.txt")
 
-# Initialize a tokenizer with a BPE model
-tokenizer = Tokenizer(BPE(unk_token="<unk>"))
+# Read all text files and create an iterator for training
+def file_iterator(file_paths):
+    for file_path in file_paths:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            yield f.read()
 
-# Use ByteLevel pre-tokenizer
-tokenizer.pre_tokenizer = ByteLevel()
+# Initialize the ByteLevelBPETokenizer
+tokenizer = ByteLevelBPETokenizer()
 
-# Define a trainer
-trainer = BpeTrainer(
-    vocab_size=50257,
-    special_tokens=[
-        "<s>",
-        "<pad>",
-        "</s>",
-        "<unk>",
-        "<mask>",
-        "<|endoftext|>"
-    ]
-)
-
-# Train the tokenizer
-tokenizer.train(files, trainer)
-
-# Post-processing to handle ByteLevel
-# This ensures trailing spaces are replaced with 'Ġ' etc., matching GPT-2 style
-from tokenizers.decoders import ByteLevel as ByteLevelDecoder
-from tokenizers.processors import ByteLevel as ByteLevelProcessor
-
-tokenizer.decoder = ByteLevelDecoder()
-tokenizer.post_processor = ByteLevelProcessor()
+# Train the tokenizer directly from the file iterator
+tokenizer.train_from_iterator(file_iterator(files), vocab_size=52000, min_frequency=2, special_tokens=["<pad>", "<s>", "</s>", "<unk>", "<mask>"])
 
 # Save the tokenizer
-tokenizer.save("byte_level_bpe.json")
+tokenizer_path = os.path.join(os.path.dirname(__file__), 'byte_level_bpe')
+os.makedirs(tokenizer_path, exist_ok=True)
+tokenizer.save_model(tokenizer_path)
+
+print(f"Tokenizer trained and saved to {tokenizer_path}")
