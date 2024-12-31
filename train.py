@@ -5,7 +5,7 @@ import torch
 import torch.nn.functional as F
 from tokenizers import Tokenizer
 from transformers import GPT2Tokenizer
-from model import GPT2WithGroupedAttentionRotary  # Import the model from model.py
+# from reasonable.model_old import GPT2WithGroupedAttentionRotary  # Import the model from model.py
 from torch.utils.data import DataLoader, TensorDataset
 import torch.nn as nn
 from torch.optim.lr_scheduler import CosineAnnealingLR
@@ -15,6 +15,7 @@ from data_preparation import prepare_data
 from torch.cuda.amp import autocast, GradScaler
 import numpy as np
 
+from model import GPTConfig, GPT
 
 
 
@@ -123,7 +124,7 @@ def generate_text(model, tokenizer, device, prompt="The quick brown fox", max_ne
     
     with torch.no_grad():
         for _ in range(max_new_tokens):
-            logits = model(input_ids)  # shape: (batch_size=1, seq_len, vocab_size)
+            logits, loss = model(input_ids)  # shape: (batch_size=1, seq_len, vocab_size)
             # Take the last token’s logits and make a distribution
             probs = F.softmax(logits[:, -1, :], dim=-1)
             # Sample from the distribution
@@ -193,8 +194,8 @@ def train_with_batches(
 
             # Enable mixed precision if using CUDA
             with autocast(enabled=use_amp):
-                logits = model(batch_X)
-                loss = criterion(logits.view(-1, vocab_size), batch_Y.view(-1))
+                logits, loss = model(batch_X, batch_Y)
+                # loss = criterion(logits.view(-1, vocab_size), batch_Y.view(-1))
 
                 # Add L1 sparsity regularization
                 l1_regularization = sparsity_alpha * sum(
@@ -249,8 +250,8 @@ def train_with_batches(
             for batch_X, batch_Y in val_progress_bar:
                 batch_X, batch_Y = batch_X.to(device, non_blocking=True), batch_Y.to(device, non_blocking=True)
 
-                logits = model(batch_X)
-                loss = criterion(logits.view(-1, vocab_size), batch_Y.view(-1))
+                logits, loss = model(batch_X, batch_Y)
+                # loss = criterion(logits.view(-1, vocab_size), batch_Y.view(-1))
                 val_loss += loss.item()
 
                 # Compute accuracy for masked tokens only
@@ -420,13 +421,17 @@ if __name__ == "__main__":
     val_loader = create_dataloader(X_val, Y_val, args.batch_size)
 
     # Model configuration
-    embed_size = 768
-    num_heads = 12
-    num_layers = 12
+    embed_size = 384
+    num_heads = 6
+    num_layers = 6
     num_groups = 1
 
     vocab_size = tokenizer.get_vocab_size()
-    model = GPT2WithGroupedAttentionRotary(vocab_size, embed_size, num_heads, num_layers, block_size, num_groups, dropout=0.1, causal=True)
+    model_args = dict(n_layer=num_layers, n_head=num_heads, n_embd=embed_size, block_size=block_size,
+                  bias=False, vocab_size=vocab_size, dropout=0.0)
+    gptconf = GPTConfig(**model_args)
+    model = GPT(gptconf)
+    # model = GPT2WithGroupedAttentionRotary(vocab_size, embed_size, num_heads, num_layers, block_size, num_groups, dropout=0.1, causal=True)
 
 
     model.to(device)
@@ -474,7 +479,7 @@ if __name__ == "__main__":
         save_path=args.model_save_path,
         generate_every=100,  # Generate text every 100 training steps
         generate_prompt="The house was build on",
-        max_gen_tokens=20
+        max_gen_tokens=100
     )
 
                 
