@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import math
+
 class GPTConfig:
     """Configuration class for the GPT model."""
     def __init__(
@@ -24,7 +25,7 @@ class GPTConfig:
         self.n_groups = n_groups
 
 class MultiHeadSelfAttention(nn.Module):
-    """Multi-Head Self Attention module with optional masking."""
+    """Multi-Head Self Attention module."""
     def __init__(self, config: GPTConfig):
         super(MultiHeadSelfAttention, self).__init__()
         assert config.n_embd % config.n_head == 0, "Embedding size must be divisible by number of heads."
@@ -38,6 +39,13 @@ class MultiHeadSelfAttention(nn.Module):
         self.proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
         self.dropout = nn.Dropout(config.dropout)
 
+        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
+        if not self.flash:
+            print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
+            # causal mask to ensure that attention is only applied to the left in the input sequence
+            self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
+                                        .view(1, 1, config.block_size, config.block_size))
+
     def forward(self, x, mask=None):
         B, T, C = x.size()
         # Compute queries, keys, values
@@ -45,15 +53,18 @@ class MultiHeadSelfAttention(nn.Module):
         k = self.key(x).view(B, T, self.n_head, self.head_dim).transpose(1, 2)    # (B, n_head, T, head_dim)
         v = self.value(x).view(B, T, self.n_head, self.head_dim).transpose(1, 2)  # (B, n_head, T, head_dim)
 
-        # Compute scaled dot-product attention
-        att = (q @ k.transpose(-2, -1)) / self.scale  # (B, n_head, T, T)
-        if mask is not None:
-            att = att.masked_fill(mask == 0, float('-inf'))
-        att = torch.softmax(att, dim=-1)
-        att = self.dropout(att)
+        if self.flash:
+            att = torch.nn.functional.scaled_dot_product_attention(q, k, v, mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
+        else:
+            # Compute scaled dot-product attention
+            att = (q @ k.transpose(-2, -1)) / self.scale  # (B, n_head, T, T)
+            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+            att = torch.softmax(att, dim=-1)
+            att = self.dropout(att)
 
-        # Apply attention to values
-        out = att @ v  # (B, n_head, T, head_dim)
+            # Apply attention to values
+            out = att @ v  # (B, n_head, T, head_dim)
+
         out = out.transpose(1, 2).contiguous().view(B, T, C)  # (B, T, C)
         out = self.proj(out)
         out = self.dropout(out)
@@ -83,16 +94,14 @@ class TransformerBlock(nn.Module):
         self.ff = FeedForward(config)
 
     def forward(self, x, mask=None):
-        # Self-Attention with residual connection
-        att_out = self.attn(self.ln1(x), mask=mask)
-        x = x + att_out
-        # Feed-Forward with residual connection
-        ff_out = self.ff(self.ln2(x))
-        x = x + ff_out
+        # Self-Attention
+        x = x + self.attn(self.ln1(x), mask=mask)
+        # Feed-Forward
+        x = x + self.ff(self.ln2(x))
         return x
 
 class GPT(nn.Module):
-    """GPT Language Model with Causal Masking."""
+    """GPT Language Model."""
     def __init__(self, config: GPTConfig):
         super(GPT, self).__init__()
         self.config = config
@@ -117,10 +126,6 @@ class GPT(nn.Module):
         if T > self.config.block_size:
             raise ValueError(f"Sequence length {T} exceeds block size {self.config.block_size}")
 
-        # Generate causal mask if not provided
-        if mask is None:
-            mask = self.generate_causal_mask(T, idx.device)  # (1, 1, T, T)
-
         positions = torch.arange(0, T, dtype=torch.long, device=idx.device).unsqueeze(0)  # (1, T)
         tok_emb = self.token_embedding(idx)  # (B, T, C)
         pos_emb = self.position_embedding(positions)  # (1, T, C)
@@ -132,10 +137,3 @@ class GPT(nn.Module):
         x = self.ln_f(x)  # (B, T, C)
         logits = self.output(x)  # (B, T, vocab_size)
         return logits
-
-    @staticmethod
-    def generate_causal_mask(T, device):
-        """Generates a causal mask to ensure that each position can only attend to previous positions."""
-        # Create a lower triangular matrix filled with 1s
-        mask = torch.tril(torch.ones((T, T), device=device)).unsqueeze(0).unsqueeze(0)  # (1, 1, T, T)
-        return mask
