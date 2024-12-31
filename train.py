@@ -124,7 +124,7 @@ def generate_text(model, tokenizer, device, prompt="The quick brown fox", max_ne
     
     with torch.no_grad():
         for _ in range(max_new_tokens):
-            logits = model(input_ids)  # shape: (batch_size=1, seq_len, vocab_size)
+            logits, loss = model(input_ids)  # shape: (batch_size=1, seq_len, vocab_size)
             # Take the last token’s logits and make a distribution
             probs = F.softmax(logits[:, -1, :], dim=-1)
             # Sample from the distribution
@@ -194,8 +194,8 @@ def train_with_batches(
 
             # Enable mixed precision if using CUDA
             with autocast(enabled=use_amp):
-                logits = model(batch_X)
-                loss = criterion(logits.view(-1, vocab_size), batch_Y.view(-1))
+                logits, loss = model(batch_X, batch_Y)
+                # loss = criterion(logits.view(-1, vocab_size), batch_Y.view(-1))
 
                 # Add L1 sparsity regularization
                 l1_regularization = sparsity_alpha * sum(
@@ -250,7 +250,7 @@ def train_with_batches(
             for batch_X, batch_Y in val_progress_bar:
                 batch_X, batch_Y = batch_X.to(device, non_blocking=True), batch_Y.to(device, non_blocking=True)
 
-                logits = model(batch_X)
+                logits, loss = model(batch_X, batch_Y)
                 loss = criterion(logits.view(-1, vocab_size), batch_Y.view(-1))
                 val_loss += loss.item()
 
@@ -429,9 +429,9 @@ if __name__ == "__main__":
     vocab_size = tokenizer.get_vocab_size()
     model_args = dict(n_layer=num_layers, n_head=num_heads, n_embd=embed_size, block_size=block_size,
                   bias=False, vocab_size=vocab_size, dropout=0.0)
-    # gptconf = GPTConfig(**model_args)
-    # model = GPT(gptconf)
-    model = GPT2WithGroupedAttentionRotary(vocab_size, embed_size, num_heads, num_layers, block_size, num_groups, dropout=0.1, causal=True)
+    gptconf = GPTConfig(**model_args)
+    model = GPT(gptconf)
+    # model = GPT2WithGroupedAttentionRotary(vocab_size, embed_size, num_heads, num_layers, block_size, num_groups, dropout=0.1, causal=True)
 
 
     model.to(device)
