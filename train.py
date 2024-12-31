@@ -51,9 +51,9 @@ def split_data(X, Y, test_size=0.2):
     X_train, X_val, Y_train, Y_val = train_test_split(X, Y, test_size=test_size, random_state=42)
     return X_train, X_val, Y_train, Y_val
 
-def create_dataloader(X, Y, batch_size):
+def create_dataloader(X, Y, batch_size, num_workers=4):
     dataset = TensorDataset(X, Y)
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True,pin_memory=True, num_workers=num_workers)
     return dataloader
 
 
@@ -401,7 +401,7 @@ if __name__ == "__main__":
     X = torch.cat(combined_X, dim=0)
     Y = torch.cat(combined_Y, dim=0)
 
-    X, Y = X.to(device).to(dtype=torch.long), Y.to(device).to(dtype=torch.long)
+    X, Y = X.to(dtype=torch.long), Y.to(dtype=torch.long)
 
     # Split data into training and validation sets
     X_train, X_val, Y_train, Y_val = train_test_split(X, Y, test_size=0.25, random_state=42)
