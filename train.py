@@ -5,7 +5,7 @@ import torch
 import torch.nn.functional as F
 from tokenizers import Tokenizer
 from transformers import GPT2Tokenizer
-from model_old import GPT2WithGroupedAttentionRotary  # Import the model from model.py
+# from model_old import GPT2WithGroupedAttentionRotary  # Import the model from model.py
 from torch.utils.data import DataLoader, TensorDataset
 import torch.nn as nn
 from torch.optim.lr_scheduler import CosineAnnealingLR
@@ -124,7 +124,7 @@ def generate_text(model, tokenizer, device, prompt="The quick brown fox", max_ne
     
     with torch.no_grad():
         for _ in range(max_new_tokens):
-            logits, loss = model(input_ids)  # shape: (batch_size=1, seq_len, vocab_size)
+            logits = model(input_ids)  # shape: (batch_size=1, seq_len, vocab_size)
             # Take the last token’s logits and make a distribution
             probs = F.softmax(logits[:, -1, :], dim=-1)
             # Sample from the distribution
@@ -194,8 +194,8 @@ def train_with_batches(
 
             # Enable mixed precision if using CUDA
             with autocast(enabled=use_amp):
-                logits, loss = model(batch_X, batch_Y)
-                # loss = criterion(logits.view(-1, vocab_size), batch_Y.view(-1))
+                logits = model(batch_X)
+                loss = criterion(logits.view(-1, vocab_size), batch_Y.view(-1))
 
                 # Add L1 sparsity regularization
                 l1_regularization = sparsity_alpha * sum(
@@ -250,7 +250,7 @@ def train_with_batches(
             for batch_X, batch_Y in val_progress_bar:
                 batch_X, batch_Y = batch_X.to(device, non_blocking=True), batch_Y.to(device, non_blocking=True)
 
-                logits, loss = model(batch_X, batch_Y)
+                logits = model(batch_X)
                 loss = criterion(logits.view(-1, vocab_size), batch_Y.view(-1))
                 val_loss += loss.item()
 
