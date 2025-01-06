@@ -1,2 +1,0 @@
-# reasonable
-Experimental reasoning model
