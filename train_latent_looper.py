@@ -13,8 +13,8 @@ from torch.cuda.amp import autocast, GradScaler
 import numpy as np
 import wandb
 from torch.nn.utils import clip_grad_norm_
-from model import GPT
-from latent_loop_model import GPTConfig, LatentLoopTransformer, LatentLoopLoss
+from model import GPT, GPTConfig
+from latent_loop_model import LatentLoopTransformer, LatentLoopLoss
 from utils import (
     generate_text,
     count_parameters,
@@ -23,12 +23,9 @@ from utils import (
     create_dataloader,
     fetch_training_data,
 )
+from torch.utils.data import DataLoader
 
 
-import torch
-import torch.nn as nn
-from torch.cuda.amp import GradScaler, autocast
-from tqdm import tqdm
 import wandb  # Optional: for logging
 from torch.nn.utils import clip_grad_norm_
 
@@ -429,21 +426,19 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    from tokenizers import ByteLevelBPETokenizer
+    from transformers import AutoTokenizer
 
     # Load the tokenizer
-    tokenizer = ByteLevelBPETokenizer(
-        "./byte_level_bpe/vocab.json", "./byte_level_bpe/merges.txt"
-    )
+    tokenizer = AutoTokenizer.from_pretrained('gpt2')
 
     # Ensure special tokens are added
-    special_tokens = ["<pad>", "<s>", "</s>", "<unk>", "<mask>"]
-    for token in special_tokens:
-        token_id = tokenizer.token_to_id(token)
-        if token_id is None:
-            print(f"Error: Token {token} was not added to the vocabulary.")
-        else:
-            print(f"Token {token} has ID: {token_id}")
+    # special_tokens = ["<pad>", "<s>", "</s>", "<unk>", "<mask>"]
+    # for token in special_tokens:
+    #     token_id = tokenizer.token_to_id(token)
+    #     if token_id is None:
+    #         print(f"Error: Token {token} was not added to the vocabulary.")
+    #     else:
+    #         print(f"Token {token} has ID: {token_id}")
 
     # Device setup
     if torch.backends.mps.is_available():
@@ -453,31 +448,45 @@ if __name__ == "__main__":
     else:
         device = torch.device("cpu")
     print("Device:", device)
+    
+    block_size = args.block_size
 
     # Load and preprocess text data
     raw_data_df = fetch_training_data(
-        task_descriptions="reasoning_over_news",
+        task_descriptions=["reasoning_over_news"],
         condition="model_version='gemini-2.0-flash-thinking-exp'",
+        limit=100
     )
-
+    
+    print(raw_data_df)
+    
     processed_data = prepare_training_data_including_thoughts(
-        raw_data_df, tokenizer, block_size=args.block_size
+        raw_data_df, block_size, tokenizer
     )
-
-    block_size = args.block_size
 
     train_data, val_data = train_test_split(
         processed_data, test_size=0.25, random_state=42
     )
 
     # Create DataLoaders for training and validation
-    train_loader = create_dataloader(
-        train_data, batch_size=args.batch_size, shuffle=True
+    train_loader = DataLoader(
+        train_data,
+        batch_size=args.batch_size,
+        shuffle=True,
+        pin_memory=True,
+        num_workers=4,
     )
-    val_loader = create_dataloader(val_data, batch_size=args.batch_size, shuffle=False)
+    
+    val_loader = DataLoader(
+        val_data,
+        batch_size=args.batch_size,
+        shuffle=False,
+        pin_memory=True,
+        num_workers=4,
+    )
 
     # Model configuration
-    vocab_size = tokenizer.get_vocab_size()
+    vocab_size = tokenizer.vocab_size
     latent_model_args = dict(
         n_layer=6,
         n_head=6,
@@ -524,10 +533,10 @@ if __name__ == "__main__":
                 nn.init.xavier_uniform_(param)
 
     print("Model created.")
-    print(
-        "Generated text:",
-        generate_text(model, tokenizer, device, args.prompt, max_new_tokens=120),
-    )
+    # print(
+    #     "Generated text:",
+    #     generate_text(model, tokenizer, device, args.prompt, max_new_tokens=120),
+    # )
     num_params = count_parameters(model)
     print(f"Number of trainable parameters: {num_params}")
 
@@ -543,7 +552,6 @@ if __name__ == "__main__":
         max_steps=args.steps,
         optimizer=optimizer,
         scheduler=scheduler,
-        sparsity_alpha=1e-5,
         start_epoch=start_epoch,
         save_path=args.model_save_path,
         generate_every=100,  # Generate text every 100 training steps

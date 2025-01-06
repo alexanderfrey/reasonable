@@ -1,6 +1,6 @@
 import pandas as pd
 from pandas import DataFrame
-import json, re
+import json, re, os
 from typing import List, Dict, Any
 from dataclasses import dataclass
 from typing import Optional
@@ -29,7 +29,7 @@ timescale_conn_pool = ThreadedConnectionPool(
 )
 
 
-def create_dataloader(X, Y, batch_size, num_workers=4):
+def create_dataloader(X, Y, batch_size, num_workers=4, shuffle=True):
     dataset = TensorDataset(X, Y)
     dataloader = DataLoader(
         dataset,
@@ -393,7 +393,7 @@ def fetch_training_data(task_descriptions, limit=50000, condition=None):
                     created_at DESC
                 LIMIT {limit}"""
 
-    # print(query)
+    print(query)
     cur = conn.cursor()
     cur.execute(query)
     rows = cur.fetchall()
