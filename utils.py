@@ -188,19 +188,11 @@ def prepare_training_data_including_thoughts(
     tokenizer,
 ) -> List[Dict]:
     """
-    Prepare data for training by processing question, context, and thought steps for all rows in DataFrame.
-    Gets context from 'input' field and question from 'prompt' field in the DataFrame.
-
-    Args:
-        df (pd.DataFrame): DataFrame containing the data with 'input', 'prompt', and 'output' fields
-        block_size (int): Maximum sequence length
-        tokenizer: Tokenizer instance
-
-    Returns:
-        List[Dict]: List of processed data items with tokenized content
+    Prepare data for training with consistent padding and sequence lengths.
     """
     data_items = []
-
+    max_thoughts = 5  # Set a maximum number of thought steps to handle
+    
     for idx, row in df.iterrows():
         try:
             # Get context and question from DataFrame fields
@@ -222,29 +214,65 @@ def prepare_training_data_including_thoughts(
                 t for t in json.loads(row["output"]) if not t.get("thought")
             ][0].get("text")
 
-            # Tokenize inputs
-            tokenized_question = tokenizer.encode(
-                question, truncation=True, max_length=block_size // 2
+            # Tokenize and pad inputs
+            tokenized_question = torch.tensor(
+                tokenizer.encode(
+                    question,
+                    truncation=True,
+                    padding='max_length',
+                    max_length=block_size // 2
+                ),
+                dtype=torch.long
             )
-            tokenized_context = tokenizer.encode(
-                context, truncation=True, max_length=block_size
+            
+            tokenized_context = torch.tensor(
+                tokenizer.encode(
+                    context,
+                    truncation=True,
+                    padding='max_length',
+                    max_length=block_size
+                ),
+                dtype=torch.long
             )
-            tokenized_complete_answer = tokenizer.encode(
-                final_answer, truncation=True, max_length=block_size
+            
+            tokenized_complete_answer = torch.tensor(
+                tokenizer.encode(
+                    final_answer,
+                    truncation=True,
+                    padding='max_length',
+                    max_length=block_size
+                ),
+                dtype=torch.long
             )
 
-            # Tokenize individual thought steps
-            tokenized_thoughts = [
-                tokenizer.encode(thought, truncation=True, max_length=block_size // 4)
-                for thought in formatted_thoughts
-            ]
+            # Tokenize and pad thought steps with consistent size
+            tokenized_thoughts = []
+            for thought in formatted_thoughts[:max_thoughts]:  # Limit number of thoughts
+                thought_tokens = torch.tensor(
+                    tokenizer.encode(
+                        thought,
+                        truncation=True,
+                        padding='max_length',
+                        max_length=block_size // 4
+                    ),
+                    dtype=torch.long
+                )
+                tokenized_thoughts.append(thought_tokens)
+            
+            # Pad thoughts list if fewer than max_thoughts
+            while len(tokenized_thoughts) < max_thoughts:
+                pad_tokens = torch.zeros(block_size // 4, dtype=torch.long)
+                tokenized_thoughts.append(pad_tokens)
+            
+            # Stack thoughts into a single tensor
+            tokenized_thoughts = torch.stack(tokenized_thoughts)
 
             # Create data item
             data_item = {
                 "question": tokenized_question,
                 "context": tokenized_context,
-                "final_answer": tokenized_complete_answer,
-                "thought_steps": tokenized_thoughts,
+                "answer": tokenized_complete_answer,  # Changed name to match training loop
+                "intermediate_answers": tokenized_thoughts,  # Changed name to match training loop
             }
 
             data_items.append(data_item)

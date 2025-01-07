@@ -430,6 +430,11 @@ if __name__ == "__main__":
 
     # Load the tokenizer
     tokenizer = AutoTokenizer.from_pretrained('gpt2')
+    
+    # Set pad token to eos token
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.pad_token_id = tokenizer.eos_token_id
 
     # Ensure special tokens are added
     # special_tokens = ["<pad>", "<s>", "</s>", "<unk>", "<mask>"]

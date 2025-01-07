@@ -11,3 +11,4 @@ __pycache__/
 input.txt
 env/
 venv/
+.env
