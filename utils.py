@@ -187,15 +187,11 @@ def prepare_training_data_including_thoughts(
     block_size: int,
     tokenizer,
 ) -> List[Dict]:
-    """
-    Prepare data for training with consistent padding and sequence lengths.
-    """
     data_items = []
-    max_thoughts = 5  # Set a maximum number of thought steps to handle
+    max_thoughts = 5  
     
     for idx, row in df.iterrows():
         try:
-            # Get context and question from DataFrame fields
             context = row["input"]
             question = row["prompt"]
 
@@ -214,71 +210,89 @@ def prepare_training_data_including_thoughts(
                 t for t in json.loads(row["output"]) if not t.get("thought")
             ][0].get("text")
 
-            # Tokenize and pad inputs
-            tokenized_question = torch.tensor(
-                tokenizer.encode(
-                    question,
-                    truncation=True,
-                    padding='max_length',
-                    max_length=block_size // 2
-                ),
-                dtype=torch.long
+            # Print lengths before tokenization
+            print(f"Row {idx}:")
+            print(f"Question length: {len(question)}")
+            print(f"Context length: {len(context)}")
+            print(f"Answer length: {len(final_answer)}")
+            print(f"Number of thought steps: {len(formatted_thoughts)}")
+
+            # Tokenize with explicit max lengths
+            max_question_length = block_size // 2
+            max_context_length = block_size
+            max_answer_length = block_size
+            max_thought_length = block_size // 4
+
+            tokenized_question = tokenizer.encode(
+                question,
+                truncation=True,
+                padding='max_length',
+                max_length=max_question_length
             )
             
-            tokenized_context = torch.tensor(
-                tokenizer.encode(
-                    context,
-                    truncation=True,
-                    padding='max_length',
-                    max_length=block_size
-                ),
-                dtype=torch.long
+            tokenized_context = tokenizer.encode(
+                context,
+                truncation=True,
+                padding='max_length',
+                max_length=max_context_length
             )
             
-            tokenized_complete_answer = torch.tensor(
-                tokenizer.encode(
-                    final_answer,
-                    truncation=True,
-                    padding='max_length',
-                    max_length=block_size
-                ),
-                dtype=torch.long
+            tokenized_complete_answer = tokenizer.encode(
+                final_answer,
+                truncation=True,
+                padding='max_length',
+                max_length=max_answer_length
             )
 
-            # Tokenize and pad thought steps with consistent size
+            # Print token lengths after tokenization
+            print(f"Tokenized lengths:")
+            print(f"Question tokens: {len(tokenized_question)}")
+            print(f"Context tokens: {len(tokenized_context)}")
+            print(f"Answer tokens: {len(tokenized_complete_answer)}")
+
+            # Handle thought steps with explicit validation
             tokenized_thoughts = []
-            for thought in formatted_thoughts[:max_thoughts]:  # Limit number of thoughts
-                thought_tokens = torch.tensor(
-                    tokenizer.encode(
-                        thought,
-                        truncation=True,
-                        padding='max_length',
-                        max_length=block_size // 4
-                    ),
-                    dtype=torch.long
+            for thought in formatted_thoughts[:max_thoughts]:
+                thought_tokens = tokenizer.encode(
+                    thought,
+                    truncation=True,
+                    padding='max_length',
+                    max_length=max_thought_length
                 )
-                tokenized_thoughts.append(thought_tokens)
+                tokenized_thoughts.append(torch.tensor(thought_tokens, dtype=torch.long))
             
-            # Pad thoughts list if fewer than max_thoughts
+            # Pad thoughts list with explicit zero tensors
             while len(tokenized_thoughts) < max_thoughts:
-                pad_tokens = torch.zeros(block_size // 4, dtype=torch.long)
-                tokenized_thoughts.append(pad_tokens)
-            
-            # Stack thoughts into a single tensor
-            tokenized_thoughts = torch.stack(tokenized_thoughts)
+                pad_tensor = torch.zeros(max_thought_length, dtype=torch.long)
+                pad_tensor.fill_(tokenizer.pad_token_id)  # Use pad token ID instead of zeros
+                tokenized_thoughts.append(pad_tensor)
 
-            # Create data item
+            # Convert to tensors with size verification
+            question_tensor = torch.tensor(tokenized_question, dtype=torch.long)
+            context_tensor = torch.tensor(tokenized_context, dtype=torch.long)
+            answer_tensor = torch.tensor(tokenized_complete_answer, dtype=torch.long)
+            thoughts_tensor = torch.stack(tokenized_thoughts)
+
+            # Print final tensor shapes
+            print(f"Final tensor shapes:")
+            print(f"Question: {question_tensor.shape}")
+            print(f"Context: {context_tensor.shape}")
+            print(f"Answer: {answer_tensor.shape}")
+            print(f"Thoughts: {thoughts_tensor.shape}")
+            print("-------------------")
+
             data_item = {
-                "question": tokenized_question,
-                "context": tokenized_context,
-                "answer": tokenized_complete_answer,  # Changed name to match training loop
-                "intermediate_answers": tokenized_thoughts,  # Changed name to match training loop
+                "question": question_tensor,
+                "context": context_tensor,
+                "answer": answer_tensor,
+                "intermediate_answers": thoughts_tensor
             }
 
             data_items.append(data_item)
 
         except Exception as e:
             print(f"Error processing row {idx}: {str(e)}")
+            raise  # Re-raise the exception to see the full stack trace
             continue
 
     return data_items
