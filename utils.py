@@ -29,16 +29,30 @@ timescale_conn_pool = ThreadedConnectionPool(
 )
 
 
-def create_dataloader(X, Y, batch_size, num_workers=4, shuffle=True):
-    dataset = TensorDataset(X, Y)
-    dataloader = DataLoader(
-        dataset,
+def create_data_loader(data, batch_size, tokenizer, shuffle=True):
+    # Validate tensors before creating DataLoader
+    for idx, item in enumerate(data):
+        for key, tensor in item.items():
+            # Ensure integer type
+            if not isinstance(tensor, torch.Tensor):
+                item[key] = torch.tensor(tensor, dtype=torch.long)
+            elif tensor.dtype != torch.long:
+                item[key] = tensor.to(torch.long)
+
+            # Validate values
+            if torch.any(tensor < 0):
+                raise ValueError(f"Negative values found in {key} at index {idx}")
+            if torch.any(tensor >= tokenizer.vocab_size):
+                raise ValueError(f"Token ID >= vocab_size in {key} at index {idx}")
+
+    return DataLoader(
+        data,
         batch_size=batch_size,
-        shuffle=True,
-        pin_memory=True,
-        num_workers=num_workers,
+        shuffle=shuffle,
+        num_workers=0,  # Use 0 for debugging
+        pin_memory=False,  # Disable pin_memory for debugging
+        persistent_workers=False,
     )
-    return dataloader
 
 
 @dataclass
@@ -188,8 +202,8 @@ def prepare_training_data_including_thoughts(
     tokenizer,
 ) -> List[Dict]:
     data_items = []
-    max_thoughts = 5  
-    
+    max_thoughts = 5
+
     for idx, row in df.iterrows():
         try:
             context = row["input"]
@@ -223,25 +237,39 @@ def prepare_training_data_including_thoughts(
             max_answer_length = block_size
             max_thought_length = block_size // 4
 
-            tokenized_question = tokenizer.encode(
-                question,
-                truncation=True,
-                padding='max_length',
-                max_length=max_question_length
+            def validate_and_clip_tokens(tokens, max_val):
+                return [min(t, max_val) for t in tokens]
+
+            max_token_id = tokenizer.vocab_size - 1
+
+            tokenized_question = validate_and_clip_tokens(
+                tokenizer.encode(
+                    question,
+                    truncation=True,
+                    padding="max_length",
+                    max_length=block_size // 2,
+                ),
+                max_token_id,
             )
-            
-            tokenized_context = tokenizer.encode(
-                context,
-                truncation=True,
-                padding='max_length',
-                max_length=max_context_length
+
+            tokenized_context = validate_and_clip_tokens(
+                tokenizer.encode(
+                    context,
+                    truncation=True,
+                    padding="max_length",
+                    max_length=block_size,
+                ),
+                max_token_id,
             )
-            
-            tokenized_complete_answer = tokenizer.encode(
-                final_answer,
-                truncation=True,
-                padding='max_length',
-                max_length=max_answer_length
+
+            tokenized_complete_answer = validate_and_clip_tokens(
+                tokenizer.encode(
+                    final_answer,
+                    truncation=True,
+                    padding="max_length",
+                    max_length=block_size,
+                ),
+                max_token_id,
             )
 
             # Print token lengths after tokenization
@@ -256,15 +284,19 @@ def prepare_training_data_including_thoughts(
                 thought_tokens = tokenizer.encode(
                     thought,
                     truncation=True,
-                    padding='max_length',
-                    max_length=max_thought_length
+                    padding="max_length",
+                    max_length=max_thought_length,
                 )
-                tokenized_thoughts.append(torch.tensor(thought_tokens, dtype=torch.long))
-            
+                tokenized_thoughts.append(
+                    torch.tensor(thought_tokens, dtype=torch.long)
+                )
+
             # Pad thoughts list with explicit zero tensors
             while len(tokenized_thoughts) < max_thoughts:
                 pad_tensor = torch.zeros(max_thought_length, dtype=torch.long)
-                pad_tensor.fill_(tokenizer.pad_token_id)  # Use pad token ID instead of zeros
+                pad_tensor.fill_(
+                    tokenizer.pad_token_id
+                )  # Use pad token ID instead of zeros
                 tokenized_thoughts.append(pad_tensor)
 
             # Convert to tensors with size verification
@@ -285,7 +317,7 @@ def prepare_training_data_including_thoughts(
                 "question": question_tensor,
                 "context": context_tensor,
                 "answer": answer_tensor,
-                "intermediate_answers": thoughts_tensor
+                "intermediate_answers": thoughts_tensor,
             }
 
             data_items.append(data_item)
@@ -331,41 +363,36 @@ def decode_example(X, Y, tokenizer, index=9):
     return input_sequence, target_sequence
 
 
-def generate_text(
-    model, tokenizer, device, prompt="The quick brown fox", max_new_tokens=30
-):
-    """
-    A simple text generation function that appends tokens to the prompt
-    one at a time, sampling from the model's output distribution.
+def generate_text(model, tokenizer, device, prompt, max_new_tokens=20):
+    """Generate text using the model."""
+    try:
+        # Encode the prompt
+        encoded = tokenizer.encode(prompt)  # This returns a list of ids
+        input_ids = torch.tensor([encoded], dtype=torch.long).to(device)
 
-    Args:
-        model: Your GPT-like model
-        tokenizer: Tokenizer used to encode/decode text
-        device: Torch device
-        prompt (str): Initial text prompt
-        max_new_tokens (int): Number of tokens to generate
+        # Set model to eval mode
+        model.eval()
 
-    Returns:
-        A string of the generated text
-    """
-    model.eval()
-    # Encode the prompt
-    encoded = tokenizer.encode(prompt)
-    input_ids = torch.tensor(encoded.ids, dtype=torch.long).unsqueeze(0).to(device)
+        with torch.no_grad():
+            # Generate
+            output = model(input_ids)
+            logits = output["logits"]
 
-    with torch.no_grad():
-        for _ in range(max_new_tokens):
-            logits = model(input_ids)  # shape: (batch_size=1, seq_len, vocab_size)
-            # Take the last token’s logits and make a distribution
-            probs = F.softmax(logits[:, -1, :], dim=-1)
-            # Sample from the distribution
-            next_token = torch.multinomial(probs, num_samples=1)
-            # Append the sampled token to the sequence
-            input_ids = torch.cat((input_ids, next_token), dim=1)
+            # Sample from logits
+            next_token_logits = logits[:, -1, :]
+            next_token = torch.argmax(next_token_logits, dim=-1)
 
-    # Decode the entire sequence
-    generated_text = tokenizer.decode(input_ids.squeeze().tolist())
-    return generated_text
+            # Decode
+            generated = list(input_ids[0].cpu().numpy())
+            generated.extend(next_token.cpu().numpy())
+
+            return tokenizer.decode(generated)
+
+    except Exception as e:
+        print(f"Error in text generation: {str(e)}")
+        return f"Error generating text: {str(e)}"
+    finally:
+        model.train()
 
 
 def count_parameters(model):

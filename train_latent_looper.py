@@ -20,10 +20,79 @@ from utils import (
     count_parameters,
     load_checkpoint,
     prepare_training_data_including_thoughts,
-    create_dataloader,
+    create_data_loader,
     fetch_training_data,
 )
 from torch.utils.data import DataLoader
+
+torch.backends.cuda.matmul.allow_tf32 = False
+torch.backends.cudnn.allow_tf32 = False
+
+# Add this before starting training
+if torch.cuda.is_available():
+    # Reset GPU state
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
+    torch.cuda.reset_accumulated_memory_stats()
+
+    # Print GPU info
+    print("\nGPU Information:")
+    print(f"Device: {torch.cuda.get_device_name(0)}")
+    print(f"Memory allocated: {torch.cuda.memory_allocated(0) / 1024**2:.2f} MB")
+    print(f"Memory cached: {torch.cuda.memory_reserved(0) / 1024**2:.2f} MB")
+
+    # Try a small tensor transfer test
+    try:
+        test_tensor = torch.ones(1, device="cuda")
+        print("GPU test transfer successful")
+    except Exception as e:
+        print(f"GPU test transfer failed: {e}")
+
+
+def test_gpu_operations():
+    print("\nRunning GPU diagnostics...")
+
+    try:
+        # Test 1: Small tensor transfer
+        print("\nTest 1: Basic tensor transfer")
+        cpu_tensor = torch.arange(10, dtype=torch.long)
+        gpu_tensor = cpu_tensor.to("cuda")
+        print("Basic tensor transfer successful")
+
+        # Test 2: Tensor with same shape as our data
+        print("\nTest 2: Testing with data-like shapes")
+        sample_question = torch.zeros((1, 1024), dtype=torch.long)
+        sample_context = torch.zeros((1, 2048), dtype=torch.long)
+        sample_answer = torch.zeros((1, 2048), dtype=torch.long)
+        sample_intermediate = torch.zeros((1, 5, 512), dtype=torch.long)
+
+        # Transfer each
+        gpu_question = sample_question.to("cuda")
+        print("Question transfer OK")
+        gpu_context = sample_context.to("cuda")
+        print("Context transfer OK")
+        gpu_answer = sample_answer.to("cuda")
+        print("Answer transfer OK")
+        gpu_intermediate = sample_intermediate.to("cuda")
+        print("Intermediate transfer OK")
+
+        # Test 3: Concatenation
+        print("\nTest 3: Testing concatenation")
+        cat_result = torch.cat([gpu_question, gpu_context], dim=1)
+        print(f"Concatenation successful, shape: {cat_result.shape}")
+
+        # Test 4: Memory cleanup
+        print("\nTest 4: Testing memory cleanup")
+        del gpu_question, gpu_context, gpu_answer, gpu_intermediate, cat_result
+        torch.cuda.empty_cache()
+        print("Memory cleanup successful")
+
+        print("\nAll GPU diagnostic tests passed!")
+        return True
+
+    except Exception as e:
+        print(f"\nGPU diagnostic failed: {str(e)}")
+        return False
 
 
 import wandb  # Optional: for logging
@@ -118,7 +187,15 @@ def train_with_batches(
                     break
 
                 try:
-                    # Move batch to device
+                    # Move batch to device and print shapes
+                    # print(f"\nBatch {batch_idx} shapes before device transfer:")
+                    # print(f"Question shape: {batch['question'].shape}")
+                    # print(f"Context shape: {batch['context'].shape}")
+                    # print(f"Answer shape: {batch['answer'].shape}")
+                    # print(
+                    #     f"Intermediate answers shape: {batch['intermediate_answers'].shape}"
+                    # )
+
                     question = batch["question"].to(device)
                     context = batch["context"].to(device)
                     answer = batch["answer"].to(device)
@@ -126,13 +203,31 @@ def train_with_batches(
                     if intermediate_answers is not None:
                         intermediate_answers = intermediate_answers.to(device)
 
+                    # Print shapes after device transfer
+                    # print(f"\nShapes after device transfer:")
+                    # print(f"Question shape: {question.shape}")
+                    # print(f"Context shape: {context.shape}")
+                    # print(
+                    #     f"Input concatenated shape: {torch.cat([question, context], dim=1).shape}"
+                    # )
+
                     # Forward pass with automatic mixed precision
                     with autocast(enabled=use_amp):
-                        # Combine input
+                        # Validate input dimensions before concatenation
+                        if len(question.shape) != 2:
+                            question = question.unsqueeze(0)
+                        if len(context.shape) != 2:
+                            context = context.unsqueeze(0)
+
+                        # Combine input with shape validation
                         input_ids = torch.cat([question, context], dim=1)
+                        # print(f"Final input_ids shape: {input_ids.shape}")
 
                         # Forward pass through model
                         output = model(input_ids)
+                        # print(
+                        #     f"Model output shape: {output.shape if isinstance(output, torch.Tensor) else 'dict'}"
+                        # )
 
                         # Prepare targets
                         targets = {
@@ -175,15 +270,15 @@ def train_with_batches(
                         )
 
                         # Generate sample text periodically
-                        if generate_every and global_step % generate_every == 0:
-                            generate_sample_text(
-                                model,
-                                tokenizer,
-                                generate_prompt,
-                                max_gen_tokens,
-                                device,
-                                global_step,
-                            )
+                        # if generate_every and global_step % generate_every == 0:
+                        #     generate_sample_text(
+                        #         model,
+                        #         tokenizer,
+                        #         generate_prompt,
+                        #         max_gen_tokens,
+                        #         device,
+                        #         global_step,
+                        #     )
 
                 except RuntimeError as e:
                     print(f"Error in batch {batch_idx}: {str(e)}")
@@ -289,7 +384,6 @@ def generate_sample_text(model, tokenizer, prompt, max_tokens, device, step):
 
 
 def validate_model(model, val_loader, criterion, device, use_amp):
-    """Run validation loop and return metrics"""
     model.eval()
     val_loss = 0.0
     val_metrics = {
@@ -300,32 +394,87 @@ def validate_model(model, val_loader, criterion, device, use_amp):
     }
 
     with torch.no_grad():
-        for batch in tqdm(val_loader, desc="Validation", leave=False):
-            question = batch["question"].to(device)
-            context = batch["context"].to(device)
-            answer = batch["answer"].to(device)
-            intermediate_answers = batch.get("intermediate_answers")
-            if intermediate_answers is not None:
-                intermediate_answers = intermediate_answers.to(device)
+        for batch_idx, batch in enumerate(
+            tqdm(val_loader, desc="Validation", leave=False)
+        ):
+            try:
+                # print(f"\nValidating batch {batch_idx}")
 
-            with autocast(enabled=use_amp):
-                input_ids = torch.cat([question, context], dim=1)
-                output = model(input_ids)
-                targets = {
-                    "answer": answer,
-                    "intermediate_states": intermediate_answers,
+                # 1. First verify all tensors before any device operations
+                for key, tensor in batch.items():
+                    # print(
+                    #     f"{key} pre-transfer - shape: {tensor.shape}, "
+                    #     f"dtype: {tensor.dtype}, device: {tensor.device}"
+                    # )
+
+                    # Ensure we're working with CPU tensors initially
+                    if tensor.device.type != "cpu":
+                        batch[key] = tensor.cpu()
+
+                    # Ensure correct dtype
+                    if tensor.dtype != torch.long:
+                        batch[key] = tensor.to(torch.long)
+
+                # 2. Create new tensors on device instead of transferring
+                device_batch = {
+                    key: torch.empty(tensor.shape, dtype=torch.long, device=device)
+                    for key, tensor in batch.items()
                 }
-                loss_dict = criterion(output, targets)
 
-            val_loss += loss_dict["total_loss"].item()
-            for key in val_metrics:
-                val_metrics[key] += loss_dict[key]
+                # 3. Copy data to new device tensors
+                for key, tensor in batch.items():
+                    try:
+                        device_batch[key].copy_(tensor)
+                        # print(
+                        #     f"{key} post-transfer - shape: {device_batch[key].shape}, "
+                        #     f"device: {device_batch[key].device}"
+                        # )
+                    except Exception as e:
+                        print(f"Error copying {key}: {str(e)}")
+                        raise
 
-    # Calculate averages
-    num_batches = len(val_loader)
-    val_loss /= num_batches
-    for key in val_metrics:
-        val_metrics[key] /= num_batches
+                # 4. Extract individual tensors
+                question = device_batch["question"]
+                context = device_batch["context"]
+                answer = device_batch["answer"]
+                intermediate_answers = device_batch.get("intermediate_answers")
+
+                # 5. Prepare input
+                try:
+                    input_ids = torch.cat([question, context], dim=1)
+                    # print(f"Combined input shape: {input_ids.shape}")
+                except Exception as e:
+                    print("Error in concatenation:", str(e))
+                    raise
+
+                # 6. Model forward pass
+                with autocast(enabled=use_amp):
+                    try:
+                        output = model(input_ids)
+                        targets = {
+                            "answer": answer,
+                            "intermediate_states": intermediate_answers,
+                        }
+                        loss_dict = criterion(output, targets)
+                    except Exception as e:
+                        print("Error in forward pass:", str(e))
+                        raise
+
+                val_loss += loss_dict["total_loss"].item()
+                for key in val_metrics:
+                    val_metrics[key] += loss_dict[key]
+
+            except Exception as e:
+                print(f"Error processing batch {batch_idx}: {str(e)}")
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                raise
+
+        # Calculate averages
+        num_batches = len(val_loader)
+        val_loss /= num_batches
+        for key in val_metrics:
+            val_metrics[key] /= num_batches
 
     return val_loss, val_metrics
 
@@ -366,23 +515,26 @@ def log_metrics(train_loss, val_loss, train_metrics, val_metrics, global_step, e
             "global_step": global_step,
         }
     )
-    
+
+
 def validate_dataset(data_items):
     shapes = []
     for item in data_items:
         shape_dict = {
-            'question': item['question'].shape,
-            'context': item['context'].shape,
-            'answer': item['answer'].shape,
-            'intermediate_answers': item['intermediate_answers'].shape
+            "question": item["question"].shape,
+            "context": item["context"].shape,
+            "answer": item["answer"].shape,
+            "intermediate_answers": item["intermediate_answers"].shape,
         }
         shapes.append(shape_dict)
-        
+
         # Validate indices are within bounds
         for key, tensor in item.items():
             if torch.any(tensor >= tokenizer.vocab_size):
-                print(f"Found out of bounds token in {key}: {torch.max(tensor)} >= {tokenizer.vocab_size}")
-    
+                print(
+                    f"Found out of bounds token in {key}: {torch.max(tensor)} >= {tokenizer.vocab_size}"
+                )
+
     # Check if all shapes are consistent
     first_shape = shapes[0]
     inconsistent = [i for i, s in enumerate(shapes) if s != first_shape]
@@ -390,8 +542,25 @@ def validate_dataset(data_items):
         print(f"Inconsistent shapes found at indices: {inconsistent}")
         print(f"Expected shapes: {first_shape}")
         print(f"Found shapes: {[shapes[i] for i in inconsistent]}")
-    
+
     return len(inconsistent) == 0
+
+
+def validate_token_indices(data_items, vocab_size):
+    for idx, item in enumerate(data_items):
+        for key, tensor in item.items():
+            max_idx = torch.max(tensor).item()
+            if max_idx >= vocab_size:
+                print(
+                    f"Found invalid token index in item {idx}, key {key}: {max_idx} >= {vocab_size}"
+                )
+                # Print a few examples of large indices
+                large_indices = (tensor >= vocab_size).nonzero()
+                if len(large_indices) > 0:
+                    print(f"First few invalid indices: {large_indices[:5]}")
+                    print(f"Corresponding values: {tensor[large_indices[:5]]}")
+                return False
+    return True
 
 
 def print_epoch_summary(
@@ -455,8 +624,8 @@ if __name__ == "__main__":
     from transformers import AutoTokenizer
 
     # Load the tokenizer
-    tokenizer = AutoTokenizer.from_pretrained('gpt2')
-    
+    tokenizer = AutoTokenizer.from_pretrained("gpt2")
+
     # Set pad token to eos token
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -479,45 +648,72 @@ if __name__ == "__main__":
     else:
         device = torch.device("cpu")
     print("Device:", device)
-    
+
     block_size = args.block_size
 
     # Load and preprocess text data
     raw_data_df = fetch_training_data(
         task_descriptions=["reasoning_over_news"],
         condition="model_version='gemini-2.0-flash-thinking-exp'",
-        limit=100
+        limit=100,
     )
-    
+
     print(raw_data_df)
-    
+
     processed_data = prepare_training_data_including_thoughts(
         raw_data_df, block_size, tokenizer
     )
-    
+
     if not validate_dataset(processed_data):
         raise ValueError("Dataset validation failed!")
+
+    print(f"Vocabulary size: {tokenizer.vocab_size}")
+    print(
+        f"Max token ID in data: {max(max(batch['question'].max(), batch['context'].max(), batch['answer'].max()) for batch in processed_data)}"
+    )
 
     train_data, val_data = train_test_split(
         processed_data, test_size=0.25, random_state=42
     )
 
+    if not validate_token_indices(processed_data, tokenizer.vocab_size):
+        raise ValueError("Found token indices larger than vocabulary size!")
+
     # Create DataLoaders for training and validation
-    train_loader = DataLoader(
-        train_data,
-        batch_size=args.batch_size,
-        shuffle=True,
-        pin_memory=True,
-        num_workers=4,
+    train_loader = create_data_loader(
+        train_data, args.batch_size, tokenizer, shuffle=True
     )
-    
-    val_loader = DataLoader(
-        val_data,
-        batch_size=args.batch_size,
-        shuffle=False,
-        pin_memory=True,
-        num_workers=4,
-    )
+    val_loader = create_data_loader(val_data, args.batch_size, tokenizer, shuffle=False)
+
+    if not test_gpu_operations():
+        raise RuntimeError("GPU diagnostics failed, cannot proceed with training")
+
+    # If diagnostics pass, try a single batch test
+    print("\nTesting with first batch...")
+    try:
+        # Get first batch
+        first_batch = next(iter(train_loader))
+
+        # Try operations on first batch
+        print("Moving first batch to GPU...")
+        question = first_batch["question"][:1].to("cuda")  # Just take first item
+        context = first_batch["context"][:1].to("cuda")
+        answer = first_batch["answer"][:1].to("cuda")
+        intermediate = first_batch["intermediate_answers"][:1].to("cuda")
+
+        print("First batch transfer successful")
+        print(f"Question shape: {question.shape}")
+        print(f"Context shape: {context.shape}")
+        print(f"Answer shape: {answer.shape}")
+        print(f"Intermediate shape: {intermediate.shape}")
+
+        # Clean up
+        del question, context, answer, intermediate
+        torch.cuda.empty_cache()
+
+    except Exception as e:
+        print(f"First batch test failed: {str(e)}")
+        raise
 
     # Model configuration
     vocab_size = tokenizer.vocab_size
@@ -544,7 +740,15 @@ if __name__ == "__main__":
     language_gpt = GPT(GPTConfig(**language_model_args)).to(device)
 
     # Combine into LatentLoopTransformer
-    model = LatentLoopTransformer(latent_gpt, language_gpt, max_loops=10).to(device)
+    model = LatentLoopTransformer(latent_gpt, language_gpt, max_loops=5).to(device)
+
+    print("Model Configuration:")
+    print(f"Vocab size: {tokenizer.vocab_size}")
+    print(f"Model embedding size: {model.latent_gpt.token_embedding.weight.size(0)}")
+    print(f"Block size: {block_size}")
+    print(
+        f"Position embedding capacity: {model.latent_gpt.position_embedding.weight.shape}"
+    )
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.1)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
