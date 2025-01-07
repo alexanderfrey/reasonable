@@ -366,6 +366,32 @@ def log_metrics(train_loss, val_loss, train_metrics, val_metrics, global_step, e
             "global_step": global_step,
         }
     )
+    
+def validate_dataset(data_items):
+    shapes = []
+    for item in data_items:
+        shape_dict = {
+            'question': item['question'].shape,
+            'context': item['context'].shape,
+            'answer': item['answer'].shape,
+            'intermediate_answers': item['intermediate_answers'].shape
+        }
+        shapes.append(shape_dict)
+        
+        # Validate indices are within bounds
+        for key, tensor in item.items():
+            if torch.any(tensor >= tokenizer.vocab_size):
+                print(f"Found out of bounds token in {key}: {torch.max(tensor)} >= {tokenizer.vocab_size}")
+    
+    # Check if all shapes are consistent
+    first_shape = shapes[0]
+    inconsistent = [i for i, s in enumerate(shapes) if s != first_shape]
+    if inconsistent:
+        print(f"Inconsistent shapes found at indices: {inconsistent}")
+        print(f"Expected shapes: {first_shape}")
+        print(f"Found shapes: {[shapes[i] for i in inconsistent]}")
+    
+    return len(inconsistent) == 0
 
 
 def print_epoch_summary(
@@ -468,6 +494,9 @@ if __name__ == "__main__":
     processed_data = prepare_training_data_including_thoughts(
         raw_data_df, block_size, tokenizer
     )
+    
+    if not validate_dataset(processed_data):
+        raise ValueError("Dataset validation failed!")
 
     train_data, val_data = train_test_split(
         processed_data, test_size=0.25, random_state=42
