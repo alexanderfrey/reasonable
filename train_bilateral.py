@@ -221,12 +221,12 @@ def load_checkpoint(
 
 def count_parameters(model):
     """
-    Count the number of trainable parameters in the model.
+    Count the number of trainable parameters in the bilateral model.
     Returns total params and a breakdown of parameters by component.
     """
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
 
-    # Count embedding parameters
+    # Count embedding parameters (shared between pathways)
     token_emb_params = model.token_embedding.weight.numel()
     pos_emb_params = model.position_embedding.weight.numel()
 
@@ -236,18 +236,35 @@ def count_parameters(model):
     )
     total_layer_params = layer_params * len(model.blocks)
 
-    # Count final layer norm and head parameters
-    final_ln_params = sum(p.numel() for p in model.ln_f.parameters() if p.requires_grad)
-    head_params = model.lm_head.weight.numel()
+    # Count final layer norms for both pathways
+    final_ln_params_main = sum(
+        p.numel() for p in model.ln_f_main.parameters() if p.requires_grad
+    )
+    final_ln_params_analysis = sum(
+        p.numel() for p in model.ln_f_analysis.parameters() if p.requires_grad
+    )
+
+    # Count head parameters for both pathways
+    main_head_params = model.lm_head.weight.numel()
+    analysis_head_params = model.analysis_head.weight.numel()
+
     if model.config.bias:  # Add bias parameters if present
-        head_params += model.lm_head.bias.numel()
+        main_head_params += model.lm_head.bias.numel()
+        analysis_head_params += model.analysis_head.bias.numel()
 
     return {
         "total": total_params,
         "embeddings": token_emb_params + pos_emb_params,
         "transformer_layers": total_layer_params,
-        "final_ln": final_ln_params,
-        "head": head_params,
+        "final_ln": final_ln_params_main
+        + final_ln_params_analysis,  # Combined layer norm params
+        "heads": main_head_params + analysis_head_params,  # Combined head params
+        # Detailed breakdown of pathways
+        "main_pathway": {"final_ln": final_ln_params_main, "head": main_head_params},
+        "analysis_pathway": {
+            "final_ln": final_ln_params_analysis,
+            "head": analysis_head_params,
+        },
     }
 
 
