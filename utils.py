@@ -1,14 +1,23 @@
 import pandas as pd
 from pandas import DataFrame
-import json, re, os
+import json, re, os, uuid, datetime
+import requests
 from typing import List, Dict, Any
 from dataclasses import dataclass
 from typing import Optional
 import psycopg2
+import aiohttp
+
+import openai
+from openai import OpenAI
 from psycopg2.pool import ThreadedConnectionPool
 from torch.utils.data import DataLoader, TensorDataset
 import torch
 import logging
+from psycopg2.extras import DictCursor
+import tiktoken
+from contextlib import contextmanager
+
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
@@ -17,16 +26,274 @@ from dotenv import load_dotenv
 # Load environment variables from .env file
 load_dotenv()
 
-# Get credentials from environment variables
-timescale_conn_pool = ThreadedConnectionPool(
-    1,  # minconn
-    40,  # maxconn
-    host=os.getenv("DB_HOST"),
-    database=os.getenv("DB_NAME"),
-    user=os.getenv("DB_USER"),
-    port=int(os.getenv("DB_PORT", 5432)),
-    password=os.getenv("DB_PASSWORD"),
-)
+
+def format_instruction_alpaca(sample):
+    if sample.get("input"):
+        return f"""### Instruction:
+{sample['instruction']}
+
+### Input:
+{sample['input']}
+"""
+    else:
+        return f"""### Instruction:
+{sample['instruction']}
+"""
+
+
+def num_tokens_from_string(string: str, encoding_name: str) -> int:
+    """Returns the number of tokens in a text string."""
+    if not string:
+        return 0
+    encoding = tiktoken.get_encoding(encoding_name)
+    num_tokens = len(encoding.encode(string))
+    return num_tokens
+
+
+class DatabaseConfig:
+    def __init__(
+        self, host: str, database: str, user: str, password: str, port: int = 5432
+    ):
+        self.host = host
+        self.database = database
+        self.user = user
+        self.password = password
+        self.port = port
+
+    @classmethod
+    def from_env(cls) -> "DatabaseConfig":
+        # You can implement environment variable loading here
+        return cls(
+            host="",
+            database="",
+            user="",
+            password="",
+            port=5432,
+        )
+
+
+@contextmanager
+def get_db_connection(config: DatabaseConfig):
+    conn = None
+    try:
+        conn = psycopg2.connect(
+            host=config.host,
+            database=config.database,
+            user=config.user,
+            password=config.password,
+            port=config.port,
+        )
+        yield conn
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+async def vllm_request(
+    prompt: str,
+    context: str,
+    model_id: str,
+    openai_api_base: str,
+    OPENROUTER_FALLBACK: bool = True,
+    max_tokens: int = 4096,
+    temperature: float = 0.5,
+    show_logs: bool = True,
+    save_as_training_data: bool = False,
+    messages: Optional[List[Dict[str, str]]] = None,
+    task_description: str = "unspecified",
+    meta_data: Optional[Dict] = None,
+) -> Optional[str]:
+
+    prompt_template = format_instruction_alpaca(
+        {"instruction": prompt, "input": context}
+    )
+
+    if not messages:
+        messages = [
+            {"role": "user", "content": prompt_template},
+        ]
+
+    num_tokens = num_tokens_from_string(prompt_template, "cl100k_base")
+    if show_logs:
+        logging.info(
+            f"vllm: Processing prompt with {num_tokens} tokens for task: {task_description}"
+        )
+
+    try:
+        # Use aiohttp for async HTTP requests
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"{openai_api_base}/chat/completions",
+                json={
+                    "model": model_id,
+                    "messages": messages,
+                    "max_tokens": max_tokens,
+                    "temperature": temperature,
+                },
+                headers={"Authorization": "Bearer EMPTY"},
+            ) as response:
+                if response.status == 200:
+                    completion = await response.json()
+                    result = completion["choices"][0]["message"]["content"]
+
+                    if save_as_training_data:
+                        # Consider making this async too if needed
+                        export_training_data_ps(
+                            [
+                                {
+                                    "input": json.dumps(messages),
+                                    "output": result,
+                                    "created_at": datetime.now().strftime(
+                                        "%Y-%m-%d %H:%M:%S"
+                                    ),
+                                    "prompt": prompt,
+                                    "uuid": str(uuid.uuid4()),
+                                    "system_prompt": None,
+                                    "model_version": model_id,
+                                    "task_description": task_description,
+                                    "data": (
+                                        json.dumps(meta_data) if meta_data else None
+                                    ),
+                                }
+                            ]
+                        )
+
+                    if show_logs:
+                        num_tokens = num_tokens_from_string(result, "cl100k_base")
+                        logging.info(
+                            f"vllm: Answered with {num_tokens} tokens for task: {task_description}"
+                        )
+
+                    return result
+                else:
+                    logging.error(f"vllm API error: {await response.text()}")
+
+    except Exception as e:
+        logging.error(f"vllm API error: {str(e)}", exc_info=True)
+
+        if OPENROUTER_FALLBACK:
+            try:
+                # Make sure call_xai_api is also async
+                result = await call_xai_api(
+                    api_key="xai-YiFHGz5vD5phZNIBRKsbvpsSNPM4GxF4LEli1jUe7fqq1MQg7jQSSpQp9CchNxY6Z4ttD3arQ291uCNx",
+                    prompt=prompt,
+                    context=context,
+                    temperature=0.5,
+                    description="text_passage_thought",
+                    save_as_training_data=True,
+                )
+                return result
+
+            except Exception as fallback_e:
+                logging.error(
+                    f"Error during fallback call_xai_api: {str(fallback_e)}",
+                    exc_info=True,
+                )
+
+    return None
+
+
+def export_training_data_ps(data_items: List[Dict[str, Any]]) -> None:
+    db_config = DatabaseConfig.from_env()
+
+    with get_db_connection(db_config) as conn:
+        try:
+            with conn.cursor(cursor_factory=DictCursor) as cur:
+                all_keys = sorted(set().union(*(item.keys() for item in data_items)))
+                columns = ",".join(all_keys)
+
+                args = ",".join(
+                    cur.mogrify(
+                        f"({','.join(['%s'] * len(all_keys))})",
+                        tuple(item.get(key) for key in all_keys),
+                    ).decode("utf-8")
+                    for item in data_items
+                )
+
+                cur.execute(
+                    f"INSERT INTO vector.training_data ({columns}) VALUES {args} ON CONFLICT DO NOTHING"
+                )
+                conn.commit()
+
+                logging.info(
+                    f"{len(data_items)} training_data written to postgres. "
+                    f"Task: {data_items[0].get('task_description', 'N/A')} "
+                    f"Model: {data_items[0].get('model_version', 'N/A')}"
+                )
+        except Exception as error:
+            conn.rollback()
+            logging.error("DatabaseError", exc_info=True)
+            raise
+
+
+def call_xai_api(
+    api_key: str,
+    prompt: str,
+    context: Optional[str] = None,
+    temperature: float = 0.0,
+    stream: bool = False,
+    save_as_training_data: bool = False,
+    description: str = "general",
+    model_version: str = "grok-2-latest",
+    data: Optional[Dict[str, Any]] = None,
+    system_prompt: Optional[str] = None,
+) -> str:
+    """Call xAI API and optionally save training data."""
+    if not api_key:
+        raise ValueError("API key is required")
+    if not 0 <= temperature <= 1:
+        raise ValueError("Temperature must be between 0 and 1")
+
+    system_prompt = (
+        system_prompt
+        or f"You are a helpful assistant. Here is relevant data: {context or ''}"
+    )
+
+    try:
+        response = requests.post(
+            "https://api.x.ai/v1/chat/completions",
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {api_key}",
+            },
+            json={
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": prompt},
+                ],
+                "model": model_version,
+                "stream": stream,
+                "temperature": temperature,
+            },
+            timeout=30,
+        )
+        response.raise_for_status()
+
+        content = response.json()["choices"][0]["message"]["content"]
+
+        if save_as_training_data:
+            export_training_data_ps(
+                [
+                    {
+                        "input": context,
+                        "output": content,
+                        "created_at": datetime.now().isoformat(),
+                        "prompt": prompt,
+                        "uuid": str(uuid.uuid4()),
+                        "system_prompt": system_prompt,
+                        "model_version": model_version,
+                        "task_description": description,
+                        "data": json.dumps(data) if data else None,
+                    }
+                ]
+            )
+
+        return content
+
+    except requests.exceptions.RequestException as e:
+        raise Exception(f"API request failed: {str(e)}")
+    except (KeyError, IndexError) as e:
+        raise Exception(f"Invalid API response format: {str(e)}")
 
 
 def create_data_loader(data, batch_size, tokenizer, shuffle=True):
@@ -1026,3 +1293,86 @@ def generate_sample_text(model, tokenizer, prompt, max_tokens, device, step):
         except Exception as e:
             print(f"Generation failed: {str(e)}")
     model.train()
+
+
+def extract_json(input_string, return_single=True):
+    """
+    Extracts JSON strings from a string that contains JSON with additional commentary.
+
+    Args:
+    input_string (str): A string that contains JSON and additional commentary.
+    return_single (bool): If True, returns a single JSON string when only one is found.
+                         If False, always returns a list. Default is False.
+
+    Returns:
+    Union[str, list, str]: If return_single is True and exactly one JSON is found, returns that JSON string.
+                          Otherwise returns a list of JSON strings. Returns an error message if no valid JSON is found.
+    """
+
+    def find_matching_bracket(s, start):
+        stack = []
+        brackets = {"{": "}", "[": "]"}
+        for i, char in enumerate(s[start:], start):
+            if char in "{[":
+                stack.append(char)
+            elif char in "}]":
+                if not stack:
+                    return -1
+                if char != brackets[stack.pop()]:
+                    return -1
+                if not stack:
+                    return i
+        return -1
+
+    valid_jsons = []
+    i = 0
+    while i < len(input_string):
+        # Find the start of a potential JSON structure
+        while i < len(input_string) and input_string[i] not in "{[":
+            i += 1
+        if i >= len(input_string):
+            break
+
+        # Find the matching closing bracket/brace
+        end = find_matching_bracket(input_string, i)
+        if end == -1:
+            i += 1
+            continue
+
+        # Extract the potential JSON string
+        json_str = input_string[i : end + 1]
+        try:
+            # Validate the JSON by parsing it, but store the original string
+            json.loads(json_str)  # Just for validation
+            valid_jsons.append(json_str)
+        except json.JSONDecodeError:
+            pass
+        i = end + 1
+
+    if not valid_jsons:
+        return "No valid JSON found in the input string."
+
+    # Return single JSON string if requested and only one JSON was found
+    if return_single and len(valid_jsons) == 1:
+        return valid_jsons[0]
+
+    return valid_jsons
+
+
+def clean_model_answer_from_leading_json_str(s):
+    if not s:
+        return None
+    # Replace the starting and ending patterns
+    s = s.replace("JSON", "", 1)
+    s = s.replace(
+        "```json", "", 1
+    )  # Remove starting ```json, only the first occurrence
+    s = s.replace(
+        "```", "", 1
+    )  # Remove starting ``` if not json, only the first occurrence
+    s = s[::-1].replace("```"[::-1], "", 1)[
+        ::-1
+    ]  # Remove the ending ```, only the last occurrence
+
+    # Strip any leftover whitespace or newline characters
+    return s.strip()
