@@ -1,0 +1,11 @@
+{"time":"2025-01-27T15:27:02.832623154+01:00","level":"INFO","msg":"using version","core version":"0.19.1"}
+{"time":"2025-01-27T15:27:02.832642821+01:00","level":"INFO","msg":"created symlink","path":"/home/alexander/Projects/financial_projects/reasonable/wandb/run-20250127_152702-g9ct5ax3/logs/debug-core.log"}
+{"time":"2025-01-27T15:27:02.941660091+01:00","level":"INFO","msg":"created new stream","id":"g9ct5ax3"}
+{"time":"2025-01-27T15:27:02.941697592+01:00","level":"INFO","msg":"stream: started","id":"g9ct5ax3"}
+{"time":"2025-01-27T15:27:02.941723802+01:00","level":"INFO","msg":"sender: started","stream_id":"g9ct5ax3"}
+{"time":"2025-01-27T15:27:02.941724864+01:00","level":"INFO","msg":"writer: Do: started","stream_id":"g9ct5ax3"}
+{"time":"2025-01-27T15:27:02.941739312+01:00","level":"INFO","msg":"handler: started","stream_id":"g9ct5ax3"}
+{"time":"2025-01-27T15:27:03.187947348+01:00","level":"INFO","msg":"Starting system monitor"}
+{"time":"2025-01-27T15:27:53.196575125+01:00","level":"INFO","msg":"stream: closing","id":"g9ct5ax3"}
+{"time":"2025-01-27T15:27:53.196604792+01:00","level":"INFO","msg":"Stopping system monitor"}
+{"time":"2025-01-27T15:27:53.197148352+01:00","level":"INFO","msg":"Stopped system monitor"}

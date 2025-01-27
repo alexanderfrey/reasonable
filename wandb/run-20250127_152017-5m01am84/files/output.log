@@ -1,0 +1,20 @@
+Traceback (most recent call last):
+  File "/home/alexander/Projects/financial_projects/reasonable/train.py", line 488, in <module>
+    param_counts = count_parameters(model)
+                   ^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/alexander/Projects/financial_projects/reasonable/train.py", line 29, in count_parameters
+    wte_params = model.transformer.wte.weight.numel()
+                 ^^^^^^^^^^^^^^^^^
+  File "/home/alexander/miniconda3/envs/pytorch/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1931, in __getattr__
+    raise AttributeError(
+AttributeError: 'GPT' object has no attribute 'transformer'
+[rank0]: Traceback (most recent call last):
+[rank0]:   File "/home/alexander/Projects/financial_projects/reasonable/train.py", line 488, in <module>
+[rank0]:     param_counts = count_parameters(model)
+[rank0]:                    ^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/home/alexander/Projects/financial_projects/reasonable/train.py", line 29, in count_parameters
+[rank0]:     wte_params = model.transformer.wte.weight.numel()
+[rank0]:                  ^^^^^^^^^^^^^^^^^
+[rank0]:   File "/home/alexander/miniconda3/envs/pytorch/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1931, in __getattr__
+[rank0]:     raise AttributeError(
+[rank0]: AttributeError: 'GPT' object has no attribute 'transformer'

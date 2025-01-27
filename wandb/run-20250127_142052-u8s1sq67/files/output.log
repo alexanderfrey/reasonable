@@ -1,0 +1,361 @@
+Using device: cuda
+Found 1 files
+Total tokens: 338026
+/home/alexander/Projects/financial_projects/reasonable/train.py:311: FutureWarning: `torch.cuda.amp.GradScaler(args...)` is deprecated. Please use `torch.amp.GradScaler('cuda', args...)` instead.
+  scaler = GradScaler()
+Epoch 1:   0%|                                                                                                                                                                            | 0/75826 [00:00<?, ?it/s]
+
+Generated samples at step 0:
+Prompt: Once upon a time
+Generated: Once upon a timenants Tracker
+ grants glances compat Actions
+ Cheney Ain Brah
+
+
+
+ wingnantsSarah
+
+
+
+women: Tracker glancesav substances renewable stresses renewable lowicide
+ review reviewicide Brah Greenerin compatUN …resist renewable stresses tremendously
+
+
+
+ renewableanity
+ptoms Brah 1984 intervenedUN
+
+ stresses
+ stresses Ainnants Brah Ain … Greene review 1984women
+UN
+native
+ptoms Brett interestedzyk Erik interested low, compatHig
+ Egyptian Brahicideconstruct Rih BrettDragonMagazine
+women Abilities stresses
+
+Prompt: In a galaxy far far away
+Generated: In a galaxy far far away490 Lama
+ Presumably Danny wrestle
+obs accessible Danny CharterTueav glamrin Abilitiesrin compat glam wrestle Ain
+ accessiblerin, glanceswomen Paw
+
+ grants490 RJ AMAwomendoms
+
+
+ accessible
+, Abilities compat, glitches, jurisdrin favourites Greene screams Abilities, RJ Brett
+ environmental,,biased screams low Charter
+ Sophie favouriteswomen compat 1984 abund compatzykdoms
+ dubiouselong AMA Ain,
+
+Basdoms
+ Abilities Aindoms
+
+ Boy interested PH lowwomenWinter Wick ProduWinter
+
+
+
+Generated samples at step 100:
+Prompt: Once upon a time
+Generated: Once upon a time for?
+And, and myEN, we will?
+To not the with it the more, and,
+To me and it, I'd be her, he,
+And, a with theEN,
+A;
+And no, I of the, it.
+
+
+And the!
+Which in it, and no of you
+To the, I the!
+I him:
+And I have hisath is my?
+I with they is be the,
+
+Prompt: In a galaxy far far away
+Generated: In a galaxy far far away,
+ToIO:
+You'd thy; and theEN' the in have to him to;
+Which as, I me, here.
+He, you aTER:
+
+I'll,
+Th brother
+Come, I his than theENC,
+And I me?
+To, and it, forIO:
+For that is have toIO:
+And so's?
+To I noan thy, and our father.
+' the of theou and
+
+
+Generated samples at step 200:
+Prompt: Once upon a time
+Generated: Once upon a time,
+With this woth my hand's life,
+We'll will the noble grace of a hands.
+
+ROMEO:
+I am an good good own, that the heart!
+
+CORIUS:
+No, and I have been not, he have his?
+
+WARCHIO:
+Aou, my cause, I shall have
+
+KINGOLUS:
+I am not thee's one.
+
+I am aENO:
+
+I'll
+
+Prompt: In a galaxy far far away
+Generated: In a galaxy far far away,
+You be his crown; and if I will you,
+What doth her in thy lord.
+
+BUCIO:
+O:
+Good graciousOUO:
+I'll thy father, I will thy father shall be
+I must be it the.
+
+CKEES:
+To have a lords, be not have a king,
+You'll not be be I have my death;
+And he shall my brother, we am I know,
+So must
+
+
+Generated samples at step 300:
+Prompt: Once upon a time
+Generated: Once upon a time he,
+For and with this king, for a king
+By my son, my brother was a sun,
+Or with a old king! I'll live,
+His lord:
+You'll be thy father have this
+Your king than he, and my mother,
+Where is their son, that, I'll not it be
+Where I do.
+
+LORTIUS:
+Why,
+My lord, we not be you had have the.
+
+NAR
+
+Prompt: In a galaxy far far away
+Generated: In a galaxy far far away.
+
+BTAGUE:
+And yet, my heart the body,
+But, my lord.
+
+COMINIUS:
+Go, sir;
+Is not nole.
+
+DUKEARELLBut, what, 'tis not the business:
+I'll be well?
+
+BONIO:
+It is him.
+
+ISABY:
+Why, you,,
+What's duke?
+
+LONIO:
+Why
+
+
+Generated samples at step 400:
+Prompt: Once upon a time
+Generated: Once upon a time.
+
+MENENIUS:
+O, let'st not; and I will I go,
+I'll keep you from his heart.
+
+ESARENCE:
+O, the court-ear.
+
+MIRANIO:
+I must so I are yourself; and they will be
+have to the dost at yourself.
+
+BRENCE:
+O, sir, your father'st the day'st:
+I'll not.
+
+
+Prompt: In a galaxy far far away
+Generated: In a galaxy far far away:
+And you have dead, and my life,
+But in his soul to the king, and thy will
+Oan we have gone to me with our blood,
+If I didst be at my brother,
+And be but that I'll have a day.
+
+HENRY BOLINGBROKE:
+And, sir, and, and a princely that
+Yourself may take me at thee as a king.
+
+CLARELLA:
+
+
+Generated samples at step 500:
+Prompt: Once upon a time
+Generated: Once upon a time of love,
+For she he hast to bear a woman's,
+And in the wail the earth,
+And yet now in hisself, which I'll die
+To do it.
+
+DUKE VINCENTIO:
+He is thy name, and not be the time
+And for my father's king.
+
+RICHARD:
+The noble lord, I wretch you,
+I may make, you, and so would I do not.
+
+
+Prompt: In a galaxy far far away
+Generated: In a galaxy far far away,
+And in my noble heart'sbroke,
+And in the great father's face I say
+But I did say the next noble father
+And yet to be too.
+
+ROMEO:
+Go, sir, to give him to thy life.
+
+HENRY BOLINGBROKE:
+I, you please you!
+
+KING RICHARD III:
+What, good?
+
+KING RICHARD II:
+Thy time so!
+
+
+Generated samples at step 600:
+Prompt: Once upon a time
+Generated: Once upon a time.
+
+RUKE VINCENTIO:
+No, as thou art the world o'er to our
+him.
+
+POMASER:
+What, I wouldst thou.
+
+ISABELLA:
+Hark you, sir, to the dost thou, I warrant you,
+As what the law did make it in the
+to't.
+
+AUTOLYCUS:
+And with the provost, I would go
+with your
+
+Prompt: In a galaxy far far away
+Generated: In a galaxy far far away.
+
+ROMEO:
+My lord, I not confess with a father's,
+So shall he do 'twere my poor man?
+
+BAPTISTA:
+To save thee, sir, it is, and by my heart.
+I did I not come to your grace of my mouth
+To speak to thee in our good soul's love,
+And that she did tell it at my heart.
+
+BENRY BOLINGBROKE:
+
+
+Generated samples at step 700:
+Prompt: Once upon a time
+Generated: Once upon a time,
+And to a world I take my shame,
+So my heart hath left me in all good.
+Where is your son? for every man's eyes
+My father's thy father, and your son,
+Will I know me and this night and life
+To have the state of the right to my soul.
+
+JULIET:
+O God, my lord! thou hast a king, a lord:
+The other is the father, to take his brother:
+
+Prompt: In a galaxy far far away
+Generated: In a galaxy far far away.
+Where doth this?
+
+ISABELLA:
+It is an man's head.
+
+KING RICHARD III:
+O, go, sir, be it on thee!
+
+W RICHARD II:
+For this, as a child's son to you!
+
+CLARENCE:
+Thanio!
+What's thy friend?
+
+QUEEN ELIZABETH:
+I will not, my lord.
+
+ARCH
+
+
+Generated samples at step 800:
+Prompt: Once upon a time
+Generated: Once upon a time,
+That makes the world of a Richard's
+To the duke, the one of the or a king
+Did more unhen for the doth, and still his own
+faim'dings on his face; but there the wail,
+In the most two of our blood, I did,
+And in the Duke of your own,
+And here I make thee more to be,
+Nor thou to say and to his heart.
+
+JOHN OF GAUNT
+
+Prompt: In a galaxy far far away
+Generated: In a galaxy far far away,
+To not show it in their own own;
+We may be more of a man, to you
+By a poor part; and, to I, you are
+To go like a maid: so, I am sorry, I see
+yourself, I'll find him on a life. Thou
+What, is my husband. I'll not remember you
+I should be all; I'll go to give you
+When I do not the man of the queen's,
+Traceback (most recent call last):
+  File "/home/alexander/Projects/financial_projects/reasonable/train.py", line 321, in <module>
+    train_loss = train_one_epoch(
+                 ^^^^^^^^^^^^^^^^
+  File "/home/alexander/Projects/financial_projects/reasonable/train.py", line 122, in train_one_epoch
+    scaler.step(optimizer)
+  File "/home/alexander/miniconda3/envs/pytorch/lib/python3.12/site-packages/torch/amp/grad_scaler.py", line 457, in step
+    retval = self._maybe_opt_step(optimizer, optimizer_state, *args, **kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/alexander/miniconda3/envs/pytorch/lib/python3.12/site-packages/torch/amp/grad_scaler.py", line 351, in _maybe_opt_step
+    if not sum(v.item() for v in optimizer_state["found_inf_per_device"].values()):
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/alexander/miniconda3/envs/pytorch/lib/python3.12/site-packages/torch/amp/grad_scaler.py", line 351, in <genexpr>
+    if not sum(v.item() for v in optimizer_state["found_inf_per_device"].values()):
+               ^^^^^^^^
+KeyboardInterrupt

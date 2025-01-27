@@ -1,0 +1,8 @@
+{"time":"2025-01-27T15:32:31.849170892+01:00","level":"INFO","msg":"using version","core version":"0.19.1"}
+{"time":"2025-01-27T15:32:31.849183466+01:00","level":"INFO","msg":"created symlink","path":"/home/alexander/Projects/financial_projects/reasonable/wandb/run-20250127_153231-fw9hvmt9/logs/debug-core.log"}
+{"time":"2025-01-27T15:32:31.957261139+01:00","level":"INFO","msg":"created new stream","id":"fw9hvmt9"}
+{"time":"2025-01-27T15:32:31.957288641+01:00","level":"INFO","msg":"stream: started","id":"fw9hvmt9"}
+{"time":"2025-01-27T15:32:31.957316454+01:00","level":"INFO","msg":"handler: started","stream_id":"fw9hvmt9"}
+{"time":"2025-01-27T15:32:31.957339448+01:00","level":"INFO","msg":"sender: started","stream_id":"fw9hvmt9"}
+{"time":"2025-01-27T15:32:31.957331493+01:00","level":"INFO","msg":"writer: Do: started","stream_id":"fw9hvmt9"}
+{"time":"2025-01-27T15:32:32.304389515+01:00","level":"INFO","msg":"Starting system monitor"}

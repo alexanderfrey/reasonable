@@ -1,0 +1,12 @@
+Using device: cuda
+Traceback (most recent call last):
+  File "/home/alexander/Projects/financial_projects/reasonable/train.py", line 181, in <module>
+    train_loader, val_loader = create_dataloaders(
+                               ^^^^^^^^^^^^^^^^^^^
+  File "/home/alexander/Projects/financial_projects/reasonable/train.py", line 113, in create_dataloaders
+    dataset = TextDataset(files_pattern, block_size, encoding_name)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/alexander/Projects/financial_projects/reasonable/train.py", line 77, in __init__
+    self.files = glob(files_pattern)
+                 ^^^^^^^^^^^^^^^^^^^
+TypeError: 'module' object is not callable. Did you mean: 'glob.glob(...)'?

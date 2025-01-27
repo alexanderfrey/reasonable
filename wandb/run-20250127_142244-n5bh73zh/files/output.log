@@ -1,0 +1,1070 @@
+Using device: cuda
+Found 1 files
+Total tokens: 338026
+/home/alexander/Projects/financial_projects/reasonable/train.py:311: FutureWarning: `torch.cuda.amp.GradScaler(args...)` is deprecated. Please use `torch.amp.GradScaler('cuda', args...)` instead.
+  scaler = GradScaler()
+Epoch 1:   0%|                                                                                                                                                                            | 0/18957 [00:00<?, ?it/s]
+
+Generated samples at step 0:
+Prompt: Once upon a time
+Generated: Once upon a time
+inently adj Weapon,Mid
+anking
+inently Weapon existing practicedilde attachbeaut
+Fresh alcohol
+ displeasure HeroMid Weaponcomp
+
+ankingMid existingitary
+yipYour electronicallyitarymble McA electronicallyyip overwhelmingly wit bulbanking corrections Adobe,
+
+ colorcomp
+ Katrina Southamptonyip attach witYour 2015yip color wait
+の� Haram
+comp
+Enhanced
+
+ attach Harrison Weapon
+
+
+ color corrections solder
+
+ Katrina setback
+
+anking safegu setback
+ Chancellor Southampton String Piece enrollment Southampton
+sym enrollment Southampton
+
+Prompt: In a galaxy far far away
+Generated: In a galaxy far far awaysym 350
+anking attachanking intimid breakingitary racked KatrinaPB intimid shocked
+Enhanced political
+
+ Adobeimeters rackedExamples KatrinaCOR
+
+
+kishinentlyankingyip rackedPublished alcohol
+ political deserves neo
+beaut
+ rentals
+ practiced overwhelmingly attach attachLeg PiecekishPB neokish
+ Imagine Chancellor
+
+の� ChancelloryipLegyip
+ Southampton
+
+
+beautitary Piece
+Leganking
+ disruptions wit
+
+ electronicallyPublished
+ Piece solder sock
+ color desires
+
+comp
+ deserves overwhelmingly electronically upper wit Adobe
+
+
+
+Generated samples at step 100:
+Prompt: Once upon a time
+Generated: Once upon a time me:
+O, it, let our!
+How is your, my of my good:
+LUCES:
+And you is not a to theirtis it, for him,
+To his of be for theine.
+
+To have this.
+
+
+PETIOL my:
+BUC'IO:
+That shall, that's as you'd for them
+LENI him, and a father.
+
+
+A:
+That you, I it
+
+Prompt: In a galaxy far far away
+Generated: In a galaxy far far away.
+
+
+ThatUCT:
+Theay, how
+IIIO:
+And a lord, I yourtwre we no,
+I her-, but to it,
+
+What, atis you, as you
+That that that not his world of this.
+
+
+HINThatU I him, and we me;
+And do me to be not the?
+
+
+IIO:
+I'll be the!
+I'll the good
+
+
+Generated samples at step 200:
+Prompt: Once upon a time
+Generated: Once upon a time,
+Of thy Lord-:
+The crown, my man, 'ior I have be I you:
+I think it, or I know no eyes,
+I'll not done, and 'twmorrow, my word to
+Will have not a a man.
+
+KING RIUS:
+Then, good so thou?
+
+Nurse:
+Pray, if you not be my head.
+
+CLARman:
+I'll make you, for you;
+
+Prompt: In a galaxy far far away
+Generated: In a galaxy far far away,
+With he'st-ine, that hast thy life's.
+
+First Murderer:
+And my lord, for I, how I have be well?
+
+CESTER:
+I am, you shall be my lady's in my word.
+
+LEONTES:
+Nay, that you know me?
+
+HENRY BOLINGBROKE:
+Is it I have a lord.
+
+POLINIET:
+Well,
+
+
+Generated samples at step 300:
+Prompt: Once upon a time
+Generated: Once upon a time of the
+Ais a little years, and for it.
+
+POMPEY:
+But I will give you; when 'tis good to die the
+fret is one to live.
+
+PETRUKE VINCENTIO:
+The word is the duke's one thing to be
+him.
+
+DUKE VINCENTIO:
+He is no more in the time of the man. Can
+DUKE VINCENTIO:
+
+Prompt: In a galaxy far far away
+Generated: In a galaxy far far away on the crown.
+The poor king, my lord, that is thy hands,
+And heaven to the time of that he had thy queen.
+
+HENRY BOLINGBROKE:
+No! I must not my heart of York,
+Or all the duke'st thy king,
+Your father's dead, and the blood of night,
+That thou not my sovereign and my noble daughter,
+And yet thou hast his children in your blood.
+
+
+
+
+Generated samples at step 400:
+Prompt: Once upon a time
+Generated: Once upon a time.
+
+PRINIOLANUS:
+
+MesOLANUS:
+I have rather for me: I'll not to give me.
+
+First Citizen:
+We say 'gious.
+
+MENENIUS:
+What is the news?
+
+SICINIUS:
+I have a man
+The Vols of the world.
+
+BRUTUS:
+I have a word with his heart.
+
+COMINIUS:
+
+Prompt: In a galaxy far far away
+Generated: In a galaxy far far away.
+
+VIRANIA:
+I saw you not; we'll think him.
+
+LARTIUS:
+What news?
+
+LUCIO:
+As then I would have so bad?
+
+LUCIO:
+Ay, if we know thee.
+
+LUCIO:
+The matter is.
+
+LUCIO:
+
+ANGELO:
+What's he was in a time, but what to see
+have been so.
+
+
+Generated samples at step 500:
+Prompt: Once upon a time
+Generated: Once upon a time of men;
+Nor I will, as I had, and I do.
+My life to me, not you well I have too much.
+
+KING RICHARD III:
+O, my lord, I'll follow you me.
+
+KING RICHARD III:
+My lord, my lord, I say, or what I do:
+I know my horse to this place I'll to thee,
+And I am I for that word he is,
+A thing
+
+Prompt: In a galaxy far far away
+Generated: In a galaxy far far away.
+Welcome, gentlemen, to have been bad at Venice,
+Or else be more, my mother, and your son,
+My good father, do not to be great,
+To be the king, your brother, your good,
+That in his honour and my daughter's,
+To enter with the queen, his mother of his
+As well as much as the prince is,
+For our hearts we have at your hands
+Of his young princes and his own sovereign:
+
+
+
+Generated samples at step 600:
+Prompt: Once upon a time
+Generated: Once upon a time,
+Of such an hundred or to hear it.
+
+KING HENRY VI:
+Then then the king's son, my Lord of Gloucester!
+
+KING HENRY VI:
+
+KING HENRY VI:
+Then, madam, to the Duke of Warwick,
+To make your grace your king to speak,
+And in his good love shall be in peace.
+
+NORTHUMBERLAND:
+My Lord of Hereford, my heart is
+
+Prompt: In a galaxy far far away
+Generated: In a galaxy far far away.
+
+LORIZEL:
+I do he.
+
+LUCIO:
+And you know, good woman.
+
+LUCIO:
+That is the duke?
+
+ANGELO:
+Why, the man's, if she duke's the world?
+
+LUCIO:
+I was a widow.
+
+LUCIO:
+Now, by the hand, and love in hand in the marriage,
+Which from your head,
+
+
+Generated samples at step 700:
+Prompt: Once upon a time
+Generated: Once upon a time of his grave;
+And yet he slew him; but his will do sleep,
+And he shall bear him from his holy hands.
+
+FRIAR LAURENCE:
+Then, then, he knows that he is here to-day.
+
+JULIET:
+I told thee how he knew him:
+Then, if he live, he should not speak it.
+I am not so long as God's name,
+Who will you never prove a soldier
+
+Prompt: In a galaxy far far away
+Generated: In a galaxy far far away.
+
+TRANIO:
+I have no less: I'll bring you first to the maid
+Of my office.
+
+TRANIO:
+Why, 'tis the time I am now to see you,
+As your foul oath against me, I think,
+I'll be content to have no sooner in;
+But yet, the devil's sake, it stands the more;
+And with all speed we'll try what it is.
+
+GREMIO:
+
+
+Generated samples at step 800:
+Prompt: Once upon a time
+Generated: Once upon a time.
+
+HENRY BOLINGBROKE:
+My heart hath power to do it, and I do not
+In all the king; 'tis you both, but not so.
+I must not look'd for this: but, in my hand,
+I cry it, and tell me what I must be.
+
+HENRY BARD:
+And so doth my kingdom, or on that head
+Do keep our brother; wherefore here wept
+
+Prompt: In a galaxy far far away
+Generated: In a galaxy far far away.
+
+JULIET:
+It is my father,
+Ere my father will; let him see, my lord.
+
+DUKE OF YORK:
+My lord, then,
+Do what my lord is this, I am so well:
+Now shall you, for I hear it; I'll look on thee,
+And I will make thee go with me this.
+So, let me go; if you shall not stay.
+I'll tell thee
+
+
+Generated samples at step 900:
+Prompt: Once upon a time
+Generated: Once upon a time,
+If he were so high than it will meet,
+As he did hear the truth: and so our lords,
+He sends we to make the state and fortune
+Did not our brother, and with the rest o' the wind,
+The manner of the state and war,
+Your gracious sovereign and his friends;
+And his upon our voices, here in England
+The Duke of York, these thoughts, who still,
+In them most well together, are for our friends
+
+Prompt: In a galaxy far far away
+Generated: In a galaxy far far away.
+
+HENRY PERCY:
+My lord, the Tower,
+I'll send thy kingdom-day, do not leave.
+
+HENVOLIO:
+Where is the first that came me long.
+Thus doth the boar bids me from our friends.
+
+HENRY BOLINGBROKE:
+Behold what I mean to-day, to London doth?
+
+HENRY BOLINGBROKE:
+
+
+
+Generated samples at step 1000:
+Prompt: Once upon a time
+Generated: Once upon a time.
+
+PETRUCHIO:
+The man that jest do me for your daughter?
+
+KATHARINA:
+I must be, sir, so is your honour;
+And you are mad and Kate to come by your daughter:
+You shall have to me that she shall go;
+For you shall have one some good for your hands.
+
+PETRUCHIO:
+What, I know that you shall importune me?
+
+KATH
+
+Prompt: In a galaxy far far away
+Generated: In a galaxy far far away;
+But, let them bear, it is, or else mine own.
+I pray you, tell me, here comes my son
+By Claudio, in this little goodly mother,
+I'll make him from that means to die for us.
+Come, my lord, you jest, and to my tent;
+Whereof doth stand upon, or all the come
+To save the king in brother to Cuts him,
+With all the rest are else at
+
+
+Generated samples at step 1100:
+Prompt: Once upon a time
+Generated: Once upon a time,
+That ever may prove many act at all;
+And for some other employ'd this present scene
+That turns an oath of heaven, for many such wrong'd
+I'll make him by the aid of heaven.
+But what's here, happy days before,
+That makes no man live, nor fear'd from him!
+The, any one; doublets of such grief,
+Shall be such fury on thy state,
+Even in a full of state, strong and
+
+Prompt: In a galaxy far far away
+Generated: In a galaxy far far away.
+Therefore, go not in: nay, for the worst way
+To the way-appes, the queen with blows;
+For, as a doubt, the bloody face
+Than those grief or labour doth itself.
+Methinks I am a king's daughter's hand,
+Till you had been too dear a slave,
+Do, Sicilia better.
+
+LORD WILLOUGHBY:
+Gain, but most mighty life in, as one
+
+
+Generated samples at step 1200:
+Prompt: Once upon a time
+Generated: Once upon a time!
+
+Third Servingman:
+My dread friend, fair boy.
+
+Second Servingman:
+Thou hast call'st me yet, let me have I hear.
+
+First Servingman:
+Away! Come, let me have you lived.
+
+Second Servingman:
+I do not chaf; neither please you and take them
+To say 'good,'tis to be all churlongs in thee.
+
+First Servingman:
+What, I
+
+Prompt: In a galaxy far far away
+Generated: In a galaxy far far away.
+
+DUKE VINCENTIO:
+'Twas you not, methinks, and you shall put you back.
+
+ESCALUS:
+My lord, I am in your company.
+
+DUKE VINCENTIO:
+Hence, Pompey, or not a word.
+
+ESCALUS:
+Good even so, nor no more badliness
+To save the life, being so far in land:
+One that there
+
+
+Generated samples at step 1300:
+Prompt: Once upon a time
+Generated: Once upon a time of York
+Is not so long a stranger, as aught for:
+Say that deceit should be sworn for one
+Hath often no pleasure; but if a world were crown'd,
+The pretty monarch of the hours; for no man,
+My father, being but one that sorrow is so,
+She would but e.'
+
+LADY CAPULET:
+He should be made for the execution?
+
+Nurse:
+No you have made a nurse,
+
+Prompt: In a galaxy far far away
+Generated: In a galaxy far far away.
+
+DUKE OF YORK:
+What is that?
+
+DUKE OF YORK:
+Are way thou hast?
+
+HENRY PERCY:
+The gentle princes, the queen, the duke's son:
+He is not but thought; neither you nor are heir,
+And so I knee, and yet you must not do.
+If, Aumerle, have I forgot my brother's face,
+If it be there, make God
+
+
+Generated samples at step 1400:
+Prompt: Once upon a time
+Generated: Once upon a time!
+I will be satisfied; but I may prig of you:
+If you say, I may remember the king,
+God send him am the firmest day of you:
+One, good Mercut, of your hearts!
+
+DUKE VINCENTIO:
+What means he?
+
+Pedant:
+These times at all for money?
+
+Pedant:
+Here, sir; what, 'tis abear with me already.
+
+TR
+
+Prompt: In a galaxy far far away
+Generated: In a galaxy far far away.
+
+PAULINA:
+Be certain as I do.
+As one, dear mark me; for this is fault,
+Nor what is trudge,
+Or likefell to consider that eyes,
+Then mend it with thee, sent out of pleasure?
+
+PAULINA:
+No, my good lord;, here is the heavens?
+
+Servant:
+He being of all that he hath deserved morn;
+To use the soul as others must himself
+
+
+Generated samples at step 1500:
+Prompt: Once upon a time
+Generated: Once upon a time.
+
+GREMIO:
+Tut, I can tell thee should be pass!
+
+TRANIO:
+I am, sir, to either thou wert best say:
+I waken 'tis for being now look'd for
+I amly Anne. But was I am beloved,
+As if I seem noble sorrow and thy wife:
+My Lord!
+
+BRAKENBURY:
+What, shall that be?
+
+LADY:
+
+
+Prompt: In a galaxy far far away
+Generated: In a galaxy far far away.
+
+RICHMOND:
+What, are they not?
+
+DERBY:
+Are you there good duke should seem by you, if
+I may feel the Duke of Hacket,
+Where no man never sons and growing with
+As to your liege and sother'd
+Your grace of your conversation with your wars.
+
+DERBY:
+We have been laid into this very body,
+To have her still asleep; for he pass'd
+And
+
+
+Generated samples at step 1600:
+Prompt: Once upon a time
+Generated: Once upon a time:
+
+LUCENTIO:
+You may name, Tranio, for Lord Angelo,
+Hath been a taming-school! much Baptista.
+
+HORTENSIO:
+'Tis well.
+I have forgot those headstrong weeds toad.
+
+HORTENSIO:
+Why, no; for he my true man to mine,
+And in my house lies in his mistress,
+Would Katharina had crave the love;
+
+
+Prompt: In a galaxy far far away
+Generated: In a galaxy far far away.
+
+ROMEO:
+Well, in; to die all!
+
+FRIAR LAURENCE:
+Romeo! O, come, let's away.
+They smile in lament-door;
+And by this own lamentation. God's comfort rest.
+
+FRIAR LAURENCE:
+Stay, then; I'll take her reason thus.
+
+ROMEO:
+Since thou canst adventure to be ruled by them.
+
+FRI
+
+
+Generated samples at step 1700:
+Prompt: Once upon a time
+Generated: Once upon a time;
+For by and by and by my company,
+My words most well served in my windows;
+And in that which I must live to-morrow,
+I have no more hath been in this present reason,
+And made it first-hath within this smallal,
+And in the pass away the faithful dead,
+Who look'd for the world's deceit of thine,
+Even in the whole world of heaven itself
+From his new kingdom, for his father's
+
+Prompt: In a galaxy far far away
+Generated: In a galaxy far far away?
+
+GREEN:
+Bidow king to dinner.
+
+HENRY BOLINGBROKE:
+Richard is banish'd, and all the worst lies great;
+For every one thing we will be sent for our.
+
+HENRY BOLINGBROKE:
+Your friends will, my lord; his face is done.
+
+NORTHUMBERLAND:
+He hath received eight to resign his crown
+And he shall bear the due
+
+
+Generated samples at step 1800:
+Prompt: Once upon a time
+Generated: Once upon a time;
+I'll he requite thy ancient body that made this kings
+My country's death before this world--
+
+GLOUCESTER:
+Look from thy knee, thou shalt old Sly;
+And yet no further than an enemy's queen.
+
+CLARENCE:
+
+Lord Mayor:
+
+HASTINGS:
+
+GLOUCESTER:
+Catesby, we hear our lord again.
+
+GLOUCESTER:
+Your love
+
+Prompt: In a galaxy far far away
+Generated: In a galaxy far far away
+And roused up with de plucker stoop.
+Here come more than this, there's the duke is done:
+If she may chance to need, but not so much wrong,
+I'll be in sign of good acquainted with
+As my priest-roses have rayed alive.
+
+KING HENRY VI:
+Farewell, thou liest.
+
+GLOUCESTER:
+Now give me some reason, and I'll strike
+
+
+Generated samples at step 1900:
+Prompt: Once upon a time
+Generated: Once upon a time
+Thy mother's grave, whose love did scorn,
+And yet not so much, nor of thy vile sign,
+Would I have begun before I was?
+
+ARIEL:
+No doubt, no more; 'tis I'ld sleptA:
+Then, by Saint George, Tybalt, dead, my life!
+
+KING RICHARD II:
+I will descend and give thee word: honourable slave,
+All comfort and the foolish'st thou
+
+Prompt: In a galaxy far far away
+Generated: In a galaxy far far away be gone
+Before the gentle heart appeal forsaken to hell.
+
+HENRY BOLINGBROKE:
+Go not, good Duke of Gloucester.
+
+HENRY BOLINGBROKE:
+Go, my dread lord.
+
+NORTHUMBERLAND:
+Then I will meet her speak it,
+That will I to slander him now the king's love.
+
+HENRY BOLINGBROKE:
+Doth he
+
+
+Generated samples at step 2000:
+Prompt: Once upon a time
+Generated: Once upon a time
+That no man shall be doing: your gallery
+At our success he thinks, we came upon him:
+His widows in his arms. You, in the plebeians,
+So dry your leaves and pluckily friends,--
+
+ hepherd:
+Hold your enemy, then?
+
+POLIXENES:
+You may go, but hear you'll lie.
+
+Second Senator:
+Thank you no more.
+
+POLIXENES:
+What
+
+Prompt: In a galaxy far far away
+Generated: In a galaxy far far away. Come,
+Lord Marshal:
+Well no less. What is the matter that dogs, that goes
+Lord Angelo?
+
+First Senator:
+A:
+Villain, I say, tell me one vouch'd, nor
+When he's a Jack-piled and a lamb o' the world.
+
+Second Officer:
+Why, then is mine misreport fort:Thou art a villain:
+I hope to bring him out at once again.
+
+First
+
+
+Generated samples at step 2100:
+Prompt: Once upon a time
+Generated: Once upon a time.
+
+Second Murderer:
+Why, then he will say we must be plain.
+
+Second Murderer:
+I mean it well; for it is so any dukes.
+
+First Murderer:
+Take him half, my lord; he doth it all.
+
+CLARENCE:
+How but it? What will he learn to me?
+
+Second Murderer:
+I'll not meddle with it: it is a dangerous thing: it
+
+
+Prompt: In a galaxy far far away
+Generated: In a galaxy far far away.
+
+JULIET:
+God keep me from hence, and we must have bought it;
+And yet I'll not endure the world's gone.
+
+JULIET:
+Come, arm me! it is the world but the child.
+
+JULIET:
+Madam, I am not well.
+
+ROMEO:
+I have night, daughter of thy love, I'll not
+Be much as true; dread long as you know
+
+
+Generated samples at step 2200:
+Prompt: Once upon a time
+Generated: Once upon a time,
+And my true blood no harm shall help.
+
+MARCIUS:
+Make bloody the Capitol! Say my head of death,
+He strew'd earth when he does bear the gods,
+How it lies himself with grief, or Caius,
+He rustdains thee, and made him too weak
+As he did litter here in the fieldacles;
+He was not peep to conceal what he did show,
+And make some poison of his Antiates
+
+Prompt: In a galaxy far far away
+Generated: In a galaxy far far away.
+
+JULIET:
+My dear dear lord, go from her lips of mine own.
+
+JULIET:
+My dear liege, by Saint Paul, once my lord of
+To be unmind from this land:
+
+JULIET:
+
+JULIET:
+
+JULIET:
+I strike the greater mother; and I'll not stay.
+
+ROMEO:
+SoWilt thou do me speak of
+
+
+Generated samples at step 2300:
+Prompt: Once upon a time
+Generated: Once upon a time.
+
+KATHARINA:
+Nay, never mother, wife, they will not.
+
+PETRUCHIO:
+Marry, lie with you, and supper in them.
+
+KATHARINA:
+The every horse that I should rascal house.
+
+PETRUCHIO:
+Father, you me unto the friar's shuns your house;
+Our guests are come on yon country's
+Shall be my thought on
+
+Prompt: In a galaxy far far away
+Generated: In a galaxy far far away. Come, madam,
+You are three days for me: I am a mad man
+Made all the seat of your highnesss: I'll
+there you that have worn you out the king's chamber,
+But I'll not meddle with this strange loss.
+
+BIANCA:
+Nay, then, good day, hath this the frantic curse
+Hath never precious coxable, but in marriage
+The mightiest of my upright soul's curse
+
+
+
+Generated samples at step 2400:
+Prompt: Once upon a time
+Generated: Once upon a time.
+
+TRANIO:
+And be true sir; Signior Gremio, stand you in marriage
+with her tale, though, as moveward, if
+in Greeky, his fault and your guest may live,
+And hear your news of your coming hither.
+
+GREMIO:
+Hark you, sir; and you must find haste.
+
+TRANIO:
+Softly, sir; to- lady and Baptista?
+
+BAP
+
+Prompt: In a galaxy far far away
+Generated: In a galaxy far far away.
+
+ROMEO:
+Why, that is banish'd from the lark and Juliet?
+
+ROMEO:
+By her name, done her coming, looking on
+; and if you serve me, I'll forget it.
+
+ROMEO:
+I shall think it is:--Bing arms is full
+Of every ground, whose names are dried pale.
+, for the book of love, upon Lord Northumberland,
+Leaveomeo the lips of
+
+
+Generated samples at step 2500:
+Prompt: Once upon a time
+Generated: Once upon a time.
+
+PETRUCHIO:
+I am contented by a while: Oie, my teeth beaute,
+And yet my life answer is not a shrewd.
+
+PETRUCHIO:
+Should be between us! Where's the world is done,
+That is, for mine own humour love yourselves,
+As thrift to that e'er I heard it not.
+Kathar, believe it; for it is much yet
+For
+
+Prompt: In a galaxy far far away
+Generated: In a galaxy far far away; nay, 'tis fled:
+Your mother nay, for the shadow
+Is all unpit to be his father and his wife;
+For he is changed divine, had no warrant
+Given Hydra, to have given his friends;
+Hold, as those fellows shall we go:
+'Tis thought he'll do it more put between it.
+
+SLY:
+Well, I have done. or my lords is taken:
+For you will all rest straight have
+
+
+Generated samples at step 2600:
+Prompt: Once upon a time
+Generated: Once upon a time,
+I have solemnly interred here now on me
+The stirr'd wondering: there is no virtue still
+Be call'd into others.
+Pitld not have,
+She to doors'd men.
+
+DUKE VINCENTIO:
+, by my life,--
+
+ISABELLA:
+O, thee! Who is that fault?
+
+FROTH:
+Here in the public complaint; But if it be honour,
+The man
+
+Prompt: In a galaxy far far away
+Generated: In a galaxy far far away.
+
+OXFORD:
+Why, would you were the like to blame him?
+
+Page:
+His harm, like an honest gentleman.
+
+KING EDWARD IV:
+Nay, bear her gone; for I must speak much.
+
+SLY:
+I would you were enough than I account thee,
+Doth cloud my true love a tendery husband.
+
+KING EDWARD IV:
+Ay, but a case of nothing to ye.
+
+
+
+Generated samples at step 2700:
+Prompt: Once upon a time
+Generated: Once upon a time:
+These God's bones are made known to these my hand
+Of the poor sun that makes there lour
+This stirnds that I would buy my consent
+With a poor bark at him.
+
+PROSPERO:
+What work he of me?
+
+AEdile:
+This is speech: this is forerun the kingdom.
+
+SOMERSET:
+My liege, the heavens! which evil it is.
+
+DUKE OF
+
+Prompt: In a galaxy far far away
+Generated: In a galaxy far far away.
+
+PROSPERO:
+Go ask, away; thou dost thou see thy miserable hour.
+
+ARIEL:
+To every article.
+
+ARIEL:
+From that, to give him flow with me.
+
+PROSPERO:
+How now, ho!
+
+PROSPERO:
+Go tell my lord;
+Thou shalt be free a-law shall old thine.
+
+PROSPERO:
+I pray thee
+
+
+Generated samples at step 2800:
+Prompt: Once upon a time
+Generated: Once upon a time.
+
+KING RICHARD III:
+Say, be a puissant host; see what am I
+Wid not wear it, to speak an oath by Him.
+
+KING RICHARD III:
+A thousand hearts are great within,:
+Yea, and much more: one is, for all in love.
+
+QUEEN ELIZABETH:
+What is your will, Clarence? and so be loath
+Seen a ring that bet
+
+Prompt: In a galaxy far far away
+Generated: In a galaxy far far away.
+
+QUEEN MARGARET:
+Ay, but a boisterous, and that love better spent.
+
+KING EDWARD IV:
+So, princely Buckingham, young Plantagenet,
+With trembling triumph, that threaten'd her blood,
+With humble- last betimes, droven, brother,Tisit,
+Sorrowing lion and a Roman hapless father's voice,
+Thou and my sceptre, that winter came consent
+Traceback (most recent call last):
+  File "/home/alexander/Projects/financial_projects/reasonable/train.py", line 321, in <module>
+    train_loss = train_one_epoch(
+                 ^^^^^^^^^^^^^^^^
+  File "/home/alexander/Projects/financial_projects/reasonable/train.py", line 122, in train_one_epoch
+    scaler.step(optimizer)
+  File "/home/alexander/miniconda3/envs/pytorch/lib/python3.12/site-packages/torch/amp/grad_scaler.py", line 457, in step
+    retval = self._maybe_opt_step(optimizer, optimizer_state, *args, **kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/alexander/miniconda3/envs/pytorch/lib/python3.12/site-packages/torch/amp/grad_scaler.py", line 351, in _maybe_opt_step
+    if not sum(v.item() for v in optimizer_state["found_inf_per_device"].values()):
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/alexander/miniconda3/envs/pytorch/lib/python3.12/site-packages/torch/amp/grad_scaler.py", line 351, in <genexpr>
+    if not sum(v.item() for v in optimizer_state["found_inf_per_device"].values()):
+               ^^^^^^^^
+KeyboardInterrupt

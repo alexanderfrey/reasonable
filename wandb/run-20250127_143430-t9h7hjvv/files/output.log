@@ -1,0 +1,244 @@
+Found 1 files
+Total tokens: 338026
+/home/alexander/Projects/financial_projects/reasonable/train.py:416: FutureWarning: `torch.cuda.amp.GradScaler(args...)` is deprecated. Please use `torch.amp.GradScaler('cuda', args...)` instead.
+  scaler = GradScaler()
+Epoch 1:   0%|                                                                                                                                                                            | 0/18957 [00:00<?, ?it/s]
+
+Generated samples at step 0:
+Prompt: Once upon a time
+Generated: Once upon a time
+
+
+athylua tapping
+YOUmap
+ datas
+
+
+ (* scared
+lua cake GaddafiUsing
+
+
+ Voter Kant
+
+YOU nestingiddles
+ lane
+ nesting
+ Beach
+ BF agreements
+ Kant
+
+ nesting
+
+ Hamburg
+ Gaddafi
+
+
+ competitors hurdle
+
+ nesting
+
+
+
+
+
+
+osing cake Kantlua
+
+ 裏�
+ Hamburg AC
+osing injections respectfully AC
+ agreements
+
+
+
+
+
+ Hamburg
+
+ Gaddafi nesting beck
+ LT
+PoliticalObject
+
+
+Prompt: The meaning of life is
+Generated: The meaning of life is rest Principal enThoseThose McConnell
+ stopp
+ Publishers Chelsea McConnellarahaptic
+dding sterling
+lua nesting
+ lane patrons whilst serious
+aptic
+odcast
+
+
+
+ congestion
+osing becklua Migration
+ competitors Voter competitors acrylic overcome ACodcast
+ nesting
+ congestion
+ Kant
+iddlesUsing
+ AC
+ competitors Beach rulers
+Vill
+
+
+ functions sects sectslua (* ACaptic
+, missileUsingCustomer
+ insert fooled
+
+ Kant fooled
+
+
+
+Vill
+ beck rulers Hamburg
+ lane
+ strikeouts Hamburg
+
+
+Generated samples at step 1000:
+Prompt: Once upon a time
+Generated: Once upon a time.
+
+KING RICHARD II:
+If thou hadst, and hast fear'd to do so:
+I am too fierce, and longly my friends:
+If you had so, not that the king of you
+Is not the king's offspring in the morning's face
+To be the most noble king indeed the like.
+Who died, the queen?
+
+BALTHASAR:
+My lord,
+Now, no, my friends! the event of you
+
+Prompt: The meaning of life is
+Generated: The meaning of life is from him
+That he can not trouble for his great law:
+I am too noble to that effect that I am
+To have it thought that he is at all,
+There is no thought or what I can, to do it.
+
+LUCIO:
+What, art thou to do?
+
+CLAUDIO:
+No, not a woman.
+
+LUCIO:
+Why, she comes gone, of brief, as a soul is done.
+I
+Traceback (most recent call last):
+  File "/home/alexander/Projects/financial_projects/reasonable/train.py", line 426, in <module>
+    train_loss = train_one_epoch(
+                 ^^^^^^^^^^^^^^^^
+  File "/home/alexander/Projects/financial_projects/reasonable/train.py", line 178, in train_one_epoch
+    logits = model(x)
+             ^^^^^^^^
+  File "/home/alexander/miniconda3/envs/pytorch/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1736, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/alexander/miniconda3/envs/pytorch/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1747, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/alexander/miniconda3/envs/pytorch/lib/python3.12/site-packages/torch/nn/parallel/distributed.py", line 1643, in forward
+    else self._run_ddp_forward(*inputs, **kwargs)
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/alexander/miniconda3/envs/pytorch/lib/python3.12/site-packages/torch/nn/parallel/distributed.py", line 1459, in _run_ddp_forward
+    return self.module(*inputs, **kwargs)  # type: ignore[index]
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/alexander/miniconda3/envs/pytorch/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1736, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/alexander/miniconda3/envs/pytorch/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1747, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/alexander/Projects/financial_projects/reasonable/model.py", line 201, in forward
+    x = block(x, mask=mask)
+        ^^^^^^^^^^^^^^^^^^^
+  File "/home/alexander/miniconda3/envs/pytorch/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1736, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/alexander/miniconda3/envs/pytorch/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1747, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/alexander/Projects/financial_projects/reasonable/model.py", line 159, in forward
+    x = x + self.attn(self.ln1(x), mask=mask)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/alexander/miniconda3/envs/pytorch/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1736, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/alexander/miniconda3/envs/pytorch/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1747, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/alexander/Projects/financial_projects/reasonable/model.py", line 100, in forward
+    v = self.value(x).view(B, T, self.n_head, self.head_dim)  # (B, T, H, D)
+        ^^^^^^^^^^^^^
+  File "/home/alexander/miniconda3/envs/pytorch/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1736, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/alexander/miniconda3/envs/pytorch/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1747, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/alexander/miniconda3/envs/pytorch/lib/python3.12/site-packages/torch/nn/modules/linear.py", line 125, in forward
+    return F.linear(input, self.weight, self.bias)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+KeyboardInterrupt
+[rank0]: Traceback (most recent call last):
+[rank0]:   File "/home/alexander/Projects/financial_projects/reasonable/train.py", line 426, in <module>
+[rank0]:     train_loss = train_one_epoch(
+[rank0]:                  ^^^^^^^^^^^^^^^^
+[rank0]:   File "/home/alexander/Projects/financial_projects/reasonable/train.py", line 178, in train_one_epoch
+[rank0]:     logits = model(x)
+[rank0]:              ^^^^^^^^
+[rank0]:   File "/home/alexander/miniconda3/envs/pytorch/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1736, in _wrapped_call_impl
+[rank0]:     return self._call_impl(*args, **kwargs)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/home/alexander/miniconda3/envs/pytorch/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1747, in _call_impl
+[rank0]:     return forward_call(*args, **kwargs)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/home/alexander/miniconda3/envs/pytorch/lib/python3.12/site-packages/torch/nn/parallel/distributed.py", line 1643, in forward
+[rank0]:     else self._run_ddp_forward(*inputs, **kwargs)
+[rank0]:          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/home/alexander/miniconda3/envs/pytorch/lib/python3.12/site-packages/torch/nn/parallel/distributed.py", line 1459, in _run_ddp_forward
+[rank0]:     return self.module(*inputs, **kwargs)  # type: ignore[index]
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/home/alexander/miniconda3/envs/pytorch/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1736, in _wrapped_call_impl
+[rank0]:     return self._call_impl(*args, **kwargs)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/home/alexander/miniconda3/envs/pytorch/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1747, in _call_impl
+[rank0]:     return forward_call(*args, **kwargs)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/home/alexander/Projects/financial_projects/reasonable/model.py", line 201, in forward
+[rank0]:     x = block(x, mask=mask)
+[rank0]:         ^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/home/alexander/miniconda3/envs/pytorch/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1736, in _wrapped_call_impl
+[rank0]:     return self._call_impl(*args, **kwargs)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/home/alexander/miniconda3/envs/pytorch/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1747, in _call_impl
+[rank0]:     return forward_call(*args, **kwargs)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/home/alexander/Projects/financial_projects/reasonable/model.py", line 159, in forward
+[rank0]:     x = x + self.attn(self.ln1(x), mask=mask)
+[rank0]:             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/home/alexander/miniconda3/envs/pytorch/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1736, in _wrapped_call_impl
+[rank0]:     return self._call_impl(*args, **kwargs)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/home/alexander/miniconda3/envs/pytorch/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1747, in _call_impl
+[rank0]:     return forward_call(*args, **kwargs)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/home/alexander/Projects/financial_projects/reasonable/model.py", line 100, in forward
+[rank0]:     v = self.value(x).view(B, T, self.n_head, self.head_dim)  # (B, T, H, D)
+[rank0]:         ^^^^^^^^^^^^^
+[rank0]:   File "/home/alexander/miniconda3/envs/pytorch/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1736, in _wrapped_call_impl
+[rank0]:     return self._call_impl(*args, **kwargs)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/home/alexander/miniconda3/envs/pytorch/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1747, in _call_impl
+[rank0]:     return forward_call(*args, **kwargs)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/home/alexander/miniconda3/envs/pytorch/lib/python3.12/site-packages/torch/nn/modules/linear.py", line 125, in forward
+[rank0]:     return F.linear(input, self.weight, self.bias)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]: KeyboardInterrupt

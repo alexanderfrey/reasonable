@@ -1,0 +1,11 @@
+{"time":"2025-01-27T15:28:08.129781412+01:00","level":"INFO","msg":"using version","core version":"0.19.1"}
+{"time":"2025-01-27T15:28:08.129792783+01:00","level":"INFO","msg":"created symlink","path":"/home/alexander/Projects/financial_projects/reasonable/wandb/run-20250127_152808-ao8n1z8s/logs/debug-core.log"}
+{"time":"2025-01-27T15:28:08.237807042+01:00","level":"INFO","msg":"created new stream","id":"ao8n1z8s"}
+{"time":"2025-01-27T15:28:08.237830807+01:00","level":"INFO","msg":"stream: started","id":"ao8n1z8s"}
+{"time":"2025-01-27T15:28:08.237866765+01:00","level":"INFO","msg":"writer: Do: started","stream_id":"ao8n1z8s"}
+{"time":"2025-01-27T15:28:08.237869591+01:00","level":"INFO","msg":"sender: started","stream_id":"ao8n1z8s"}
+{"time":"2025-01-27T15:28:08.237904587+01:00","level":"INFO","msg":"handler: started","stream_id":"ao8n1z8s"}
+{"time":"2025-01-27T15:28:08.499673044+01:00","level":"INFO","msg":"Starting system monitor"}
+{"time":"2025-01-27T15:31:26.933978324+01:00","level":"INFO","msg":"stream: closing","id":"ao8n1z8s"}
+{"time":"2025-01-27T15:31:26.934016586+01:00","level":"INFO","msg":"Stopping system monitor"}
+{"time":"2025-01-27T15:31:26.934457803+01:00","level":"INFO","msg":"Stopped system monitor"}

@@ -30,29 +30,70 @@ timescale_conn_pool = ThreadedConnectionPool(
 
 
 def create_data_loader(data, batch_size, tokenizer, shuffle=True):
-    # Validate tensors before creating DataLoader
-    for idx, item in enumerate(data):
-        for key, tensor in item.items():
-            # Ensure integer type
-            if not isinstance(tensor, torch.Tensor):
-                item[key] = torch.tensor(tensor, dtype=torch.long)
-            elif tensor.dtype != torch.long:
-                item[key] = tensor.to(torch.long)
+    """
+    Enhanced data loader creation with thought handling and tensor validation
+    """
+    processed_data = []
 
-            # Validate values
+    # First pass: validate and process each item
+    for idx, item in enumerate(data):
+        processed_item = {}
+        for key, value in item.items():
+            # Handle raw text data
+            if key == "raw_intermediate_answers":
+                processed_item[key] = value
+                continue
+
+            # Convert to tensor if needed
+            if not isinstance(value, torch.Tensor):
+                processed_item[key] = torch.tensor(value, dtype=torch.long)
+            elif value.dtype != torch.long:
+                processed_item[key] = value.to(torch.long)
+            else:
+                processed_item[key] = value
+
+            # Validate tensor values
+            tensor = processed_item[key]
             if torch.any(tensor < 0):
                 raise ValueError(f"Negative values found in {key} at index {idx}")
             if torch.any(tensor >= tokenizer.vocab_size):
                 raise ValueError(f"Token ID >= vocab_size in {key} at index {idx}")
 
-    return DataLoader(
-        data,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        num_workers=0,  # Use 0 for debugging
-        pin_memory=False,  # Disable pin_memory for debugging
-        persistent_workers=False,
-    )
+        processed_data.append(processed_item)
+
+    # Create tensors for DataLoader
+    try:
+        questions = torch.stack([item["question"] for item in processed_data])
+        contexts = torch.stack([item["context"] for item in processed_data])
+        answers = torch.stack([item["answer"] for item in processed_data])
+
+        # Handle intermediate answers (thoughts)
+        if "intermediate_answers" in processed_data[0]:
+            thoughts = torch.stack(
+                [item["intermediate_answers"] for item in processed_data]
+            )
+            dataset = TensorDataset(questions, contexts, answers, thoughts)
+        else:
+            dataset = TensorDataset(questions, contexts, answers)
+
+        return DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=shuffle,
+            num_workers=4,
+            pin_memory=True,
+            persistent_workers=False,
+        )
+
+    except Exception as e:
+        print(f"Error creating DataLoader: {e}")
+        print(
+            f"Shapes - questions: {questions.shape}, contexts: {contexts.shape}, "
+            f"answers: {answers.shape}"
+        )
+        if "thoughts" in locals():
+            print(f"thoughts: {thoughts.shape}")
+        raise
 
 
 @dataclass
@@ -64,136 +105,202 @@ class ThoughtStep:
     correction: Optional[str] = None
 
 
+class ThoughtProcessor:
+    def __init__(self, tokenizer, max_length=512):
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.thought_start_token = "<thought>"
+        self.thought_end_token = "</thought>"
+        self.title_start_token = "<title>"
+        self.title_end_token = "</title>"
+        self.value_start_token = "<value>"
+        self.value_end_token = "</value>"
+
+    def format_thought_step(self, step: ThoughtStep) -> str:
+        """
+        Formats a thought step with explicit token handling and better structure
+        """
+        # Start with thought token
+        output_parts = [self.thought_start_token]
+
+        # Add title with tokens
+        output_parts.append(
+            f"{self.title_start_token}{step.title}{self.title_end_token}"
+        )
+
+        if step.sub_points:
+            output_parts.append(self.value_start_token)
+
+        # Process sub-points with better formatting
+        for point in step.sub_points:
+            if "title" in point:
+                # Main points with bullet
+                output_parts.append(f"\n• {point['title']}")
+                if "content" in point:
+                    # Add content with proper indentation
+                    output_parts.append(f"  {point['content']}")
+                # Process sub-points with proper indentation
+                for sub_point in point.get("sub_points", []):
+                    output_parts.append(f"    - {sub_point}")
+            elif "content" in point:
+                output_parts.append(point["content"])
+
+        # Add correction if present
+        if step.correction:
+            output_parts.append(f"\nSelf-Correction:\n{step.correction}")
+
+        if step.sub_points:
+            output_parts.append(self.value_end_token)
+
+        # Close thought tag
+        output_parts.append(self.thought_end_token)
+
+        return "\n".join(output_parts)
+
+    def tokenize_thought(self, thought_text: str) -> List[int]:
+        """
+        Tokenize a thought with proper handling of special tokens
+        """
+        # Ensure thought has proper XML structure
+        if not thought_text.startswith(self.thought_start_token):
+            thought_text = f"{self.thought_start_token}{thought_text}"
+        if not thought_text.endswith(self.thought_end_token):
+            thought_text = f"{thought_text}{self.thought_end_token}"
+
+        # Tokenize with special token handling
+        tokens = self.tokenizer.encode(
+            thought_text,
+            add_special_tokens=True,
+            max_length=self.max_length,
+            truncation=True,
+            padding=False,
+        )
+
+        return tokens
+
+    def batch_process_thoughts(
+        self, thoughts: List[ThoughtStep], max_thoughts: int = 20
+    ) -> torch.Tensor:
+        """
+        Process multiple thoughts into a batched tensor
+        """
+        formatted_thoughts = []
+
+        for thought in thoughts[:max_thoughts]:
+            # Format the thought
+            formatted_text = self.format_thought_step(thought)
+            # Tokenize with proper structure
+            tokens = self.tokenize_thought(formatted_text)
+            # Convert to tensor
+            thought_tensor = torch.tensor(tokens, dtype=torch.long)
+            formatted_thoughts.append(thought_tensor)
+
+        # Pad sequence to same length
+        padded_thoughts = pad_sequence(
+            formatted_thoughts,
+            batch_first=True,
+            padding_value=self.tokenizer.pad_token_id,
+        )
+
+        return padded_thoughts
+
+
 def parse_thinking_process(text: str) -> List[ThoughtStep]:
     """
-    Parses a structured thinking process text into component thoughts and sub-points.
-
-    Args:
-        text (str): The thinking process text to parse
-
-    Returns:
-        List[ThoughtStep]: List of parsed thought steps with their content and sub-points
+    Enhanced parser with better regex patterns and error handling
     """
-    # Split into main numbered sections, keeping the number
-    sections = re.split(r"(?=\d+\.\s+\*\*)", text)
+    try:
+        # Split into main numbered sections with improved regex
+        sections = re.split(r"(?=\d+\.\s+\*\*(?![^*]*\*\*))", text)
+        sections = [s for s in sections if s.strip()]
 
-    # Remove any leading empty sections
-    sections = [s for s in sections if s.strip()]
+        thought_steps = []
 
-    thought_steps = []
+        for section in sections:
+            # Extract step number with more robust pattern
+            number_match = re.match(r"(\d+)\.\s+\*\*(?![^*]*\*\*)", section)
+            if not number_match:
+                continue
 
-    for section in sections:
-        # Extract step number
-        number_match = re.match(r"(\d+)\.\s+\*\*", section)
-        if not number_match:
-            continue
+            step_number = int(number_match.group(1))
 
-        step_number = int(number_match.group(1))
+            # Extract title with improved pattern
+            title_match = re.match(r"\d+\.\s+\*\*([^:*]+?)(?:\s*:)?\*\*\s*", section)
+            if not title_match:
+                continue
 
-        # Extract title
-        title_match = re.match(r"\d+\.\s+\*\*([^:*]+):\*\*\s*", section)
-        if not title_match:
-            continue
+            title = title_match.group(1).strip()
+            content = section[title_match.end() :].strip()
 
-        title = title_match.group(1).strip()
-        content = section[title_match.end() :].strip()
+            # Process sub-points with better structure handling
+            sub_points = process_sub_points(content)
 
-        # Extract sub-points
-        sub_points = []
-        current_main_point = None
+            # Extract correction with improved pattern
+            correction = extract_correction(section)
 
-        # Split content into lines, preserving empty lines
-        lines = content.split("\n")
-        i = 0
-        while i < len(lines):
-            line = lines[i].strip()
-
-            # Handle main bullet points starting with *
-            if line.startswith("* **"):
-                point_title = re.search(r"\* \*\*([^*]+)\*\*", line)
-                if point_title:
-                    current_main_point = {
-                        "title": point_title.group(1).strip(":"),
-                        "sub_points": [],
-                    }
-                    sub_points.append(current_main_point)
-
-            # Handle sub-bullet points (indented with spaces + *)
-            elif line.strip().startswith("*") and current_main_point is not None:
-                sub_point = line.strip("* ").strip()
-                if sub_point:
-                    current_main_point["sub_points"].append(sub_point)
-
-            # Handle regular content
-            elif line and not line.startswith("*"):
-                if current_main_point is None:
-                    sub_points.append({"content": line})
-                else:
-                    if "content" not in current_main_point:
-                        current_main_point["content"] = line
-                    else:
-                        current_main_point["content"] += " " + line
-
-            i += 1
-
-        # Check for self-correction section
-        correction = None
-        if "Self-Correction" in section:
-            correction_match = re.search(
-                r"\*\*\(Self-Correction[^)]*\):\*\*\s*(.*?)(?=\n\n|\Z)",
-                section,
-                re.DOTALL,
+            thought_step = ThoughtStep(
+                number=step_number,
+                title=title,
+                content=content,
+                sub_points=sub_points,
+                correction=correction,
             )
-            if correction_match:
-                correction = correction_match.group(1).strip()
+            thought_steps.append(thought_step)
 
-        thought_step = ThoughtStep(
-            number=step_number,
-            title=title,
-            content=content,
-            sub_points=sub_points,
-            correction=correction,
+        return sorted(thought_steps, key=lambda x: x.number)
+
+    except Exception as e:
+        print(f"Error parsing thinking process: {e}")
+        return []
+
+
+def process_sub_points(content: str) -> List[Dict[str, Any]]:
+    """
+    Process sub-points with improved structure handling
+    """
+    sub_points = []
+    current_main_point = None
+
+    lines = content.split("\n")
+    for line in lines:
+        line = line.strip()
+
+        if line.startswith("* **"):
+            # Handle main bullet points
+            point_title = re.search(r"\* \*\*([^*]+)\*\*", line)
+            if point_title:
+                current_main_point = {
+                    "title": point_title.group(1).strip(":"),
+                    "sub_points": [],
+                }
+                sub_points.append(current_main_point)
+        elif line.startswith("*") and current_main_point is not None:
+            # Handle sub-bullet points
+            sub_point = line.strip("* ").strip()
+            if sub_point:
+                current_main_point["sub_points"].append(sub_point)
+        elif line:
+            # Handle regular content
+            if current_main_point is None:
+                sub_points.append({"content": line})
+            else:
+                current_main_point.setdefault("content", "")
+                current_main_point["content"] += f" {line}".strip()
+
+    return sub_points
+
+
+def extract_correction(section: str) -> Optional[str]:
+    """
+    Extract self-correction with improved pattern matching
+    """
+    if "Self-Correction" in section:
+        correction_match = re.search(
+            r"\*\*\(Self-Correction[^)]*\):\*\*\s*(.*?)(?=\n\n|\Z)", section, re.DOTALL
         )
-        thought_steps.append(thought_step)
-
-    return sorted(thought_steps, key=lambda x: x.number)
-
-
-def format_thought_step(step: ThoughtStep) -> str:
-    """
-    Formats a thought step into a readable string representation.
-
-    Args:
-        step (ThoughtStep): The thought step to format
-
-    Returns:
-        str: Formatted string representation of the thought step
-    """
-    output = "<thought>"
-    output += f"<title>{step.title}</title>\n"
-
-    if step.sub_points:
-        output += "<value>"
-
-    for point in step.sub_points:
-        if "title" in point:
-            output += f"\n• {point['title']}\n"
-            if "content" in point:
-                output += f"  {point['content']}\n"
-            for sub_point in point.get("sub_points", []):
-                output += f"    - {sub_point}\n"
-        elif "content" in point:
-            output += f"{point['content']}\n"
-
-    if step.correction:
-        output += f"\nSelf-Correction:\n{step.correction}\n"
-
-    if step.sub_points:
-        output += "</value>"
-
-    output += "</thought>"
-
-    return output
+        if correction_match:
+            return correction_match.group(1).strip()
+    return None
 
 
 def prepare_training_data_including_thoughts(
@@ -207,7 +314,7 @@ def prepare_training_data_including_thoughts(
     for idx, row in df.iterrows():
         try:
             context = row["input"]
-            question = row["prompt"]
+            question = row["prompt"].split("**Title:**")[0].strip()
 
             # Get thoughts and format them
             formatted_thoughts = []
@@ -225,17 +332,17 @@ def prepare_training_data_including_thoughts(
             ][0].get("text")
 
             # Print lengths before tokenization
-            print(f"Row {idx}:")
-            print(f"Question length: {len(question)}")
-            print(f"Context length: {len(context)}")
-            print(f"Answer length: {len(final_answer)}")
-            print(f"Number of thought steps: {len(formatted_thoughts)}")
+            # print(f"Row {idx}:")
+            # print(f"Question length: {len(question)}")
+            # print(f"Context length: {len(context)}")
+            # print(f"Answer length: {len(final_answer)}")
+            # print(f"Number of thought steps: {len(formatted_thoughts)}")
 
             # Tokenize with explicit max lengths
-            max_question_length = block_size // 2
-            max_context_length = block_size
-            max_answer_length = block_size
-            max_thought_length = block_size // 4
+            max_question_length = block_size // 16
+            max_context_length = block_size // 2
+            max_answer_length = block_size // 2
+            max_thought_length = block_size // 16
 
             def validate_and_clip_tokens(tokens, max_val):
                 return [min(t, max_val) for t in tokens]
@@ -247,7 +354,7 @@ def prepare_training_data_including_thoughts(
                     question,
                     truncation=True,
                     padding="max_length",
-                    max_length=block_size // 2,
+                    max_length=max_question_length,
                 ),
                 max_token_id,
             )
@@ -257,7 +364,7 @@ def prepare_training_data_including_thoughts(
                     context,
                     truncation=True,
                     padding="max_length",
-                    max_length=block_size,
+                    max_length=max_context_length,
                 ),
                 max_token_id,
             )
@@ -267,16 +374,10 @@ def prepare_training_data_including_thoughts(
                     final_answer,
                     truncation=True,
                     padding="max_length",
-                    max_length=block_size,
+                    max_length=max_answer_length,
                 ),
                 max_token_id,
             )
-
-            # Print token lengths after tokenization
-            print(f"Tokenized lengths:")
-            print(f"Question tokens: {len(tokenized_question)}")
-            print(f"Context tokens: {len(tokenized_context)}")
-            print(f"Answer tokens: {len(tokenized_complete_answer)}")
 
             # Handle thought steps with explicit validation
             tokenized_thoughts = []
@@ -306,18 +407,19 @@ def prepare_training_data_including_thoughts(
             thoughts_tensor = torch.stack(tokenized_thoughts)
 
             # Print final tensor shapes
-            print(f"Final tensor shapes:")
-            print(f"Question: {question_tensor.shape}")
-            print(f"Context: {context_tensor.shape}")
-            print(f"Answer: {answer_tensor.shape}")
-            print(f"Thoughts: {thoughts_tensor.shape}")
-            print("-------------------")
+            # print(f"Final tensor shapes:")
+            # print(f"Question: {question_tensor.shape}")
+            # print(f"Context: {context_tensor.shape}")
+            # print(f"Answer: {answer_tensor.shape}")
+            # print(f"Thoughts: {thoughts_tensor.shape}")
+            # print("-------------------")
 
             data_item = {
                 "question": question_tensor,
                 "context": context_tensor,
                 "answer": answer_tensor,
                 "intermediate_answers": thoughts_tensor,
+                "raw_intermediate_answers": formatted_thoughts[:max_thoughts],
             }
 
             data_items.append(data_item)
@@ -462,7 +564,7 @@ def fetch_training_data(task_descriptions, limit=50000, condition=None):
                     created_at DESC
                 LIMIT {limit}"""
 
-    print(query)
+    # print(query)
     cur = conn.cursor()
     cur.execute(query)
     rows = cur.fetchall()
@@ -583,7 +685,7 @@ def load_news_from_ps(
         # Execute SQL query
 
         formatted_query = sql_query % tuple(map(psycopg2.extensions.adapt, parameters))
-        print("Executing SQL query:", formatted_query)
+        # print("Executing SQL query:", formatted_query)
 
         cur.execute(sql_query, parameters)
 
@@ -690,3 +792,237 @@ def prepare_question_context_answer_data(df, block_size, tokenizer):
         )
 
     return data
+
+
+def test_gpu_operations():
+    print("\nRunning GPU diagnostics...")
+
+    try:
+        # Test 1: Small tensor transfer
+        print("\nTest 1: Basic tensor transfer")
+        cpu_tensor = torch.arange(10, dtype=torch.long)
+        gpu_tensor = cpu_tensor.to("cuda")
+        print("Basic tensor transfer successful")
+
+        # Test 2: Tensor with same shape as our data
+        print("\nTest 2: Testing with data-like shapes")
+        sample_question = torch.zeros((1, 1024), dtype=torch.long)
+        sample_context = torch.zeros((1, 2048), dtype=torch.long)
+        sample_answer = torch.zeros((1, 2048), dtype=torch.long)
+        sample_intermediate = torch.zeros((1, 5, 512), dtype=torch.long)
+
+        # Transfer each
+        gpu_question = sample_question.to("cuda")
+        print("Question transfer OK")
+        gpu_context = sample_context.to("cuda")
+        print("Context transfer OK")
+        gpu_answer = sample_answer.to("cuda")
+        print("Answer transfer OK")
+        gpu_intermediate = sample_intermediate.to("cuda")
+        print("Intermediate transfer OK")
+
+        # Test 3: Concatenation
+        print("\nTest 3: Testing concatenation")
+        cat_result = torch.cat([gpu_question, gpu_context], dim=1)
+        print(f"Concatenation successful, shape: {cat_result.shape}")
+
+        # Test 4: Memory cleanup
+        print("\nTest 4: Testing memory cleanup")
+        del gpu_question, gpu_context, gpu_answer, gpu_intermediate, cat_result
+        torch.cuda.empty_cache()
+        print("Memory cleanup successful")
+
+        print("\nAll GPU diagnostic tests passed!")
+        return True
+
+    except Exception as e:
+        print(f"\nGPU diagnostic failed: {str(e)}")
+        return False
+
+
+def validate_dataset(data_items, tokenizer):
+    shapes = []
+    raw_text_lengths = []
+    is_dataset_valid = True
+
+    print("\nValidating dataset...")
+
+    # First pass: Collect all shapes and check for basic tensor validity
+    for idx, item in enumerate(data_items):
+        try:
+            # Basic tensor validation
+            required_keys = ["question", "context", "answer", "intermediate_answers"]
+            for key in required_keys:
+                if key not in item:
+                    print(f"Missing required key '{key}' at index {idx}")
+                    is_dataset_valid = False
+                    continue
+
+                if not isinstance(item[key], torch.Tensor):
+                    print(f"Item '{key}' at index {idx} is not a tensor")
+                    is_dataset_valid = False
+                    continue
+
+            # Collect shapes
+            shape_dict = {key: item[key].shape for key in required_keys}
+            shapes.append(shape_dict)
+
+            # Check for token indices within vocabulary bounds
+            for key, tensor in item.items():
+                if isinstance(tensor, torch.Tensor):
+                    if torch.any(tensor < 0):
+                        print(f"Found negative token indices in {key} at index {idx}")
+                        is_dataset_valid = False
+                    if torch.any(tensor >= tokenizer.vocab_size):
+                        max_token = torch.max(tensor).item()
+                        print(
+                            f"Found out of bounds token in {key} at index {idx}: {max_token} >= {tokenizer.vocab_size}"
+                        )
+                        is_dataset_valid = False
+
+        except Exception as e:
+            print(f"Error validating item at index {idx}: {str(e)}")
+            is_dataset_valid = False
+            continue
+
+    # Second pass: Check shape consistency
+    if shapes:
+        first_shape = shapes[0]
+        print("\nExpected shapes:", first_shape)
+
+        for idx, shape in enumerate(shapes):
+            if shape != first_shape:
+                print(f"\nInconsistent shapes at index {idx}:")
+                for key in first_shape:
+                    if shape[key] != first_shape[key]:
+                        print(f"{key}: expected {first_shape[key]}, got {shape[key]}")
+                is_dataset_valid = False
+
+    # Third pass: Validate intermediate answers structure
+    for idx, item in enumerate(data_items):
+        try:
+            # Check intermediate answers structure
+            if "intermediate_answers" in item:
+                int_answers = item["intermediate_answers"]
+
+                # Print shape information for debugging
+                print(f"\nIndex {idx} intermediate answers shape: {int_answers.shape}")
+
+                # Validate basic shape requirements
+                if len(int_answers.shape) != 2:
+                    print(
+                        f"Invalid intermediate_answers shape at index {idx}: expected 2D tensor, got {len(int_answers.shape)}D"
+                    )
+                    is_dataset_valid = False
+
+                # Check for empty or invalid sequences
+                if torch.all(int_answers == tokenizer.pad_token_id):
+                    print(
+                        f"Warning: All padding tokens in intermediate_answers at index {idx}"
+                    )
+
+                # Check for proper token structure
+                thought_starts = (
+                    (int_answers == tokenizer.convert_tokens_to_ids("<thought>"))
+                    .sum()
+                    .item()
+                )
+                thought_ends = (
+                    (int_answers == tokenizer.convert_tokens_to_ids("</thought>"))
+                    .sum()
+                    .item()
+                )
+
+                if thought_starts != thought_ends:
+                    print(
+                        f"Mismatched thought tags at index {idx}: {thought_starts} starts, {thought_ends} ends"
+                    )
+                    is_dataset_valid = False
+
+        except Exception as e:
+            print(f"Error validating intermediate answers at index {idx}: {str(e)}")
+            is_dataset_valid = False
+
+    if is_dataset_valid:
+        print("\nDataset validation successful!")
+    else:
+        print("\nDataset validation failed!")
+
+    return is_dataset_valid
+
+
+def print_epoch_summary(
+    epoch, global_step, train_loss, val_loss, train_metrics, val_metrics
+):
+    print(f"\nEpoch {epoch + 1} (Step {global_step}) Summary:")
+    print(f"Training - Total Loss: {train_loss:.4f}")
+
+    print("Training Metrics:")
+    for key, value in train_metrics.items():
+        if key == "per_loop_latent_losses":
+            print(f"  {key}:")
+            # Check if value is a dict or list and handle accordingly
+            if isinstance(value, dict):
+                for loop_idx, loop_loss in sorted(value.items()):
+                    print(f"    Loop {loop_idx}: {loop_loss:.4f}")
+            elif isinstance(value, list):
+                for i, loop_loss in enumerate(value):
+                    print(f"    Loop {i}: {loop_loss:.4f}")
+        elif isinstance(value, list):
+            print(f"  {key}:")
+            for i, v in enumerate(value):
+                print(f"    Loop {i}: {v:.4f}")
+        else:
+            # Handle scalar metrics
+            try:
+                print(f"  {key}: {value:.4f}")
+            except (ValueError, TypeError):
+                print(f"  {key}: {value}")
+
+    if val_loss is not None and val_metrics is not None:
+        print(f"Validation - Total Loss: {val_loss:.4f}")
+        print("Validation Metrics:")
+        for key, value in val_metrics.items():
+            if key == "per_loop_latent_losses":
+                print(f"  {key}:")
+                # Check if value is a dict or list and handle accordingly
+                if isinstance(value, dict):
+                    for loop_idx, loop_loss in sorted(value.items()):
+                        print(f"    Loop {loop_idx}: {loop_loss:.4f}")
+                elif isinstance(value, list):
+                    for i, loop_loss in enumerate(value):
+                        print(f"    Loop {i}: {loop_loss:.4f}")
+            elif isinstance(value, list):
+                print(f"  {key}:")
+                for i, v in enumerate(value):
+                    print(f"    Loop {i}: {v:.4f}")
+            else:
+                # Handle scalar metrics
+                try:
+                    print(f"  {key}: {value:.4f}")
+                except (ValueError, TypeError):
+                    print(f"  {key}: {value}")
+
+
+def generate_sample_text(model, tokenizer, prompt, max_tokens, device, step):
+    """Generate and print sample text from the model"""
+    print(f"\n[Step {step}] Generating text for prompt: {prompt}")
+    model.eval()
+    with torch.no_grad():
+        input_ids = tokenizer.encode(prompt, return_tensors="pt").to(device)
+
+        # Assuming model has a generate method
+        try:
+            output_ids = model.generate(
+                input_ids,
+                max_new_tokens=max_tokens,
+                num_beams=4,
+                no_repeat_ngram_size=2,
+                temperature=0.7,
+                top_p=0.9,
+            )
+            generated_text = tokenizer.decode(output_ids[0], skip_special_tokens=True)
+            print(f"[Step {step}] Generated text:\n{generated_text}\n")
+        except Exception as e:
+            print(f"Generation failed: {str(e)}")
+    model.train()

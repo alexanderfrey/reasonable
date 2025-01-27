@@ -1,0 +1,360 @@
+
+Model Parameter Counts:
+Total Parameters: 49,617,408
+- Embeddings: 19,691,904
+- Transformer Layers: 10,626,048
+- Final Layer Norm: 768
+- Output Head: 19,298,688
+
+Found 11 files
+Total tokens: 3204672
+/home/alexander/Projects/financial_projects/reasonable/train.py:573: FutureWarning: `torch.cuda.amp.GradScaler(args...)` is deprecated. Please use `torch.amp.GradScaler('cuda', args...)` instead.
+  scaler = GradScaler()
+
+Generation settings:
+Tokenizer present: True
+gen_every_n_steps: 100
+sample_prompts: ['Once upon a time', 'In a galaxy far far away']
+Epoch 1:   0%|▏                                                                                                           | 100/60068 [00:13<2:02:18,  8.17it/s, loss=7.4500, avg_loss=8.7816, lr=3.00e-04, step=99]
+
+Generated samples at step 100:
+Prompt: Once upon a time
+Generated: Once upon a time", than., the,, of
+,,,
+
+
+
+
+
+
+." the
+
+
+.
+ by one,
+
+
+
+
+ the
+
+ the
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+,
+
+
+
+
+
+
+  these
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+.
+
+
+
+
+
+Prompt: In a galaxy far far away
+Generated: In a galaxy far far away,. in. and that,., is,,, is the,,,,, any,,, " one.,,,, is the, by
+
+
+
+
+
+
+
+
+s,
+
+
+ any,
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ at was
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Generated samples at step 200:
+Prompt: Once upon a time
+Generated: Once upon a time the the the the a in of,
+ but the he which the as is the
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Prompt: In a galaxy far far away
+Generated: In a galaxy far far away a a ", and not for a or the for is, that the the and the the a the- all the which and a to, to the the which, the a, and, a- in a the, the;, to a, of the the or as the, a his is and a the the and the
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+And
+ was the,
+
+
+
+Generated samples at step 300:
+Prompt: Once upon a time
+Generated: Once upon a time.
+
+
+ It:
+
+
+
+
+
+
+
+
+O.
+
+ 1.
+
+DEN
+
+
+
+
+
+
+
+of you so the my
+
+A
+ If of the
+What that the
+
+
+
+
+
+
+
+
+
+
+
+
+The
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+"
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+,
+
+
+Prompt: In a galaxy far far away
+Generated: In a galaxy far far away of one of the the same, a not, and the be the the no it
+" This with no the that the the a the same be not the
+
+
+A the own the the the good to the it to is theThe
+
+O,, "that the the the the the the
+the a the the the
+[ of what, and the the
+
+O the
+The
+And which to the same, and the our be not the
+O for the
+Traceback (most recent call last):
+  File "/home/alexander/Projects/financial_projects/reasonable/train.py", line 582, in <module>
+    train_loss = train_one_epoch(
+                 ^^^^^^^^^^^^^^^^
+  File "/home/alexander/Projects/financial_projects/reasonable/train.py", line 277, in train_one_epoch
+    scaler.step(optimizer)
+  File "/home/alexander/miniconda3/envs/pytorch/lib/python3.12/site-packages/torch/amp/grad_scaler.py", line 457, in step
+    retval = self._maybe_opt_step(optimizer, optimizer_state, *args, **kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/alexander/miniconda3/envs/pytorch/lib/python3.12/site-packages/torch/amp/grad_scaler.py", line 351, in _maybe_opt_step
+    if not sum(v.item() for v in optimizer_state["found_inf_per_device"].values()):
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/alexander/miniconda3/envs/pytorch/lib/python3.12/site-packages/torch/amp/grad_scaler.py", line 351, in <genexpr>
+    if not sum(v.item() for v in optimizer_state["found_inf_per_device"].values()):
+               ^^^^^^^^
+KeyboardInterrupt
+[rank0]: Traceback (most recent call last):
+[rank0]:   File "/home/alexander/Projects/financial_projects/reasonable/train.py", line 582, in <module>
+[rank0]:     train_loss = train_one_epoch(
+[rank0]:                  ^^^^^^^^^^^^^^^^
+[rank0]:   File "/home/alexander/Projects/financial_projects/reasonable/train.py", line 277, in train_one_epoch
+[rank0]:     scaler.step(optimizer)
+[rank0]:   File "/home/alexander/miniconda3/envs/pytorch/lib/python3.12/site-packages/torch/amp/grad_scaler.py", line 457, in step
+[rank0]:     retval = self._maybe_opt_step(optimizer, optimizer_state, *args, **kwargs)
+[rank0]:              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/home/alexander/miniconda3/envs/pytorch/lib/python3.12/site-packages/torch/amp/grad_scaler.py", line 351, in _maybe_opt_step
+[rank0]:     if not sum(v.item() for v in optimizer_state["found_inf_per_device"].values()):
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/home/alexander/miniconda3/envs/pytorch/lib/python3.12/site-packages/torch/amp/grad_scaler.py", line 351, in <genexpr>
+[rank0]:     if not sum(v.item() for v in optimizer_state["found_inf_per_device"].values()):
+[rank0]:                ^^^^^^^^
+[rank0]: KeyboardInterrupt

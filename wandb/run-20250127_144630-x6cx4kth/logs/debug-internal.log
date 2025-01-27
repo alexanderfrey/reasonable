@@ -1,0 +1,11 @@
+{"time":"2025-01-27T14:46:30.031359997+01:00","level":"INFO","msg":"using version","core version":"0.19.1"}
+{"time":"2025-01-27T14:46:30.031373312+01:00","level":"INFO","msg":"created symlink","path":"/home/alexander/Projects/financial_projects/reasonable/wandb/run-20250127_144630-x6cx4kth/logs/debug-core.log"}
+{"time":"2025-01-27T14:46:30.140336681+01:00","level":"INFO","msg":"created new stream","id":"x6cx4kth"}
+{"time":"2025-01-27T14:46:30.140370586+01:00","level":"INFO","msg":"stream: started","id":"x6cx4kth"}
+{"time":"2025-01-27T14:46:30.140392487+01:00","level":"INFO","msg":"writer: Do: started","stream_id":"x6cx4kth"}
+{"time":"2025-01-27T14:46:30.140397046+01:00","level":"INFO","msg":"handler: started","stream_id":"x6cx4kth"}
+{"time":"2025-01-27T14:46:30.140406203+01:00","level":"INFO","msg":"sender: started","stream_id":"x6cx4kth"}
+{"time":"2025-01-27T14:46:30.39902548+01:00","level":"INFO","msg":"Starting system monitor"}
+{"time":"2025-01-27T14:46:45.692682023+01:00","level":"INFO","msg":"stream: closing","id":"x6cx4kth"}
+{"time":"2025-01-27T14:46:45.692711269+01:00","level":"INFO","msg":"Stopping system monitor"}
+{"time":"2025-01-27T14:46:45.693109815+01:00","level":"INFO","msg":"Stopped system monitor"}

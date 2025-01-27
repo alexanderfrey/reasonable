@@ -1,0 +1,11 @@
+{"time":"2025-01-27T14:22:44.473780865+01:00","level":"INFO","msg":"using version","core version":"0.19.1"}
+{"time":"2025-01-27T14:22:44.473793208+01:00","level":"INFO","msg":"created symlink","path":"/home/alexander/Projects/financial_projects/reasonable/wandb/run-20250127_142244-n5bh73zh/logs/debug-core.log"}
+{"time":"2025-01-27T14:22:44.582400205+01:00","level":"INFO","msg":"created new stream","id":"n5bh73zh"}
+{"time":"2025-01-27T14:22:44.582431655+01:00","level":"INFO","msg":"stream: started","id":"n5bh73zh"}
+{"time":"2025-01-27T14:22:44.582471281+01:00","level":"INFO","msg":"writer: Do: started","stream_id":"n5bh73zh"}
+{"time":"2025-01-27T14:22:44.582490167+01:00","level":"INFO","msg":"handler: started","stream_id":"n5bh73zh"}
+{"time":"2025-01-27T14:22:44.582532547+01:00","level":"INFO","msg":"sender: started","stream_id":"n5bh73zh"}
+{"time":"2025-01-27T14:22:44.836519941+01:00","level":"INFO","msg":"Starting system monitor"}
+{"time":"2025-01-27T14:26:15.886583553+01:00","level":"INFO","msg":"stream: closing","id":"n5bh73zh"}
+{"time":"2025-01-27T14:26:15.886623369+01:00","level":"INFO","msg":"Stopping system monitor"}
+{"time":"2025-01-27T14:26:15.887074448+01:00","level":"INFO","msg":"Stopped system monitor"}

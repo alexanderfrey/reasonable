@@ -5,107 +5,281 @@ import math
 from sentence_transformers import SentenceTransformer
 
 
-class LatentLoopTransformer(nn.Module):
-    def __init__(self, latent_gpt, language_gpt, max_loops=5):
-        """
-        Initializes the LatentLoopTransformer with two GPT models.
+class LatentReasoningTransformer(nn.Module):
+    def __init__(self, latent_gpt, language_gpt, max_loops=5, thought_processor=None):
+        super(LatentReasoningTransformer, self).__init__()
+        if thought_processor is None:
+            raise ValueError("thought_processor must be provided")
 
-        Args:
-            latent_gpt (GPT): GPT model used for latent mode refinement.
-            language_gpt (GPT): GPT model used for language mode generation.
-            max_loops (int): Maximum number of latent refinement loops.
-        """
-        super(LatentLoopTransformer, self).__init__()
         self.latent_gpt = latent_gpt
         self.language_gpt = language_gpt
         self.max_loops = max_loops
+        self.thought_processor = thought_processor
 
-    def forward(self, input_ids, return_intermediate=False):
-        B, T = input_ids.size()
-        device = input_ids.device
+        # Add projection layers for reasoning state
+        self.reasoning_projector = nn.Linear(
+            latent_gpt.config.n_embd, latent_gpt.config.n_embd
+        )
+        self.reasoning_predictor = nn.Linear(
+            latent_gpt.config.n_embd, latent_gpt.config.n_embd
+        )
 
-        # Detailed input validation
-        # print(f"\nInput validation:")
-        # print(f"Batch size: {B}, Sequence length: {T}")
-        # print(
-        #     f"Input range: min={input_ids.min().item()}, max={input_ids.max().item()}"
-        # )
-        # print(f"Embedding weight shape: {self.latent_gpt.token_embedding.weight.shape}")
-        # print(
-        #     f"Position embedding max size: {self.latent_gpt.position_embedding.weight.shape}"
-        # )
+        # Initialize reasoning probe
+        self.reasoning_probe = LatentReasoningProbe(
+            hidden_size=latent_gpt.config.n_embd,
+            vocab_size=latent_gpt.config.vocab_size,
+            max_seq_len=1024,
+        )
 
-        max_len = self.latent_gpt.position_embedding.weight.shape[0]
-        if T > max_len:
-            # print(f"Truncating sequence from {T} to {max_len}")
-            input_ids = input_ids[:, :max_len]
-            T = max_len
+        # Add thought processing layers
+        self.thought_encoder = nn.Linear(
+            latent_gpt.config.n_embd, latent_gpt.config.n_embd
+        )
+        self.thought_attention = nn.MultiheadAttention(
+            embed_dim=latent_gpt.config.n_embd,
+            num_heads=8,
+            dropout=0.1,
+            batch_first=True,
+        )
 
-        try:
-            # Token embedding with validation
-            tok_emb = self.latent_gpt.token_embedding(input_ids)
-            # print("Token embedding successful:", tok_emb.shape)
+    def process_thoughts(self, latent_states, thoughts):
+        """
+        Process thoughts using the thought processor
+        """
+        processed_thoughts = self.thought_processor.process_thought(thoughts)
+        encoded_thoughts = self.thought_encoder(processed_thoughts)
 
-            # Position embedding with validation
-            positions = torch.arange(0, T, dtype=torch.long, device=device)
-            if positions.max() >= self.latent_gpt.position_embedding.weight.shape[0]:
-                raise ValueError("Position indices exceed embedding capacity")
+        attended_states, _ = self.thought_attention(
+            query=latent_states, key=encoded_thoughts, value=encoded_thoughts
+        )
 
-            positions = positions.unsqueeze(0)  # (1, T)
-            pos_emb = self.latent_gpt.position_embedding(positions)
-            # print("Position embedding successful:", pos_emb.shape)
+        return attended_states
 
-            # Combine embeddings
-            hidden_states = tok_emb + pos_emb
-            # print("Initial hidden states shape:", hidden_states.shape)
+    def interpret_reasoning_step(self, latent_state, tokenizer, max_length=50):
+        """
+        Reasoning step interpretation using thought processor
+        """
+        with torch.no_grad():
+            return self.thought_processor.decode_thought(
+                latent_state, self.reasoning_probe, max_length=max_length
+            )
 
-            latent_results = []
-            for loop_idx in range(self.max_loops):
-                current_hidden = hidden_states
+    def freeze_probe(self):
+        for param in self.reasoning_probe.parameters():
+            param.requires_grad = False
 
-                # Process through blocks with validation
-                for i, block in enumerate(self.latent_gpt.blocks):
-                    try:
-                        current_hidden = block(current_hidden)
-                        if torch.isnan(current_hidden).any():
-                            raise ValueError(f"NaN detected after block {i}")
-                    except Exception as e:
-                        print(f"Error in block {i}: {str(e)}")
-                        raise
+    def unfreeze_probe(self):
+        for param in self.reasoning_probe.parameters():
+            param.requires_grad = True
 
-                latent_results.append(current_hidden)
+    def generate_intermediate_state(
+        self, hidden_states, thoughts=None, prev_reasoning_state=None
+    ):
+        """
+        Generate intermediate state with thought processing
+        """
+        current_hidden = hidden_states
 
-            # Stack and process latent results
-            latent_results = torch.stack(latent_results, dim=1)
-            # print("Latent results shape:", latent_results.shape)
+        # Incorporate previous reasoning state if available
+        if prev_reasoning_state is not None:
+            reasoning_projection = self.reasoning_projector(prev_reasoning_state)
+            current_hidden = current_hidden + reasoning_projection
 
-            # Language model processing
-            latent_context = latent_results.mean(dim=1)
-            # print("Latent context shape:", latent_context.shape)
+        # Process through latent GPT blocks
+        for block in self.latent_gpt.blocks:
+            current_hidden = block(current_hidden)
 
-            # Final processing
-            hidden_states = latent_context
-            for i, block in enumerate(self.language_gpt.blocks):
-                try:
-                    hidden_states = block(hidden_states)
-                    if torch.isnan(hidden_states).any():
-                        raise ValueError(f"NaN detected in language model block {i}")
-                except Exception as e:
-                    print(f"Error in language model block {i}: {str(e)}")
-                    raise
+        # Project to latent space
+        latent_state = self.latent_gpt.ln_f(current_hidden)
+
+        # Process thoughts if available
+        if thoughts is not None:
+            latent_state = self.process_thoughts(latent_state, thoughts)
+
+        # Generate prediction for next reasoning state
+        next_reasoning_state = self.reasoning_predictor(latent_state)
+
+        return current_hidden, latent_state, next_reasoning_state
+
+    def forward(
+        self,
+        input_ids,
+        intermediate_answers=None,
+        return_intermediate=True,
+        target_loop_idx=None,
+    ):
+        """
+        Enhanced forward pass with thought processing
+        """
+        hidden_states = self._get_embeddings(input_ids)
+
+        # Initialize storage for intermediate results
+        latent_results = []
+        intermediate_hiddens = []
+        reasoning_predictions = []
+        probe_outputs = []
+        prev_reasoning_state = None
+
+        # Determine number of loops
+        num_loops = (
+            target_loop_idx + 1 if target_loop_idx is not None else self.max_loops
+        )
+
+        # Generate intermediate states with thought processing
+        for loop_idx in range(num_loops):
+            # Get thoughts for current loop if available
+            current_thoughts = (
+                intermediate_answers[:, loop_idx]
+                if intermediate_answers is not None
+                else None
+            )
+
+            # Generate intermediate state
+            current_hidden, latent_state, next_reasoning_state = (
+                self.generate_intermediate_state(
+                    hidden_states,
+                    thoughts=current_thoughts,
+                    prev_reasoning_state=prev_reasoning_state,
+                )
+            )
+
+            # Generate probe output for current state
+            probe_output = self.reasoning_probe(
+                latent_state.unsqueeze(1),
+                target_length=(
+                    intermediate_answers.size(-1)
+                    if intermediate_answers is not None
+                    else None
+                ),
+            )
+
+            # Store results
+            intermediate_hiddens.append(current_hidden)
+            latent_results.append(latent_state)
+            reasoning_predictions.append(next_reasoning_state)
+            probe_outputs.append(probe_output)
+
+            # Update states for next iteration
+            hidden_states = current_hidden
+            prev_reasoning_state = latent_state
+
+            # Return early if targeting specific loop
+            if target_loop_idx is not None and loop_idx == target_loop_idx:
+                return {
+                    "intermediate_state": latent_state,
+                    "probe_output": probe_output,
+                    "loop_idx": loop_idx,
+                }
+
+        # Stack results
+        latent_results = torch.stack(latent_results, dim=1)
+        intermediate_hiddens = torch.stack(intermediate_hiddens, dim=1)
+        reasoning_predictions = torch.stack(reasoning_predictions, dim=1)
+        probe_outputs = torch.stack(probe_outputs, dim=1)
+
+        # Process through language model if not targeting specific loop
+        if target_loop_idx is None:
+            # Combine inputs
+            question_context = self._get_embeddings(input_ids)
+            combined_input = torch.cat(
+                [question_context.unsqueeze(1), intermediate_hiddens], dim=1
+            )
+            combined_input = combined_input.view(
+                combined_input.size(0), -1, combined_input.size(-1)
+            )
+
+            # Process through language GPT
+            hidden_states = combined_input
+            for block in self.language_gpt.blocks:
+                hidden_states = block(hidden_states)
 
             hidden_states = self.language_gpt.ln_f(hidden_states)
             logits = self.language_gpt.lm_head(hidden_states)
-            # print("Final logits shape:", logits.shape)
 
-            return {
-                "latent_results": latent_results,
-                "logits": logits,
-            }
+            if return_intermediate:
+                return {
+                    "latent_results": latent_results,
+                    "intermediate_hiddens": intermediate_hiddens,
+                    "reasoning_predictions": reasoning_predictions,
+                    "probe_outputs": probe_outputs,
+                    "logits": logits,
+                    "combined_input": combined_input,
+                }
+            else:
+                return {"logits": logits}
+        else:
+            raise ValueError(
+                "Unexpectedly reached end of forward pass with target_loop_idx"
+            )
 
-        except Exception as e:
-            print(f"Forward pass error: {str(e)}")
-            raise
+
+class LatentReasoningProbe(nn.Module):
+    def __init__(self, hidden_size, vocab_size, max_seq_len=1024):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.vocab_size = vocab_size
+        self.max_seq_len = max_seq_len
+
+        # Add special token handling
+        self.start_token_embedding = nn.Parameter(
+            torch.randn(1, hidden_size) / hidden_size**0.5
+        )
+        self.end_token_embedding = nn.Parameter(
+            torch.randn(1, hidden_size) / hidden_size**0.5
+        )
+
+        # Rest of the architecture remains similar but with improved initialization
+        self.token_embedding = nn.Parameter(
+            torch.randn(vocab_size, hidden_size) / hidden_size**0.5
+        )
+        self.pos_embedding = nn.Parameter(torch.zeros(1, max_seq_len, hidden_size))
+        nn.init.trunc_normal_(self.pos_embedding, std=0.02)
+
+        # Enhanced latent projection
+        self.latent_proj = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size * 2),
+            nn.LayerNorm(hidden_size * 2),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_size * 2, hidden_size),
+            nn.LayerNorm(hidden_size),
+        )
+
+        # Add attention mask handling
+        self.register_buffer(
+            "causal_mask",
+            torch.triu(torch.ones(max_seq_len, max_seq_len), diagonal=1).bool(),
+        )
+
+    def generate(self, latent_states, max_length=512, temperature=0.7):
+        """
+        Improved generation with explicit handling of special tokens
+        """
+        batch_size = latent_states.size(0)
+        device = latent_states.device
+
+        # Start with start token
+        current_output = torch.full(
+            (batch_size, 1), self.start_token_id, dtype=torch.long, device=device
+        )
+
+        for _ in range(max_length - 1):
+            # Get predictions
+            logits = self.forward(latent_states, current_output)
+            next_token_logits = logits[:, -1, :] / temperature
+
+            # Sample next token
+            probs = F.softmax(next_token_logits, dim=-1)
+            next_token = torch.multinomial(probs, num_samples=1)
+
+            # Check for end of sequence
+            if (next_token == self.end_token_id).all():
+                break
+
+            # Append next token
+            current_output = torch.cat([current_output, next_token], dim=1)
+
+        return current_output
 
 
 class EmbeddingLatentSupervision(nn.Module):
@@ -138,200 +312,130 @@ class EmbeddingLatentSupervision(nn.Module):
 
 
 class LatentLoopLoss(nn.Module):
-    def __init__(
-        self, vocab_size, loop_weight=0.1, consistency_weight=0.1
-    ):  # Reduced weights
+    def __init__(self, vocab_size, embedding_dim, latent_dim, latent_weight=1.0):
         super().__init__()
         self.vocab_size = vocab_size
-        self.loop_weight = loop_weight
-        self.consistency_weight = consistency_weight
+        self.latent_weight = latent_weight
+        self.ce_loss = nn.CrossEntropyLoss()
 
-        self.ce_loss = nn.CrossEntropyLoss(ignore_index=-1)
-        self.mse_loss = nn.MSELoss()
-
-    def forward(self, model_output, targets):
-        # Language Generation Loss
-        logits = model_output["logits"]
-        generation_loss = self.ce_loss(
-            logits.view(-1, self.vocab_size), targets["answer"].view(-1)
+        # Initialize embedding supervision
+        self.embedding_supervision = EmbeddingLatentSupervision(
+            embedding_dim=embedding_dim, latent_dim=latent_dim
         )
 
-        # Latent Refinement Loss with gradient clipping
-        latent_loss = torch.tensor(0.0, device=logits.device)
-        if "intermediate_states" in targets:
-            intermediate_states = targets["intermediate_states"]
-            latent_results = model_output["latent_results"]
+        # Add projection layer for student states
+        self.student_proj = nn.Linear(latent_dim, latent_dim)
 
-            # Mean over sequence dimension
-            latent_results_mean = latent_results.mean(dim=2)
-            latent_steps = latent_results_mean[:, : intermediate_states.shape[1], :]
+    def calculate_intermediate_loss(
+        self, model_output, target_state, tokenizer, loop_idx
+    ):
+        """Calculate loss for a specific intermediate state"""
+        intermediate_state = model_output["intermediate_state"]
 
-            # Project with gradient clipping
-            projection = nn.Linear(
-                intermediate_states.shape[2], latent_results.shape[-1]
-            ).to(intermediate_states.device)
+        # Convert target state tensor to text
+        target_text = tokenizer.decode(target_state, skip_special_tokens=True)
 
-            projected_states = projection(intermediate_states.float())
+        # Convert target state text to embedding
+        with torch.no_grad():
+            target_embedding = self.embedding_supervision.get_target_embeddings(
+                [target_text]
+            )
+            target_embedding = target_embedding.to(intermediate_state.device)
 
-            # Clip gradients for stability
-            projected_states = torch.clamp(projected_states, -100, 100)
-            latent_steps = torch.clamp(latent_steps, -100, 100)
+        # Calculate alignment loss
+        state_representation = intermediate_state.mean(
+            dim=1
+        )  # Average over sequence length
+        student_proj = self.student_proj(state_representation)
+        student_norm = F.normalize(student_proj, dim=-1)
+        teacher_norm = F.normalize(target_embedding, dim=-1)
+        latent_loss = F.mse_loss(student_norm, teacher_norm)
 
-            latent_loss = self.mse_loss(latent_steps, projected_states)
-            latent_loss = torch.clamp(latent_loss, 0, 100)  # Prevent explosion
-
-        # Consistency Loss
-        consistency_loss = torch.tensor(0.0, device=logits.device)
-        num_loops = model_output["latent_results"].shape[1]
-        if num_loops > 1:
-            latent_avg = model_output["latent_results"].mean(dim=2)
-            latent_avg = torch.clamp(latent_avg, -100, 100)  # Clip values
-
-            for i in range(num_loops - 1):
-                step_loss = self.mse_loss(
-                    latent_avg[:, i + 1], latent_avg[:, i].detach()
-                )
-                consistency_loss += torch.clamp(step_loss, 0, 100)
-            consistency_loss /= num_loops - 1
-
-        # Combine losses with checks
-        total_loss = (
-            generation_loss
-            + self.loop_weight * latent_loss
-            + self.consistency_weight * consistency_loss
-        )
-
-        # Final safety clamp
-        total_loss = torch.clamp(total_loss, 0, 1000)
+        total_loss = self.latent_weight * latent_loss
 
         return {
             "total_loss": total_loss,
-            "generation_loss": generation_loss.item(),
             "latent_loss": latent_loss.item(),
-            "consistency_loss": consistency_loss.item(),
-            "kl_loss": 0.0,
+            "loop_idx": loop_idx,
         }
 
+    def calculate_generation_loss(self, model_output, targets, tokenizer):
+        """Calculate loss for final answer generation"""
+        logits = model_output["logits"]
+        answer = targets["answer"]
 
-# class LatentLoopLoss(nn.Module):
-#     def __init__(
-#         self,
-#         vocab_size,
-#         loop_weight=0.5,
-#         kl_weight=0.1,
-#         consistency_weight=0.3,
-#         embedding_weight=0.4,
-#     ):
-#         """
-#         Enhanced Loss function with embedding supervision
+        # Truncate to matching length
+        trunc_length = min(logits.size(1), answer.size(1))
+        logits = logits[:, :trunc_length, :]
+        answer = answer[:, :trunc_length]
 
-#         Args:
-#             vocab_size (int): Size of vocabulary for language generation
-#             loop_weight (float): Weight for latent refinement loss
-#             kl_weight (float): Weight for KL divergence
-#             consistency_weight (float): Weight for consistency loss
-#             embedding_weight (float): Weight for embedding supervision loss
-#         """
-#         super().__init__()
-#         self.vocab_size = vocab_size
-#         self.loop_weight = loop_weight
-#         self.kl_weight = kl_weight
-#         self.consistency_weight = consistency_weight
-#         self.embedding_weight = embedding_weight
+        # Calculate cross entropy loss
+        logits_flat = logits.view(-1, self.vocab_size)
+        answer_flat = answer.view(-1)
+        gen_loss = self.ce_loss(logits_flat, answer_flat)
 
-#         self.ce_loss = nn.CrossEntropyLoss(ignore_index=-1)
-#         self.mse_loss = nn.MSELoss()
-#         self.cosine_loss = nn.CosineEmbeddingLoss()
+        return gen_loss
 
-#     def kl_divergence(self, p, q):
-#         """Calculate KL divergence between two latent distributions"""
-#         p_norm = F.softmax(p, dim=-1)
-#         q_norm = F.softmax(q, dim=-1)
-#         return torch.mean(
-#             torch.sum(
-#                 p_norm * (torch.log(p_norm + 1e-10) - torch.log(q_norm + 1e-10)), dim=-1
-#             )
-#         )
+    def forward(self, model_output, targets, tokenizer):
+        # Check if this is an intermediate state loss calculation
+        if "intermediate_state" in model_output:
+            loop_idx = model_output["loop_idx"]
+            # Get target for specific loop and ensure it's a proper tensor
+            target_state = targets["intermediate_answers"][0, loop_idx].squeeze()
+            loss_dict = self.calculate_intermediate_loss(
+                model_output, target_state, tokenizer, loop_idx
+            )
+            return loss_dict
 
-#     def forward(self, model_output, targets):
-#         """
-#         Calculate the combined loss including embedding supervision
+        # Calculate generation loss for final answer
+        gen_loss = self.calculate_generation_loss(model_output, targets, tokenizer)
 
-#         Args:
-#             model_output (dict): Output from LatentLoopTransformer containing:
-#                 - latent_results: Tensor of shape (B, max_loops, T, C)
-#                 - logits: Final language model logits
-#             targets (dict): Target values containing:
-#                 - answer: Target tokens for language generation
-#                 - intermediate_states: Target latent states
-#                 - embedding_targets: Target embeddings from EmbeddingLatentSupervision
-#         """
-#         latent_results = model_output["latent_results"]
-#         final_logits = model_output["logits"]
-#         batch_size, num_loops, seq_len, hidden_dim = latent_results.size()
+        # Return combined metrics
+        metrics = {
+            "total_loss": gen_loss,
+            "generation_loss": gen_loss.item(),
+            "latent_loss": sum(
+                model_output.get("per_loop_latent_losses", [])
+            ),  # Sum all loop losses
+            "per_loop_latent_losses": model_output.get("per_loop_latent_losses", []),
+        }
 
-#         # 1. Language Generation Loss
-#         generation_loss = self.ce_loss(
-#             final_logits.view(-1, self.vocab_size), targets["answer"].view(-1)
-#         )
+        return metrics
 
-#         # 2. Latent Refinement Loss
-#         latent_loss = 0
-#         if "intermediate_states" in targets:
-#             for loop_idx in range(num_loops):
-#                 latent_loss += self.mse_loss(
-#                     latent_results[:, loop_idx],
-#                     targets["intermediate_states"][:, loop_idx],
-#                 )
-#         latent_loss /= num_loops
+    def calculate_generation_loss(self, model_output, targets, tokenizer):
+        """Calculate loss for final answer generation"""
+        logits = model_output["logits"]
+        answer = targets["answer"]
 
-#         # 3. Embedding Supervision Loss
-#         embedding_loss = 0
-#         if "embedding_targets" in targets:
-#             target_embeddings = targets["embedding_targets"]
-#             # Calculate loss against final latent state
-#             final_latent = latent_results[:, -1].mean(
-#                 dim=1
-#             )  # Average over sequence length
-#             embedding_loss = self.cosine_loss(
-#                 final_latent,
-#                 target_embeddings,
-#                 torch.ones(batch_size, device=final_latent.device),
-#             )
+        # Truncate to matching length
+        trunc_length = min(logits.size(1), answer.size(1))
+        logits = logits[:, :trunc_length, :]
+        answer = answer[:, :trunc_length]
 
-#         # 4. Inter-loop Consistency Loss
-#         consistency_loss = 0
-#         if num_loops > 1:
-#             for i in range(num_loops - 1):
-#                 consistency_loss += self.mse_loss(
-#                     latent_results[:, i + 1], latent_results[:, i].detach()
-#                 )
-#             consistency_loss /= num_loops - 1
+        # Calculate cross entropy loss
+        logits_flat = logits.view(-1, self.vocab_size)
+        answer_flat = answer.view(-1)
+        gen_loss = self.ce_loss(logits_flat, answer_flat)
 
-#         # 5. KL Divergence between successive latent states
-#         kl_loss = 0
-#         if num_loops > 1:
-#             for i in range(num_loops - 1):
-#                 kl_loss += self.kl_divergence(
-#                     latent_results[:, i + 1].view(-1, hidden_dim),
-#                     latent_results[:, i].view(-1, hidden_dim),
-#                 )
-#             kl_loss /= num_loops - 1
+        return gen_loss
 
-#         # Combine all losses
-#         total_loss = (
-#             generation_loss
-#             + self.loop_weight * latent_loss
-#             + self.consistency_weight * consistency_loss
-#             + self.kl_weight * kl_loss
-#             + self.embedding_weight * embedding_loss
-#         )
+    def forward(self, model_output, targets, tokenizer):
+        # Check if this is an intermediate state loss calculation
+        if "intermediate_state" in model_output:
+            loop_idx = model_output["loop_idx"]
+            # Get target for specific loop and ensure it's a proper tensor
+            target_state = targets["intermediate_answers"][0, loop_idx].squeeze()
+            return self.calculate_intermediate_loss(
+                model_output, target_state, tokenizer, loop_idx
+            )
 
-#         return {
-#             "total_loss": total_loss,
-#             "generation_loss": generation_loss.item(),
-#             "latent_loss": latent_loss.item(),
-#             "consistency_loss": consistency_loss.item(),
-#             "kl_loss": kl_loss.item(),
-#             "embedding_loss": embedding_loss.item(),
-#         }
+        # Calculate generation loss for final answer
+        gen_loss = self.calculate_generation_loss(model_output, targets, tokenizer)
+
+        # Return combined metrics
+        return {
+            "total_loss": gen_loss,
+            "generation_loss": gen_loss.item(),
+            "latent_loss": 0.0,  # No latent loss for final generation
+            "per_loop_latent_losses": [],  # Empty for final generation
+        }

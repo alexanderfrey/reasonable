@@ -1,0 +1,21 @@
+Found 1 files
+Total tokens: 338026
+/home/alexander/Projects/financial_projects/reasonable/train.py:443: FutureWarning: `torch.cuda.amp.GradScaler(args...)` is deprecated. Please use `torch.amp.GradScaler('cuda', args...)` instead.
+  scaler = GradScaler()
+Epoch 1:   7%|███████▊                                                                                                                | 617/9478 [00:56<13:36, 10.86it/s, loss=4.4133, avg_loss=5.7811, lr=3.00e-04]
+Traceback (most recent call last):
+  File "/home/alexander/Projects/financial_projects/reasonable/train.py", line 452, in <module>
+    train_loss = train_one_epoch(
+                 ^^^^^^^^^^^^^^^^
+  File "/home/alexander/Projects/financial_projects/reasonable/train.py", line 219, in train_one_epoch
+    total_loss += loss.item() * gradient_accumulation_steps
+                  ^^^^^^^^^^^
+KeyboardInterrupt
+[rank0]: Traceback (most recent call last):
+[rank0]:   File "/home/alexander/Projects/financial_projects/reasonable/train.py", line 452, in <module>
+[rank0]:     train_loss = train_one_epoch(
+[rank0]:                  ^^^^^^^^^^^^^^^^
+[rank0]:   File "/home/alexander/Projects/financial_projects/reasonable/train.py", line 219, in train_one_epoch
+[rank0]:     total_loss += loss.item() * gradient_accumulation_steps
+[rank0]:                   ^^^^^^^^^^^
+[rank0]: KeyboardInterrupt

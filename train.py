@@ -1,481 +1,644 @@
-import os, random, math
-import glob
+import tiktoken
 import argparse
+import os
+from glob import glob
+import bitsandbytes as bnb
 import torch
+from torch.utils.data import Dataset, DataLoader
+from model import GPT, GPTConfig
 import torch.nn.functional as F
-from tokenizers import Tokenizer
-from transformers import GPT2Tokenizer
-
-# from model_old import GPT2WithGroupedAttentionRotary  # Import the model from model.py
-from torch.utils.data import DataLoader, TensorDataset
-import torch.nn as nn
-from torch.optim.lr_scheduler import CosineAnnealingLR
-from tqdm import tqdm
-from sklearn.model_selection import train_test_split
-from data_preparation import prepare_data
 from torch.cuda.amp import autocast, GradScaler
-import numpy as np
-from utils import (
-    create_dataloader,
-    read_text_from_directory,
-    decode_example,
-    generate_text,
-    count_parameters,
-)
-from model import GPTConfig, GPT
+from torch.optim.lr_scheduler import CosineAnnealingLR
+import wandb  # for logging
+from tqdm.auto import tqdm
+import math
+from pathlib import Path
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
 
 
-# Read text from all `.txt` files in the specified directory
-def read_text_from_directory(directory):
-    files = glob.glob(os.path.join(directory, "*.txt"))
-    text = ""
-    for file in files:
-        with open(file, "r", encoding="utf-8") as f:
-            text += f.read() + "\n"
-    return text
+def count_parameters(model):
+    """
+    Count the number of trainable parameters in the model.
+    Returns total params and a breakdown of parameters by component.
+    """
+    total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    
+    # Count embedding parameters
+    token_emb_params = model.token_embedding.weight.numel()
+    pos_emb_params = model.position_embedding.weight.numel()
+    
+    # Count parameters per layer
+    layer_params = sum(p.numel() for p in model.blocks[0].parameters() if p.requires_grad)
+    total_layer_params = layer_params * len(model.blocks)
+    
+    # Count final layer norm and head parameters
+    final_ln_params = sum(p.numel() for p in model.ln_f.parameters() if p.requires_grad)
+    head_params = model.lm_head.weight.numel()
+    if model.config.bias:  # Add bias parameters if present
+        head_params += model.lm_head.bias.numel()
+    
+    return {
+        'total': total_params,
+        'embeddings': token_emb_params + pos_emb_params,
+        'transformer_layers': total_layer_params,
+        'final_ln': final_ln_params,
+        'head': head_params
+    }
+
+def setup_distributed():
+    """Initialize distributed training"""
+    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
+        rank = int(os.environ['RANK'])
+        world_size = int(os.environ['WORLD_SIZE'])
+        local_rank = int(os.environ['LOCAL_RANK'])
+    else:
+        print('Not using distributed mode')
+        return None, None, None
+
+    torch.cuda.set_device(local_rank)
+    dist.init_process_group(backend='nccl', init_method='env://')
+    
+    return rank, world_size, local_rank
+
+def create_distributed_dataloaders(files_pattern, block_size, batch_size, rank, world_size, num_workers=4, prefetch_factor=2, encoding_name="gpt2"):
+    """Create distributed training and validation dataloaders with optimized settings"""
+    dataset = TextDataset(files_pattern, block_size, encoding_name)
+    
+    # Split into train/val
+    train_size = int(0.9 * len(dataset))
+    val_size = len(dataset) - train_size
+    train_dataset, val_dataset = torch.utils.data.random_split(
+        dataset, [train_size, val_size]
+    )
+    
+    # Create distributed samplers
+    train_sampler = DistributedSampler(
+        train_dataset,
+        num_replicas=world_size,
+        rank=rank,
+        shuffle=True,
+        drop_last=True  # Drop last incomplete batch for better GPU utilization
+    )
+    
+    val_sampler = DistributedSampler(
+        val_dataset,
+        num_replicas=world_size,
+        rank=rank,
+        shuffle=False
+    )
+    
+    # Create dataloaders with optimized settings
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        sampler=train_sampler,
+        num_workers=num_workers,  # Adjust based on CPU cores available
+        pin_memory=True,
+        prefetch_factor=prefetch_factor,  # Prefetch 2 batches per worker
+        persistent_workers=True,  # Keep workers alive between epochs
+        drop_last=True  # Drop last incomplete batch
+    )
+    
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        sampler=val_sampler,
+        num_workers=num_workers,
+        pin_memory=True,
+        prefetch_factor=prefetch_factor,
+        persistent_workers=True
+    )
+    
+    return train_loader, val_loader, train_sampler, val_sampler
 
 
-# Text generation function
-def generate(model, prompt, max_new_tokens, tokenizer, device):
+def generate_text(model, tokenizer, prompt, max_new_tokens=100, temperature=0.8, top_k=40, device='cuda'):
+    """Generate text using the model.
+    
+    Args:
+        model: The GPT model
+        tokenizer: The tiktoken tokenizer
+        prompt: String prompt to start generation
+        max_new_tokens: Maximum number of tokens to generate
+        temperature: Sampling temperature (higher = more random)
+        top_k: Number of top tokens to consider for sampling
+        device: Device to run generation on
+    
+    Returns:
+        Generated text as string
+    """
     model.eval()
     # Encode the prompt
-    encoded_prompt = tokenizer.encode(prompt)
-    generated = (
-        torch.tensor(encoded_prompt.ids, dtype=torch.long).unsqueeze(0).to(device)
-    )
-
+    prompt_tokens = tokenizer.encode(prompt)
+    x = torch.tensor(prompt_tokens, dtype=torch.long)[None,...].to(device)
+    
+    # Generate tokens
     for _ in range(max_new_tokens):
-        logits = model(generated)
-        probs = F.softmax(logits[:, -1, :], dim=-1)
+        # Get model predictions
+        with torch.no_grad():
+            with torch.amp.autocast('cuda'):
+                logits = model(x)
+        
+        # Focus on last time step
+        logits = logits[:, -1, :] / temperature
+        
+        # Optional: top-k sampling
+        if top_k is not None:
+            v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+            logits[logits < v[:, [-1]]] = -float('Inf')
+        
+        # Apply softmax to convert logits to probabilities
+        probs = F.softmax(logits, dim=-1)
+        
+        # Sample from the distribution
         next_token = torch.multinomial(probs, num_samples=1)
-        generated = torch.cat((generated, next_token), dim=1)
+        
+        # Append sampled token to the sequence
+        x = torch.cat((x, next_token), dim=1)
+        
+        # If we hit the EOT token, stop
+        if next_token.item() == tokenizer.eot_token:
+            break
+    
+    # Decode the generated tokens
+    generated_tokens = x[0].tolist()
+    generated_text = tokenizer.decode(generated_tokens)
+    
+    return generated_text
 
-    # Decode the generated sequence
-    decoded = tokenizer.decode(generated.squeeze().tolist())
-    return decoded
-
-
-def compute_accuracy(logits, targets):
-    """
-    Computes the accuracy for masked token prediction, ignoring positions where targets == -100.
-    """
-    mask = targets != -100
-    preds = torch.argmax(logits, dim=-1)  # Get the index of the max logit
-    correct = (
-        (preds[mask] == targets[mask]).sum().item()
-    )  # Compare only masked positions
-    total = mask.sum().item()  # Total number of valid positions
-    return correct, total
-
-
-def compute_sparsity(model):
-    total_params = 0
-    zero_params = 0
-    for param in model.parameters():
-        total_params += param.numel()
-        zero_params += (param.abs() < 1e-6).sum().item()
-    return zero_params / total_params
-
-
-def train_with_batches(
-    model,
-    train_loader,
-    val_loader,
-    vocab_size,
-    device,
-    tokenizer,
-    optimizer,
-    scheduler,
-    *,
-    epochs=1,
-    max_steps=None,
-    generate_every=100,
-    generate_prompt="My name",
-    max_gen_tokens=20,
-    sparsity_alpha=1e-5,
-    start_epoch=0,
-    save_path="best_model.pth",
-):
-    """
-    Train the model using batches with masked token prediction strategy.
-    Save only the best model based on validation loss.
-    Includes AMP for CUDA, while keeping compatibility with MPS.
-
-    Args:
-        (same as before)
-        save_path (str): File path for saving the best model based on validation loss.
-    """
-    criterion = torch.nn.CrossEntropyLoss(ignore_index=-1)
-    global_step = 0  # Track total training steps across epochs
-    best_val_loss = float("inf")  # Initialize the best validation loss as infinity
-
-    # Use AMP only if CUDA is available
-    use_amp = device.type == "cuda"
-    scaler = GradScaler(enabled=use_amp)
-
-    for epoch in range(start_epoch, start_epoch + epochs):
-        # ---------------------
-        #      Training
-        # ---------------------
+def generate_samples_ddp(model, tokenizer, sample_prompts, device, rank):
+    """Generate samples in a DDP-safe way"""
+    # Store original training state
+    was_training = model.training
+    
+    # Switch to eval mode
+    model.eval()
+    
+    # Sync all processes
+    if dist.is_initialized():
+        dist.barrier()
+    
+    samples = ""
+    if rank == 0:  # Only generate on rank 0
+        try:
+            # Use model.module if it exists (DDP), otherwise use model directly
+            generating_model = model.module if hasattr(model, 'module') else model
+            samples = generate_samples(generating_model, tokenizer, sample_prompts, device)
+        except Exception as e:
+            print(f"Error generating samples: {str(e)}")
+    
+    # Sync all processes again
+    if dist.is_initialized():
+        dist.barrier()
+    
+    # Restore original training state
+    if was_training:
         model.train()
-        train_loss = 0.0
-        train_progress_bar = tqdm(
-            train_loader, desc=f"Training Epoch {epoch + 1}", leave=False
-        )
+    
+    return samples
 
-        for batch_X, batch_Y in train_progress_bar:
-            # 1) Check if we've exceeded max_steps
-            if max_steps is not None and global_step >= max_steps:
-                print(f"Reached {max_steps} steps, stopping training.")
-                break
+def generate_samples(model, tokenizer, prompts, device='cuda'):
+    """Generate samples from a list of prompts"""
+    samples = []
+    for prompt in prompts:
+        sample = generate_text(model, tokenizer, prompt, device=device)
+        samples.append(f"Prompt: {prompt}\nGenerated: {sample}\n")
+    return "\n".join(samples)
 
-            global_step += 1
+# Add arguments for generation
+def get_args():
+    parser = argparse.ArgumentParser()
+    # Original arguments
+    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--block_size", type=int, default=1024)
+    parser.add_argument("--train_data", type=str, default="./text_files/*.txt")
+    parser.add_argument("--gen_every_n_steps", type=int, default=100,
+                       help="Generate samples every N training steps")
+    parser.add_argument("--sample_prompts", type=str, nargs='+',
+                       default=["Once upon a time", "In a galaxy far far away"],
+                       help="Prompts to use for generation during training")
+    
+    # New optimization-related arguments
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=1,
+                       help="Number of steps to accumulate gradients")
+    parser.add_argument("--num_workers", type=int, default=4,
+                       help="Number of data loader workers")
+    parser.add_argument("--prefetch_factor", type=int, default=2,
+                       help="Number of batches to prefetch per worker")
+    parser.add_argument("--opt_level", type=str, default="O2",
+                       help="AMP optimization level")
+    return parser.parse_args()
 
-            batch_X, batch_Y = batch_X.to(device, non_blocking=True), batch_Y.to(
-                device, non_blocking=True
-            )
 
-            optimizer.zero_grad()
-
-            # Enable mixed precision if using CUDA
-            with autocast(enabled=use_amp):
-                logits = model(batch_X)
-                loss = criterion(logits.view(-1, vocab_size), batch_Y.view(-1))
-
-                # Add L1 sparsity regularization
-                l1_regularization = sparsity_alpha * sum(
-                    torch.abs(param).sum()
-                    for name, param in model.named_parameters()
-                    if "weight" in name
-                )
-                total_loss = loss + l1_regularization
-
-            # Backward pass with gradient scaling
-            scaler.scale(total_loss).backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+def train_one_epoch(model, train_loader, train_sampler, optimizer, scheduler, scaler, 
+                   device, epoch, tokenizer=None, gen_every_n_steps=None, 
+                   sample_prompts=None, rank=0, gradient_accumulation_steps=1):
+    model.train()
+    total_loss = 0
+    global_step = epoch * len(train_loader)
+    
+    if train_sampler is not None:
+        train_sampler.set_epoch(epoch)
+    
+    # Debug print at start of epoch
+    if rank == 0:
+        print(f"\nGeneration settings:")
+        print(f"Tokenizer present: {tokenizer is not None}")
+        print(f"gen_every_n_steps: {gen_every_n_steps}")
+        print(f"sample_prompts: {sample_prompts}")
+    
+    optimizer.zero_grad()
+    
+    progress_bar = tqdm(train_loader, desc=f'Epoch {epoch + 1}', disable=rank != 0)
+    for batch_idx, (x, y) in enumerate(progress_bar):
+        # Determine if this is an accumulation step
+        is_accumulation_step = (batch_idx + 1) % gradient_accumulation_steps != 0
+        
+        # Move batch to device
+        x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+        
+        # Forward pass with autocast
+        with torch.amp.autocast('cuda', dtype=torch.float16):
+            logits = model(x)
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1))
+            loss = loss / gradient_accumulation_steps
+        
+        # Backward pass with gradient scaling
+        scaler.scale(loss).backward()
+        
+        if not is_accumulation_step:
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            
             scaler.step(optimizer)
             scaler.update()
-
-            train_loss += total_loss.item()
-
-            train_progress_bar.set_postfix(train_loss=total_loss.item())
-
-            # Mid-training generation
-            if (
-                generate_every is not None
-                and generate_every > 0
-                and global_step % generate_every == 0
-            ):
-                print(
-                    f"\n[Step {global_step}] Generating text for prompt:\n{generate_prompt}"
-                )
-                sample_output = generate_text(
-                    model,
-                    tokenizer,
-                    device,
-                    prompt=generate_prompt,
-                    max_new_tokens=max_gen_tokens,
-                )
-                print(f"[Step {global_step}] Generated text:\n{sample_output}\n")
-                model.train()  # switch back to train mode
-
-        if max_steps is not None and global_step >= max_steps:
-            print(f"Completed training after reaching {global_step} steps.")
-            break
-
-        # End of epoch: compute average train loss
-        train_loss /= len(train_loader)
-        train_ppl = math.exp(train_loss) if train_loss < 20 else float("inf")
-
-        scheduler.step()
-
-        # ---------------------
-        #    Validation
-        # ---------------------
-        model.eval()
-        val_loss = 0.0
-        correct, total = 0, 0
-        val_progress_bar = tqdm(
-            val_loader, desc=f"Validation Epoch {epoch + 1}", leave=False
+            optimizer.zero_grad()
+            
+            scheduler.step()
+        
+        # Update metrics
+        total_loss += loss.item() * gradient_accumulation_steps
+        
+        # Check for generation - note we moved it outside the rank check
+        should_generate = (
+            tokenizer is not None and 
+            gen_every_n_steps is not None and 
+            sample_prompts is not None and 
+            global_step > 0 and
+            global_step % gen_every_n_steps == 0
         )
+        
+        if should_generate:
+            samples = generate_samples_ddp(model, tokenizer, sample_prompts, device, rank)
+            
+            # Only log on rank 0
+            if rank == 0:
+                print(f"\nGenerated samples at step {global_step}:")
+                print(samples)
+                wandb.log({
+                    'generated_samples': wandb.Html(samples.replace('\n', '<br>'))
+                })
+        
+        if rank == 0 and not is_accumulation_step:
+            current_lr = scheduler.get_last_lr()[0]
+            
+            # Update progress bar
+            progress_bar.set_postfix({
+                'loss': f'{loss.item() * gradient_accumulation_steps:.4f}',
+                'avg_loss': f'{total_loss / (batch_idx + 1):.4f}',
+                'lr': f'{current_lr:.2e}',
+                'step': global_step
+            })
+            
+            # Log to wandb
+            wandb.log({
+                'train_loss': loss.item() * gradient_accumulation_steps,
+                'learning_rate': current_lr,
+                'grad_scale': scaler.get_scale(),
+                'global_step': global_step
+            })
+        
+        global_step += 1
+    
+    if dist.is_initialized():
+        dist.all_reduce(torch.tensor([total_loss]).to(device))
+        total_loss /= dist.get_world_size()
+    
+    return total_loss / len(train_loader)
 
-        with torch.no_grad():
-            for batch_X, batch_Y in val_progress_bar:
-                batch_X, batch_Y = batch_X.to(device, non_blocking=True), batch_Y.to(
-                    device, non_blocking=True
-                )
+@torch.no_grad()
+def evaluate(model, val_loader, val_sampler, device, rank=0):
+    model.eval()
+    total_loss = 0
+    
+    # Set epoch for distributed sampler
+    if val_sampler is not None:
+        val_sampler.set_epoch(0)
+    
+    for x, y in tqdm(val_loader, desc='Evaluating', disable=rank != 0):
+        x, y = x.to(device), y.to(device)
+        with torch.amp.autocast('cuda'):
+            logits = model(x)
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1))
+        total_loss += loss.item()
+    
+    # Gather loss from all processes
+    if dist.is_initialized():
+        dist.all_reduce(torch.tensor([total_loss]).to(device))
+        total_loss /= dist.get_world_size()
+    
+    return total_loss / len(val_loader)
 
-                logits = model(batch_X)
-                loss = criterion(logits.view(-1, vocab_size), batch_Y.view(-1))
-                val_loss += loss.item()
+def save_checkpoint(model, optimizer, scheduler, scaler, epoch, train_loss, val_loss, config, path, rank=0):
+    """Save checkpoint only on rank 0"""
+    if rank == 0:
+        torch.save({
+            'epoch': epoch,
+            'model_state_dict': model.module.state_dict(),  # Save the inner model
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict(),
+            'scaler_state_dict': scaler.state_dict(),
+            'train_loss': train_loss,
+            'val_loss': val_loss,
+            'config': config.__dict__,
+        }, path)
+        print(f"Saved checkpoint to {path}")
 
-                # Compute accuracy for masked tokens only
-                mask = batch_Y != -100
-                masked_preds = torch.argmax(logits, dim=-1)[mask]
-                masked_labels = batch_Y[mask]
-                correct += (masked_preds == masked_labels).sum().item()
-                total += mask.sum().item()
+class TextDataset(Dataset):
+    def __init__(self, files_pattern, block_size, encoding_name="gpt2"):
+        # Initialize tokenizer
+        self.tokenizer = tiktoken.get_encoding(encoding_name)
+        self.block_size = block_size
+        
+        # Get all files matching the pattern
+        self.files = glob(files_pattern)
+        if not self.files:
+            raise ValueError(f"No files found matching pattern: {files_pattern}")
+        
+        print(f"Found {len(self.files)} files")
+        
+        # Read and tokenize all files
+        self.tokens = []
+        for file_path in self.files:
+            try:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    text = f.read()
+                # Add tokens for this file
+                self.tokens.extend(self.tokenizer.encode(text))
+                # Add an end of text token between files
+                self.tokens.append(self.tokenizer.eot_token)
+            except Exception as e:
+                print(f"Warning: Could not process file {file_path}: {str(e)}")
+        
+        print(f"Total tokens: {len(self.tokens)}")
+        
+    def __len__(self):
+        return len(self.tokens) - self.block_size
+        
+    def __getitem__(self, i):
+        # Get block_size tokens from position i
+        chunk = self.tokens[i:i + self.block_size + 1]  # +1 for the target
+        
+        # Convert to torch tensors
+        x = torch.tensor(chunk[:-1], dtype=torch.long)
+        y = torch.tensor(chunk[1:], dtype=torch.long)
+        
+        return x, y
 
-                val_progress_bar.set_postfix(val_loss=loss.item())
+def create_dataloaders(files_pattern, block_size, batch_size, encoding_name="gpt2"):
+    """Create training and validation dataloaders from multiple files"""
+    dataset = TextDataset(files_pattern, block_size, encoding_name)
+    
+    # Split into train/val
+    train_size = int(0.9 * len(dataset))
+    val_size = len(dataset) - train_size
+    train_dataset, val_dataset = torch.utils.data.random_split(
+        dataset, [train_size, val_size]
+    )
+    
+    # Create dataloaders
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=4
+    )
+    
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=4
+    )
+    
+    return train_loader, val_loader
 
-        val_loss /= len(val_loader)
-        val_ppl = math.exp(val_loss) if val_loss < 20 else float("inf")
-        val_accuracy = correct / total if total > 0 else 0.0
+# When creating your GPT model, use the tokenizer's vocab size
+def get_vocab_size(encoding_name="gpt2"):
+    tokenizer = tiktoken.get_encoding(encoding_name)
+    return tokenizer.n_vocab
 
-        try:
-            sparsity = compute_sparsity(model)
-        except NameError:
-            sparsity = 0.0
+def setup_instruction_finetuning(pretrained_path, config, device, rank=0):
+    """
+    Setup model for instruction fine-tuning from pretrained weights
+    """
+    # Load the pretrained checkpoint
+    checkpoint = torch.load(pretrained_path, map_location='cpu')
+    
+    # Create model with same config as pretrained
+    pretrained_config = GPTConfig(**checkpoint['config'])
+    model = GPT(pretrained_config)
+    
+    # Load pretrained weights
+    model.load_state_dict(checkpoint['model_state_dict'])
+    model = model.to(device)
+    
+    if rank == 0:
+        print("\nLoaded pretrained model with config:")
+        for key, value in pretrained_config.__dict__.items():
+            print(f"{key}: {value}")
+    
+    # Create optimizer with fine-tuning specific parameters
+    optimizer = bnb.optim.AdamW(
+        model.parameters(),
+        lr=2e-5,  # Lower learning rate for fine-tuning
+        weight_decay=0.1,
+        optim_bits=8,
+        block_wise=True,
+        is_paged=True
+    )
+    
+    # Create scheduler with shorter warmup and decay
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        optimizer,
+        T_0=1000,  # Shorter cycle length for fine-tuning
+        T_mult=2,
+        eta_min=1e-6
+    )
+    
+    return model, optimizer, scheduler
 
-        # Print epoch results
-        print(
-            f"Epoch {epoch + 1} (Step {global_step}) | "
-            f"Train Loss: {train_loss:.4f} (PPL: {train_ppl:.2f}), "
-            f"Val Loss: {val_loss:.4f} (PPL: {val_ppl:.2f}), "
-            f"Val Accuracy: {val_accuracy:.4f}, "
-            f"Sparsity: {sparsity:.4f}"
+# Example usage:
+if __name__ == "__main__":
+    args = get_args()
+    torch.backends.cudnn.benchmark = True 
+
+    # parser.add_argument("--pretrained_path", type=str, required=True,
+    #                    help="Path to pretrained model checkpoint")
+    # parser.add_argument("--instruction_data", type=str, required=True,
+    #                    help="Path to instruction dataset JSON files")
+    
+    # Setup distributed training
+    rank, world_size, local_rank = setup_distributed()
+    device = torch.device(f'cuda:{local_rank}' if local_rank is not None else 'cuda')
+    
+    # Get vocab size and create tokenizer
+    vocab_size = get_vocab_size("gpt2")
+    tokenizer = tiktoken.get_encoding("gpt2")
+    
+    # Create config
+    config = GPTConfig(
+        vocab_size=vocab_size,
+        n_layer=6,
+        n_head=6,
+        n_embd=384,
+        block_size=args.block_size,
+        dropout=0.1
+    )
+    
+    # Initialize wandb only on rank 0
+    if rank == 0:
+        wandb.init(
+            project="gpt-training",
+            config={
+                "vocab_size": vocab_size,
+                "n_layer": config.n_layer,
+                "n_head": config.n_head,
+                "n_embd": config.n_embd,
+                "block_size": config.block_size,
+                "dropout": config.dropout,
+                "learning_rate": args.lr,
+                "batch_size": args.batch_size * (world_size or 1),  # Global batch size
+                "optimizer": "8-bit AdamW",
+                "num_gpus": world_size or 1
+            }
         )
+    
+    # Create model
+    model = GPT(config)
+    model = model.to(device)
 
-        # Save the model only if validation loss improves
+    if rank == 0:  # Only print on main process
+        param_counts = count_parameters(model)
+        print("\nModel Parameter Counts:")
+        print(f"Total Parameters: {param_counts['total']:,}")
+        print(f"- Embeddings: {param_counts['embeddings']:,}")
+        print(f"- Transformer Layers: {param_counts['transformer_layers']:,}")
+        print(f"- Final Layer Norm: {param_counts['final_ln']:,}")
+        print(f"- Output Head: {param_counts['head']:,}\n")
+    
+    # Wrap model with DDP
+    if world_size is not None:
+        model = DDP(model, device_ids=[local_rank])
+    
+    # Create distributed dataloaders
+    train_loader, val_loader, train_sampler, val_sampler = create_distributed_dataloaders(
+        args.train_data,
+        block_size=args.block_size,
+        batch_size=args.batch_size,
+        rank=rank,
+        world_size=world_size,
+        num_workers=args.num_workers,
+        prefetch_factor=args.prefetch_factor
+    )
+    
+    # Create optimizer and scheduler
+    optimizer = bnb.optim.AdamW(
+        model.parameters(),
+        lr=args.lr,
+        weight_decay=0.1,
+        optim_bits=8,      # Enable 8-bit optimization
+        block_wise=True,   # Enable block-wise quantization
+        is_paged=True      # Enable memory paging
+    )
+    
+    scheduler = CosineAnnealingLR(
+        optimizer, 
+        T_max=len(train_loader) * args.epochs
+    )
+    scaler = GradScaler()
+    
+    checkpoint_dir = Path("checkpoints")
+    if rank == 0:  # Only create directory on main process
+        checkpoint_dir.mkdir(exist_ok=True)
+    
+    # Training loop
+    best_val_loss = float('inf')
+    for epoch in range(args.epochs):
+        train_loss = train_one_epoch(
+            model, train_loader, train_sampler, optimizer, scheduler, 
+            scaler, device, epoch, tokenizer=tokenizer,
+            gen_every_n_steps=args.gen_every_n_steps,
+            sample_prompts=args.sample_prompts,
+            rank=rank,
+            gradient_accumulation_steps=args.gradient_accumulation_steps
+        )
+        
+        # Evaluate
+        val_loss = evaluate(model, val_loader, val_sampler, device, rank)
+        
+        # Log metrics (only on rank 0)
+        if rank == 0:
+            wandb.log({
+                'epoch': epoch,
+                'train_loss': train_loss,
+                'val_loss': val_loss,
+            })
+            
+            print(f"Epoch {epoch + 1}/{args.epochs}")
+            print(f"Train Loss: {train_loss:.4f}")
+            print(f"Val Loss: {val_loss:.4f}")
+        
+        # Save checkpoints
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            print(
-                f"Validation loss improved to {val_loss:.4f}. Saving the best model..."
+            save_checkpoint(
+                model, optimizer, scheduler, scaler,
+                epoch, train_loss, val_loss, config,
+                checkpoint_dir / "best_model.pt",
+                rank=rank
             )
-            save_checkpoint(model, optimizer, scheduler, epoch + 1, save_path)
-
-    print(f"Training finished. Best validation loss: {best_val_loss:.4f}")
-
-
-def save_checkpoint(model, optimizer, scheduler, epoch, path):
-    torch.save(
-        {
-            "model_state_dict": model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "scheduler_state_dict": scheduler.state_dict(),
-            "epoch": epoch,
-        },
-        path,
-    )
-    print(f"Checkpoint saved to {path} with epoch {epoch}")
-
-
-def load_checkpoint(path, model, optimizer=None, scheduler=None):
-    """
-    Load model, optimizer, and scheduler states from a checkpoint.
-    """
-    checkpoint = torch.load(path)
-
-    # Load model state
-    model.load_state_dict(checkpoint["model_state_dict"])
-
-    # Optionally load optimizer and scheduler states
-    if optimizer:
-        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-    if scheduler:
-        scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
-
-    epoch = checkpoint["epoch"]
-    print(f"Checkpoint loaded from {path}, resuming at epoch {epoch}")
-    return epoch  # Return the exact epoch saved
-
-
-if __name__ == "__main__":
-    # Parse CLI arguments
-    parser = argparse.ArgumentParser(
-        description="Train GPT-3 model with CLI parameters."
-    )
-    parser.add_argument(
-        "--text_files_directory",
-        type=str,
-        default="./text_files",
-        help="Path to the text files directory",
-    )
-    parser.add_argument(
-        "--block_size", type=int, default=128, help="Block size for training sequences"
-    )
-    parser.add_argument(
-        "--batch_size", type=int, default=256, help="Batch size for training"
-    )
-    parser.add_argument(
-        "--epochs", type=int, default=3, help="Number of training epochs"
-    )
-    parser.add_argument(
-        "--steps", type=int, default=None, help="Number of training steps"
-    )
-    parser.add_argument(
-        "--lr", type=float, default=3e-4, help="Learning rate for training"
-    )
-    parser.add_argument(
-        "--model_save_path",
-        type=str,
-        default="trained_model.pth",
-        help="Path to save the trained model",
-    )
-    parser.add_argument(
-        "--model_load_path",
-        type=str,
-        default=None,
-        help="Path to a pre-trained model file to continue training",
-    )
-    parser.add_argument(
-        "--prompt", type=str, default="My name is", help="Prompt for text generation"
-    )
-    args = parser.parse_args()
-
-    from tokenizers import ByteLevelBPETokenizer
-
-    # Load the trained ByteLevelBPETokenizer
-    tokenizer = ByteLevelBPETokenizer(
-        "./byte_level_bpe/vocab.json", "./byte_level_bpe/merges.txt"
-    )
-
-    # Special tokens to be verified
-    special_tokens = ["<pad>", "<s>", "</s>", "<unk>", "<mask>"]
-
-    # Verify that special tokens are correctly added
-    for token in special_tokens:
-        token_id = tokenizer.token_to_id(token)
-        if token_id is None:
-            print(f"Error: Token {token} was not added to the vocabulary.")
-        else:
-            print(f"Token {token} has ID: {token_id}")
-
-    # Save the updated tokenizer (if required)
-    # tokenizer.save_model("./updated_byte_level_bpe")
-
-    print("Tokenizer loaded and verified.")
-
-    if torch.backends.mps.is_available():
-        device = torch.device("mps")
-    elif torch.cuda.is_available():
-        device = torch.device("cuda")
-    else:
-        device = torch.device("cpu")
-
-    print("Device:", device)
-
-    # Load text data
-    text = read_text_from_directory(args.text_files_directory)  # [:100000]
-    block_size = args.block_size
-
-    strategy_names = [
-        "next_token"
-    ]  # , , "span_masking", "masked_token","whole_word_masking"
-    combined_X, combined_Y = [], []
-
-    for strategy_name in strategy_names:
-        if strategy_name == "permuted_language":
-            X, Y, _ = prepare_data(
-                strategy_name, text, block_size, tokenizer, mask_probability=0.15
+        
+        if (epoch + 1) % 10 == 0:
+            save_checkpoint(
+                model, optimizer, scheduler, scaler,
+                epoch, train_loss, val_loss, config,
+                checkpoint_dir / f"checkpoint_epoch_{epoch + 1}.pt",
+                rank=rank
             )
-        else:
-            X, Y = prepare_data(
-                strategy_name, text, block_size, tokenizer, mask_probability=0.15
-            )
+    
+    if rank == 0:
+        wandb.finish()
+    
+    # Cleanup distributed training
+    if dist.is_initialized():
+        dist.destroy_process_group()
 
-        combined_X.append(X)
-        combined_Y.append(Y)
-
-    X = torch.cat(combined_X, dim=0)
-    Y = torch.cat(combined_Y, dim=0)
-
-    X, Y = X.to(dtype=torch.long), Y.to(dtype=torch.long)
-
-    # Split data into training and validation sets
-    X_train, X_val, Y_train, Y_val = train_test_split(
-        X, Y, test_size=0.25, random_state=42
-    )
-
-    print(f"Number of training examples: {len(X_train)}")
-
-    # Decode the 10th example for inspection
-    # for i in range(15):
-    #     input_seq, target_seq = decode_example(X, Y, tokenizer, index=1000+i)
-    #     print(f"Input Sequence (X[{i}]): {input_seq}\n")
-    #     print(f"Target Sequence (Y[{i}]): {target_seq}")
-    #     print("\n\n\n")
-
-    # Create DataLoaders for training and validation
-    train_loader = create_dataloader(X_train, Y_train, args.batch_size)
-    val_loader = create_dataloader(X_val, Y_val, args.batch_size)
-
-    # Model configuration
-    embed_size = 384
-    num_heads = 6
-    num_layers = 6
-    num_groups = 1
-
-    vocab_size = tokenizer.get_vocab_size()
-    model_args = dict(
-        n_layer=num_layers,
-        n_head=num_heads,
-        n_embd=embed_size,
-        block_size=block_size,
-        bias=False,
-        vocab_size=vocab_size,
-        dropout=0.0,
-    )
-    gptconf = GPTConfig(**model_args)
-    model = GPT(gptconf)
-    # model = GPT2WithGroupedAttentionRotary(vocab_size, embed_size, num_heads, num_layers, block_size, num_groups, dropout=0.1, causal=True)
-
-    model.to(device)
-
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.1)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=len(train_loader) * args.epochs
-    )
-
-    # Load model from file if specified
-    start_epoch = 0
-    if args.model_load_path:
-        try:
-            start_epoch = load_checkpoint(
-                args.model_load_path, model, optimizer, scheduler
-            )
-
-        except Exception as e:
-            print(f"Failed to load checkpoint from {args.model_load_path}: {e}")
-            exit(1)
-
-    if not args.model_load_path:
-        for name, param in model.named_parameters():
-            if "weight" in name and param.dim() > 1:
-                nn.init.xavier_uniform_(param)
-
-    print("Model created.")
-
-    print(
-        "Generated text:",
-        generate_text(model, tokenizer, device, args.prompt, max_new_tokens=120),
-    )
-
-    num_params = count_parameters(model)
-    print(f"Number of trainable parameters: {num_params}")
-
-    # Train with batches
-    train_with_batches(
-        model=model,
-        train_loader=train_loader,
-        val_loader=val_loader,
-        vocab_size=vocab_size,
-        tokenizer=tokenizer,
-        device=device,
-        epochs=args.epochs,
-        max_steps=args.steps,
-        optimizer=optimizer,
-        scheduler=scheduler,
-        sparsity_alpha=1e-5,
-        start_epoch=start_epoch,
-        save_path=args.model_save_path,
-        generate_every=100,  # Generate text every 100 training steps
-        generate_prompt="The house was build on",
-        max_gen_tokens=100,
-    )
-
-    # Generate text
-    print(
-        "Generated text:",
-        generate_text(model, tokenizer, device, args.prompt, max_new_tokens=120),
-    )
+def load_checkpoint(checkpoint_path, model, optimizer=None, scheduler=None, scaler=None):
+    checkpoint = torch.load(checkpoint_path)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    
+    if optimizer is not None:
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    
+    if scheduler is not None:
+        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+    
+    if scaler is not None:
+        scaler.load_state_dict(checkpoint['scaler_state_dict'])
+    
+    return checkpoint['epoch'], checkpoint['train_loss'], checkpoint['val_loss']

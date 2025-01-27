@@ -1,0 +1,29 @@
+
+Model Parameter Counts:
+Total Parameters: 49,617,408
+- Embeddings: 19,691,904
+- Transformer Layers: 10,626,048
+- Final Layer Norm: 768
+- Output Head: 19,298,688
+
+Found 11 files
+Total tokens: 3204672
+/home/alexander/Projects/financial_projects/reasonable/train.py:527: FutureWarning: `torch.cuda.amp.GradScaler(args...)` is deprecated. Please use `torch.amp.GradScaler('cuda', args...)` instead.
+  scaler = GradScaler()
+Epoch 1:   0%|▏                                                                                                                    | 110/60068 [00:14<2:11:28,  7.60it/s, loss=7.3374, avg_loss=8.6906, lr=3.00e-04]
+Traceback (most recent call last):
+  File "/home/alexander/Projects/financial_projects/reasonable/train.py", line 536, in <module>
+    train_loss = train_one_epoch(
+                 ^^^^^^^^^^^^^^^^
+  File "/home/alexander/Projects/financial_projects/reasonable/train.py", line 249, in train_one_epoch
+    total_loss += loss.item() * gradient_accumulation_steps
+                  ^^^^^^^^^^^
+KeyboardInterrupt
+[rank0]: Traceback (most recent call last):
+[rank0]:   File "/home/alexander/Projects/financial_projects/reasonable/train.py", line 536, in <module>
+[rank0]:     train_loss = train_one_epoch(
+[rank0]:                  ^^^^^^^^^^^^^^^^
+[rank0]:   File "/home/alexander/Projects/financial_projects/reasonable/train.py", line 249, in train_one_epoch
+[rank0]:     total_loss += loss.item() * gradient_accumulation_steps
+[rank0]:                   ^^^^^^^^^^^
+[rank0]: KeyboardInterrupt

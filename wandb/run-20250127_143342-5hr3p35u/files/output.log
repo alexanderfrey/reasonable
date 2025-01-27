@@ -1,0 +1,138 @@
+Found 1 files
+Total tokens: 338026
+/home/alexander/Projects/financial_projects/reasonable/train.py:416: FutureWarning: `torch.cuda.amp.GradScaler(args...)` is deprecated. Please use `torch.amp.GradScaler('cuda', args...)` instead.
+  scaler = GradScaler()
+Epoch 1:   0%|                                                                                                                                                                             | 0/9479 [00:00<?, ?it/s]
+
+Generated samples at step 0:
+Prompt: Once upon a time
+Generated: Once upon a timeicion EQUlevels
+ayette
+ parts
+, Plot loss
+ fist JO
+
+
+
+ Persona
+ adventure adventure
+ r
+
+ adventure flame Pett759
+ Slash r
+
+ija
+ loss jan
+
+
+ Slash not
+
+
+
+
+
+ NETQuest jan JO
+
+nos fist Personanos Slash
+
+
+ eurozone
+ayetteleg
+
+759
+
+
+ JavaScript adventure
+
+ Persona
+ his fist
+Quest
+
+
+unning jan Roe batting Persona
+
+
+ Roe not r
+ Persona
+
+Prompt: The meaning of life is
+Generated: The meaning of life isFeatureAST multipleanga kidnappingion
+ 318plus
+ physicist adventure poets
+, sten packet
+
+ gigs
+ Missileion,
+ pooledutical
+ assigned natural NET
+ gigs
+ayette carpayette
+lines NET natural packetutical
+, carp adventure
+
+
+
+
+
+
+
+
+
+nos
+
+ assignedore759
+nos
+ ]; jan jan
+
+
+
+
+ion
+ore
+ rehearsal
+
+ija
+
+ Roe
+good not
+ore
+
+
+
+
+
+
+
+leg adventure
+Traceback (most recent call last):
+  File "/home/alexander/Projects/financial_projects/reasonable/train.py", line 426, in <module>
+    train_loss = train_one_epoch(
+                 ^^^^^^^^^^^^^^^^
+  File "/home/alexander/Projects/financial_projects/reasonable/train.py", line 190, in train_one_epoch
+    scaler.step(optimizer)
+  File "/home/alexander/miniconda3/envs/pytorch/lib/python3.12/site-packages/torch/amp/grad_scaler.py", line 457, in step
+    retval = self._maybe_opt_step(optimizer, optimizer_state, *args, **kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/alexander/miniconda3/envs/pytorch/lib/python3.12/site-packages/torch/amp/grad_scaler.py", line 351, in _maybe_opt_step
+    if not sum(v.item() for v in optimizer_state["found_inf_per_device"].values()):
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/alexander/miniconda3/envs/pytorch/lib/python3.12/site-packages/torch/amp/grad_scaler.py", line 351, in <genexpr>
+    if not sum(v.item() for v in optimizer_state["found_inf_per_device"].values()):
+               ^^^^^^^^
+KeyboardInterrupt
+[rank0]: Traceback (most recent call last):
+[rank0]:   File "/home/alexander/Projects/financial_projects/reasonable/train.py", line 426, in <module>
+[rank0]:     train_loss = train_one_epoch(
+[rank0]:                  ^^^^^^^^^^^^^^^^
+[rank0]:   File "/home/alexander/Projects/financial_projects/reasonable/train.py", line 190, in train_one_epoch
+[rank0]:     scaler.step(optimizer)
+[rank0]:   File "/home/alexander/miniconda3/envs/pytorch/lib/python3.12/site-packages/torch/amp/grad_scaler.py", line 457, in step
+[rank0]:     retval = self._maybe_opt_step(optimizer, optimizer_state, *args, **kwargs)
+[rank0]:              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/home/alexander/miniconda3/envs/pytorch/lib/python3.12/site-packages/torch/amp/grad_scaler.py", line 351, in _maybe_opt_step
+[rank0]:     if not sum(v.item() for v in optimizer_state["found_inf_per_device"].values()):
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/home/alexander/miniconda3/envs/pytorch/lib/python3.12/site-packages/torch/amp/grad_scaler.py", line 351, in <genexpr>
+[rank0]:     if not sum(v.item() for v in optimizer_state["found_inf_per_device"].values()):
+[rank0]:                ^^^^^^^^
+[rank0]: KeyboardInterrupt
