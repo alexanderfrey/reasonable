@@ -899,13 +899,17 @@ if __name__ == "__main__":
 
     if rank == 0:  # Only print on main process
         param_counts = count_parameters(model)
-        print("\nModel Parameter Counts:")
+        # Print parameter counts
+        print(f"Model Parameter Counts:")
         print(f"Total Parameters: {param_counts['total']:,}")
         print(f"- Embeddings: {param_counts['embeddings']:,}")
-        print(f"- Main Pathway: {param_counts['main_pathway']:,}")
-        print(f"- Analysis Pathway: {param_counts['analysis_pathway']:,}")
-        print(f"- Lateral Connections: {param_counts['lateral_connections']:,}")
-        print(f"- Output Heads: {param_counts['heads']:,}\n")
+        print("- Main Pathway:")
+        print(f"  - Final Layer Norm: {param_counts['main_pathway']['final_ln']:,}")
+        print(f"  - Head: {param_counts['main_pathway']['head']:,}")
+        print("- Analysis Pathway:")
+        print(f"  - Final Layer Norm: {param_counts['analysis_pathway']['final_ln']:,}")
+        print(f"  - Head: {param_counts['analysis_pathway']['head']:,}")
+        print(f"- Transformer Layers: {param_counts['transformer_layers']:,}")
 
     # Wrap model with DDP
     if world_size is not None:
