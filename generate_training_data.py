@@ -255,6 +255,7 @@ def get_unprocessed_files(directory_path: str, processed_files: Set[str]) -> Lis
         List of Path objects for unprocessed files
     """
     all_files = list(Path(directory_path).glob("*.txt"))
+    print(all_files)
     unprocessed_files = [f for f in all_files if f.name not in processed_files]
 
     print(
@@ -276,7 +277,7 @@ async def generate_training_examples(
 ) -> None:
     # Load already processed files
     processed_files = load_processed_files(output_file)
-
+    print(processed_files)
     # Get list of unprocessed files
     unprocessed_files = get_unprocessed_files(directory_path, processed_files)
 
@@ -340,7 +341,7 @@ async def generate_training_examples(
     for txt_file in unprocessed_files:
         try:
             with open(txt_file, "r", encoding="utf-8") as file:
-                text = file.read()
+                text = file.read()  # [:5000]
                 print(f"\nProcessing file: {txt_file.name}")
 
                 sentences = text_processor.process_text_parallel(
