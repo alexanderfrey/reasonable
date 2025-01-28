@@ -2,7 +2,7 @@ import os
 from pathlib import Path
 import json
 import random
-from typing import List, Dict
+from typing import List, Dict, Set
 import argparse
 from text_processor import TextProcessor
 from tqdm import tqdm
@@ -210,6 +210,59 @@ async def append_example(example: Dict, output_file: str) -> None:
         raise
 
 
+def load_processed_files(output_file: str) -> Set[str]:
+    """
+    Load the set of files that have already been processed from existing training examples.
+
+    Args:
+        output_file: Path to the existing training examples file
+
+    Returns:
+        Set of filenames that have already been processed
+    """
+    processed_files = set()
+
+    if not Path(output_file).exists():
+        return processed_files
+
+    try:
+        with open(output_file, "r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    example = json.loads(line)
+                    if "source_file" in example:
+                        processed_files.add(example["source_file"])
+                except json.JSONDecodeError:
+                    continue
+
+        print(f"Found {len(processed_files)} already processed files")
+        return processed_files
+
+    except Exception as e:
+        print(f"Error loading processed files from {output_file}: {str(e)}")
+        return set()
+
+
+def get_unprocessed_files(directory_path: str, processed_files: Set[str]) -> List[Path]:
+    """
+    Get list of files that haven't been processed yet.
+
+    Args:
+        directory_path: Path to directory containing text files
+        processed_files: Set of already processed filenames
+
+    Returns:
+        List of Path objects for unprocessed files
+    """
+    all_files = list(Path(directory_path).glob("*.txt"))
+    unprocessed_files = [f for f in all_files if f.name not in processed_files]
+
+    print(
+        f"Found {len(unprocessed_files)} unprocessed files out of {len(all_files)} total files"
+    )
+    return unprocessed_files
+
+
 async def generate_training_examples(
     directory_path: str,
     text_processor: TextProcessor,
@@ -221,7 +274,16 @@ async def generate_training_examples(
     delay_between_calls: float = 1.0,
     max_concurrent_requests: int = 5,
 ) -> None:
-    directory = Path(directory_path)
+    # Load already processed files
+    processed_files = load_processed_files(output_file)
+
+    # Get list of unprocessed files
+    unprocessed_files = get_unprocessed_files(directory_path, processed_files)
+
+    if not unprocessed_files:
+        print("No new files to process")
+        return
+
     examples_count = 0
 
     # Semaphore to control concurrent API requests
@@ -230,10 +292,6 @@ async def generate_training_examples(
     async def process_chunk(chunk: List[str], txt_file: Path, pbar) -> Dict:
         """Process a single chunk of sentences"""
         input_text = " ".join(chunk)
-
-        # if len(input_text) > max_seq_length:
-        #     pbar.update(1)
-        #     return None
 
         async with sem:
             for attempt in range(max_retries):
@@ -273,16 +331,16 @@ async def generate_training_examples(
             pbar.update(1)
             return None
 
-    total_files = len(list(directory.glob("*.txt")))
-    print(f"Found {total_files} text files to process")
+    total_files = len(unprocessed_files)
+    print(f"Processing {total_files} new text files")
 
     # Use regular tqdm for file progress
     pbar_files = tqdm(total=total_files, desc="Processing files", position=0)
 
-    for txt_file in directory.glob("*.txt"):
+    for txt_file in unprocessed_files:
         try:
             with open(txt_file, "r", encoding="utf-8") as file:
-                text = file.read()  # [:5000]
+                text = file.read()
                 print(f"\nProcessing file: {txt_file.name}")
 
                 sentences = text_processor.process_text_parallel(
@@ -316,7 +374,9 @@ async def generate_training_examples(
             pbar_files.update(1)
 
     pbar_files.close()
-    print(f"\nGenerated and saved {examples_count} training examples to {output_file}")
+    print(
+        f"\nGenerated and saved {examples_count} new training examples to {output_file}"
+    )
 
 
 # Update the main function to handle async execution
