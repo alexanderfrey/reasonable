@@ -7,7 +7,6 @@ from dataclasses import dataclass
 from typing import Optional
 import psycopg2
 import aiohttp
-
 import openai
 from openai import OpenAI
 from psycopg2.pool import ThreadedConnectionPool

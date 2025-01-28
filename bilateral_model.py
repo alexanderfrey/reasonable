@@ -61,6 +61,7 @@ class BilateralGPTConfig:
         dropout: float = 0.0,
         rope_theta: float = 10000.0,
         lateral_dim: int = None,
+        pretrain_mode: bool = False,  # New parameter for pre-training mode
     ):
         self.vocab_size = vocab_size
         self.n_layer = n_layer
@@ -71,6 +72,105 @@ class BilateralGPTConfig:
         self.dropout = dropout
         self.rope_theta = rope_theta
         self.lateral_dim = lateral_dim if lateral_dim is not None else n_embd
+        self.pretrain_mode = pretrain_mode  # Store pre-training mode flag
+
+
+class BilateralGPT(nn.Module):
+    """GPT model with two parallel pathways and lateral connections."""
+
+    def __init__(self, config: BilateralGPTConfig):
+        super().__init__()
+        self.config = config
+
+        # Shared embeddings
+        self.token_embedding = nn.Embedding(config.vocab_size, config.n_embd)
+        self.position_embedding = nn.Embedding(config.block_size, config.n_embd)
+
+        # Bilateral transformer blocks
+        self.blocks = nn.ModuleList(
+            [BilateralTransformerBlock(config) for _ in range(config.n_layer)]
+        )
+
+        # Output layers for both pathways
+        self.ln_f_main = nn.LayerNorm(config.n_embd)
+        self.ln_f_analysis = nn.LayerNorm(config.n_embd)
+
+        # In pre-training mode, both heads are language model heads
+        if config.pretrain_mode:
+            self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=config.bias)
+            # Share weights between heads in pre-training mode
+            self.analysis_head = self.lm_head
+        else:
+            # In fine-tuning mode, maintain separate heads
+            self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=config.bias)
+            self.analysis_head = nn.Linear(
+                config.n_embd, config.vocab_size, bias=config.bias
+            )
+
+        # Initialize weights
+        self._init_weights()
+
+        self.gradient_checkpointing = False
+
+    def _init_weights(self):
+        # Initialize embeddings
+        nn.init.normal_(self.token_embedding.weight, mean=0.0, std=0.02)
+        nn.init.normal_(self.position_embedding.weight, mean=0.0, std=0.02)
+
+        # Initialize head biases if present
+        if self.config.bias:
+            nn.init.zeros_(self.lm_head.bias)
+            if (
+                not self.config.pretrain_mode
+            ):  # Only initialize separate analysis head if not in pre-training
+                nn.init.zeros_(self.analysis_head.bias)
+
+        # Initialize head weights
+        nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.02)
+        if (
+            not self.config.pretrain_mode
+        ):  # Only initialize separate analysis head if not in pre-training
+            nn.init.normal_(self.analysis_head.weight, mean=0.0, std=0.02)
+
+    def forward(self, idx, mask=None):
+        B, T = idx.size()
+        if T > self.config.block_size:
+            raise ValueError(
+                f"Sequence length {T} exceeds block size {self.config.block_size}"
+            )
+
+        # Generate embeddings
+        positions = torch.arange(0, T, dtype=torch.long, device=idx.device).unsqueeze(0)
+        tok_emb = self.token_embedding(idx)
+        pos_emb = self.position_embedding(positions)
+
+        # Initialize both pathways with same embeddings
+        x_main = tok_emb + pos_emb
+        x_analysis = tok_emb + pos_emb
+
+        # Process through bilateral blocks
+        for block in self.blocks:
+            if self.gradient_checkpointing and self.training:
+                x_main, x_analysis = torch.utils.checkpoint.checkpoint(
+                    block, x_main, x_analysis, mask
+                )
+            else:
+                x_main, x_analysis = block(x_main, x_analysis, mask=mask)
+
+        # Generate outputs for both pathways
+        x_main = self.ln_f_main(x_main)
+        x_analysis = self.ln_f_analysis(x_analysis)
+
+        # Generate logits
+        logits_main = self.lm_head(x_main)
+
+        # In pre-training mode, both pathways use the same head
+        if self.config.pretrain_mode:
+            logits_analysis = self.lm_head(x_analysis)
+        else:
+            logits_analysis = self.analysis_head(x_analysis)
+
+        return logits_main, logits_analysis
 
 
 class MultiHeadSelfAttention(nn.Module):
@@ -259,76 +359,3 @@ class BilateralTransformerBlock(nn.Module):
         )
 
         return x_main, x_analysis
-
-
-class BilateralGPT(nn.Module):
-    """GPT model with two parallel pathways and lateral connections."""
-
-    def __init__(self, config: BilateralGPTConfig):
-        super().__init__()
-        self.config = config
-
-        # Shared embeddings
-        self.token_embedding = nn.Embedding(config.vocab_size, config.n_embd)
-        self.position_embedding = nn.Embedding(config.block_size, config.n_embd)
-
-        # Bilateral transformer blocks
-        self.blocks = nn.ModuleList(
-            [BilateralTransformerBlock(config) for _ in range(config.n_layer)]
-        )
-
-        # Output layers for both pathways
-        self.ln_f_main = nn.LayerNorm(config.n_embd)
-        self.ln_f_analysis = nn.LayerNorm(config.n_embd)
-        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=config.bias)
-        self.analysis_head = nn.Linear(
-            config.n_embd, config.vocab_size, bias=config.bias
-        )
-
-        # Initialize weights
-        self._init_weights()
-
-        self.gradient_checkpointing = False
-
-    def _init_weights(self):
-        nn.init.normal_(self.token_embedding.weight, mean=0.0, std=0.02)
-        nn.init.normal_(self.position_embedding.weight, mean=0.0, std=0.02)
-        if self.config.bias:
-            nn.init.zeros_(self.lm_head.bias)
-            nn.init.zeros_(self.analysis_head.bias)
-        nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.02)
-        nn.init.normal_(self.analysis_head.weight, mean=0.0, std=0.02)
-
-    def forward(self, idx, mask=None):
-        B, T = idx.size()
-        if T > self.config.block_size:
-            raise ValueError(
-                f"Sequence length {T} exceeds block size {self.config.block_size}"
-            )
-
-        # Generate embeddings
-        positions = torch.arange(0, T, dtype=torch.long, device=idx.device).unsqueeze(0)
-        tok_emb = self.token_embedding(idx)
-        pos_emb = self.position_embedding(positions)
-
-        # Initialize both pathways with same embeddings
-        x_main = tok_emb + pos_emb
-        x_analysis = tok_emb + pos_emb
-
-        # Process through bilateral blocks
-        for block in self.blocks:
-            if self.gradient_checkpointing and self.training:
-                x_main, x_analysis = torch.utils.checkpoint.checkpoint(
-                    block, x_main, x_analysis, mask
-                )
-            else:
-                x_main, x_analysis = block(x_main, x_analysis, mask=mask)
-
-        # Generate outputs for both pathways
-        x_main = self.ln_f_main(x_main)
-        x_analysis = self.ln_f_analysis(x_analysis)
-
-        logits_main = self.lm_head(x_main)
-        logits_analysis = self.analysis_head(x_analysis)
-
-        return logits_main, logits_analysis
