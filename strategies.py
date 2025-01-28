@@ -1,6 +1,8 @@
 from abc import ABC, abstractmethod
 import torch
 import torch.nn.functional as F
+import numpy as np
+import random
 
 
 class ModelingStrategy(ABC):
@@ -17,28 +19,59 @@ class ModelingStrategy(ABC):
         pass
 
 
+class MixedStrategy(ModelingStrategy):
+    def __init__(self, tokenizer, mask_token_id, mixing_ratio=0.5):
+        super().__init__()
+        self.next_token_strategy = NextTokenStrategy(tokenizer)
+        self.span_mask_strategy = SpanMaskingStrategy(
+            mask_token_id=mask_token_id,
+            max_span_length=5,
+            min_span_length=1,
+            masking_ratio=0.15,
+        )
+        self.mixing_ratio = mixing_ratio
+
+    def compute_loss(self, logits, targets, **kwargs):
+        next_token_loss = self.next_token_strategy.compute_loss(logits, targets)
+        span_mask_loss = self.span_mask_strategy.compute_loss(logits, targets)
+        return (
+            self.mixing_ratio * next_token_loss
+            + (1 - self.mixing_ratio) * span_mask_loss
+        )
+
+    def generate(self, model, input_ids, max_length, **kwargs):
+        # Use next-token strategy for generation
+        return self.next_token_strategy.generate(model, input_ids, max_length, **kwargs)
+
+
 class NextTokenStrategy(ModelingStrategy):
     """Standard next-token prediction strategy"""
 
+    def __init__(self, tokenizer=None):
+        super().__init__()
+        self.tokenizer = tokenizer
+
     def compute_loss(self, logits, targets, **kwargs):
-        # Standard next token prediction loss
         return F.cross_entropy(
             logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-100
         )
 
-    def generate(self, model, input_ids, max_length, top_p=0.9):
+    def generate(
+        self, model, input_ids, max_length, top_p=0.9, temperature=1.0, **kwargs
+    ):
         device = input_ids.device
         tokens = input_ids.clone()
 
         for _ in range(max_length):
-            # Get predictions
             with torch.no_grad():
-                # Ensure tokens are on correct device
                 tokens = tokens.to(device)
                 logits = model(tokens)[0]  # Take main path logits
                 next_token_logits = logits[0, -1:, :].to(device)
 
-                # Sample next token
+                # Apply temperature
+                if temperature != 1.0:
+                    next_token_logits = next_token_logits / temperature
+
                 next_token = self.sample_top_p(next_token_logits, top_p)
                 next_token = next_token.to(device)
                 tokens = torch.cat([tokens, next_token.view(1, 1)], dim=1)
@@ -53,25 +86,16 @@ class NextTokenStrategy(ModelingStrategy):
         device = logits.device
         probs = F.softmax(logits, dim=-1)
 
-        # Ensure all tensors are on the same device
         sorted_probs, sorted_indices = torch.sort(probs, descending=True)
-        sorted_probs = sorted_probs.to(device)
-        sorted_indices = sorted_indices.to(device)
-
         cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
-        cumulative_probs = cumulative_probs.to(device)
 
-        # Remove tokens with cumulative probability above threshold
         sorted_indices_to_remove = cumulative_probs > top_p
-        sorted_indices_to_remove = sorted_indices_to_remove.to(device)
         sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
         sorted_indices_to_remove[..., 0] = 0
 
         indices_to_remove = sorted_indices_to_remove.scatter(
             1, sorted_indices, sorted_indices_to_remove
         )
-        indices_to_remove = indices_to_remove.to(device)
-
         probs = probs.masked_fill(indices_to_remove, 0.0)
         return torch.multinomial(probs, num_samples=1)
 
@@ -215,29 +239,41 @@ class SpanMaskingStrategy(ModelingStrategy):
         return loss
 
     def generate(self, model, input_ids, max_length, temperature=1.0, top_p=0.9):
-        """Generate completions for masked spans"""
+        """Generate completions for both masked spans and next tokens"""
         device = input_ids.device
         tokens = input_ids.clone().to(device)
 
-        # Find masked positions
+        # First generate for any masked positions if present
         mask_positions = (tokens == self.mask_token_id).nonzero(as_tuple=True)
+        if len(mask_positions[0]) > 0:
+            for pos in mask_positions[1]:
+                with torch.no_grad():
+                    logits = model(tokens)[0]
+                    next_token_logits = logits[0, pos : pos + 1, :].to(device)
+                    next_token_logits = next_token_logits / temperature
+                    next_token = self.sample_top_p(next_token_logits, top_p)
+                    tokens[0, pos] = next_token
 
-        # Generate for each masked position
-        for pos in mask_positions[1]:
+        # Then generate new tokens at the end
+        original_length = tokens.size(1)
+        for _ in range(max_length - original_length):
             with torch.no_grad():
-                tokens = tokens.to(device)
+                # Get model predictions
                 logits = model(tokens)[0]
-                next_token_logits = logits[0, pos : pos + 1, :].to(device)
+                next_token_logits = logits[0, -1:, :].to(device)
 
-                # Temperature scaling
+                # Apply temperature
                 next_token_logits = next_token_logits / temperature
 
-                # Top-p sampling
+                # Sample next token
                 next_token = self.sample_top_p(next_token_logits, top_p)
-                next_token = next_token.to(device)
 
-                # Replace mask token with generated token
-                tokens[0, pos] = next_token
+                # Append to sequence
+                tokens = torch.cat([tokens, next_token.view(1, 1)], dim=1)
+
+                # Stop if we generate an end token
+                if next_token.item() == 50256:  # End token
+                    break
 
         return tokens
 

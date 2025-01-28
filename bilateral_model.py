@@ -173,6 +173,141 @@ class BilateralGPT(nn.Module):
         return logits_main, logits_analysis
 
 
+class MultiLatentAttention(nn.Module):
+    """Multi-Latent Attention module with RoPE."""
+
+    def __init__(self, config: BilateralGPTConfig):
+        super().__init__()
+        assert config.n_embd % config.n_head == 0
+
+        # Core attention parameters
+        self.n_head = config.n_head
+        self.n_latents = (
+            config.n_head // 2
+        )  # Number of latent units (typically fewer than heads)
+        self.head_dim = config.n_embd // config.n_head
+        self.latent_dim = self.head_dim * 2  # Larger dim for latent units
+        self.scale = math.sqrt(self.head_dim)
+
+        # Latent units - learned parameters
+        self.latent_queries = nn.Parameter(
+            torch.randn(1, self.n_latents, self.latent_dim) / math.sqrt(self.latent_dim)
+        )
+        self.latent_keys = nn.Parameter(
+            torch.randn(1, self.n_latents, self.latent_dim) / math.sqrt(self.latent_dim)
+        )
+
+        # Projections
+        self.to_queries = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        self.to_keys = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        self.to_values = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+
+        # Latent projections
+        self.to_latent_q = nn.Linear(self.latent_dim, config.n_embd, bias=config.bias)
+        self.to_latent_k = nn.Linear(self.latent_dim, config.n_embd, bias=config.bias)
+
+        # Output projection
+        self.proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+
+        # RoPE parameters
+        self.rope_theta = config.rope_theta
+        self.max_seq_len = config.block_size
+        self.freqs_cis = None
+
+        # Dropout
+        self.dropout = nn.Dropout(config.dropout)
+        self.dropout_value = config.dropout
+
+        # Flash Attention check
+        self.use_flash_attention = hasattr(
+            torch.nn.functional, "scaled_dot_product_attention"
+        )
+        if not self.use_flash_attention:
+            self.register_buffer(
+                "mask",
+                torch.tril(torch.ones(config.block_size, config.block_size)).view(
+                    1, 1, config.block_size, config.block_size
+                ),
+            )
+
+    def forward(self, x: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
+        B, T, C = x.size()
+        H = self.n_head
+        L = self.n_latents
+
+        # Initialize RoPE frequencies if needed
+        if self.freqs_cis is None or self.freqs_cis.device != x.device:
+            self.freqs_cis = precompute_freqs_cis(
+                self.head_dim, self.max_seq_len, self.rope_theta
+            ).to(x.device)
+
+        # Project input to queries, keys, and values
+        q = self.to_queries(x).view(B, T, H, -1)
+        k = self.to_keys(x).view(B, T, H, -1)
+        v = self.to_values(x).view(B, T, H, -1)
+
+        # Apply rotary embeddings
+        q = apply_rotary_emb(q, self.freqs_cis[:T])
+        k = apply_rotary_emb(k, self.freqs_cis[:T])
+
+        # Expand latent units to batch size
+        latent_q = self.latent_queries.expand(B, -1, -1)
+        latent_k = self.latent_keys.expand(B, -1, -1)
+
+        # Project latent units
+        latent_q = self.to_latent_q(latent_q).view(B, L, H, -1)
+        latent_k = self.to_latent_k(latent_k).view(B, L, H, -1)
+
+        # Combine with input projections
+        q = torch.cat([q, latent_q], dim=1)  # B, T+L, H, D
+        k = torch.cat([k, latent_k], dim=1)  # B, T+L, H, D
+        v = torch.cat([v, torch.zeros_like(latent_q)], dim=1)  # Pad values
+
+        # Rearrange for attention
+        q = q.transpose(1, 2)  # B, H, T+L, D
+        k = k.transpose(1, 2)  # B, H, T+L, D
+        v = v.transpose(1, 2)  # B, H, T+L, D
+
+        # Compute attention
+        if self.use_flash_attention:
+            # Adjust causal mask for latent units
+            causal_mask = torch.ones((T + L, T + L), device=x.device, dtype=torch.bool)
+            causal_mask[:T, :T] = torch.tril(torch.ones((T, T), device=x.device)).bool()
+            causal_mask[T:, :] = True  # Latent units can attend to everything
+
+            out = torch.nn.functional.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=causal_mask,
+                dropout_p=self.dropout_value if self.training else 0,
+                is_causal=False,  # We handle causality with our custom mask
+            )
+        else:
+            # Manual attention with custom mask for latent units
+            att = (q @ k.transpose(-2, -1)) / self.scale
+
+            # Create mask that allows latent units to attend globally
+            extended_mask = torch.ones((B, H, T + L, T + L), device=x.device)
+            extended_mask[:, :, :T, :T] = self.mask[:, :, :T, :T]
+            extended_mask[:, :, T:, :] = 1  # Latent units can attend to everything
+
+            att = att.masked_fill(extended_mask == 0, float("-inf"))
+            att = torch.softmax(att, dim=-1)
+            att = self.dropout(att)
+            out = att @ v
+
+        # Extract only the non-latent outputs
+        out = out[:, :, :T, :].transpose(1, 2).contiguous()
+        out = out.view(B, T, C)
+
+        # Final projection
+        out = self.proj(out)
+        out = self.dropout(out)
+
+        return out
+
+
 class MultiHeadSelfAttention(nn.Module):
     """Multi-Head Self Attention module with RoPE."""
 
@@ -319,23 +454,21 @@ class LateralConnection(nn.Module):
 
 
 class BilateralTransformerBlock(nn.Module):
-    """Transformer block with lateral connections between pathways."""
-
     def __init__(self, config: BilateralGPTConfig):
         super().__init__()
         # Main pathway
         self.ln1_main = nn.LayerNorm(config.n_embd)
-        self.attn_main = MultiHeadSelfAttention(config)
+        self.attn_main = MultiLatentAttention(config)
         self.ln2_main = nn.LayerNorm(config.n_embd)
         self.ff_main = FeedForward(config)
 
         # Analysis pathway
         self.ln1_analysis = nn.LayerNorm(config.n_embd)
-        self.attn_analysis = MultiHeadSelfAttention(config)
+        self.attn_analysis = MultiLatentAttention(config)
         self.ln2_analysis = nn.LayerNorm(config.n_embd)
         self.ff_analysis = FeedForward(config)
 
-        # Lateral connections
+        # Lateral connections remain unchanged
         self.lateral_pre = LateralConnection(config)
         self.lateral_post = LateralConnection(config)
 
@@ -349,10 +482,8 @@ class BilateralTransformerBlock(nn.Module):
             self.ln1_analysis(x_analysis_lat), mask=mask
         )
 
-        # Lateral connection after attention
+        # Rest remains unchanged
         x_main_lat, x_analysis_lat = self.lateral_post(x_main, x_analysis)
-
-        # Feed-forward for both pathways
         x_main = x_main_lat + self.ff_main(self.ln2_main(x_main_lat))
         x_analysis = x_analysis_lat + self.ff_analysis(
             self.ln2_analysis(x_analysis_lat)
