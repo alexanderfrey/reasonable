@@ -3,6 +3,8 @@ import json
 from glob import glob
 from torch.utils.data.distributed import DistributedSampler
 import torch
+import random
+import numpy as np
 from torch.utils.data import Dataset, DataLoader
 from strategies import (
     SpanMaskingStrategy,
@@ -20,64 +22,32 @@ def create_dataloaders(
     world_size,
     num_workers=4,
     prefetch_factor=2,
-    pretrain=False,
     main_strategy=None,
-    analysis_strategy=None,
-    tokenizer=None,  # Add explicit tokenizer parameter
+    tokenizer=None,
 ):
-    """Create distributed dataloaders with strategy-specific data processing"""
+    """Create distributed dataloaders for main path data processing"""
 
     if tokenizer is None:
-        tokenizer = tiktoken.get_encoding("gpt2")  # Default to GPT-2 tokenizer
+        tokenizer = tiktoken.get_encoding("gpt2")
 
-    # Create appropriate dataset based on strategy types
-    if isinstance(main_strategy, NextTokenStrategy):
-        dataset = TextDataset(
-            files_pattern=files_pattern,
-            block_size=block_size,
-            tokenizer=tokenizer,
-        )
-    elif isinstance(main_strategy, SpanMaskingStrategy):
-        dataset = MaskingDataset(
-            files_pattern=files_pattern,
-            block_size=block_size,
-            tokenizer=tokenizer,  # Pass tokenizer explicitly
-            main_strategy=main_strategy,
-            analysis_strategy=analysis_strategy,
-        )
-    elif isinstance(main_strategy, InstructionFollowingStrategy):
-        dataset = InstructionDataset(
-            files_pattern=files_pattern,
-            block_size=block_size,
-            tokenizer=main_strategy.tokenizer,  # Use strategy's tokenizer
-            main_strategy=main_strategy,
-            analysis_strategy=analysis_strategy,
-        )
-    else:
-        dataset = TextDataset(
-            files_pattern=files_pattern, block_size=block_size, tokenizer=tokenizer
-        )
+    # Select appropriate dataset based on strategy
+    dataset = select_dataset(
+        files_pattern=files_pattern,
+        block_size=block_size,
+        tokenizer=tokenizer,
+        main_strategy=main_strategy,
+    )
 
-    # Strategy-specific collate function
-    def collate_fn(examples):
-        if isinstance(main_strategy, NextTokenStrategy):
-            return collate_default_batch(examples)
-        elif isinstance(main_strategy, SpanMaskingStrategy):
-            return collate_masking_batch(
-                examples, main_strategy, analysis_strategy, tokenizer
-            )
-        elif isinstance(main_strategy, InstructionFollowingStrategy):
-            return collate_instruction_batch(examples, main_strategy, analysis_strategy)
-        elif isinstance(main_strategy, MixedStrategy):
-            return collate_default_batch(examples)
-        else:
-            return collate_default_batch(examples)
+    # Select appropriate collate function based on strategy
+    collate_fn = select_collate_function(main_strategy)
 
-    # Split into train/val
+    # Create train/val splits
+    generator = torch.Generator().manual_seed(42)
     train_size = int(0.8 * len(dataset))
     val_size = len(dataset) - train_size
+
     train_dataset, val_dataset = torch.utils.data.random_split(
-        dataset, [train_size, val_size]
+        dataset, [train_size, val_size], generator=generator
     )
 
     # Create distributed samplers
@@ -87,16 +57,14 @@ def create_dataloaders(
         rank=rank,
         shuffle=True,
         drop_last=True,
+        seed=42,
     )
 
     val_sampler = DistributedSampler(
-        val_dataset,
-        num_replicas=world_size,
-        rank=rank,
-        shuffle=False,
+        val_dataset, num_replicas=world_size, rank=rank, shuffle=False, seed=42
     )
 
-    # Create dataloaders
+    # Create dataloaders with selected collate function
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
@@ -105,8 +73,9 @@ def create_dataloaders(
         pin_memory=True,
         prefetch_factor=prefetch_factor,
         persistent_workers=True,
-        collate_fn=collate_fn,
+        collate_fn=lambda x: collate_fn(x),
         drop_last=True,
+        worker_init_fn=lambda worker_id: torch.manual_seed(42 + worker_id),
     )
 
     val_loader = DataLoader(
@@ -117,65 +86,121 @@ def create_dataloaders(
         pin_memory=True,
         prefetch_factor=prefetch_factor,
         persistent_workers=True,
-        collate_fn=collate_fn,
+        collate_fn=lambda x: collate_fn(x),
+        worker_init_fn=lambda worker_id: torch.manual_seed(42 + worker_id),
     )
 
     return train_loader, val_loader, train_sampler, val_sampler
 
 
-def collate_masking_batch(examples, main_strategy, analysis_strategy, tokenizer):
+def select_dataset(files_pattern, block_size, tokenizer, main_strategy):
+    """Select appropriate dataset based on strategy"""
+
+    if isinstance(main_strategy, NextTokenStrategy):
+        return TextDataset(
+            files_pattern=files_pattern,
+            block_size=block_size,
+            tokenizer=tokenizer,
+        )
+    elif isinstance(main_strategy, SpanMaskingStrategy):
+        return MaskingDataset(
+            files_pattern=files_pattern,
+            block_size=block_size,
+            tokenizer=tokenizer,
+            main_strategy=main_strategy,
+        )
+    elif isinstance(main_strategy, InstructionFollowingStrategy):
+        return InstructionDataset(
+            files_pattern=files_pattern,
+            block_size=block_size,
+            tokenizer=main_strategy.tokenizer,
+            main_strategy=main_strategy,
+        )
+    else:
+        return TextDataset(
+            files_pattern=files_pattern, block_size=block_size, tokenizer=tokenizer
+        )
+
+
+def select_collate_function(main_strategy):
+    """Select appropriate collate function based on strategy"""
+
+    if isinstance(main_strategy, InstructionFollowingStrategy):
+        return collate_instruction_batch
+    elif isinstance(main_strategy, SpanMaskingStrategy):
+        return collate_masking_batch
+    else:
+        return collate_default_batch
+
+
+def collate_default_batch(examples):
+    """Default collate function with proper padding and length handling"""
+
+    # Get max length for sequences in this batch
+    x_lengths = [len(ex["x"]) for ex in examples]
+    y_lengths = [len(ex["y"]) for ex in examples]
+    max_len = max(max(x_lengths), max(y_lengths))
+
+    # Pad and stack sequences
+    def pad_and_stack(key):
+        sequences = [ex[key] for ex in examples]
+        padded_seqs = []
+
+        for seq in sequences:
+            if len(seq) < max_len:
+                # Pad with zeros
+                padding = [0] * (max_len - len(seq))
+                padded_seq = np.concatenate([seq, padding])
+            else:
+                padded_seq = seq[:max_len]
+            padded_seqs.append(padded_seq)
+
+        return torch.tensor(padded_seqs)
+
+    x = pad_and_stack("x")
+    y = pad_and_stack("y")
+
+    return {
+        "inputs": x,
+        "targets": y,
+    }
+
+
+def collate_masking_batch(examples, main_strategy, tokenizer):
     """Collate function for span masking strategies"""
     # Get tokens from examples
     tokens = torch.stack([ex["tokens"] for ex in examples])
 
-    # Apply masking strategies
-    main_inputs, main_targets = main_strategy.prepare_masked_input(tokens)
-    analysis_inputs, analysis_targets = analysis_strategy.prepare_masked_input(tokens)
+    # Apply masking strategy
+    inputs, targets = main_strategy.prepare_masked_input(tokens)
 
     return {
-        "main_inputs": main_inputs,
-        "main_targets": main_targets,
-        "analysis_inputs": analysis_inputs,
-        "analysis_targets": analysis_targets,
+        "inputs": inputs,
+        "targets": targets,
     }
 
 
-def collate_instruction_batch(examples, main_strategy, analysis_strategy):
+def collate_instruction_batch(examples, main_strategy):
     """Collate function for instruction-following strategies"""
-    # Format instructions and responses
-    main_texts = [main_strategy.format_prompt(ex["instruction"]) for ex in examples]
-    analysis_texts = [
-        analysis_strategy.format_prompt(ex.get("thought", "")) for ex in examples
-    ]
+    # Format instructions
+    texts = [main_strategy.format_prompt(ex["instruction"]) for ex in examples]
 
     # Tokenize
-    main_tokens = [main_strategy.tokenizer.encode(text) for text in main_texts]
-    analysis_tokens = [
-        analysis_strategy.tokenizer.encode(text) for text in analysis_texts
-    ]
+    tokens = [main_strategy.tokenizer.encode(text) for text in texts]
 
     # Pad sequences
-    main_inputs = torch.nn.utils.rnn.pad_sequence(
-        [torch.tensor(t) for t in main_tokens], batch_first=True, padding_value=0
-    )
-    analysis_inputs = torch.nn.utils.rnn.pad_sequence(
-        [torch.tensor(t) for t in analysis_tokens], batch_first=True, padding_value=0
+    inputs = torch.nn.utils.rnn.pad_sequence(
+        [torch.tensor(t) for t in tokens], batch_first=True, padding_value=0
     )
 
     # Create targets (shifted inputs)
-    main_targets = main_inputs.clone()
-    main_targets = torch.roll(main_targets, shifts=-1, dims=1)
-    main_targets[:, -1] = -100  # Mask last token
-
-    analysis_targets = analysis_inputs.clone()
-    analysis_targets = torch.roll(analysis_targets, shifts=-1, dims=1)
-    analysis_targets[:, -1] = -100
+    targets = inputs.clone()
+    targets = torch.roll(targets, shifts=-1, dims=1)
+    targets[:, -1] = -100  # Mask last token
 
     return {
-        "main_inputs": main_inputs,
-        "main_targets": main_targets,
-        "analysis_inputs": analysis_inputs,
-        "analysis_targets": analysis_targets,
+        "inputs": inputs,
+        "targets": targets,
     }
 
 
@@ -189,35 +214,29 @@ def collate_default_batch(examples):
     targets[:, -1] = -100
 
     return {
-        "main_inputs": padded,
-        "main_targets": targets,
-        "analysis_inputs": padded.clone(),
-        "analysis_targets": targets.clone(),
+        "inputs": padded,
+        "targets": targets,
     }
 
 
 def get_data_info(files_pattern):
     """Get information about the dataset for logging purposes"""
-    dataset = BilateralDataset(
-        files_pattern, block_size=1024
+    dataset = TextDataset(
+        files_pattern, block_size=1024, tokenizer=None
     )  # block_size doesn't matter here
 
     # Analyze a sample of examples
     sample_size = min(1000, len(dataset))
     input_lengths = []
-    thought_lengths = []
 
     for idx in range(sample_size):
         example = dataset[idx]
-        input_lengths.append(len(example["input"].split()))
-        thought_lengths.append(len(example["thought"].split()))
+        input_lengths.append(len(example["tokens"]))
 
     info = {
         "total_examples": len(dataset),
         "avg_input_length": sum(input_lengths) / len(input_lengths),
-        "avg_thought_length": sum(thought_lengths) / len(thought_lengths),
         "max_input_length": max(input_lengths),
-        "max_thought_length": max(thought_lengths),
     }
 
     return info
@@ -251,14 +270,11 @@ class TextDataset(Dataset):
 class InstructionDataset(Dataset):
     """Dataset for instruction-following strategies"""
 
-    def __init__(
-        self, files_pattern, block_size, tokenizer, main_strategy, analysis_strategy
-    ):
+    def __init__(self, files_pattern, block_size, tokenizer, main_strategy):
         super().__init__()
         self.block_size = block_size
         self.tokenizer = tokenizer
         self.main_strategy = main_strategy
-        self.analysis_strategy = analysis_strategy
 
         # Load instruction-response pairs from JSONL files
         self.examples = []
@@ -279,14 +295,11 @@ class InstructionDataset(Dataset):
 class MaskingDataset(Dataset):
     """Dataset for span masking strategies"""
 
-    def __init__(
-        self, files_pattern, block_size, tokenizer, main_strategy, analysis_strategy
-    ):
+    def __init__(self, files_pattern, block_size, tokenizer, main_strategy):
         super().__init__()
         self.block_size = block_size
         self.tokenizer = tokenizer
         self.main_strategy = main_strategy
-        self.analysis_strategy = analysis_strategy
 
         # Load and tokenize texts
         self.examples = []
@@ -340,3 +353,103 @@ class BilateralDataset(Dataset):
     def __getitem__(self, idx):
         example = self.examples[idx]
         return {"input": example["input"], "thought": example["thought"]}
+
+
+class MixedStrategyDataset(Dataset):
+    """Dataset that handles different strategies for main and analysis paths"""
+
+    def __init__(
+        self, files_pattern, block_size, tokenizer, main_strategy, analysis_strategy
+    ):
+        super().__init__()
+        self.block_size = block_size
+        self.tokenizer = tokenizer
+        self.main_strategy = main_strategy
+        self.analysis_strategy = analysis_strategy
+
+        # Store aligned examples where each item contains both input tokens and instruction data
+        self.aligned_examples = []
+        print(files_pattern, block_size)
+        # Load and process data from files
+        for file_path in glob(files_pattern):
+            print(file_path)
+            if file_path.endswith(".jsonl"):
+                with open(file_path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        example = json.loads(line.strip())
+                        # Tokenize input text for main path
+                        input_text = example["input"]
+                        input_tokens = np.array(self.tokenizer.encode(input_text))
+
+                        # Store all necessary data for both paths together
+                        self.aligned_examples.append(
+                            {
+                                "input_tokens": input_tokens,
+                                "instruction": example["instruction"],
+                                "thought": example["thought"],
+                            }
+                        )
+
+        if not self.aligned_examples:
+            raise ValueError("No valid examples found in the data files")
+
+    def __len__(self):
+        return len(self.aligned_examples)
+
+    def __getitem__(self, idx):
+        """Get item with sequence length handling and proper tokenization"""
+        example = self.aligned_examples[idx]
+
+        # Get main path data using next token prediction on input text
+        if isinstance(self.main_strategy, NextTokenStrategy):
+            # Randomly select a valid starting point if input is longer than block_size
+            input_tokens = example["input_tokens"]
+            max_start_idx = len(input_tokens) - (self.block_size + 1)
+            if max_start_idx > 0:
+                start_idx = random.randint(0, max_start_idx)
+            else:
+                start_idx = 0
+
+            # Get the chunk for next token prediction
+            main_chunk = input_tokens[start_idx : start_idx + self.block_size + 1]
+            main_x = main_chunk[:-1]
+            main_y = main_chunk[1:]
+        else:
+            raise NotImplementedError("Only NextTokenStrategy supported for main path")
+
+        # Get analysis path data from the same example
+        if isinstance(self.analysis_strategy, InstructionFollowingStrategy):
+            # First decode the input tokens to text
+            input_text = self.tokenizer.decode(example["input_tokens"])
+
+            # Format the instruction with the decoded input text
+            instruction = f"{example['instruction']}\n\nInput: {input_text}"
+
+            # Tokenize and handle sequence lengths
+            max_length = self.analysis_strategy.max_length
+            instruction_tokens = self.analysis_strategy.tokenizer.encode(instruction)
+            thought_tokens = self.analysis_strategy.tokenizer.encode(example["thought"])
+
+            # Truncate if needed, leaving room for special tokens
+            max_seq_length = (
+                max_length - 3
+            )  # Account for [INST], [/INST], and </s] tokens
+            if len(instruction_tokens) > max_seq_length:
+                instruction_tokens = instruction_tokens[:max_seq_length]
+            if len(thought_tokens) > max_seq_length:
+                thought_tokens = thought_tokens[:max_seq_length]
+
+            # Decode back to text after truncation
+            instruction = self.analysis_strategy.tokenizer.decode(instruction_tokens)
+            thought = self.analysis_strategy.tokenizer.decode(thought_tokens)
+
+            return {
+                "main_x": main_x,
+                "main_y": main_y,
+                "analysis_instruction": instruction,
+                "analysis_thought": thought,
+            }
+        else:
+            raise NotImplementedError(
+                "Only InstructionFollowingStrategy supported for analysis path"
+            )

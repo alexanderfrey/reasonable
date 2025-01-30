@@ -42,6 +42,7 @@ class MixedStrategy(ModelingStrategy):
     def generate(self, model, input_ids, max_length, **kwargs):
         # Use next-token strategy for generation
         return self.next_token_strategy.generate(model, input_ids, max_length, **kwargs)
+    
 
 
 class NextTokenStrategy(ModelingStrategy):
@@ -467,7 +468,7 @@ class BidirectionalStrategy(ModelingStrategy):
 
 
 class InstructionFollowingStrategy(ModelingStrategy):
-    """Strategy specialized for instruction-following tasks"""
+    """Strategy specialized for instruction-following tasks with proper sequence length handling"""
 
     def __init__(
         self,
@@ -475,11 +476,13 @@ class InstructionFollowingStrategy(ModelingStrategy):
         instruction_token="[INST]",
         response_token="[/INST]",
         end_token="</s>",
+        max_length=1024  # Add max_length parameter
     ):
         self.tokenizer = tokenizer
         self.instruction_token = instruction_token
         self.response_token = response_token
         self.end_token = end_token
+        self.max_length = max_length
 
         # Cache token IDs
         self.instruction_token_id = self.tokenizer.encode(instruction_token)[0]
@@ -487,35 +490,57 @@ class InstructionFollowingStrategy(ModelingStrategy):
         self.end_token_id = self.tokenizer.encode(end_token)[0]
 
     def compute_loss(self, logits, targets, instruction_mask=None, **kwargs):
+        """Compute loss with proper dimension handling"""
         device = logits.device
-        logits = logits.to(device)
-        targets = targets.to(device)
-
+        
+        # Get dimensions
+        batch_size, logits_seq_len, vocab_size = logits.shape
+        target_seq_len = targets.shape[1]
+        
+        # Truncate logits to match target length
+        if logits_seq_len > target_seq_len:
+            logits = logits[:, :target_seq_len, :]
+        
         if instruction_mask is None:
             # Create instruction mask - don't compute loss on instruction tokens
             instruction_mask = self._create_instruction_mask(targets)
-            instruction_mask = instruction_mask.to(device)
-
-        # Apply higher loss weight to response tokens
+        
+        instruction_mask = instruction_mask.to(device)
+        
+        # Verify shapes after truncation
+        assert logits.shape[:2] == targets.shape == instruction_mask.shape, \
+            f"Shape mismatch: logits={logits.shape}, targets={targets.shape}, mask={instruction_mask.shape}"
+        
+        # Create loss weights
         loss_weights = torch.where(
             instruction_mask,
-            torch.tensor(0.0).to(device),  # Don't train on instructions
-            torch.tensor(1.0).to(device),
-        )  # Full weight on responses
-
+            torch.tensor(0.0, device=device),  # Don't train on instructions
+            torch.tensor(1.0, device=device),  # Full weight on responses
+        )
+        
         # Compute cross entropy with masked targets
         masked_targets = torch.where(
             instruction_mask,
-            torch.tensor(-100).to(device),  # Ignore instruction tokens
+            torch.tensor(-100, device=device),  # Ignore instruction tokens
             targets,
         )
-
+        
+        # Ensure all tensors are contiguous
+        logits = logits.contiguous()
+        masked_targets = masked_targets.contiguous()
+        loss_weights = loss_weights.contiguous()
+        
+        # Compute loss
         loss = F.cross_entropy(
-            logits.view(-1, logits.size(-1)), masked_targets.view(-1), reduction="none"
+            logits.view(-1, vocab_size),
+            masked_targets.view(-1),
+            reduction="none",
+            ignore_index=-100
         )
-
+        
         # Apply weights and average
-        weighted_loss = (loss * loss_weights.view(-1)).mean()
+        weighted_loss = (loss * loss_weights.view(-1)).sum() / (loss_weights.sum() + 1e-8)
+        
         return weighted_loss
 
     def generate(self, model, input_ids, max_length, top_p=0.9, temperature=0.7):
@@ -549,35 +574,67 @@ class InstructionFollowingStrategy(ModelingStrategy):
 
         return tokens
 
-    def _create_instruction_mask(self, tokens):
-        """Create mask identifying instruction tokens (True for instruction tokens)"""
-        device = tokens.device
-        batch_size, seq_len = tokens.shape
-        mask = torch.zeros((batch_size, seq_len), dtype=torch.bool, device=device)
-
+    def _create_instruction_mask(self, token_ids):
+        """Create attention mask that focuses on instruction portion"""
+        batch_size, seq_length = token_ids.shape
+        masks = torch.zeros((batch_size, seq_length), dtype=torch.bool)
+        
         for i in range(batch_size):
-            in_instruction = False
-            for j in range(seq_len):
-                if tokens[i, j] == self.instruction_token_id:
-                    in_instruction = True
-                elif tokens[i, j] == self.response_token_id:
-                    in_instruction = False
-                mask[i, j] = in_instruction
+            # Find positions of special tokens
+            try:
+                inst_start = (token_ids[i] == self.instruction_token_id).nonzero(as_tuple=True)[0][0]
+                inst_end = (token_ids[i] == self.response_token_id).nonzero(as_tuple=True)[0][0]
+                
+                # Set mask to True between instruction tokens
+                masks[i, inst_start:inst_end+1] = True
+            except IndexError:
+                # If tokens not found, mask everything
+                masks[i, :] = True
+                
+        return masks
+        
+    def get_padding_value(self):
+        """Return the padding token ID"""
+        return self.end_token_id
 
-        return mask
+    def format_prompt(self, instruction):
+        """Format instruction with special tokens and length constraint"""
+        formatted = f"{self.instruction_token}{instruction}{self.response_token}"
+        # Tokenize and truncate if needed
+        tokens = self.tokenizer.encode(formatted)
+        if len(tokens) > self.max_length:
+            tokens = tokens[:self.max_length-1] + [self.end_token_id]
+        return self.tokenizer.decode(tokens)
+        
+    def prepare_sequence(self, sequence):
+        """Prepare and validate sequence length"""
+        tokens = self.tokenizer.encode(sequence)
+        if len(tokens) > self.max_length:
+            tokens = tokens[:self.max_length-1] + [self.end_token_id]
+        return tokens
 
-    def format_prompt(self, instruction, prior_conversation=None):
-        """Format an instruction into the expected prompt structure"""
-        if prior_conversation:
-            # Include prior conversation with proper formatting
-            prompt = prior_conversation + "\n"
-        else:
-            prompt = ""
 
-        # Add new instruction
-        prompt += f"{self.instruction_token}{instruction}{self.response_token}"
+    def sample_top_p(self, logits, top_p):
+        """Sample from the distribution with top-p (nucleus) sampling"""
+        probs = F.softmax(logits, dim=-1)
+        sorted_probs, sorted_indices = torch.sort(probs, descending=True)
+        cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+        
+        # Remove tokens with cumulative probability above the threshold
+        sorted_indices_to_remove = cumulative_probs > top_p
+        # Shift the indices to the right to keep also the first token above the threshold
+        sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+        sorted_indices_to_remove[..., 0] = 0
+        
+        indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+        probs = probs.masked_fill(indices_to_remove, 0.0)
+        
+        # Sample from the filtered distribution
+        sample = torch.multinomial(probs, 1)
+        return sample
+            
+    
 
-        return prompt
 
     @staticmethod
     def sample_top_p(logits, top_p):

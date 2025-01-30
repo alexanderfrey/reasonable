@@ -3,542 +3,276 @@ import torch
 from tqdm.auto import tqdm
 import wandb
 import torch.distributed as dist
-from strategies import SpanMaskingStrategy
 
 
-def print_batch_examples(batch, tokenizer, n_examples=3):
-    """Print n examples from a batch with their decoded text"""
-    print("Batch keys:", batch.keys())
+def print_batch_examples(batch, tokenizer):
+    """Print a detailed example of what's being fed into the model"""
+    print("\n" + "=" * 100)
+    print("MODEL INPUT VISUALIZATION".center(100))
+    print("=" * 100 + "\n")
+
+    # Print batch information
+    print("Batch Structure:")
     for key, value in batch.items():
-        if hasattr(value, "shape"):
-            print(f"{key} shape:", value.shape)
+        if isinstance(value, torch.Tensor):
+            print(f"  {key:<20} Shape: {list(value.shape)}")
+    print("\n" + "-" * 100 + "\n")
+
+    def format_text_block(text, max_len=80):
+        """Format text into lines with proper wrapping"""
+        lines = []
+        current_line = ""
+        for word in text.split():
+            if len(current_line) + len(word) + 1 <= max_len:
+                current_line += word + " "
+            else:
+                lines.append(current_line)
+                current_line = word + " "
+        lines.append(current_line)
+        return "\n".join(lines)
 
     def safe_decode(tensor):
         try:
-            # Convert to list and filter out padding and special tokens
             tokens = tensor.tolist()
-            # Only keep tokens within valid range for GPT-2 tokenizer (0-50257)
-            valid_tokens = [t for t in tokens if 0 < t < 50257]
+            valid_tokens = [t for t in tokens if 0 <= t < 50257]
             return tokenizer.decode(valid_tokens)
         except Exception as e:
             return f"[Error decoding: {str(e)}]"
 
-    print("\n=== Example Batch Samples ===")
-    batch_size = batch["main_inputs"].shape[0]
-    for idx in range(min(n_examples, batch_size)):
-        print(f"\n--- Example {idx+1} ---")
+    # Get first example from batch
+    idx = 0
 
-        # Print first few and last few tokens to help debug
-        def print_token_info(tensor, name):
-            tokens = tensor[idx].tolist()
-            print(f"\n{name} tokens (first 10): {tokens[:10]}")
-            print(f"{name} tokens (last 10): {tokens[-10:]}")
-            print(f"Text: {safe_decode(tensor[idx])[:500]}...")  # First 500 chars
+    print("\nInput:")
+    input_text = safe_decode(batch["inputs"][idx])
+    print(format_text_block(input_text))
 
-        print("\nMAIN PATHWAY:")
-        print_token_info(batch["main_inputs"], "Input")
-        print_token_info(batch["main_targets"], "Target")
+    print("\nTarget:")
+    target_text = safe_decode(batch["targets"][idx])
+    print(format_text_block(target_text))
 
-        print("\nANALYSIS PATHWAY:")
-        print_token_info(batch["analysis_inputs"], "Input")
-        print_token_info(batch["analysis_targets"], "Target")
+    print("\n" + "=" * 100)
 
-        print("\n" + "=" * 80)
+    # Print token information for debugging
+    print("\nDEBUG INFORMATION:")
+    print("-" * 50)
+    print("\nToken Counts:")
+    print(f"Input tokens:  {len(batch['inputs'][idx])} tokens")
+    print(f"Target tokens: {len(batch['targets'][idx])} tokens")
+
+    print("\n" + "=" * 100 + "\n")
 
 
-class BilateralTrainer:
-    """Trainer class for bilateral models that handles different strategies for each pathway"""
+class DualHeadTrainer:
+    """Trainer for dual-head GPT model using NextTokenStrategy for both heads"""
 
-    def __init__(self, main_strategy, analysis_strategy):
-        self.main_strategy = main_strategy
-        self.analysis_strategy = analysis_strategy
-        self.global_step = 0
-
-    def set_global_step(self, step):
-        """Set the global step, used when loading from checkpoint"""
-        self.global_step = step
-
-    def save_checkpoint(
-        self,
-        model,
-        optimizer,
-        scheduler,
-        scaler,
-        epoch,
-        step,
-        train_metrics,
-        val_metrics,
-        config,
-        path,
-        rank=0,
-    ):
+    def __init__(self, main_strategy, second_strategy=None):
         """
-        Save checkpoint only on rank 0.
+        Initialize trainer with strategies for both heads.
 
         Args:
-            model: The bilateral model
-            optimizer: The optimizer
-            scheduler: The learning rate scheduler
-            scaler: The gradient scaler for mixed precision training
-            epoch: Current epoch number
-            step: Current global step number
-            train_metrics: Dictionary containing training metrics
-            val_metrics: Dictionary containing validation metrics
-            config: BilateralGPTConfig instance
-            path: Path to save the checkpoint
-            rank: Process rank in distributed training
+            main_strategy: Strategy for primary head (NextTokenStrategy instance)
+            second_strategy: Strategy for second head (if None, uses main_strategy)
         """
-        if rank == 0:
-            # Get the underlying model if using DDP
-            model_state_dict = (
-                model.module.state_dict()
-                if hasattr(model, "module")
-                else model.state_dict()
-            )
+        self.main_strategy = main_strategy
+        self.second_strategy = second_strategy or main_strategy
+        self.global_step = 0
 
-            checkpoint = {
-                "epoch": epoch,
-                "step": step,  # Add step to checkpoint
-                "model_state_dict": model_state_dict,
-                "optimizer_state_dict": optimizer.state_dict(),
-                "scheduler_state_dict": scheduler.state_dict(),
-                "scaler_state_dict": scaler.state_dict(),
-                "train_metrics": train_metrics,
-                "val_metrics": val_metrics,
-                "config": config.__dict__,
-            }
+    def save_checkpoint(self, model, optimizer, scheduler, epoch, step, save_dir):
+        """Save model checkpoint and training state"""
+        # Handle distributed training
+        model_to_save = model.module if hasattr(model, "module") else model
 
-            # Create checkpoint directory if it doesn't exist
-            os.makedirs(os.path.dirname(path), exist_ok=True)
+        checkpoint = {
+            "epoch": epoch,
+            "global_step": self.global_step,
+            "model_state_dict": model_to_save.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "scheduler_state_dict": scheduler.state_dict(),
+        }
 
-            # Save checkpoint
-            torch.save(checkpoint, path)
+        save_path = f"{save_dir}/checkpoint_epoch{epoch}_step{step}.pt"
+        torch.save(checkpoint, save_path)
 
-            # Log checkpoint information
-            print(f"\nSaved checkpoint to {path}")
-            print(f"Checkpoint metrics:")
-            print(
-                f"- Epoch: {epoch}, Step: {step}\n"
-                f"- Train: total_loss={train_metrics['total_loss']:.4f}, "
-                f"main_loss={train_metrics['main_loss']:.4f}, "
-                f"analysis_loss={train_metrics['analysis_loss']:.4f}"
-            )
-            print(
-                f"- Val: total_loss={val_metrics['total_loss']:.4f}, "
-                f"main_loss={val_metrics['main_loss']:.4f}, "
-                f"analysis_loss={val_metrics['analysis_loss']:.4f}"
-            )
+        # Also save as latest checkpoint
+        latest_path = f"{save_dir}/checkpoint_latest.pt"
+        torch.save(checkpoint, latest_path)
 
     def train_epoch(
         self,
         model,
         train_loader,
-        train_sampler,
         optimizer,
         scheduler,
         scaler,
         device,
         epoch,
-        tokenizer=None,
-        gen_every_n_steps=None,
-        sample_prompts=None,
-        rank=0,
         gradient_accumulation_steps=1,
-        save_every_n_steps=None,  # New parameter
-        checkpoint_dir=None,  # New parameter
-        config=None,  # New parameter for saving checkpoints
+        save_every_n_steps=None,
+        checkpoint_dir=None,
     ):
+        """Train for one epoch using the specified strategies
+
+        Args:
+            save_every_n_steps: If not None, save checkpoint every n steps
+            checkpoint_dir: Directory to save checkpoints if save_every_n_steps is set
+        """
+        if save_every_n_steps and not checkpoint_dir:
+            raise ValueError(
+                "checkpoint_dir must be provided if save_every_n_steps is set"
+            )
+
         model.train()
         total_loss = 0
         total_main_loss = 0
-        total_analysis_loss = 0
-        # Initialize global_step to count total steps from start of training
-        global_step = self.global_step
+        total_second_loss = 0
 
-        print("global_step ", global_step)
+        progress_bar = tqdm(train_loader, desc=f"Epoch {epoch + 1}")
 
-        if rank == 0:
-            print(f"\nStarting epoch {epoch} from global step {global_step}")
-            print(f"\nGeneration settings:")
-            print(f"Tokenizer present: {tokenizer is not None}")
-            print(f"gen_every_n_steps: {gen_every_n_steps}")
-            print(f"sample_prompts: {sample_prompts}")
-            print(f"save_every_n_steps: {save_every_n_steps}")
-            # print("\nPrinting examples from first batch:")
-            # try:
-            #     first_batch = next(iter(train_loader))
-            #     # Move batch to CPU for printing
-            #     first_batch = {
-            #         k: v.cpu() if isinstance(v, torch.Tensor) else v
-            #         for k, v in first_batch.items()
-            #     }
-            #     print_batch_examples(first_batch, tokenizer)
-            # except Exception as e:
-            #     print(f"Error printing batch examples: {str(e)}")
-            #     import traceback
-
-            #     traceback.print_exc()
-
-        if train_sampler is not None:
-            train_sampler.set_epoch(epoch)
-
-        optimizer.zero_grad()
-
-        progress_bar = tqdm(train_loader, desc=f"Epoch {epoch + 1}", disable=rank != 0)
+        # Get aux_head_weight from model, handling DDP case
+        aux_head_weight = (
+            model.module.config.aux_head_weight
+            if hasattr(model, "module")
+            else model.config.aux_head_weight
+        )
 
         for batch_idx, batch in enumerate(progress_bar):
-            # Handle both tuple and dict batch formats
-            if isinstance(batch, tuple):
-                input_ids, targets = batch
-                input_ids = input_ids.to(device, non_blocking=True)
-                targets = targets.to(device, non_blocking=True)
+            # Move data to device
+            input_ids = batch["inputs"].to(device)
+            targets = batch["targets"].to(device)
+            targets_second = (
+                targets.clone()
+            )  # Same targets for both heads in pretraining
 
-                # Let strategies prepare inputs if needed
-                main_inputs, main_targets = (
-                    self.main_strategy.prepare_masked_input(input_ids)
-                    if hasattr(self.main_strategy, "prepare_masked_input")
-                    else (input_ids, targets)
-                )
-                analysis_inputs, analysis_targets = (
-                    self.analysis_strategy.prepare_masked_input(input_ids)
-                    if hasattr(self.analysis_strategy, "prepare_masked_input")
-                    else (input_ids, targets)
-                )
-            else:
-                # Batch is already prepared by the dataloader
-                main_inputs = batch["main_inputs"].to(device, non_blocking=True)
-                main_targets = batch["main_targets"].to(device, non_blocking=True)
-                analysis_inputs = batch["analysis_inputs"].to(device, non_blocking=True)
-                analysis_targets = batch["analysis_targets"].to(
-                    device, non_blocking=True
-                )
-
-            # Determine if this is an accumulation step
+            # Check if this is an accumulation step
             is_accumulation_step = (batch_idx + 1) % gradient_accumulation_steps != 0
 
             # Forward pass with autocast
             with torch.amp.autocast("cuda", dtype=torch.float16):
-                # Get logits and optional embeddings from both pathways
-                outputs = model(main_inputs)
-                if isinstance(outputs, tuple):
-                    main_logits, analysis_logits = outputs
-                    embeddings = None
-                else:
-                    main_logits, analysis_logits, embeddings = outputs
-
-                # Calculate losses using strategies
-                main_loss = self.main_strategy.compute_loss(
-                    main_logits, main_targets, embeddings=embeddings
+                # Get outputs from both heads
+                primary_logits, second_logits, _, _ = model(
+                    input_ids, target_second=targets_second
                 )
 
-                analysis_loss = self.analysis_strategy.compute_loss(
-                    analysis_logits, analysis_targets, embeddings=embeddings
+                # Compute losses using strategies
+                primary_loss = self.main_strategy.compute_loss(primary_logits, targets)
+                second_loss = self.second_strategy.compute_loss(
+                    second_logits, targets_second
                 )
 
-                # Combine losses with equal weighting
-                loss = (main_loss + analysis_loss) / 2
+                # Combined loss with aux_head_weight
+                loss = primary_loss + (aux_head_weight * second_loss)
                 loss = loss / gradient_accumulation_steps
 
-            # Backward pass with gradient scaling
+            # Backward pass
             scaler.scale(loss).backward()
 
             if not is_accumulation_step:
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad()
-
                 scheduler.step()
+                self.global_step += 1
 
-                global_step += 1
-
-                # Step-based checkpoint saving
-                if (
-                    save_every_n_steps is not None
-                    and checkpoint_dir is not None
-                    and config is not None
-                    and global_step > 0
-                    and global_step % save_every_n_steps == 0
-                ):
-                    # Current training metrics only, no validation
-                    train_metrics = {
-                        "total_loss": loss.item() * gradient_accumulation_steps,
-                        "main_loss": main_loss.item(),
-                        "analysis_loss": analysis_loss.item(),
-                    }
-
-                    # Save step checkpoint with empty validation metrics
-                    step_checkpoint_path = f"{checkpoint_dir}/step_{global_step}.pt"
+                # Save checkpoint if needed
+                if save_every_n_steps and self.global_step % save_every_n_steps == 0:
                     self.save_checkpoint(
                         model=model,
                         optimizer=optimizer,
                         scheduler=scheduler,
-                        scaler=scaler,
                         epoch=epoch,
-                        step=global_step,
-                        train_metrics=train_metrics,
-                        val_metrics={
-                            "total_loss": 0.0,
-                            "main_loss": 0.0,
-                            "analysis_loss": 0.0,
-                        },
-                        config=config,
-                        path=step_checkpoint_path,
-                        rank=rank,
+                        step=self.global_step,
+                        save_dir=checkpoint_dir,
                     )
-
-                    if rank == 0:
-                        print(f"\nSaved step checkpoint at global_step {global_step}")
 
             # Update metrics
             total_loss += loss.item() * gradient_accumulation_steps
-            total_main_loss += main_loss.item() * gradient_accumulation_steps
-            total_analysis_loss += analysis_loss.item() * gradient_accumulation_steps
+            total_main_loss += primary_loss.item()
+            total_second_loss += second_loss.item()
 
-            # Sample generation logic
-            should_generate = (
-                tokenizer is not None
-                and gen_every_n_steps is not None
-                and sample_prompts is not None
-                and global_step > 0
-                and global_step % gen_every_n_steps == 0
+            # Update progress bar
+            current_lr = scheduler.get_last_lr()[0]
+            progress_bar.set_postfix(
+                {
+                    "loss": f"{loss.item() * gradient_accumulation_steps:.4f}",
+                    "main_loss": f"{primary_loss.item():.4f}",
+                    "second_loss": f"{second_loss.item():.4f}",
+                    "lr": f"{current_lr:.2e}",
+                    "step": self.global_step,
+                }
             )
 
-            if should_generate:
-                samples = self._generate_samples(
-                    model=model,
-                    tokenizer=tokenizer,
-                    sample_prompts=sample_prompts,
-                    device=device,
-                    rank=rank,
-                )
-
-                if rank == 0:
-                    print(f"\nGenerated samples at step {global_step}:")
-                    print(samples)
-                    wandb.log(
-                        {"generated_samples": wandb.Html(samples.replace("\n", "<br>"))}
-                    )
-
-            # Logging (only on rank 0)
-            if rank == 0 and not is_accumulation_step:
-                current_lr = scheduler.get_last_lr()[0]
-
-                # Update progress bar
-                progress_bar.set_postfix(
-                    {
-                        "total_loss": f"{loss.item() * gradient_accumulation_steps:.4f}",
-                        "main_loss": f"{main_loss.item():.4f}",
-                        "analysis_loss": f"{analysis_loss.item():.4f}",
-                        "lr": f"{current_lr:.2e}",
-                        "step": global_step,
-                    }
-                )
-
-                # Log to wandb
-                wandb.log(
-                    {
-                        "train/total_loss": loss.item() * gradient_accumulation_steps,
-                        "train/main_loss": main_loss.item(),
-                        "train/analysis_loss": analysis_loss.item(),
-                        "train/learning_rate": current_lr,
-                        "train/grad_scale": scaler.get_scale(),
-                        "train/global_step": global_step,
-                    }
-                )
-
-        if dist.is_initialized():
-            dist.all_reduce(torch.tensor([total_loss]).to(device))
-            total_loss /= dist.get_world_size()
-
-        # Store the global step for next epoch
-        self.global_step = global_step
+        # Compute average losses
+        num_batches = len(train_loader)
+        avg_total_loss = total_loss / num_batches
+        avg_main_loss = total_main_loss / num_batches
+        avg_second_loss = total_second_loss / num_batches
 
         return {
-            "total_loss": total_loss / len(train_loader),
-            "main_loss": total_main_loss / len(train_loader),
-            "analysis_loss": total_analysis_loss / len(train_loader),
+            "total_loss": avg_total_loss,
+            "main_loss": avg_main_loss,
+            "second_loss": avg_second_loss,
         }
 
-    def evaluate(
-        self,
-        model,
-        val_loader,
-        val_sampler,
-        device,
-        rank=0,
-    ):
+    def evaluate(self, model, val_loader, device):
         """Evaluate the model using the strategies"""
         model.eval()
         total_loss = 0
         total_main_loss = 0
-        total_analysis_loss = 0
+        total_second_loss = 0
 
-        if val_sampler is not None:
-            val_sampler.set_epoch(0)
+        # Get aux_head_weight from model, handling DDP case
+        aux_head_weight = (
+            model.module.config.aux_head_weight
+            if hasattr(model, "module")
+            else model.config.aux_head_weight
+        )
 
-        progress_bar = tqdm(val_loader, desc="Evaluating", disable=rank != 0)
+        with torch.no_grad():
+            for batch in tqdm(val_loader, desc="Evaluating"):
+                input_ids = batch["inputs"].to(device)
+                targets = batch["targets"].to(device)
+                targets_second = targets.clone()
 
-        for batch in progress_bar:
-            # Handle both tuple and dict batch formats similar to training
-            if isinstance(batch, tuple):
-                input_ids, targets = batch
-                input_ids = input_ids.to(device, non_blocking=True)
-                targets = targets.to(device, non_blocking=True)
-
-                main_inputs, main_targets = (
-                    self.main_strategy.prepare_masked_input(input_ids)
-                    if hasattr(self.main_strategy, "prepare_masked_input")
-                    else (input_ids, targets)
-                )
-                analysis_inputs, analysis_targets = (
-                    self.analysis_strategy.prepare_masked_input(input_ids)
-                    if hasattr(self.analysis_strategy, "prepare_masked_input")
-                    else (input_ids, targets)
-                )
-            else:
-                main_inputs = batch["main_inputs"].to(device, non_blocking=True)
-                main_targets = batch["main_targets"].to(device, non_blocking=True)
-                analysis_inputs = batch["analysis_inputs"].to(device, non_blocking=True)
-                analysis_targets = batch["analysis_targets"].to(
-                    device, non_blocking=True
-                )
-
-            with torch.no_grad():
                 with torch.amp.autocast("cuda", dtype=torch.float16):
-                    # Get predictions from both pathways
-                    outputs = model(main_inputs)
-                    if isinstance(outputs, tuple):
-                        main_logits, analysis_logits = outputs
-                        embeddings = None
-                    else:
-                        main_logits, analysis_logits, embeddings = outputs
-
-                    # Calculate losses using strategies
-                    main_loss = self.main_strategy.compute_loss(
-                        main_logits, main_targets, embeddings=embeddings
+                    primary_logits, second_logits, _, _ = model(
+                        input_ids, target_second=targets_second
                     )
 
-                    analysis_loss = self.analysis_strategy.compute_loss(
-                        analysis_logits, analysis_targets, embeddings=embeddings
+                    # Compute losses using strategies
+                    primary_loss = self.main_strategy.compute_loss(
+                        primary_logits, targets
+                    )
+                    second_loss = self.second_strategy.compute_loss(
+                        second_logits, targets_second
                     )
 
-                    # Combine losses
-                    loss = (main_loss + analysis_loss) / 2
+                    loss = primary_loss + (aux_head_weight * second_loss)
 
-            # Accumulate losses
-            total_loss += loss.item()
-            total_main_loss += main_loss.item()
-            total_analysis_loss += analysis_loss.item()
+                total_loss += loss.item()
+                total_main_loss += primary_loss.item()
+                total_second_loss += second_loss.item()
 
-            if rank == 0:
-                progress_bar.set_postfix(
-                    {
-                        "total_loss": f"{loss.item():.4f}",
-                        "main_loss": f"{main_loss.item():.4f}",
-                        "analysis_loss": f"{analysis_loss.item():.4f}",
-                    }
-                )
-
-        # Gather losses from all processes
-        if dist.is_initialized():
-            losses = torch.tensor(
-                [total_loss, total_main_loss, total_analysis_loss], device=device
-            )
-            dist.all_reduce(losses)
-            total_loss, total_main_loss, total_analysis_loss = (
-                losses / dist.get_world_size()
-            )
-
+        num_batches = len(val_loader)
         return {
-            "total_loss": total_loss / len(val_loader),
-            "main_loss": total_main_loss / len(val_loader),
-            "analysis_loss": total_analysis_loss / len(val_loader),
+            "total_loss": total_loss / num_batches,
+            "main_loss": total_main_loss / num_batches,
+            "second_loss": total_second_loss / num_batches,
         }
 
-    def _generate_samples(self, model, tokenizer, sample_prompts, device, rank):
-        """Generate samples using both pathway strategies"""
-        was_training = model.training
-        model.eval()
-
-        if dist.is_initialized():
-            dist.barrier()
-
-        samples = ""
-        if rank == 0:
-            try:
-                sample_outputs = []
-                for prompt in sample_prompts:
-                    # Tokenize prompt
-                    input_ids = torch.tensor(
-                        tokenizer.encode(prompt), device=device
-                    ).unsqueeze(0)
-
-                    # For pretraining, create a masked version of the prompt
-                    if isinstance(self.main_strategy, SpanMaskingStrategy):
-                        masked_input_ids, _ = self.main_strategy.prepare_masked_input(
-                            input_ids
-                        )
-                        masked_prompt = tokenizer.decode(masked_input_ids[0].tolist())
-                    else:
-                        masked_input_ids = input_ids
-
-                    with torch.no_grad():
-                        # Generate using main pathway strategy
-                        main_output = self.main_strategy.generate(
-                            model=model,
-                            input_ids=input_ids,  # Use unmasked for continuation
-                            max_length=100,
-                            temperature=0.7,
-                        )
-
-                        # Generate using analysis pathway strategy
-                        analysis_output = self.analysis_strategy.generate(
-                            model=model,
-                            input_ids=masked_input_ids,  # Use masked for analysis
-                            max_length=50,
-                            temperature=0.7,
-                        )
-
-                        # Decode outputs
-                        main_text = tokenizer.decode(main_output[0].tolist())
-                        analysis_text = tokenizer.decode(analysis_output[0].tolist())
-
-                        # Include masked prompt if used
-                        if isinstance(self.main_strategy, SpanMaskingStrategy):
-                            sample_output = (
-                                f"Prompt: {prompt}\n"
-                                f"Masked Prompt: {masked_prompt}\n"
-                                f"Main Pathway Output:\n{main_text}\n"
-                                f"Analysis Pathway Output:\n{analysis_text}\n"
-                                f"{'='*50}\n"
-                            )
-                        else:
-                            sample_output = (
-                                f"Prompt: {prompt}\n"
-                                f"Main Pathway Output:\n{main_text}\n"
-                                f"Analysis Pathway Output:\n{analysis_text}\n"
-                                f"{'='*50}\n"
-                            )
-                        sample_outputs.append(sample_output)
-
-                samples = "\n".join(sample_outputs)
-
-            except Exception as e:
-                print(f"Error generating samples: {str(e)}")
-                import traceback
-
-                traceback.print_exc()
-
-        if dist.is_initialized():
-            dist.barrier()
-
-        if was_training:
-            model.train()
-
-        return samples
+    def generate(
+        self, model, input_ids, max_length, temperature=1.0, top_p=0.9, head="primary"
+    ):
+        """Generate tokens using specified head's strategy"""
+        strategy = self.main_strategy if head == "primary" else self.second_strategy
+        return strategy.generate(
+            model=model,
+            input_ids=input_ids,
+            max_length=max_length,
+            temperature=temperature,
+            top_p=top_p,
+        )
 
 
 def log_latent_stats(model):
