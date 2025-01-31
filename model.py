@@ -1,10 +1,17 @@
 import torch
 import math
+import time
+import warnings
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Tuple, Callable
+from typing import Optional, Tuple, Callable, Union, Dict
 import triton
 import triton.language as tl
+
+
+# Todos:
+# Consider implementing a streaming inference mode for handling long sequences
+# Add support for sparse attention patterns
 
 
 class GPTConfig:
@@ -30,9 +37,10 @@ class GPTConfig:
         # MoE settings
         use_moe: bool = False,
         num_experts: int = 8,
-        num_experts_per_tok: int = 2,
-        expert_capacity_factor: float = 1.0,
-        moe_jitter_noise: float = 0.1,
+        num_experts_per_tok: int = 3,
+        expert_capacity_factor: float = 1.5,
+        moe_jitter_noise: float = 0.05,
+        moe_aux_loss_scale: float = 0.3,
         # Memory optimization settings
         use_activation_checkpointing: bool = False,
         checkpoint_ratio: float = 0.5,
@@ -40,7 +48,7 @@ class GPTConfig:
         kv_cache_strategy: str = "dynamic",  # "dynamic" or "static"
         # Mixed precision settings
         mixed_precision: bool = True,
-        mixed_precision_dtype: str = "fp16",  # "fp16" or "bf16"
+        mixed_precision_dtype: str = "bf16",  # "fp16" or "bf16"
         # Multi-Latent Attention settings
         latent_dim_scale: int = 2,  # multiplier for latent dimension
         n_latents: Optional[int] = None,  # if None, will be n_head // 2
@@ -80,6 +88,7 @@ class GPTConfig:
         self.num_experts_per_tok = num_experts_per_tok
         self.expert_capacity_factor = expert_capacity_factor
         self.moe_jitter_noise = moe_jitter_noise
+        self.moe_aux_loss_scale = moe_aux_loss_scale
 
         # Memory optimization settings
         self.use_activation_checkpointing = use_activation_checkpointing
@@ -169,13 +178,16 @@ class OptimizedKVCache:
         self.cache_k = None
         self.cache_v = None
         self.curr_len = 0
+        self.use_half_precision = True
 
     def _ensure_cache_size(self, batch_size: int):
         """Dynamically resize cache if needed"""
         if self.cache_k is None or self.current_batch_size != batch_size:
+            dtype = torch.float16 if self.use_half_precision else torch.float32
             self.current_batch_size = batch_size
             self.cache_k = torch.zeros(
                 (batch_size, self.n_head, self.max_seq_len, self.head_dim),
+                dtype=dtype,
                 pin_memory=True,
                 device=self.device,
             )
@@ -203,161 +215,6 @@ class OptimizedKVCache:
         self.cache_v = None
         self.curr_len = 0
         self.current_batch_size = None
-
-
-class SparseMoE(nn.Module):
-    """Sparse Mixture of Experts with dynamic pruning."""
-
-    def __init__(self, config: GPTConfig):
-        super().__init__()
-        self.sparsity_threshold = 0.1
-        self.num_experts = config.num_experts
-
-        # Sparse expert allocation
-        self.sparse_allocation = torch.zeros(config.num_experts)
-        self.expert_masks = nn.Parameter(torch.ones(config.num_experts))
-
-    def _prune_experts(self, usage_stats: torch.Tensor):
-        """Dynamically prune inactive experts."""
-        normalized_usage = usage_stats / usage_stats.sum()
-        self.expert_masks.data = (normalized_usage > self.sparsity_threshold).float()
-
-    def forward(self, x: torch.Tensor, router_outputs: torch.Tensor) -> torch.Tensor:
-        # Apply expert masks
-        masked_routing = router_outputs * self.expert_masks
-        return masked_routing
-
-
-@triton.jit
-def fused_rope_attention_kernel(
-    q_ptr,
-    k_ptr,
-    v_ptr,
-    out_ptr,
-    stride_q,
-    stride_k,
-    stride_v,
-    stride_out,
-    seq_len,
-    head_dim,
-    scale,
-    BLOCK_SIZE: tl.constexpr,
-):
-    """Fused RoPE and attention computation."""
-    pid = tl.program_id(0)
-
-    # Load inputs
-    q = tl.load(q_ptr + pid * stride_q)
-    k = tl.load(k_ptr + pid * stride_k)
-    v = tl.load(v_ptr + pid * stride_v)
-
-    # Compute RoPE
-    position = pid % seq_len
-    freq = tl.arange(0, head_dim, 2)
-    freq = 1.0 / (10000 ** (freq / head_dim))
-    rope = tl.cos(position * freq)
-
-    # Apply RoPE
-    q_rotated = q * rope
-    k_rotated = k * rope
-
-    # Compute attention
-    scores = tl.sum(q_rotated * k_rotated) * scale
-    scores = tl.softmax(scores)
-    out = scores * v
-
-    # Store output
-    tl.store(out_ptr + pid * stride_out, out)
-
-
-class QuantizedMoERouter(nn.Module):
-    """8-bit quantized MoE router with caching."""
-
-    def __init__(self, config: GPTConfig):
-        super().__init__()
-        self.cache_size = 1024
-        self.router_cache = {}
-
-        # 8-bit quantization parameters
-        self.scale = nn.Parameter(torch.ones(1))
-        self.zero_point = nn.Parameter(torch.zeros(1))
-
-    def quantize(self, x: torch.Tensor) -> torch.Tensor:
-        return torch.round(x / self.scale + self.zero_point).clamp(0, 255)
-
-    def dequantize(self, x: torch.Tensor) -> torch.Tensor:
-        return (x - self.zero_point) * self.scale
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Check cache first
-        cache_key = hash(x.data_ptr())
-        if cache_key in self.router_cache:
-            return self.router_cache[cache_key]
-
-        # Quantize computation
-        x_q = self.quantize(x)
-        logits = self.dequantize(x_q)
-
-        # Update cache
-        if len(self.router_cache) >= self.cache_size:
-            self.router_cache.clear()
-        self.router_cache[cache_key] = logits
-
-        return logits
-
-
-class StreamingStateManager:
-    """Manages streaming state for efficient inference."""
-
-    def __init__(self, config: GPTConfig):
-        self.max_sequence_length = config.block_size
-        self.current_position = 0
-        self.state_buffers = {}
-
-    def update_state(self, layer_id: int, state: torch.Tensor):
-        if layer_id not in self.state_buffers:
-            self.state_buffers[layer_id] = torch.zeros(
-                self.max_sequence_length, state.shape[-1]
-            )
-        start_idx = self.current_position
-        end_idx = start_idx + state.shape[0]
-        self.state_buffers[layer_id][start_idx:end_idx] = state
-
-    def get_state(self, layer_id: int, position: int) -> torch.Tensor:
-        return self.state_buffers[layer_id][:position]
-
-    def reset(self):
-        self.current_position = 0
-        self.state_buffers.clear()
-
-
-class AdaptiveQuantization(nn.Module):
-    """Adaptive quantization based on activation patterns."""
-
-    def __init__(self, config: GPTConfig):
-        super().__init__()
-        self.num_bits = 8
-        self.history_size = 1000
-        self.activation_history = []
-
-    def update_statistics(self, x: torch.Tensor):
-        if len(self.activation_history) >= self.history_size:
-            self.activation_history.pop(0)
-        self.activation_history.append(x.abs().mean().item())
-
-    def get_optimal_scale(self) -> float:
-        if not self.activation_history:
-            return 1.0
-        max_val = max(self.activation_history)
-        return (2**self.num_bits - 1) / max_val
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        self.update_statistics(x)
-        scale = self.get_optimal_scale()
-        x_q = torch.round(x * scale).clamp(
-            -(2 ** (self.num_bits - 1)), 2 ** (self.num_bits - 1) - 1
-        )
-        return x_q / scale
 
 
 class FlashAttention(nn.Module):
@@ -421,18 +278,8 @@ class FlashAttention(nn.Module):
 
         return x_out.reshape(B, H, T, D)
 
-    def _memory_efficient_attention(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """Memory efficient attention implementation."""
+    def _memory_efficient_attention(self, q, k, v, mask, chunk_size):
         B, H, T, D = q.shape
-
-        # Process in chunks to save memory
-        chunk_size = min(T, 1024)  # Adjust based on available memory
         output = torch.zeros_like(q)
 
         for i in range(0, T, chunk_size):
@@ -503,6 +350,14 @@ class FlashAttention(nn.Module):
 
         return output
 
+    def compute_optimal_chunk_size(self, seq_len):
+        # Heuristic for optimal chunk size based on sequence length
+        if seq_len <= 512:
+            return 128
+        elif seq_len <= 2048:
+            return 256
+        return 512
+
     def forward(
         self,
         x: torch.Tensor,
@@ -523,6 +378,8 @@ class FlashAttention(nn.Module):
             Output tensor of shape [batch_size, sequence_length, embedding_dim]
         """
         B, T, C = x.shape
+
+        chunk_size = min(self.compute_optimal_chunk_size(x.shape[1]), 1024)
 
         # Project to Q, K, V
         q = self.q_proj(x).view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
@@ -553,7 +410,10 @@ class FlashAttention(nn.Module):
                 scale=self.scale,
             )
         elif self.use_memory_efficient:
-            output = self._memory_efficient_attention(q, k, v, mask)
+            output = self._memory_efficient_attention(
+                q, k, v, mask, chunk_size=chunk_size
+            )
+
         elif self.use_parallel:
             output = self._parallel_attention(q, k, v, mask)
         else:
@@ -583,11 +443,9 @@ class GPTBlock(nn.Module):
         if config.use_flash_attn and hasattr(
             torch.nn.functional, "scaled_dot_product_attention"
         ):
-            self.attn = FlashAttention(
-                config
-            )  # A hypothetical flash attention implementation
+            self.attn = FlashAttention(config)
         else:
-            self.attn = OptimizedMultiLatentAttention(config)
+            self.attn = OptimizedPagedMultiLatentAttention(config)
 
         self.ln_2 = nn.LayerNorm(config.n_embd)
 
@@ -827,94 +685,185 @@ class GPT(nn.Module):
 
 
 class QuantizedLinear(nn.Module):
-    """Memory-efficient linear layer with dynamic quantization support."""
+    """
+    Memory-efficient linear layer with advanced quantization support.
+    Supports both dynamic and static quantization with per-channel or per-tensor schemes.
+    """
 
     def __init__(
-        self, in_features: int, out_features: int, bias: bool = True, bits: int = 8
+        self,
+        in_features: int,
+        out_features: int,
+        bias: bool = True,
+        bits: int = 8,
+        per_channel: bool = True,
+        symmetric: bool = True,
+        static_quantization: bool = False,
     ):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
         self.bits = bits
-
+        self.per_channel = per_channel
+        self.symmetric = symmetric
+        self.static_quantization = static_quantization
+        
+        # Quantization parameters
+        self.quant_min = 0
+        self.quant_max = 2**bits - 1
+        
         # Initialize weights and bias
         self.weight = nn.Parameter(torch.empty(out_features, in_features))
         if bias:
             self.bias = nn.Parameter(torch.empty(out_features))
         else:
-            self.register_parameter("bias", None)
+            self.register_parameter('bias', None)
 
-        # Quantization parameters
-        self.register_buffer("scale", None)
-        self.register_buffer("zero_point", None)
-
-        # Per-channel quantization parameters
-        self.register_buffer("weight_scale", None)
-        self.register_buffer("weight_zero_point", None)
+        # Quantization buffers
+        self.register_buffer('weight_scale', None)
+        self.register_buffer('weight_zero_point', None)
+        self.register_buffer('input_scale', None)
+        self.register_buffer('input_zero_point', None)
+        
+        # Cached quantized weights for inference
+        self.register_buffer('weight_quantized', None)
+        
+        # Running estimates for static quantization
+        if static_quantization:
+            self.register_buffer('running_min', torch.zeros(1))
+            self.register_buffer('running_max', torch.zeros(1))
+            self.register_buffer('num_batches_tracked', torch.tensor(0, dtype=torch.long))
 
         self.reset_parameters()
 
     def reset_parameters(self):
-        """Initialize parameters."""
-        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        """Initialize parameters with proper scaling."""
+        # Use Kaiming initialization with correction for quantization
+        fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight)
+        scale = math.sqrt(2. / fan_in) * (2 ** (self.bits - 1))
+        nn.init.uniform_(self.weight, -scale, scale)
+        
         if self.bias is not None:
-            fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight)
             bound = 1 / math.sqrt(fan_in)
             nn.init.uniform_(self.bias, -bound, bound)
 
-    def _quantize_weight(self):
-        """Quantize weights using per-channel dynamic quantization."""
-        if self.weight_scale is None:
-            # Compute per-channel scaling factors
-            weight_max = torch.max(self.weight.abs(), dim=1, keepdim=True)[0]
-            self.weight_scale = (2 * weight_max) / (2**self.bits - 1)
-            self.weight_zero_point = torch.zeros_like(self.weight_scale)
+    def _compute_weight_scaling_factors(self):
+        """Compute weight scaling factors using improved calibration."""
+        if self.per_channel:
+            axis = 1  # per output channel
+            keepdim = True
+        else:
+            axis = None
+            keepdim = False
+
+        if self.symmetric:
+            weight_max = torch.max(torch.abs(self.weight), dim=axis, keepdim=keepdim)[0]
+            weight_min = -weight_max
+        else:
+            weight_max = torch.max(self.weight, dim=axis, keepdim=keepdim)[0]
+            weight_min = torch.min(self.weight, dim=axis, keepdim=keepdim)[0]
+
+        # Improve stability with moving averages during training
+        if self.training and hasattr(self, 'running_max'):
+            momentum = 0.1
+            self.running_max.mul_(1 - momentum).add_(weight_max.mean() * momentum)
+            self.running_min.mul_(1 - momentum).add_(weight_min.mean() * momentum)
+            
+        scale = (weight_max - weight_min) / (self.quant_max - self.quant_min)
+        zero_point = self.quant_min - torch.round(weight_min / scale)
+        
+        return scale, zero_point
+
+    def quantize_weight(self):
+        """Quantize weights with caching for inference."""
+        if not self.training and self.weight_quantized is not None:
+            return self.weight_quantized
+
+        if self.weight_scale is None or self.training:
+            self.weight_scale, self.weight_zero_point = self._compute_weight_scaling_factors()
 
         # Quantize weights
         weight_q = torch.clamp(
             torch.round(self.weight / self.weight_scale + self.weight_zero_point),
-            0,
-            2**self.bits - 1,
+            self.quant_min,
+            self.quant_max
         )
 
-        # Dequantize for computation
-        return (weight_q - self.weight_zero_point) * self.weight_scale
+        # Dequantize
+        weight_dq = (weight_q - self.weight_zero_point) * self.weight_scale
 
-    def _quantize_input(
-        self, x: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Quantize input tensor dynamically."""
-        with torch.no_grad():
-            x_max = torch.max(torch.abs(x))
-            scale = (2 * x_max) / (2**self.bits - 1)
-            zero_point = torch.zeros_like(scale)
+        # Cache for inference
+        if not self.training:
+            self.weight_quantized = weight_dq
 
-            # Quantize input
-            x_q = torch.clamp(torch.round(x / scale + zero_point), 0, 2**self.bits - 1)
+        return weight_dq
 
-            # Dequantize for computation
-            x_dq = (x_q - zero_point) * scale
-            return x_dq, scale, zero_point
+    def quantize_input(self, x: torch.Tensor) -> torch.Tensor:
+        """Quantize input with support for static quantization."""
+        if self.static_quantization and self.input_scale is not None:
+            scale = self.input_scale
+            zero_point = self.input_zero_point
+        else:
+            with torch.no_grad():
+                if self.symmetric:
+                    x_max = torch.max(torch.abs(x))
+                    x_min = -x_max
+                else:
+                    x_max = torch.max(x)
+                    x_min = torch.min(x)
 
-    @torch.jit.script
-    def _compute_output(
-        self, x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor]
-    ) -> torch.Tensor:
-        """JIT-compiled forward computation."""
-        output = F.linear(x, weight, bias)
-        return output
+                # Update running estimates for static quantization
+                if self.static_quantization and self.training:
+                    self.num_batches_tracked += 1
+                    momentum = 0.1
+                    self.running_max.mul_(1 - momentum).add_(x_max * momentum)
+                    self.running_min.mul_(1 - momentum).add_(x_min * momentum)
 
+                scale = (x_max - x_min) / (self.quant_max - self.quant_min)
+                zero_point = self.quant_min - torch.round(x_min / scale)
+
+                if self.static_quantization and not self.training:
+                    self.input_scale = scale
+                    self.input_zero_point = zero_point
+
+        # Quantize and dequantize
+        x_q = torch.clamp(
+            torch.round(x / scale + zero_point),
+            self.quant_min,
+            self.quant_max
+        )
+        return (x_q - zero_point) * scale
+
+    @torch.jit.script_method
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass with dynamic quantization during inference."""
-        if self.training:
-            return F.linear(x, self.weight, self.bias)
+        """Forward pass with quantization aware training."""
+        if self.training or not self.static_quantization:
+            # Quantize weights and input
+            weight_q = self.quantize_weight()
+            x_q = self.quantize_input(x)
+            
+            # Compute output
+            output = F.linear(x_q, weight_q, self.bias)
+            
+            # Apply straight-through estimator for gradients
+            if self.training:
+                output = output + (x - x_q).detach() + (self.weight - weight_q).detach()
+            
+            return output
+        else:
+            # Use cached quantized weights during inference
+            if self.weight_quantized is None:
+                self.weight_quantized = self.quantize_weight()
+            return F.linear(self.quantize_input(x), self.weight_quantized, self.bias)
 
-        # Quantize weights and input
-        weight_q = self._quantize_weight()
-        x_q, _, _ = self._quantize_input(x)
-
-        # Compute output with quantized values
-        return self._compute_output(x_q, weight_q, self.bias)
+    def extra_repr(self) -> str:
+        return (f'in_features={self.in_features}, '
+                f'out_features={self.out_features}, '
+                f'bias={self.bias is not None}, '
+                f'bits={self.bits}, '
+                f'per_channel={self.per_channel}, '
+                f'symmetric={self.symmetric}, '
+                f'static={self.static_quantization}')
 
 
 # 1. Optimized Multi-Latent Attention with Triton kernel
@@ -1017,6 +966,8 @@ class OptimizedPagedMultiLatentAttention(nn.Module):
         self.latent_dim = self.head_dim * 2
         self.scale = math.sqrt(self.head_dim)
         self.page_size = getattr(config, "page_size", 16)
+        self.use_sdpa = config.use_sdpa
+        self.dropout = config.dropout
 
         # Latent parameters with memory pinning
         self.latent_queries = nn.Parameter(
@@ -1030,6 +981,10 @@ class OptimizedPagedMultiLatentAttention(nn.Module):
         self.to_queries = FusedLinear(config.n_embd, config.n_embd, bias=config.bias)
         self.to_keys = FusedLinear(config.n_embd, config.n_embd, bias=config.bias)
         self.to_values = FusedLinear(config.n_embd, config.n_embd, bias=config.bias)
+
+        self.out_proj = FusedLinear(
+            config.n_embd, config.n_embd, bias=config.bias, dropout=config.dropout
+        )
 
         # Latent projections
         self.to_latent_q = QuantizedLinear(
@@ -1053,6 +1008,29 @@ class OptimizedPagedMultiLatentAttention(nn.Module):
         self.use_flash_attention = hasattr(
             torch.nn.functional, "scaled_dot_product_attention"
         )
+
+    def _apply_rope(self, x: torch.Tensor, start_pos: int) -> torch.Tensor:
+        """
+        Applies rotary positional embeddings to x in shape [B, H, T, D].
+        """
+        B, H, T, D = x.shape
+
+        # Compute if needed
+        if self.freqs_cis is None or self.freqs_cis.size(0) < (start_pos + T):
+            # Recompute and store
+            self.freqs_cis = optimized_precompute_freqs_cis(
+                dim=D, end=self.max_seq_len, theta=self.rope_theta
+            ).to(x.device)
+
+        # Slice out needed positions
+        freqs_slice = self.freqs_cis[start_pos : start_pos + T]  # shape [T, D//2]
+
+        # Permute to [B, T, H, D] for apply_rotary_emb
+        x = x.permute(0, 2, 1, 3)
+        x = apply_rotary_emb(x, freqs_slice)  # returns [B, T, H, D]
+        # Permute back
+        x = x.permute(0, 2, 1, 3)
+        return x
 
     def _process_page(
         self,
@@ -1101,45 +1079,89 @@ class OptimizedPagedMultiLatentAttention(nn.Module):
         start_idx: int,
         end_idx: int,
     ) -> torch.Tensor:
-        B = q.size(0)
-        page_size = end_idx - start_idx
+        """Process attention with proper tensor reshaping."""
+        try:
+            B, H, T, D = q.shape
 
-        # Get appropriate kernel
-        kernel = get_paged_attention_kernel(page_size, self.head_dim)
-        grid = (B * self.n_head,)
+            # Make tensors contiguous and reshape
+            q = q.contiguous().view(B * H, T, D)
+            k = k.contiguous().view(B * H, -1, D)  # -1 to handle variable length
+            v = v.contiguous().view(B * H, -1, D)
 
-        # Reshape for Triton kernel
-        q = q.permute(0, 2, 1, 3).contiguous()
-        k = k.permute(0, 2, 1, 3).contiguous()
-        v = v.permute(0, 2, 1, 3).contiguous()
+            # Create output tensor
+            output = torch.empty_like(q)
 
-        output = torch.empty_like(q)
+            # Get kernel config
+            kernel_config = get_paged_attention_kernel(T, D)
+            kernel = kernel_config["kernel"]
+            kwargs = kernel_config["kwargs"]
 
-        # Launch kernel
-        kernel[grid](
-            q,
-            k,
-            v,
-            output,
-            q.stride(0),
-            q.stride(1),
-            q.stride(2),
-            k.stride(0),
-            k.stride(1),
-            k.stride(2),
-            v.stride(0),
-            v.stride(1),
-            v.stride(2),
-            output.stride(0),
-            output.stride(1),
-            output.stride(2),
-            start_idx,
-            end_idx,
-            BLOCK_M=32,
-            BLOCK_N=32,
-        )
+            # Launch kernel
+            grid = (B * H,)
+            kernel[grid](
+                q,
+                k,
+                v,
+                output,
+                q.stride(0),
+                q.stride(1),
+                q.stride(2),
+                k.stride(0),
+                k.stride(1),
+                k.stride(2),
+                v.stride(0),
+                v.stride(1),
+                v.stride(2),
+                output.stride(0),
+                output.stride(1),
+                output.stride(2),
+                start_idx=start_idx,
+                end_idx=end_idx,
+                **kwargs,
+            )
 
-        return output.permute(0, 2, 1, 3)
+            # Reshape output back to original dimensions
+            return output.view(B, H, T, D)
+
+        except Exception as e:
+            warnings.warn(f"Triton kernel failed, falling back to PyTorch: {str(e)}")
+            return self._process_page_pytorch(q, k, v, start_idx, end_idx)
+
+    def _process_page_pytorch(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        start_idx: int,
+        end_idx: int,
+    ) -> torch.Tensor:
+        """PyTorch fallback implementation with proper sequence length handling."""
+        # Get input dimensions
+        B, H, T, D = q.shape
+        _, _, S, _ = k.shape  # S is the source sequence length
+
+        # Handle the page slice
+        page_q = q[:, :, start_idx:end_idx]  # Take the current page from query
+
+        # Compute attention with proper scaling
+        scale = 1.0 / math.sqrt(D)
+
+        # Compute attention scores for this page
+        scores = (
+            torch.matmul(page_q, k.transpose(-2, -1)) * scale
+        )  # [B, H, page_size, S]
+
+        # Apply softmax over the key dimension
+        attn_weights = F.softmax(scores, dim=-1)
+
+        # Apply attention to values
+        output = torch.matmul(attn_weights, v)  # [B, H, page_size, D]
+
+        # Create output tensor of the same size as input q
+        full_output = torch.zeros_like(q)
+        full_output[:, :, start_idx:end_idx] = output
+
+        return full_output
 
     def forward(
         self,
@@ -1148,57 +1170,92 @@ class OptimizedPagedMultiLatentAttention(nn.Module):
         kv_cache: Optional[OptimizedKVCache] = None,
         position: int = 0,
     ) -> torch.Tensor:
+        """
+        Forward pass with improved tensor handling.
+        """
         B, T, C = x.size()
 
-        # Initialize RoPE frequencies if needed
-        if self.freqs_cis is None or self.freqs_cis.device != x.device:
-            self.freqs_cis = optimized_precompute_freqs_cis(
-                self.head_dim, self.max_seq_len, self.rope_theta
-            ).to(x.device)
-
-        # Project inputs
-        q = self.to_queries(x).view(B, T, self.n_head, -1)
-        k = self.to_keys(x).view(B, T, self.n_head, -1)
-        v = self.to_values(x).view(B, T, self.n_head, -1)
+        # Project to Q, K, V with proper reshaping
+        q = (
+            self.to_queries(x)
+            .reshape(B, T, self.n_head, C // self.n_head)
+            .transpose(1, 2)
+        )
+        k = self.to_keys(x).reshape(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        v = (
+            self.to_values(x)
+            .reshape(B, T, self.n_head, C // self.n_head)
+            .transpose(1, 2)
+        )
 
         # Apply RoPE
-        q = apply_rotary_emb(q, self.freqs_cis[:T])
-        k = apply_rotary_emb(k, self.freqs_cis[:T])
+        q = self._apply_rope(q, position)
+        k = self._apply_rope(k, position)
 
-        # Process latent components
-        latent_q = self.latent_queries.expand(B, -1, -1)
-        latent_k = self.latent_keys.expand(B, -1, -1)
-
-        latent_q = self.to_latent_q(latent_q).view(B, self.n_latents, self.n_head, -1)
-        latent_k = self.to_latent_k(latent_k).view(B, self.n_latents, self.n_head, -1)
-
-        # Handle KV cache
-        if kv_cache is not None and position > 0:
-            k_cached, v_cached = kv_cache.get_kv(position)
-            k = torch.cat([k_cached, k[:, -1:]], dim=1)
-            v = torch.cat([v_cached, v[:, -1:]], dim=1)
+        # Handle KV cache during inference
+        if kv_cache is not None:
+            if position > 0:
+                k_cache, v_cache = kv_cache.get_kv(position)
+                k = torch.cat([k_cache, k[:, :, -1:]], dim=2)
+                v = torch.cat([v_cache, v[:, :, -1:]], dim=2)
             kv_cache.update(k, v, position)
 
-        # Initialize output
-        output = torch.zeros_like(q)
+        # Calculate chunk size based on sequence length
+        chunk_size = min(self.compute_optimal_chunk_size(T), 1024)
 
-        # Process pages
-        n_pages = (T + self.page_size - 1) // self.page_size
-        for page_idx in range(n_pages):
-            page_output = self._process_page(
-                q, k, v, latent_q, latent_k, page_idx, mask
+        # Choose attention implementation
+        if self.use_sdpa and hasattr(F, "scaled_dot_product_attention"):
+            # Use native scaled dot product attention if available
+            output = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=mask,
+                dropout_p=self.dropout if self.training else 0.0,
+                scale=self.scale,
             )
-            start_idx = page_idx * self.page_size
-            end_idx = min(start_idx + self.page_size, T)
-            output[:, start_idx:end_idx] = page_output
+        elif self.use_memory_efficient:
+            output = self._memory_efficient_attention(
+                q, k, v, mask, chunk_size=chunk_size
+            )
+        elif self.use_parallel:
+            output = self._parallel_attention(q, k, v, mask)
+        else:
+            # Fallback to standard attention
+            scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+            if mask is not None:
+                scores = scores + mask
+            attn_weights = F.softmax(scores, dim=-1)
+            attn_weights = F.dropout(
+                attn_weights, p=self.dropout, training=self.training
+            )
+            output = torch.matmul(attn_weights, v)
 
-        # Final projection
-        output = output.view(B, T, C)
-        return self.proj(output)
+        # Reshape and project output
+        output = output.transpose(1, 2).contiguous().view(B, T, C)
+        return self.out_proj(output)
+
+    def compute_optimal_chunk_size(self, seq_len):
+        # Heuristic for optimal chunk size based on sequence length
+        if seq_len <= 512:
+            return 128
+        elif seq_len <= 2048:
+            return 256
+        return 512
 
 
 class FusedLinear(nn.Module):
-    """Memory-efficient linear layer with fused operations."""
+    """
+    Memory-efficient linear layer with fused operations for linear transform,
+    activation, and dropout.
+    """
+
+    SUPPORTED_ACTIVATIONS = {
+        "gelu": F.gelu,
+        "relu": F.relu,
+        "silu": F.silu,
+        None: lambda x: x
+    }
 
     def __init__(
         self,
@@ -1207,41 +1264,116 @@ class FusedLinear(nn.Module):
         bias: bool = True,
         dropout: float = 0.0,
         activation: Optional[str] = None,
+        device: Optional[torch.device] = None,
+        dtype: Optional[torch.dtype] = None,
     ):
+        """
+        Initialize FusedLinear layer.
+        
+        Args:
+            in_features: Input feature dimension
+            out_features: Output feature dimension
+            bias: Whether to include bias term
+            dropout: Dropout probability
+            activation: Activation function ('gelu', 'relu', 'silu', or None)
+            device: Torch device
+            dtype: Tensor dtype
+        """
+        factory_kwargs = {'device': device, 'dtype': dtype}
         super().__init__()
+        
+        # Validate inputs
+        if not (0 <= dropout < 1.0):
+            raise ValueError(f"Dropout must be in [0, 1), got {dropout}")
+        if activation not in self.SUPPORTED_ACTIVATIONS:
+            raise ValueError(f"Unsupported activation: {activation}. "
+                           f"Choose from {list(self.SUPPORTED_ACTIVATIONS.keys())}")
+        
         self.in_features = in_features
         self.out_features = out_features
         self.dropout = dropout
-        self.activation = activation
+        self.activation_fn = self.SUPPORTED_ACTIVATIONS[activation]
 
-        self.weight = nn.Parameter(torch.empty(out_features, in_features))
+        # Initialize parameters with proper dtype/device
+        self.weight = nn.Parameter(torch.empty(
+            (out_features, in_features), **factory_kwargs))
+        
         if bias:
-            self.bias = nn.Parameter(torch.empty(out_features))
+            self.bias = nn.Parameter(torch.empty(out_features, **factory_kwargs))
         else:
-            self.register_parameter("bias", None)
+            self.register_parameter('bias', None)
 
-        self.reset_parameters()
+        self.reset_parameters(activation)
 
-    def reset_parameters(self):
-        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+    def reset_parameters(self, activation: Optional[str] = None) -> None:
+        """
+        Reset layer parameters with activation-aware initialization.
+        """
+        if activation == 'gelu':
+            # Use He initialization adjusted for GELU
+            gain = 1.0 / math.sqrt(0.8862)
+            nn.init.kaiming_normal_(self.weight, a=math.sqrt(5), nonlinearity='leaky_relu')
+            self.weight.data *= gain
+        elif activation == 'relu':
+            nn.init.kaiming_normal_(self.weight, nonlinearity='relu')
+        else:
+            # Default initialization for linear/other activations
+            nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+
         if self.bias is not None:
             fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight)
-            bound = 1 / math.sqrt(fan_in)
+            bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
             nn.init.uniform_(self.bias, -bound, bound)
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
-        # Compute linear transformation
-        output = F.linear(input, self.weight, self.bias)
+        """
+        Forward pass with fused operations.
+        
+        Args:
+            input: Input tensor of shape [..., in_features]
+            
+        Returns:
+            Output tensor of shape [..., out_features]
+        """
+        # Validate input shape
+        if input.size(-1) != self.in_features:
+            raise ValueError(f"Expected input features: {self.in_features}, "
+                           f"got: {input.size(-1)}")
 
-        # Apply activation if specified
-        if self.activation == "gelu":
-            output = F.gelu(output)
+        if torch.jit.is_scripting() or not self.training:
+            # Standard forward pass when scripting or in eval mode
+            output = F.linear(input, self.weight, self.bias)
+            output = self.activation_fn(output)
+            if self.dropout > 0 and self.training:
+                output = F.dropout(output, p=self.dropout, training=True)
+            return output
+        else:
+            # Fused operations for training mode
+            if hasattr(torch.nn.functional, 'fused_linear'):
+                # Use fused kernel if available
+                return F.fused_linear(
+                    input, 
+                    self.weight,
+                    self.bias,
+                    self.activation_fn,
+                    self.dropout if self.training else 0.0
+                )
+            else:
+                # Fallback to standard operations
+                output = F.linear(input, self.weight, self.bias)
+                output = self.activation_fn(output)
+                if self.dropout > 0:
+                    output = F.dropout(output, p=self.dropout, training=True)
+                return output
 
-        # Apply dropout during training
-        if self.dropout > 0 and self.training:
-            output = F.dropout(output, p=self.dropout, training=True)
-
-        return output
+    def extra_repr(self) -> str:
+        """Return extra representation string."""
+        return (f'in_features={self.in_features}, '
+                f'out_features={self.out_features}, '
+                f'bias={self.bias is not None}, '
+                f'dropout={self.dropout}, '
+                f'activation={[k for k, v in self.SUPPORTED_ACTIVATIONS.items() '
+                f'if v == self.activation_fn][0]}')
 
 
 # Optimized precomputation of RoPE frequencies
@@ -1249,17 +1381,35 @@ class FusedLinear(nn.Module):
 def optimized_precompute_freqs_cis(
     dim: int, end: int, theta: float = 10000.0
 ) -> torch.Tensor:
-    """JIT-compiled frequency precomputation for better performance."""
-    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
-    t = torch.arange(end)
-    freqs = torch.outer(t, freqs)
+    """
+    JIT-compiled frequency precomputation with improved numerical stability.
+
+    Args:
+        dim: Model dimension
+        end: Maximum sequence length
+        theta: Base value for frequency computation
+
+    Returns:
+        Complex tensor of shape [end, dim//2] containing precomputed frequencies
+    """
+    # Compute frequencies with better numerical stability
+    freq_seq = torch.arange(0, dim, 2, dtype=torch.float32)[: (dim // 2)]
+    inv_freq = torch.exp(-torch.log(torch.tensor(theta)) * (freq_seq / dim))
+
+    # Create position sequence
+    pos_seq = torch.arange(end, dtype=torch.float32)
+
+    # Compute outer product more efficiently
+    freqs = torch.einsum("i,j->ij", pos_seq, inv_freq)
+
+    # Convert to complex numbers using polar coordinates
     return torch.polar(torch.ones_like(freqs), freqs)
 
 
 @torch.jit.script
 def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
     """
-    Apply rotary embeddings to input tensor using precomputed frequencies.
+    Apply rotary embeddings with improved efficiency and stability.
 
     Args:
         x: Input tensor of shape [B, T, H, D]
@@ -1268,34 +1418,37 @@ def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
     Returns:
         Tensor with rotary embeddings applied
     """
-    # Extract shapes
     B, T, H, D = x.shape
 
-    # Reshape x for complex multiplication explicitly
-    x_reshaped = x.float().reshape(B, T, H, D // 2, 2)
+    # Input validation
+    assert D % 2 == 0, f"Dimension {D} must be divisible by 2"
+    assert (
+        freqs_cis.shape[0] >= T
+    ), f"freq_cis length {freqs_cis.shape[0]} too small for seq length {T}"
+
+    # Reshape input maintaining original dtype
+    x_reshaped = x.reshape(B, T, H, D // 2, 2)
     x_complex = torch.view_as_complex(x_reshaped)
 
-    # Expand freqs_cis to match batch and head dimensions
-    freqs_cis = freqs_cis[:T, None, :]  # [T, 1, D/2]
-    freqs_cis = freqs_cis.expand(T, H, x_complex.shape[-1])  # [T, H, D/2]
+    # Prepare frequencies more efficiently
+    freqs_cis = freqs_cis[:T]  # [T, D/2]
 
-    # Apply rotary embeddings through complex multiplication
-    x_out = torch.view_as_real(x_complex * freqs_cis.unsqueeze(0))  # [B, T, H, D/2, 2]
+    # Optimize the broadcasting
+    x_complex = x_complex.view(B, T, H, -1)
+    freqs_cis = freqs_cis.view(T, 1, -1)  # [T, 1, D/2]
 
-    # Reshape back to original shape
-    x_out = x_out.reshape(B, T, H, D)
+    # Apply rotary embeddings
+    x_out = torch.view_as_real(x_complex * freqs_cis).reshape(B, T, H, D)
 
-    return x_out.type_as(x)
+    return x_out
 
 
 @triton.jit
 def fused_paged_attention_kernel(
-    # Pointers to matrices
     q_ptr,
     k_ptr,
     v_ptr,
     output_ptr,
-    # Matrix strides
     stride_qb,
     stride_qh,
     stride_qm,
@@ -1308,71 +1461,67 @@ def fused_paged_attention_kernel(
     stride_ob,
     stride_oh,
     stride_om,
-    # Attention-specific params
     start_idx: tl.constexpr,
     end_idx: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
-    # Optional params
-    scale: tl.constexpr = None,
+    BLOCK_K: tl.constexpr,
 ):
-    """
-    Compute paged attention for a single block.
-    Uses Triton for efficient GPU computation.
-
-    Args:
-        q_ptr: Query tensor pointer [B, H, page_size, D]
-        k_ptr: Key tensor pointer [B, H, N, D]
-        v_ptr: Value tensor pointer [B, H, N, D]
-        output_ptr: Output tensor pointer [B, H, page_size, D]
-        Various strides for tensor access
-        start_idx, end_idx: Current page bounds
-        BLOCK_M, BLOCK_N: Block sizes for tiling
-    """
-    # Program ID
+    """Fixed implementation of paged attention kernel."""
+    # Get program ID
     pid = tl.program_id(0)
 
-    # Page dimensions
+    # Calculate dimensions
     page_size = end_idx - start_idx
-
-    # Block dimensions
     n_blocks = tl.cdiv(page_size, BLOCK_M)
+
+    # Calculate block indices
     block_id = pid // n_blocks
     block_m = pid % n_blocks
 
-    # Offsets
-    offs_m = block_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    # Calculate offsets
+    offs_m = tl.arange(0, BLOCK_M)
     offs_n = tl.arange(0, BLOCK_N)
+
+    # Add base offset for this block
+    offs_m = block_m * BLOCK_M + offs_m
+
+    # Create masks
+    m_mask = offs_m < page_size
 
     # Initialize accumulator
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
-    # Load query block
-    q = tl.load(q_ptr + offs_m[:, None] * stride_qm)
+    # Load query block with proper pointer arithmetic
+    q_block_ptr = q_ptr + (offs_m[:, None] * stride_qm)
+    q = tl.load(q_block_ptr, mask=m_mask[:, None], other=0.0)
 
     # Process key-value pairs in blocks
     for k_start in range(0, end_idx, BLOCK_N):
-        k_block = k_start + offs_n
-        k_mask = k_block < end_idx
+        k_offs = k_start + offs_n
+        k_mask = k_offs < end_idx
 
-        # Load key and value blocks
-        k = tl.load(k_ptr + k_block * stride_kn, mask=k_mask)
-        v = tl.load(v_ptr + k_block * stride_vn, mask=k_mask)
+        # Load key and value blocks with correct pointer arithmetic
+        k_block_ptr = k_ptr + (k_offs * stride_kn)
+        v_block_ptr = v_ptr + (k_offs * stride_vn)
 
-        # Compute attention scores for this block
-        scores = tl.dot(q, k.transpose(1, 0))
-        if scale is not None:
-            scores = scores * scale
+        k = tl.load(k_block_ptr, mask=k_mask, other=0.0)
+        v = tl.load(v_block_ptr, mask=k_mask, other=0.0)
 
-        # Apply softmax
-        scores = tl.softmax(scores, axis=-1)
+        # Compute attention scores without explicit indexing
+        qk = tl.dot(q, k)
+        qk = qk * (1.0 / tl.sqrt(float(BLOCK_K)))
 
-        # Update accumulator
-        acc += tl.dot(scores, v)
+        # Apply masking and softmax
+        qk = tl.where(k_mask[None, :], qk, float("-inf"))
+        qk = tl.softmax(qk, axis=-1)
 
-    # Write output
-    output_offset = block_id * stride_ob + offs_m[:, None] * stride_om
-    tl.store(output_ptr + output_offset, acc.to(tl.float16))
+        # Compute weighted sum
+        acc += tl.dot(qk, v)
+
+    # Store output
+    out_ptr = output_ptr + (offs_m * stride_om)
+    tl.store(out_ptr, acc.to(tl.float16), mask=m_mask)
 
 
 # Modified version of fused_paged_attention_kernel for larger pages
@@ -1441,83 +1590,74 @@ def fused_paged_attention_kernel_large(
     tl.store(output_ptr + output_offset, acc.to(tl.float16))
 
 
-def get_paged_attention_kernel(page_size: int, head_dim: int) -> Callable:
-    """
-    Returns the appropriate kernel based on page and model size.
+def get_paged_attention_kernel(page_size: int, head_dim: int) -> dict:
+    """Returns kernel configuration with fixed block sizes."""
+    # Use smaller block sizes for better stability
+    BLOCK_M = min(16, page_size)
+    BLOCK_N = min(16, head_dim)
+    BLOCK_K = min(16, head_dim)
 
-    Args:
-        page_size: Size of attention pages
-        head_dim: Dimension of attention heads
-
-    Returns:
-        Appropriate Triton kernel for these dimensions
-    """
-    if page_size <= 32 and head_dim <= 64:
-        return fused_paged_attention_kernel
-    else:
-        return fused_paged_attention_kernel_large
+    return {
+        "kernel": fused_paged_attention_kernel,
+        "kwargs": {"BLOCK_M": BLOCK_M, "BLOCK_N": BLOCK_N, "BLOCK_K": BLOCK_K},
+    }
 
 
-# Optimized MoE Implementation
 @triton.jit
-def fused_expert_kernel(
-    x_ptr,
-    weight_ptr,
-    bias_ptr,
-    out_ptr,
-    M,
-    N,
-    K,
-    has_bias: tl.constexpr,
+def fused_paged_attention_kernel(
+    q_ptr,
+    k_ptr,
+    v_ptr,
+    output_ptr,
+    stride_qb,
+    stride_qh,
+    stride_qm,
+    stride_kb,
+    stride_kh,
+    stride_kn,
+    stride_vb,
+    stride_vh,
+    stride_vn,
+    stride_ob,
+    stride_oh,
+    stride_om,
+    start_idx: tl.constexpr,
+    end_idx: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
-    BLOCK_K: tl.constexpr,
-    stride_xm,
-    stride_xk,
-    stride_wn,
-    stride_wk,
-    stride_out,
 ):
-    """Fused expert computation kernel using Triton."""
+    """Simplified paged attention kernel."""
+    # Get program ID
     pid = tl.program_id(0)
 
-    # Compute offsets
-    offs_m = pid * BLOCK_M + tl.arange(0, BLOCK_M)
+    # Calculate dimensions
+    page_size = end_idx - start_idx
+
+    # Calculate offsets
+    offs_m = tl.arange(0, BLOCK_M)
     offs_n = tl.arange(0, BLOCK_N)
-    offs_k = tl.arange(0, BLOCK_K)
 
-    # Initialize accumulator for matrix multiplication
-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    # Create masks
+    m_mask = offs_m < page_size
 
-    # Iterate through K dimension
-    for k in range(0, tl.cdiv(K, BLOCK_K) * BLOCK_K, BLOCK_K):
-        # Load x and weight blocks
-        x_block_ptr = (
-            x_ptr + offs_m[:, None] * stride_xm + (k + offs_k[None, :]) * stride_xk
-        )
-        w_block_ptr = (
-            weight_ptr + (k + offs_k[:, None]) * stride_wk + offs_n[None, :] * stride_wn
-        )
+    # Load query block
+    q = tl.load(q_ptr + offs_m * stride_qm, mask=m_mask, other=0.0)
 
-        x_block = tl.load(x_block_ptr, mask=offs_m[:, None] < M, other=0.0)
-        w_block = tl.load(w_block_ptr, mask=offs_n[None, :] < N, other=0.0)
+    # Load key and value
+    k = tl.load(k_ptr + offs_n * stride_kn)
+    v = tl.load(v_ptr + offs_n * stride_vn)
 
-        # Compute matrix multiplication
-        acc += tl.dot(x_block, w_block)
+    # Compute attention scores
+    scores = tl.dot(q, k) / tl.sqrt(float(q.shape[-1]))
 
-    # Add bias if present
-    if has_bias:
-        bias = tl.load(bias_ptr + offs_m, mask=offs_m < M, other=0.0)
-        acc = acc + bias[:, None]
+    # Apply softmax
+    scores = tl.softmax(scores, axis=-1)
 
-    # Apply ReLU activation
-    acc = tl.maximum(acc, 0.0)
+    # Compute output
+    output = tl.dot(scores, v)
 
-    # Store the result
-    for n in range(BLOCK_N):
-        out_ptr_n = out_ptr + offs_m * stride_out + n
-        mask = offs_m < M
-        tl.store(out_ptr_n, acc[:, n], mask=mask)
+    # Store output
+    tl.store(output_ptr + offs_m * stride_om, output, mask=m_mask)
 
 
 class OptimizedMoELayer(nn.Module):
@@ -1531,6 +1671,16 @@ class OptimizedMoELayer(nn.Module):
         self.hidden_dim = config.n_embd
         self.ffn_dim = 4 * config.n_embd
         self.dropout = config.dropout
+
+        # Add routing parameters
+        self.moe_jitter_noise = getattr(config, "moe_jitter_noise", 0.1)
+        self.temperature = getattr(config, "router_temperature", 0.1)
+        self.overflow_factor = getattr(config, "overflow_factor", 0.2)
+
+        # Initialize metrics and losses
+        self.entropy_loss = 0.0
+        self.aux_loss = 0.0
+        self.metrics = {}
 
         # Create experts (quantized)
         self.experts = nn.ModuleList(
@@ -1548,6 +1698,9 @@ class OptimizedMoELayer(nn.Module):
         # Dropout for routing
         self.route_dropout = nn.Dropout(config.dropout)
 
+        self.layer_norm = nn.LayerNorm(config.n_embd)
+        self.noise_scale = 0.01
+
         # Initialize router weights
         with torch.no_grad():
             self.router.weight.data.normal_(mean=0.0, std=0.02)
@@ -1555,15 +1708,14 @@ class OptimizedMoELayer(nn.Module):
     def _compute_routing_weights(
         self, x: torch.Tensor, importance_scores: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Compute routing weights with dynamic capacity and load balancing."""
-        batch_size, seq_len, _ = x.shape
+        """Compute routing weights with stable gradient flow."""
+        seq_len = x.size(1)
 
         # Get router logits
         router_logits = self.router(x)  # [batch_size, seq_len, num_experts]
 
-        # Apply importance scoring if provided
-        if importance_scores is not None:
-            router_logits = router_logits * importance_scores.unsqueeze(-1)
+        # Add gating
+        gate_value = torch.sigmoid(router_logits.mean(-1, keepdim=True))
 
         # Calculate expert capacity
         capacity = int(
@@ -1573,26 +1725,51 @@ class OptimizedMoELayer(nn.Module):
             / self.num_experts
         )
 
-        # Get top-k experts per token
+        # Get top-k experts per token with temperature
+        temperature = getattr(self, "temperature", 0.1)
+        router_logits = router_logits / temperature
         router_probs = F.softmax(router_logits, dim=-1)
+
+        # Add auxiliary loss for load balancing
+        if self.training:
+            # Calculate load balancing loss
+            token_usage = router_probs.sum(dim=(0, 1))  # [num_experts]
+            target_usage = router_probs.sum() / self.num_experts
+            balance_loss = (token_usage - target_usage).pow(2).mean()
+
+            # Calculate entropy loss for exploration
+            entropy = -(router_probs * torch.log(router_probs + 1e-10)).sum(-1).mean()
+
+            # Store auxiliary losses
+            self.aux_loss = balance_loss * 0.01 + entropy * 0.01
+
+        # Get top-k experts
         expert_weights, expert_indices = torch.topk(
             router_probs, self.num_experts_per_tok, dim=-1
         )
 
-        # Normalize weights
-        expert_weights = expert_weights / expert_weights.sum(dim=-1, keepdim=True)
+        # Convert indices to correct dtype for scattering
+        expert_indices = expert_indices.to(router_logits.dtype)
 
-        # Create dispatch tensors - ensure same dtype as expert_weights
-        dispatch_mask = torch.zeros_like(router_logits, dtype=expert_weights.dtype)
-        dispatch_mask.scatter_(-1, expert_indices, expert_weights)
+        # Normalize weights with stability ensuring float dtype
+        expert_weights = F.softmax(expert_weights / temperature, dim=-1).to(
+            router_logits.dtype
+        )
 
-        # Implement load balancing
+        # Create dispatch tensors with gating
+        dispatch_mask = torch.zeros_like(router_logits)
+        dispatch_mask = dispatch_mask.to(expert_weights.dtype)
+        dispatch_mask.scatter_(-1, expert_indices.long(), expert_weights)
+        dispatch_mask = dispatch_mask * gate_value.to(dispatch_mask.dtype)
+
+        # Implement capacity-based pruning
         position_in_expert = torch.cumsum(dispatch_mask, dim=1)
-        capacity_mask = position_in_expert <= capacity
-        dispatch_mask = dispatch_mask * capacity_mask.float().to(dispatch_mask.dtype)
+        capacity_mask = (position_in_expert <= capacity).to(dispatch_mask.dtype)
+        dispatch_mask = dispatch_mask * capacity_mask
 
-        # Renormalize weights
-        dispatch_mask = dispatch_mask / (dispatch_mask.sum(dim=-1, keepdim=True) + 1e-6)
+        # Final normalization with stability
+        normalizer = dispatch_mask.sum(dim=-1, keepdim=True)
+        dispatch_mask = dispatch_mask / (normalizer + 1e-6)
 
         return dispatch_mask, expert_indices
 
@@ -1615,47 +1792,102 @@ class OptimizedMoELayer(nn.Module):
 
         return load_balancing_loss * 0.01  # Scale factor
 
-    def forward(
-        self, x: torch.Tensor, importance_scores: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:
-        """Forward pass with optimized expert computation and load balancing."""
-        batch_size, seq_len, hidden_dim = x.shape
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass with gradient stabilization."""
 
-        # Get routing weights and indices
-        dispatch_mask, expert_indices = self._compute_routing_weights(
-            x, importance_scores
-        )
+        router_logits = self.router(x)
+        router_probs = F.softmax(router_logits, dim=-1)
 
-        # Update expert usage statistics
-        self._update_expert_counts(dispatch_mask)
+        # Cache router probabilities for statistics
+        self._last_router_probs = router_probs.detach()  # Store detached version
 
-        # Initialize output tensor
+        # Get dispatch mask and indices
+        dispatch_mask, expert_indices = self._compute_routing_weights(x)
+
+        # Rest of the forward method remains the same...
         final_output = torch.zeros_like(x)
-
-        # Process each expert
+        expert_outputs = []
         for i, expert in enumerate(self.experts):
-            # Get tokens routed to this expert
             expert_mask = dispatch_mask[:, :, i].unsqueeze(-1)
             expert_input = x * expert_mask
 
-            # Skip computation if no tokens are routed here
             if expert_mask.sum() == 0:
                 continue
 
-            # Process tokens through expert
-            if torch.cuda.is_available() and x.is_cuda:
-                # Optimize for GPU by doing the computation in a single batch
-                # Reshape for efficient computation
-                expert_input = expert_input.view(-1, hidden_dim)
-                expert_output = expert(expert_input)
-                expert_output = expert_output.view(batch_size, seq_len, -1)
-            else:
-                # Standard CPU processing
-                expert_output = expert(expert_input)
+            expert_output = expert(expert_input)
+            expert_outputs.append(expert_output)
 
-            final_output = final_output + expert_output
+        if expert_outputs:
+            final_output = sum(expert_outputs)
+
+        gate = torch.sigmoid(router_logits.mean(-1, keepdim=True))
+        final_output = gate * final_output + (1 - gate) * x
+
+        if self.training:
+            noise = torch.randn_like(final_output) * self.noise_scale
+            final_output = final_output + noise
+
+        if hasattr(self, "layer_norm"):
+            final_output = self.layer_norm(final_output)
 
         return final_output
+
+    def get_expert_statistics(self) -> Dict[str, torch.Tensor]:
+        """Collect detailed expert usage statistics using cached router probabilities."""
+        if not hasattr(self, "_last_router_probs"):
+            raise RuntimeError(
+                "Statistics not available - forward pass must be run first"
+            )
+
+        with torch.no_grad():
+            router_probs = self._last_router_probs
+
+            # Calculate expert usage
+            expert_usage = router_probs.sum(dim=(0, 1))  # Sum over batch and sequence
+            total_tokens = router_probs.size(0) * router_probs.size(1)
+            expert_usage = expert_usage / total_tokens  # Normalize
+
+            # Calculate entropy
+            entropy = -(router_probs * torch.log(router_probs + 1e-10)).sum(-1).mean()
+
+            # Calculate load balancing score
+            target_usage = 1.0 / self.num_experts
+            balance_score = 1.0 - (expert_usage - target_usage).abs().mean()
+
+            # Calculate expert capacity utilization
+            capacity = int(
+                self.expert_capacity_factor * total_tokens / self.num_experts
+            )
+            usage_per_expert = (router_probs > 0).float().sum(dim=(0, 1))
+            capacity_utilization = usage_per_expert / capacity
+
+            return {
+                "expert_usage": expert_usage,
+                "entropy": entropy,
+                "balance_score": balance_score,
+                "capacity_utilization": capacity_utilization,
+                "router_max_prob": router_probs.max(dim=-1)[0].mean(),
+                "unused_expert_count": (expert_usage < 0.01).sum(),
+            }
+
+    def log_statistics(self, step: int):
+        """Log expert statistics for monitoring."""
+        stats = self.get_expert_statistics()
+
+        print(f"\nStep {step} Expert Statistics:")
+        print("Expert Usage Distribution:")
+        for i, usage in enumerate(stats["expert_usage"]):
+            print(f"Expert {i}: {usage:.3f}")
+
+        print(f"\nRouting Metrics:")
+        print(f"Entropy: {stats['entropy']:.3f}")
+        print(f"Balance Score: {stats['balance_score']:.3f}")
+        print(f"Unused Experts: {stats['unused_expert_count']}")
+        print(
+            f"Average Capacity Utilization: {stats['capacity_utilization'].mean():.3f}"
+        )
+
+        return stats
 
 
 class QuantizedExpertLayer(nn.Module):
@@ -1713,172 +1945,6 @@ class QuantizedExpertLayer(nn.Module):
         return self.dropout(self.w2(F.gelu(self.w1(x))))
 
 
-class CombinedAttention(nn.Module):
-    """Combines Multi-Latent Attention with Paged processing and KV cache."""
-
-    def __init__(self, config: GPTConfig):
-        super().__init__()
-        assert config.n_embd % config.n_head == 0
-
-        # Multi-Latent parameters
-        self.n_head = config.n_head
-        self.n_latents = config.n_head // 2
-        self.head_dim = config.n_embd // config.n_head
-        self.latent_dim = self.head_dim * 2
-        self.scale = math.sqrt(self.head_dim)
-
-        # Paging parameters
-        self.page_size = 16  # Can be tuned
-        self.max_seq_len = config.block_size
-
-        # Latent parameters
-        self.latent_queries = nn.Parameter(
-            torch.randn(1, self.n_latents, self.latent_dim) / math.sqrt(self.latent_dim)
-        )
-        self.latent_keys = nn.Parameter(
-            torch.randn(1, self.n_latents, self.latent_dim) / math.sqrt(self.latent_dim)
-        )
-
-        # Projections
-        self.to_queries = FusedLinear(config.n_embd, config.n_embd, bias=config.bias)
-        self.to_keys = FusedLinear(config.n_embd, config.n_embd, bias=config.bias)
-        self.to_values = FusedLinear(config.n_embd, config.n_embd, bias=config.bias)
-
-        # Latent projections
-        self.to_latent_q = QuantizedLinear(
-            self.latent_dim, config.n_embd, bias=config.bias
-        )
-        self.to_latent_k = QuantizedLinear(
-            self.latent_dim, config.n_embd, bias=config.bias
-        )
-
-        # Output projection
-        self.proj = FusedLinear(
-            config.n_embd, config.n_embd, bias=config.bias, dropout=config.dropout
-        )
-
-        # Flash Attention support
-        self.use_flash_attention = hasattr(
-            torch.nn.functional, "scaled_dot_product_attention"
-        )
-
-    def _process_page(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        latent_q: torch.Tensor,
-        latent_k: torch.Tensor,
-        mask: Optional[torch.Tensor],
-        page_idx: int,
-        page_size: int,
-    ) -> torch.Tensor:
-        """Process a single page of attention including latent components."""
-        B, H, T, D = q.shape
-        start_idx = page_idx * page_size
-        end_idx = min(start_idx + page_size, T)
-
-        # Get current page
-        page_q = q[:, :, start_idx:end_idx]
-        page_k = k[:, :, :end_idx]  # Use all previous keys up to current page
-        page_v = v[:, :, :end_idx]  # Use all previous values up to current page
-
-        # Combine with latent components
-        combined_k = torch.cat([page_k, latent_k], dim=2)
-        combined_v = torch.cat([page_v, latent_q], dim=2)
-
-        if self.use_flash_attention:
-            page_mask = (
-                mask[:, :, start_idx:end_idx, :end_idx] if mask is not None else None
-            )
-            output = F.scaled_dot_product_attention(
-                page_q,
-                combined_k,
-                combined_v,
-                attn_mask=page_mask,
-                dropout_p=0.0 if not self.training else 0.1,
-                scale=self.scale,
-            )
-        else:
-            # Regular attention computation
-            scores = torch.matmul(page_q, combined_k.transpose(-2, -1)) / self.scale
-            if mask is not None:
-                page_mask = mask[:, :, start_idx:end_idx, :end_idx]
-                scores = scores + page_mask
-            attn_weights = F.softmax(scores, dim=-1)
-            output = torch.matmul(attn_weights, combined_v)
-
-        return output
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        mask: Optional[torch.Tensor] = None,
-        kv_cache: Optional[OptimizedKVCache] = None,
-        position: int = 0,
-    ) -> torch.Tensor:
-        B, T, C = x.size()
-
-        # Project inputs
-        q = self.to_queries(x).view(B, T, self.n_head, -1).transpose(1, 2)
-        k = self.to_keys(x).view(B, T, self.n_head, -1).transpose(1, 2)
-        v = self.to_values(x).view(B, T, self.n_head, -1).transpose(1, 2)
-
-        # Process latent components
-        latent_q = self.latent_queries.expand(B, -1, -1)
-        latent_k = self.latent_keys.expand(B, -1, -1)
-
-        latent_q = (
-            self.to_latent_q(latent_q)
-            .view(B, self.n_latents, self.n_head, -1)
-            .transpose(1, 2)
-        )
-        latent_k = (
-            self.to_latent_k(latent_k)
-            .view(B, self.n_latents, self.n_head, -1)
-            .transpose(1, 2)
-        )
-
-        # Handle KV cache during inference
-        if kv_cache is not None:
-            if position > 0:
-                # Retrieve cached keys and values
-                k_cached, v_cached = kv_cache.get_kv(position)
-                # Only compute for new position
-                k = torch.cat([k_cached, k[:, :, -1:]], dim=2)
-                v = torch.cat([v_cached, v[:, :, -1:]], dim=2)
-            # Update cache
-            kv_cache.update(k, v, position)
-
-            # For inference with KV cache, we only process the last token
-            output = self._process_page(
-                q[:, :, -1:],
-                k,
-                v,
-                latent_q,
-                latent_k,
-                mask,
-                0,
-                1,  # Process single token as a page
-            )
-        else:
-            # Training or inference without KV cache - use paged attention
-            output = torch.zeros_like(q)
-            n_pages = (T + self.page_size - 1) // self.page_size
-
-            for page_idx in range(n_pages):
-                page_output = self._process_page(
-                    q, k, v, latent_q, latent_k, mask, page_idx, self.page_size
-                )
-                start_idx = page_idx * self.page_size
-                end_idx = min(start_idx + self.page_size, T)
-                output[:, :, start_idx:end_idx] = page_output
-
-        # Reshape and project output
-        output = output.transpose(1, 2).contiguous().view(B, T, C)
-        return self.proj(output)
-
-
 class DualHeadGPTConfig(GPTConfig):
     """Extended GPT config with dual head support."""
 
@@ -1886,24 +1952,63 @@ class DualHeadGPTConfig(GPTConfig):
         self,
         second_vocab_size: int = 50257,  # Size of second vocabulary
         aux_head_weight: float = 0.5,  # Weight for auxiliary loss
+        dropout: float = 0.1,
         **kwargs,
     ):
         super().__init__(**kwargs)
         self.second_vocab_size = second_vocab_size
         self.aux_head_weight = aux_head_weight
+        self.dropout = dropout
 
-
-class DualHeadGPT(GPT):
-    """GPT model with dual heads but single input."""
+class DualHeadGPT(nn.Module):
+    """GPT model with dual heads and improved stability."""
 
     def __init__(self, config: DualHeadGPTConfig):
-        super().__init__(config)
+        super().__init__()
         self.config = config
 
-        # Second head for auxiliary task
-        self.second_head = FusedLinear(
-            config.n_embd, config.second_vocab_size, bias=config.bias
-        )
+        # Core model components
+        self.wte = nn.Embedding(config.vocab_size, config.n_embd)
+        self.drop = nn.Dropout(config.dropout)
+        self.blocks = nn.ModuleList([self._create_block() for _ in range(config.n_layer)])
+        self.ln_f = nn.LayerNorm(config.n_embd)
+        
+        # Initialize second head
+        self.second_head = nn.Linear(config.n_embd, config.second_vocab_size, bias=config.bias)
+        self._init_weights(self.second_head)
+        
+        # Performance monitoring with bounded storage
+        self.max_stats_size = 1000
+        self.perf_stats = {
+            'forward_time': deque(maxlen=self.max_stats_size),
+            'backward_time': deque(maxlen=self.max_stats_size),
+            'memory_used': deque(maxlen=self.max_stats_size)
+        }
+        
+        # Model state
+        self.kv_cache = {}
+        self._is_static_graph = False
+        self.gradient_checkpointing = False
+        self.checkpoint_ratio = 0.5
+        
+        # Loss scaling parameters
+        self.loss_scale_factor = 1.0
+        self.min_loss_scale = 1e-8
+        self.max_loss_scale = 1.0
+        self.loss_scale_decay = 0.5
+        self.max_loss_value = 100.0
+
+        # Debug settings
+        self.debug_mode = False
+        
+    def _init_weights(self, module: nn.Module) -> None:
+        """Initialize weights with improved scaling."""
+        if isinstance(module, nn.Linear):
+            nn.init.kaiming_normal_(module.weight, mode='fan_in', nonlinearity='linear')
+            if module.bias is not None:
+                fan_in, _ = nn.init._calculate_fan_in_and_fan_out(module.weight)
+                bound = 1 / math.sqrt(fan_in)
+                nn.init.uniform_(module.bias, -bound, bound)
 
     def forward(
         self,
@@ -1911,68 +2016,52 @@ class DualHeadGPT(GPT):
         target_second: Optional[torch.Tensor] = None,
         mask: Optional[torch.Tensor] = None,
         position: int = 0,
-    ) -> Tuple[
-        torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]
-    ]:
-        """
-        Forward pass with dual heads.
-
-        Args:
-            idx: Input token indices [batch_size, sequence_length]
-            target_second: Target indices for second head [batch_size, sequence_length]
-            mask: Attention mask [batch_size, sequence_length]
-            position: Position for KV cache
-
-        Returns:
-            tuple: (primary_logits, second_logits, primary_loss, second_loss)
-        """
-        device = idx.device
-        b, t = idx.size()
-
-        assert (
-            t <= self.config.block_size
-        ), f"Cannot forward sequence of length {t}, block size is {self.config.block_size}"
-
-        # Get token embeddings
+        return_router_logits: bool = False,
+    ) -> Union[ModelOutput, ModelOutputWithAux]:
+        """Enhanced forward pass with improved validation and error handling."""
+        if position < 0:
+            raise ValueError("position must be non-negative")
+            
+        start_time = time.time()
+        batch_size, seq_len = idx.size()
+        
+        # Validate and adjust mask
+        if mask is not None:
+            mask = self._validate_and_adjust_mask(mask, batch_size, seq_len)
+            
+        # Validate sequence length
+        if seq_len > self.config.block_size:
+            raise ValueError(f"Input sequence length {seq_len} exceeds maximum block size {self.config.block_size}")
+            
+        # Process embeddings
         x = self.wte(idx)
-
+        x = self.drop(x)
+        
+        self._debug_log("embeddings", x)
+        
         # Forward through transformer blocks
-        for block in self.blocks:
-            x = block(x, mask=mask, kv_cache=self.kv_cache, position=position)
-
-        # Final layer norm
+        aux_losses = {}
+        for i, block in enumerate(self.blocks):
+            x = self._process_block(block, x, mask, position, return_router_logits, i)
+            
+        # Final processing
         x = self.ln_f(x)
-
-        # Get logits from both heads
-        primary_logits = F.linear(x, self.wte.weight)  # Weight tying for primary
-        second_logits = self.second_head(x)
-
-        # Calculate losses if in training mode
-        primary_loss = None
-        second_loss = None
+        x = self.drop(x)
+        
+        # Compute logits and losses
+        primary_logits, second_logits = self._compute_logits(x)
+        primary_loss, second_loss = self._compute_losses(
+            primary_logits, second_logits, idx, target_second
+        )
+        
+        # Update performance stats
         if self.training:
-            primary_loss = F.cross_entropy(
-                primary_logits.view(-1, primary_logits.size(-1)), idx.view(-1)
-            )
-            if target_second is not None:
-                second_loss = F.cross_entropy(
-                    second_logits.view(-1, second_logits.size(-1)),
-                    target_second.view(-1),
-                )
-                # Apply auxiliary loss weight
-                second_loss *= self.config.aux_head_weight
-
+            self._update_perf_stats(start_time)
+            
+        if return_router_logits:
+            return primary_logits, second_logits, primary_loss, second_loss, aux_losses
         return primary_logits, second_logits, primary_loss, second_loss
 
-    def get_num_params(self, non_embedding: bool = True) -> int:
-        """Return the number of parameters in the model."""
-        n_params = super().get_num_params(non_embedding)
-        n_params += self.second_head.weight.numel()
-        if self.second_head.bias is not None:
-            n_params += self.second_head.bias.numel()
-        return n_params
-
-    @torch.no_grad()
     def generate(
         self,
         idx: torch.Tensor,
@@ -1980,61 +2069,231 @@ class DualHeadGPT(GPT):
         temperature: float = 1.0,
         top_k: Optional[int] = None,
         eos_token_id: Optional[int] = None,
-        target_head: str = "primary",  # 'primary' or 'second'
+        target_head: str = "primary",
     ) -> torch.Tensor:
-        """
-        Generate tokens autoregressively from either head.
-
-        Args:
-            idx: Context token indices [batch_size, sequence_length]
-            max_new_tokens: Number of tokens to generate
-            temperature: Sampling temperature
-            top_k: Number of top tokens to sample from
-            eos_token_id: Token ID for end of sequence
-            target_head: Which head to use for generation ('primary' or 'second')
-
-        Returns:
-            torch.Tensor: Generated token indices
-        """
+        """Generate tokens with improved parameter validation and efficiency."""
+        if temperature <= 0:
+            raise ValueError("Temperature must be positive")
+        if top_k is not None and top_k <= 0:
+            raise ValueError("top_k must be positive")
+        if target_head not in {"primary", "second"}:
+            raise ValueError('target_head must be "primary" or "second"')
+            
         self.eval()
-
-        # Clear KV cache if using it
-        if self.kv_cache is not None:
+        
+        # Clear KV cache only if it exists and isn't empty
+        if self.kv_cache and len(self.kv_cache) > 0:
             self.kv_cache.clear()
-
+            
+        vocab_size = (
+            self.config.vocab_size 
+            if target_head == "primary" 
+            else self.config.second_vocab_size
+        )
+        
+        if top_k is not None:
+            top_k = min(top_k, vocab_size)
+            
         for _ in range(max_new_tokens):
             # Crop context if needed
             idx_cond = (
                 idx
                 if idx.size(1) <= self.config.block_size
-                else idx[:, -self.config.block_size :]
+                else idx[:, -self.config.block_size:]
             )
-
+            
             # Forward pass
-            primary_logits, second_logits, _, _ = self(idx_cond, position=idx.size(1))
-
-            # Select appropriate logits
-            logits = primary_logits if target_head == "primary" else second_logits
-            logits = logits[:, -1, :]  # Take last timestep
-
-            # Apply temperature
-            if temperature != 1.0:
-                logits = logits / temperature
-
-            # Apply top-k if specified
-            if top_k is not None:
-                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                logits[logits < v[:, [-1]]] = -float("Inf")
-
-            # Apply softmax and sample
-            probs = F.softmax(logits, dim=-1)
-            idx_next = torch.multinomial(probs, num_samples=1)
-
-            # Append to sequence
+            logits = self._get_next_token_logits(idx_cond, target_head)
+            
+            # Apply temperature and sampling
+            logits = self._apply_sampling_params(logits, temperature, top_k)
+            idx_next = torch.multinomial(F.softmax(logits, dim=-1), num_samples=1)
+            
+            # Append and check for EOS
             idx = torch.cat((idx, idx_next), dim=1)
-
-            # Check for EOS token
             if eos_token_id is not None and (idx_next == eos_token_id).any():
                 break
-
+                
         return idx
+
+    def _validate_and_adjust_mask(
+        self, mask: torch.Tensor, batch_size: int, seq_len: int
+    ) -> torch.Tensor:
+        """Validate and adjust attention mask dimensions."""
+        expected_shape = (batch_size, 1, seq_len, seq_len)
+        
+        if mask.shape != expected_shape:
+            if len(mask.shape) == 2:
+                mask = mask.unsqueeze(1).unsqueeze(2)
+            elif len(mask.shape) == 3:
+                mask = mask.unsqueeze(1)
+                
+            if mask.shape != expected_shape:
+                raise ValueError(
+                    f"Mask shape {mask.shape} cannot be adjusted to expected shape {expected_shape}"
+                )
+                
+        return mask
+
+    def _process_block(
+        self,
+        block: nn.Module,
+        x: torch.Tensor,
+        mask: Optional[torch.Tensor],
+        position: int,
+        return_router_logits: bool,
+        block_idx: int,
+    ) -> torch.Tensor:
+        """Process a single transformer block with optional checkpointing."""
+        should_checkpoint = (
+            self.gradient_checkpointing
+            and self.training
+            and block_idx % max(1, int(len(self.blocks) * self.checkpoint_ratio)) == 0
+        )
+        
+        if should_checkpoint:
+            x = self._forward_block_with_checkpoint(
+                block, x, mask, position, return_router_logits
+            )
+        else:
+            x = self._forward_block(block, x, mask, position, return_router_logits)
+            
+        self._debug_log(f"block_{block_idx}", x)
+        return x
+
+    def _compute_losses(
+        self,
+        primary_logits: torch.Tensor,
+        second_logits: torch.Tensor,
+        idx: torch.Tensor,
+        target_second: Optional[torch.Tensor],
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """Compute losses for both heads with proper scaling."""
+        if not self.training:
+            return None, None
+            
+        primary_loss = (
+            self._compute_loss(primary_logits, idx)
+            if idx is not None
+            else None
+        )
+        
+        second_loss = (
+            self._compute_loss(second_logits, target_second) * self.config.aux_head_weight
+            if target_second is not None
+            else None
+        )
+        
+        return primary_loss, second_loss
+
+    def _compute_loss(
+        self, logits: torch.Tensor, targets: torch.Tensor
+    ) -> torch.Tensor:
+        """Compute cross entropy loss with improved numerical stability."""
+        if logits.shape[:-1] != targets.shape:
+            raise ValueError(
+                f"Logits shape {logits.shape} incompatible with targets shape {targets.shape}"
+            )
+            
+        with torch.cuda.amp.autocast(enabled=False):
+            loss = F.cross_entropy(
+                logits.float().view(-1, logits.size(-1)),
+                targets.view(-1),
+                ignore_index=-100,
+            )
+            
+            scaled_loss = self._scale_loss(loss)
+            return scaled_loss
+
+    def _scale_loss(self, loss: torch.Tensor) -> torch.Tensor:
+        """Scale loss with bounds to prevent numerical instability."""
+        if loss.item() > self.max_loss_value:
+            self.loss_scale_factor = max(
+                self.min_loss_scale,
+                self.loss_scale_factor * self.loss_scale_decay
+            )
+            return loss * self.loss_scale_factor
+        return loss
+
+    def _get_next_token_logits(
+        self, idx: torch.Tensor, target_head: str
+    ) -> torch.Tensor:
+        """Get logits for next token generation."""
+        primary_logits, second_logits, _, _ = self(idx, position=idx.size(1))
+        logits = primary_logits if target_head == "primary" else second_logits
+        return logits[:, -1, :]
+
+    def _apply_sampling_params(
+        self,
+        logits: torch.Tensor,
+        temperature: float,
+        top_k: Optional[int],
+    ) -> torch.Tensor:
+        """Apply temperature and top-k sampling to logits."""
+        if temperature != 1.0:
+            logits = logits / temperature
+            
+        if top_k is not None:
+            v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+            logits[logits < v[:, [-1]]] = float('-inf')
+            
+        return logits
+
+    def _debug_log(self, stage: str, x: torch.Tensor) -> None:
+        """Log debug information when debug mode is enabled."""
+        if not self.debug_mode:
+            return
+            
+        print(f"\nDebug Info - {stage}:")
+        print(f"Shape: {x.shape}")
+        print(f"Device: {x.device}")
+        print(
+            f"Stats: min={x.min().item():.3f}, max={x.max().item():.3f}, "
+            f"mean={x.mean().item():.3f}, std={x.std().item():.3f}"
+        )
+        has_nan = torch.isnan(x).any()
+        has_inf = torch.isinf(x).any()
+        if has_nan:
+            print("WARNING: NaN values detected!")
+        if has_inf:
+            print("WARNING: Inf values detected!")
+
+    def _update_perf_stats(self, start_time: float) -> None:
+        """Update performance statistics with time and memory usage."""
+        self.perf_stats["forward_time"].append(time.time() - start_time)
+        if torch.cuda.is_available():
+            self.perf_stats["memory_used"].append(torch.cuda.max_memory_allocated())
+
+    def get_performance_stats(self) -> Dict[str, float]:
+        """Get performance statistics with proper handling of empty stats."""
+        if not self.perf_stats["forward_time"]:
+            return {}
+            
+        stats = {}
+        for key, values in self.perf_stats.items():
+            if values:
+                stats[f"avg_{key}"] = sum(values) / len(values)
+                stats[f"max_{key}"] = max(values)
+                
+        return stats
+
+    def reset_performance_stats(self) -> None:
+        """Reset performance statistics."""
+        for key in self.perf_stats:
+            self.perf_stats[key].clear()
+
+    def get_num_params(self, non_embedding: bool = True) -> int:
+        """Get total number of parameters."""
+        n_params = sum(p.numel() for p in self.parameters())
+        if non_embedding:
+            n_params -= self.wte.weight.numel()
+        return n_params
+
+    def save_state(self, path: str) -> None:
+        """Save model state including performance statistics."""
+        state = {
+            'model_state': self.state_dict(),
+            'config': self.config,
+            'perf_stats': dict(self.perf_stats),
+        }
+        torch.save(state, path)

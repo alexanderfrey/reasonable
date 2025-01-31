@@ -14,6 +14,65 @@ from strategies import (
 )
 
 
+def select_dataset(files_pattern, block_size, tokenizer, main_strategy):
+    """Select appropriate dataset based on strategy"""
+    return TextDataset(
+        files_pattern=files_pattern,
+        block_size=block_size,
+        tokenizer=tokenizer,
+    )
+
+
+class TextDataset(Dataset):
+    """Basic dataset for next-token prediction"""
+
+    def __init__(self, files_pattern, block_size, tokenizer):
+        super().__init__()
+        self.block_size = block_size
+        self.tokenizer = tokenizer
+
+        # Load and tokenize texts
+        self.tokens = []
+        for file_path in glob(files_pattern):
+            with open(file_path, "r", encoding="utf-8") as f:
+                text = f.read()
+                self.tokens.extend(self.tokenizer.encode(text))
+
+    def __len__(self):
+        return len(self.tokens) - self.block_size
+
+    def __getitem__(self, idx):
+        chunk = self.tokens[idx : idx + self.block_size]
+        x = torch.tensor(chunk, dtype=torch.long)
+        # Create target by shifting input right by 1
+        y = torch.tensor(
+            self.tokens[idx + 1 : idx + self.block_size + 1], dtype=torch.long
+        )
+        return {"input_ids": x, "labels": y}
+
+
+def collate_default_batch(examples):
+    """Default collate function for next-token prediction"""
+    # Get max length in this batch
+    max_len = max(len(ex["input_ids"]) for ex in examples)
+
+    batch_size = len(examples)
+
+    # Initialize tensors
+    input_ids = torch.zeros((batch_size, max_len), dtype=torch.long)
+    labels = torch.full(
+        (batch_size, max_len), fill_value=-100, dtype=torch.long
+    )  # -100 is ignore_index for CrossEntropyLoss
+
+    # Fill in the tensors
+    for i, example in enumerate(examples):
+        seq_len = len(example["input_ids"])
+        input_ids[i, :seq_len] = example["input_ids"]
+        labels[i, :seq_len] = example["labels"]
+
+    return {"inputs": input_ids, "targets": labels}
+
+
 def create_dataloaders(
     files_pattern,
     block_size,
@@ -30,16 +89,13 @@ def create_dataloaders(
     if tokenizer is None:
         tokenizer = tiktoken.get_encoding("gpt2")
 
-    # Select appropriate dataset based on strategy
+    # Create dataset
     dataset = select_dataset(
         files_pattern=files_pattern,
         block_size=block_size,
         tokenizer=tokenizer,
         main_strategy=main_strategy,
     )
-
-    # Select appropriate collate function based on strategy
-    collate_fn = select_collate_function(main_strategy)
 
     # Create train/val splits
     generator = torch.Generator().manual_seed(42)
@@ -64,7 +120,7 @@ def create_dataloaders(
         val_dataset, num_replicas=world_size, rank=rank, shuffle=False, seed=42
     )
 
-    # Create dataloaders with selected collate function
+    # Create dataloaders
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
@@ -73,7 +129,7 @@ def create_dataloaders(
         pin_memory=True,
         prefetch_factor=prefetch_factor,
         persistent_workers=True,
-        collate_fn=lambda x: collate_fn(x),
+        collate_fn=collate_default_batch,
         drop_last=True,
         worker_init_fn=lambda worker_id: torch.manual_seed(42 + worker_id),
     )
@@ -86,40 +142,11 @@ def create_dataloaders(
         pin_memory=True,
         prefetch_factor=prefetch_factor,
         persistent_workers=True,
-        collate_fn=lambda x: collate_fn(x),
+        collate_fn=collate_default_batch,
         worker_init_fn=lambda worker_id: torch.manual_seed(42 + worker_id),
     )
 
     return train_loader, val_loader, train_sampler, val_sampler
-
-
-def select_dataset(files_pattern, block_size, tokenizer, main_strategy):
-    """Select appropriate dataset based on strategy"""
-
-    if isinstance(main_strategy, NextTokenStrategy):
-        return TextDataset(
-            files_pattern=files_pattern,
-            block_size=block_size,
-            tokenizer=tokenizer,
-        )
-    elif isinstance(main_strategy, SpanMaskingStrategy):
-        return MaskingDataset(
-            files_pattern=files_pattern,
-            block_size=block_size,
-            tokenizer=tokenizer,
-            main_strategy=main_strategy,
-        )
-    elif isinstance(main_strategy, InstructionFollowingStrategy):
-        return InstructionDataset(
-            files_pattern=files_pattern,
-            block_size=block_size,
-            tokenizer=main_strategy.tokenizer,
-            main_strategy=main_strategy,
-        )
-    else:
-        return TextDataset(
-            files_pattern=files_pattern, block_size=block_size, tokenizer=tokenizer
-        )
 
 
 def select_collate_function(main_strategy):
@@ -131,39 +158,6 @@ def select_collate_function(main_strategy):
         return collate_masking_batch
     else:
         return collate_default_batch
-
-
-def collate_default_batch(examples):
-    """Default collate function with proper padding and length handling"""
-
-    # Get max length for sequences in this batch
-    x_lengths = [len(ex["x"]) for ex in examples]
-    y_lengths = [len(ex["y"]) for ex in examples]
-    max_len = max(max(x_lengths), max(y_lengths))
-
-    # Pad and stack sequences
-    def pad_and_stack(key):
-        sequences = [ex[key] for ex in examples]
-        padded_seqs = []
-
-        for seq in sequences:
-            if len(seq) < max_len:
-                # Pad with zeros
-                padding = [0] * (max_len - len(seq))
-                padded_seq = np.concatenate([seq, padding])
-            else:
-                padded_seq = seq[:max_len]
-            padded_seqs.append(padded_seq)
-
-        return torch.tensor(padded_seqs)
-
-    x = pad_and_stack("x")
-    y = pad_and_stack("y")
-
-    return {
-        "inputs": x,
-        "targets": y,
-    }
 
 
 def collate_masking_batch(examples, main_strategy, tokenizer):
@@ -204,21 +198,6 @@ def collate_instruction_batch(examples, main_strategy):
     }
 
 
-def collate_default_batch(examples):
-    """Default collate function for next-token prediction"""
-    tokens = [ex["tokens"].clone().detach() for ex in examples]
-    padded = torch.nn.utils.rnn.pad_sequence(tokens, batch_first=True, padding_value=0)
-
-    targets = padded.clone()
-    targets = torch.roll(targets, shifts=-1, dims=1)
-    targets[:, -1] = -100
-
-    return {
-        "inputs": padded,
-        "targets": targets,
-    }
-
-
 def get_data_info(files_pattern):
     """Get information about the dataset for logging purposes"""
     dataset = TextDataset(
@@ -240,31 +219,6 @@ def get_data_info(files_pattern):
     }
 
     return info
-
-
-class TextDataset(Dataset):
-    """Basic dataset for next-token prediction"""
-
-    def __init__(self, files_pattern, block_size, tokenizer):
-        super().__init__()
-        self.block_size = block_size
-        self.tokenizer = tokenizer
-
-        # Load and tokenize texts
-        self.tokens = []
-        for file_path in glob(files_pattern):
-            with open(file_path, "r", encoding="utf-8") as f:
-                text = f.read()
-                self.tokens.extend(self.tokenizer.encode(text))
-
-    def __len__(self):
-        return len(self.tokens) - self.block_size
-
-    def __getitem__(self, idx):
-        chunk = self.tokens[idx : idx + self.block_size + 1]
-        x = torch.tensor(chunk[:-1])
-        y = torch.tensor(chunk[1:])
-        return {"tokens": x, "targets": y}
 
 
 class InstructionDataset(Dataset):
