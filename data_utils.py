@@ -12,34 +12,103 @@ from strategies import (
     NextTokenStrategy,
     MixedStrategy,
 )
+from typing import Dict, List, Optional, Tuple
+
+
+class MultiHeadDataset(Dataset):
+    """Dataset that supports multiple heads with different strategies"""
+
+    def __init__(
+        self,
+        files_pattern: str,
+        block_size: int,
+        tokenizer,
+        strategies: Dict[str, "ModelingStrategy"],
+        is_instruction_data: bool = False,
+    ):
+        super().__init__()
+        self.block_size = block_size
+        self.tokenizer = tokenizer
+        self.strategies = strategies
+        self.is_instruction_data = is_instruction_data
+
+        if is_instruction_data:
+            self.load_instruction_data(files_pattern)
+        else:
+            self.load_text_data(files_pattern)
+
+    def load_text_data(self, files_pattern: str):
+        """Load and tokenize plain text data"""
+        self.tokens = []
+        for file_path in glob(files_pattern):
+            with open(file_path, "r", encoding="utf-8") as f:
+                text = f.read()
+                self.tokens.extend(self.tokenizer.encode(text))
+
+    def load_instruction_data(self, files_pattern: str):
+        """Load instruction-response pairs from JSONL files"""
+        self.examples = []
+        for file_path in glob(files_pattern):
+            with open(file_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    example = json.loads(line.strip())
+                    if isinstance(example, dict):
+                        self.examples.append(example)
+
+    def __len__(self):
+        if self.is_instruction_data:
+            return len(self.examples)
+        return len(self.tokens) - self.block_size
+
+    def __getitem__(self, idx):
+        if self.is_instruction_data:
+            return self.get_instruction_item(idx)
+        return self.get_text_item(idx)
+
+    def get_text_item(self, idx):
+        """Get item for plain text data"""
+        chunk = self.tokens[idx : idx + self.block_size + 1]
+        x = torch.tensor(chunk[:-1])
+        y = torch.tensor(chunk[1:])
+
+        # Create data for each head using their respective strategies
+        return {"tokens": x, "targets": {name: y for name in self.strategies.keys()}}
+
+    def get_instruction_item(self, idx):
+        """Get item for instruction data"""
+        example = self.examples[idx]
+        # Each strategy might process the instruction differently
+        return {
+            "instruction": example,
+            "targets": {name: example for name in self.strategies.keys()},
+        }
 
 
 def create_dataloaders(
-    files_pattern,
-    block_size,
-    batch_size,
-    rank,
-    world_size,
-    num_workers=4,
-    prefetch_factor=2,
-    main_strategy=None,
+    files_pattern: str,
+    block_size: int,
+    batch_size: int,
+    rank: Optional[int],
+    world_size: Optional[int],
+    strategies: Dict[str, "ModelingStrategy"],
     tokenizer=None,
+    num_workers: int = 4,
+    prefetch_factor: int = 2,
+    is_instruction_data: bool = False,
 ):
-    """Create distributed dataloaders for main path data processing"""
+    """Create distributed dataloaders for multi-head processing"""
 
     if tokenizer is None:
         tokenizer = tiktoken.get_encoding("gpt2")
 
-    # Select appropriate dataset based on strategy
-    dataset = select_dataset(
+    # Create dataset with all strategies
+    dataset = MultiHeadDataset(
         files_pattern=files_pattern,
         block_size=block_size,
         tokenizer=tokenizer,
-        main_strategy=main_strategy,
+        strategies=strategies,
+        is_instruction_data=is_instruction_data,
     )
-
-    # Select appropriate collate function based on strategy
-    collate_fn = select_collate_function(main_strategy)
 
     # Create train/val splits
     generator = torch.Generator().manual_seed(42)
@@ -50,30 +119,42 @@ def create_dataloaders(
         dataset, [train_size, val_size], generator=generator
     )
 
-    # Create distributed samplers
-    train_sampler = DistributedSampler(
-        train_dataset,
-        num_replicas=world_size,
-        rank=rank,
-        shuffle=True,
-        drop_last=True,
-        seed=42,
-    )
+    # Create distributed samplers if needed
+    train_sampler = val_sampler = None
+    if world_size is not None and world_size > 1:
+        train_sampler = DistributedSampler(
+            train_dataset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=True,
+            drop_last=True,
+            seed=42,
+        )
+        val_sampler = DistributedSampler(
+            val_dataset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=False,
+            seed=42,
+        )
 
-    val_sampler = DistributedSampler(
-        val_dataset, num_replicas=world_size, rank=rank, shuffle=False, seed=42
-    )
+    # Create collate function that handles all strategies
+    def collate_multi_head(examples: List[Dict]) -> Dict:
+        if is_instruction_data:
+            return collate_instruction_batch(examples, strategies)
+        return collate_text_batch(examples, strategies)
 
-    # Create dataloaders with selected collate function
+    # Create dataloaders
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
         sampler=train_sampler,
+        shuffle=train_sampler is None,
         num_workers=num_workers,
         pin_memory=True,
         prefetch_factor=prefetch_factor,
         persistent_workers=True,
-        collate_fn=lambda x: collate_fn(x),
+        collate_fn=collate_multi_head,
         drop_last=True,
         worker_init_fn=lambda worker_id: torch.manual_seed(42 + worker_id),
     )
@@ -82,214 +163,74 @@ def create_dataloaders(
         val_dataset,
         batch_size=batch_size,
         sampler=val_sampler,
+        shuffle=False,
         num_workers=num_workers,
         pin_memory=True,
         prefetch_factor=prefetch_factor,
         persistent_workers=True,
-        collate_fn=lambda x: collate_fn(x),
+        collate_fn=collate_multi_head,
         worker_init_fn=lambda worker_id: torch.manual_seed(42 + worker_id),
     )
 
     return train_loader, val_loader, train_sampler, val_sampler
 
 
-def select_dataset(files_pattern, block_size, tokenizer, main_strategy):
-    """Select appropriate dataset based on strategy"""
-
-    if isinstance(main_strategy, NextTokenStrategy):
-        return TextDataset(
-            files_pattern=files_pattern,
-            block_size=block_size,
-            tokenizer=tokenizer,
-        )
-    elif isinstance(main_strategy, SpanMaskingStrategy):
-        return MaskingDataset(
-            files_pattern=files_pattern,
-            block_size=block_size,
-            tokenizer=tokenizer,
-            main_strategy=main_strategy,
-        )
-    elif isinstance(main_strategy, InstructionFollowingStrategy):
-        return InstructionDataset(
-            files_pattern=files_pattern,
-            block_size=block_size,
-            tokenizer=main_strategy.tokenizer,
-            main_strategy=main_strategy,
-        )
-    else:
-        return TextDataset(
-            files_pattern=files_pattern, block_size=block_size, tokenizer=tokenizer
-        )
-
-
-def select_collate_function(main_strategy):
-    """Select appropriate collate function based on strategy"""
-
-    if isinstance(main_strategy, InstructionFollowingStrategy):
-        return collate_instruction_batch
-    elif isinstance(main_strategy, SpanMaskingStrategy):
-        return collate_masking_batch
-    else:
-        return collate_default_batch
-
-
-def collate_default_batch(examples):
-    """Default collate function with proper padding and length handling"""
-
-    # Get max length for sequences in this batch
-    x_lengths = [len(ex["x"]) for ex in examples]
-    y_lengths = [len(ex["y"]) for ex in examples]
-    max_len = max(max(x_lengths), max(y_lengths))
-
-    # Pad and stack sequences
-    def pad_and_stack(key):
-        sequences = [ex[key] for ex in examples]
-        padded_seqs = []
-
-        for seq in sequences:
-            if len(seq) < max_len:
-                # Pad with zeros
-                padding = [0] * (max_len - len(seq))
-                padded_seq = np.concatenate([seq, padding])
-            else:
-                padded_seq = seq[:max_len]
-            padded_seqs.append(padded_seq)
-
-        return torch.tensor(padded_seqs)
-
-    x = pad_and_stack("x")
-    y = pad_and_stack("y")
-
-    return {
-        "inputs": x,
-        "targets": y,
-    }
-
-
-def collate_masking_batch(examples, main_strategy, tokenizer):
-    """Collate function for span masking strategies"""
-    # Get tokens from examples
-    tokens = torch.stack([ex["tokens"] for ex in examples])
-
-    # Apply masking strategy
-    inputs, targets = main_strategy.prepare_masked_input(tokens)
-
-    return {
-        "inputs": inputs,
-        "targets": targets,
-    }
-
-
-def collate_instruction_batch(examples, main_strategy):
-    """Collate function for instruction-following strategies"""
-    # Format instructions
-    texts = [main_strategy.format_prompt(ex["instruction"]) for ex in examples]
-
-    # Tokenize
-    tokens = [main_strategy.tokenizer.encode(text) for text in texts]
-
-    # Pad sequences
-    inputs = torch.nn.utils.rnn.pad_sequence(
-        [torch.tensor(t) for t in tokens], batch_first=True, padding_value=0
-    )
-
-    # Create targets (shifted inputs)
-    targets = inputs.clone()
-    targets = torch.roll(targets, shifts=-1, dims=1)
-    targets[:, -1] = -100  # Mask last token
-
-    return {
-        "inputs": inputs,
-        "targets": targets,
-    }
-
-
-def collate_default_batch(examples):
-    """Default collate function for next-token prediction"""
-    tokens = [ex["tokens"].clone().detach() for ex in examples]
+def collate_text_batch(
+    examples: List[Dict], strategies: Dict[str, "ModelingStrategy"]
+) -> Dict:
+    """Collate function for text data that handles all heads"""
+    # Get and pad token sequences
+    tokens = [ex["tokens"] for ex in examples]
     padded = torch.nn.utils.rnn.pad_sequence(tokens, batch_first=True, padding_value=0)
 
-    targets = padded.clone()
-    targets = torch.roll(targets, shifts=-1, dims=1)
-    targets[:, -1] = -100
+    # Create targets dictionary for each head
+    targets = {}
+    for name, strategy in strategies.items():
+        head_targets = torch.nn.utils.rnn.pad_sequence(
+            [ex["targets"][name] for ex in examples],
+            batch_first=True,
+            padding_value=-100,
+        )
+        targets[name] = (
+            strategy.prepare_targets(head_targets)
+            if hasattr(strategy, "prepare_targets")
+            else head_targets
+        )
 
-    return {
-        "inputs": padded,
-        "targets": targets,
-    }
-
-
-def get_data_info(files_pattern):
-    """Get information about the dataset for logging purposes"""
-    dataset = TextDataset(
-        files_pattern, block_size=1024, tokenizer=None
-    )  # block_size doesn't matter here
-
-    # Analyze a sample of examples
-    sample_size = min(1000, len(dataset))
-    input_lengths = []
-
-    for idx in range(sample_size):
-        example = dataset[idx]
-        input_lengths.append(len(example["tokens"]))
-
-    info = {
-        "total_examples": len(dataset),
-        "avg_input_length": sum(input_lengths) / len(input_lengths),
-        "max_input_length": max(input_lengths),
-    }
-
-    return info
+    return {"inputs": padded, "targets": targets}
 
 
-class TextDataset(Dataset):
-    """Basic dataset for next-token prediction"""
+def collate_instruction_batch(
+    examples: List[Dict], strategies: Dict[str, "ModelingStrategy"]
+) -> Dict:
+    """Collate function for instruction data that handles all heads"""
+    # Process inputs and targets for each head according to its strategy
+    head_inputs = {}
+    head_targets = {}
 
-    def __init__(self, files_pattern, block_size, tokenizer):
-        super().__init__()
-        self.block_size = block_size
-        self.tokenizer = tokenizer
+    for name, strategy in strategies.items():
+        if hasattr(strategy, "prepare_instruction_batch"):
+            inputs, targets = strategy.prepare_instruction_batch(
+                [ex["instruction"] for ex in examples]
+            )
+            head_inputs[name] = inputs
+            head_targets[name] = targets
+        else:
+            # Fallback to default processing if strategy doesn't implement custom handling
+            texts = [strategy.format_prompt(ex["instruction"]) for ex in examples]
+            tokens = [strategy.tokenizer.encode(text) for text in texts]
 
-        # Load and tokenize texts
-        self.tokens = []
-        for file_path in glob(files_pattern):
-            with open(file_path, "r", encoding="utf-8") as f:
-                text = f.read()
-                self.tokens.extend(self.tokenizer.encode(text))
+            inputs = torch.nn.utils.rnn.pad_sequence(
+                [torch.tensor(t) for t in tokens], batch_first=True, padding_value=0
+            )
 
-    def __len__(self):
-        return len(self.tokens) - self.block_size
+            targets = torch.roll(inputs.clone(), shifts=-1, dims=1)
+            targets[:, -1] = -100
 
-    def __getitem__(self, idx):
-        chunk = self.tokens[idx : idx + self.block_size + 1]
-        x = torch.tensor(chunk[:-1])
-        y = torch.tensor(chunk[1:])
-        return {"tokens": x, "targets": y}
+            head_inputs[name] = inputs
+            head_targets[name] = targets
 
-
-class InstructionDataset(Dataset):
-    """Dataset for instruction-following strategies"""
-
-    def __init__(self, files_pattern, block_size, tokenizer, main_strategy):
-        super().__init__()
-        self.block_size = block_size
-        self.tokenizer = tokenizer
-        self.main_strategy = main_strategy
-
-        # Load instruction-response pairs from JSONL files
-        self.examples = []
-        for file_path in glob(files_pattern):
-            with open(file_path, "r", encoding="utf-8") as f:
-                for line in f:
-                    example = json.loads(line.strip())
-                    if isinstance(example, dict):
-                        self.examples.append(example)
-
-    def __len__(self):
-        return len(self.examples)
-
-    def __getitem__(self, idx):
-        return self.examples[idx]
+    return {"inputs": head_inputs, "targets": head_targets}
 
 
 class MaskingDataset(Dataset):

@@ -4,49 +4,125 @@ import os
 from glob import glob
 import bitsandbytes as bnb
 import torch
-from torch.utils.data import Dataset, DataLoader
-from model import GPT, GPTConfig
 import torch.nn.functional as F
 from torch.cuda.amp import autocast, GradScaler
 from torch.optim.lr_scheduler import CosineAnnealingLR
-import wandb  # for logging
-from tqdm.auto import tqdm
-import math
+import wandb
 from pathlib import Path
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data.distributed import DistributedSampler
+from transformers import get_linear_schedule_with_warmup
+from model import GPTConfig, GPT, HeadConfig, MultiHeadGPT
+from strategies import (
+    SpanMaskingStrategy,
+    InstructionFollowingStrategy,
+    NextTokenStrategy,
+    MixedStrategy,
+)
+from trainer import MultiHeadTrainer
+from data_utils import create_dataloaders
+
+
+def load_checkpoint(
+    path, model, optimizer=None, scheduler=None, scaler=None, device="cuda"
+):
+    """Modified to handle pretrain -> finetune transition"""
+    try:
+        checkpoint = torch.load(path, map_location="cpu")
+
+        # Load only model weights, skip optimizer state when transitioning
+        if dist.is_initialized():
+            model_to_load = model.module if hasattr(model, "module") else model
+        else:
+            model_to_load = model
+
+        # Load model state dict
+        model_to_load.load_state_dict(checkpoint["model_state_dict"])
+
+        # Don't load optimizer state when transitioning between modes
+        if optimizer is not None and "optimizer_state_dict" in checkpoint:
+
+            try:
+                optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+                if device != "cpu":
+                    for state in optimizer.state.values():
+                        for k, v in state.items():
+                            if isinstance(v, torch.Tensor):
+                                state[k] = v.to(device)
+            except ValueError as e:
+                print(f"Warning: Could not load optimizer state: {e}")
+                print("Starting with fresh optimizer state")
+
+        # Set model to training mode
+        model.train()
+
+        return {
+            "epoch": checkpoint["epoch"],
+            "step": checkpoint["step"],
+            "train_metrics": checkpoint.get("train_metrics", {}),
+            "val_metrics": checkpoint.get("val_metrics", {}),
+            "config": checkpoint.get("config", {}),
+        }
+
+    except Exception as e:
+        print(f"Error loading checkpoint: {str(e)}")
+        raise
 
 
 def count_parameters(model):
     """
-    Count the number of trainable parameters in the model.
+    Count the number of trainable parameters in the multi-head model.
     Returns total params and a breakdown of parameters by component.
     """
+    # Get the unwrapped model if using DDP
+    model = model.module if hasattr(model, "module") else model
+
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
 
     # Count embedding parameters
     token_emb_params = model.token_embedding.weight.numel()
     pos_emb_params = model.position_embedding.weight.numel()
+    total_emb_params = token_emb_params + pos_emb_params
 
-    # Count parameters per layer
+    # Count parameters per transformer block
     layer_params = sum(
         p.numel() for p in model.blocks[0].parameters() if p.requires_grad
     )
     total_layer_params = layer_params * len(model.blocks)
 
-    # Count final layer norm and head parameters
-    final_ln_params = sum(p.numel() for p in model.ln_f.parameters() if p.requires_grad)
-    head_params = model.lm_head.weight.numel()
-    if model.config.bias:  # Add bias parameters if present
-        head_params += model.lm_head.bias.numel()
+    # Count layer norm parameters for each head
+    ln_params = {
+        name: sum(p.numel() for p in ln.parameters() if p.requires_grad)
+        for name, ln in model.ln_fs.items()
+    }
+    total_ln_params = sum(ln_params.values())
+
+    # Count head parameters for each head
+    head_params = {
+        name: sum(p.numel() for p in head.parameters() if p.requires_grad)
+        for name, head in model.lm_heads.items()
+    }
+    total_head_params = sum(head_params.values())
+
+    # Create detailed breakdown by pathway
+    pathway_breakdown = {
+        name: {"layer_norm": ln_params[name], "head": head_params[name]}
+        for name in model.lm_heads.keys()
+    }
 
     return {
         "total": total_params,
-        "embeddings": token_emb_params + pos_emb_params,
+        "embeddings": {
+            "total": total_emb_params,
+            "token": token_emb_params,
+            "position": pos_emb_params,
+        },
         "transformer_layers": total_layer_params,
-        "final_ln": final_ln_params,
-        "head": head_params,
+        "layer_norms": total_ln_params,
+        "heads": total_head_params,
+        "pathways": pathway_breakdown,
+        # Add parameters per million for easy reference
+        "total_params_M": total_params / 1_000_000,
     }
 
 
@@ -66,179 +142,63 @@ def setup_distributed():
     return rank, world_size, local_rank
 
 
-def create_distributed_dataloaders(
-    files_pattern,
-    block_size,
-    batch_size,
-    rank,
-    world_size,
-    num_workers=4,
-    prefetch_factor=2,
-    encoding_name="gpt2",
-):
-    """Create distributed training and validation dataloaders with optimized settings"""
-    dataset = TextDataset(files_pattern, block_size, encoding_name)
-
-    # Split into train/val
-    train_size = int(0.9 * len(dataset))
-    val_size = len(dataset) - train_size
-    train_dataset, val_dataset = torch.utils.data.random_split(
-        dataset, [train_size, val_size]
-    )
-
-    # Create distributed samplers
-    train_sampler = DistributedSampler(
-        train_dataset,
-        num_replicas=world_size,
-        rank=rank,
-        shuffle=True,
-        drop_last=True,  # Drop last incomplete batch for better GPU utilization
-    )
-
-    val_sampler = DistributedSampler(
-        val_dataset, num_replicas=world_size, rank=rank, shuffle=False
-    )
-
-    # Create dataloaders with optimized settings
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        sampler=train_sampler,
-        num_workers=num_workers,  # Adjust based on CPU cores available
-        pin_memory=True,
-        prefetch_factor=prefetch_factor,  # Prefetch 2 batches per worker
-        persistent_workers=True,  # Keep workers alive between epochs
-        drop_last=True,  # Drop last incomplete batch
-    )
-
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=batch_size,
-        sampler=val_sampler,
-        num_workers=num_workers,
-        pin_memory=True,
-        prefetch_factor=prefetch_factor,
-        persistent_workers=True,
-    )
-
-    return train_loader, val_loader, train_sampler, val_sampler
+def get_vocab_size(encoding_name="gpt2"):
+    tokenizer = tiktoken.get_encoding(encoding_name)
+    return tokenizer.n_vocab
 
 
-def generate_text(
-    model,
-    tokenizer,
-    prompt,
-    max_new_tokens=100,
-    temperature=0.8,
-    top_k=40,
-    device="cuda",
-):
-    """Generate text using the model.
-
-    Args:
-        model: The GPT model
-        tokenizer: The tiktoken tokenizer
-        prompt: String prompt to start generation
-        max_new_tokens: Maximum number of tokens to generate
-        temperature: Sampling temperature (higher = more random)
-        top_k: Number of top tokens to consider for sampling
-        device: Device to run generation on
-
-    Returns:
-        Generated text as string
-    """
-    model.eval()
-    # Encode the prompt
-    prompt_tokens = tokenizer.encode(prompt)
-    x = torch.tensor(prompt_tokens, dtype=torch.long)[None, ...].to(device)
-
-    # Generate tokens
-    for _ in range(max_new_tokens):
-        # Get model predictions
-        with torch.no_grad():
-            with torch.amp.autocast("cuda"):
-                logits = model(x)
-
-        # Focus on last time step
-        logits = logits[:, -1, :] / temperature
-
-        # Optional: top-k sampling
-        if top_k is not None:
-            v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-            logits[logits < v[:, [-1]]] = -float("Inf")
-
-        # Apply softmax to convert logits to probabilities
-        probs = F.softmax(logits, dim=-1)
-
-        # Sample from the distribution
-        next_token = torch.multinomial(probs, num_samples=1)
-
-        # Append sampled token to the sequence
-        x = torch.cat((x, next_token), dim=1)
-
-        # If we hit the EOT token, stop
-        if next_token.item() == tokenizer.eot_token:
-            break
-
-    # Decode the generated tokens
-    generated_tokens = x[0].tolist()
-    generated_text = tokenizer.decode(generated_tokens)
-
-    return generated_text
-
-
-def generate_samples_ddp(model, tokenizer, sample_prompts, device, rank):
-    """Generate samples in a DDP-safe way"""
-    # Store original training state
-    was_training = model.training
-
-    # Switch to eval mode
-    model.eval()
-
-    # Sync all processes
-    if dist.is_initialized():
-        dist.barrier()
-
-    samples = ""
-    if rank == 0:  # Only generate on rank 0
-        try:
-            # Use model.module if it exists (DDP), otherwise use model directly
-            generating_model = model.module if hasattr(model, "module") else model
-            samples = generate_samples(
-                generating_model, tokenizer, sample_prompts, device
-            )
-        except Exception as e:
-            print(f"Error generating samples: {str(e)}")
-
-    # Sync all processes again
-    if dist.is_initialized():
-        dist.barrier()
-
-    # Restore original training state
-    if was_training:
-        model.train()
-
-    return samples
-
-
-def generate_samples(model, tokenizer, prompts, device="cuda"):
-    """Generate samples from a list of prompts"""
-    samples = []
-    for prompt in prompts:
-        sample = generate_text(model, tokenizer, prompt, device=device)
-        samples.append(f"Prompt: {prompt}\nGenerated: {sample}\n")
-    return "\n".join(samples)
-
-
-# Add arguments for generation
 def get_args():
     parser = argparse.ArgumentParser()
-    # Original arguments
-    parser.add_argument("--lr", type=float, default=3e-4)
-    parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--batch_size", type=int, default=32)
-    parser.add_argument("--block_size", type=int, default=1024)
-    parser.add_argument("--train_data", type=str, default="./text_files/*.txt")
+
+    # Model architecture arguments
+    parser.add_argument(
+        "--n_layer", type=int, default=6, help="Number of transformer layers"
+    )
+    parser.add_argument(
+        "--n_head", type=int, default=6, help="Number of attention heads"
+    )
+    parser.add_argument("--n_embd", type=int, default=384, help="Embedding dimension")
+    parser.add_argument(
+        "--block_size", type=int, default=1024, help="Maximum sequence length"
+    )
+    parser.add_argument(
+        "--lateral_dim", type=int, default=192, help="Dimension of lateral connections"
+    )
+    parser.add_argument(
+        "--dropout", type=float, default=0.1, help="Dropout probability"
+    )
+
+    # Training arguments
+    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
+    parser.add_argument(
+        "--epochs", type=int, default=50, help="Number of training epochs"
+    )
+    parser.add_argument("--batch_size", type=int, default=16, help="Batch size per GPU")
+    parser.add_argument(
+        "--weight_decay", type=float, default=0.1, help="Weight decay coefficient"
+    )
+    parser.add_argument(
+        "--main_loss_weight",
+        type=float,
+        default=0.5,
+        help="Weight for main pathway loss (0-1). Analysis pathway weight will be 1 - this value",
+    )
+
+    # Data arguments
+    parser.add_argument(
+        "--train_data",
+        type=str,
+        default="./training_data/*.jsonl",
+        help="Path pattern to JSON files containing input-thought pairs",
+    )
+    parser.add_argument(
+        "--max_thought_length",
+        type=int,
+        default=256,
+        help="Maximum length for thought/analysis text",
+    )
+
+    # Generation arguments
     parser.add_argument(
         "--gen_every_n_steps",
         type=int,
@@ -252,8 +212,20 @@ def get_args():
         default=["Once upon a time", "In a galaxy far far away"],
         help="Prompts to use for generation during training",
     )
+    parser.add_argument(
+        "--top_p",
+        type=float,
+        default=0.9,
+        help="Top-p sampling parameter for text generation",
+    )
+    parser.add_argument(
+        "--max_gen_length",
+        type=int,
+        default=100,
+        help="Maximum length for generated continuations",
+    )
 
-    # New optimization-related arguments
+    # Optimization arguments
     parser.add_argument(
         "--gradient_accumulation_steps",
         type=int,
@@ -272,299 +244,56 @@ def get_args():
     parser.add_argument(
         "--opt_level", type=str, default="O2", help="AMP optimization level"
     )
-    return parser.parse_args()
 
-
-def train_one_epoch(
-    model,
-    train_loader,
-    train_sampler,
-    optimizer,
-    scheduler,
-    scaler,
-    device,
-    epoch,
-    tokenizer=None,
-    gen_every_n_steps=None,
-    sample_prompts=None,
-    rank=0,
-    gradient_accumulation_steps=1,
-):
-    model.train()
-    total_loss = 0
-    global_step = epoch * len(train_loader)
-
-    if train_sampler is not None:
-        train_sampler.set_epoch(epoch)
-
-    # Debug print at start of epoch
-    if rank == 0:
-        print(f"\nGeneration settings:")
-        print(f"Tokenizer present: {tokenizer is not None}")
-        print(f"gen_every_n_steps: {gen_every_n_steps}")
-        print(f"sample_prompts: {sample_prompts}")
-
-    optimizer.zero_grad()
-
-    progress_bar = tqdm(train_loader, desc=f"Epoch {epoch + 1}", disable=rank != 0)
-    for batch_idx, (x, y) in enumerate(progress_bar):
-        # Determine if this is an accumulation step
-        is_accumulation_step = (batch_idx + 1) % gradient_accumulation_steps != 0
-
-        # Move batch to device
-        x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
-
-        # Forward pass with autocast
-        with torch.amp.autocast("cuda", dtype=torch.float16):
-            logits = model(x)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1))
-            loss = loss / gradient_accumulation_steps
-
-        # Backward pass with gradient scaling
-        scaler.scale(loss).backward()
-
-        if not is_accumulation_step:
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-
-            scaler.step(optimizer)
-            scaler.update()
-            optimizer.zero_grad()
-
-            scheduler.step()
-
-        # Update metrics
-        total_loss += loss.item() * gradient_accumulation_steps
-
-        # Check for generation - note we moved it outside the rank check
-        should_generate = (
-            tokenizer is not None
-            and gen_every_n_steps is not None
-            and sample_prompts is not None
-            and global_step > 0
-            and global_step % gen_every_n_steps == 0
-        )
-
-        if should_generate:
-            samples = generate_samples_ddp(
-                model, tokenizer, sample_prompts, device, rank
-            )
-
-            # Only log on rank 0
-            if rank == 0:
-                print(f"\nGenerated samples at step {global_step}:")
-                print(samples)
-                wandb.log(
-                    {"generated_samples": wandb.Html(samples.replace("\n", "<br>"))}
-                )
-
-        if rank == 0 and not is_accumulation_step:
-            current_lr = scheduler.get_last_lr()[0]
-
-            # Update progress bar
-            progress_bar.set_postfix(
-                {
-                    "loss": f"{loss.item() * gradient_accumulation_steps:.4f}",
-                    "avg_loss": f"{total_loss / (batch_idx + 1):.4f}",
-                    "lr": f"{current_lr:.2e}",
-                    "step": global_step,
-                }
-            )
-
-            # Log to wandb
-            wandb.log(
-                {
-                    "train_loss": loss.item() * gradient_accumulation_steps,
-                    "learning_rate": current_lr,
-                    "grad_scale": scaler.get_scale(),
-                    "global_step": global_step,
-                }
-            )
-
-        global_step += 1
-
-    if dist.is_initialized():
-        dist.all_reduce(torch.tensor([total_loss]).to(device))
-        total_loss /= dist.get_world_size()
-
-    return total_loss / len(train_loader)
-
-
-@torch.no_grad()
-def evaluate(model, val_loader, val_sampler, device, rank=0):
-    model.eval()
-    total_loss = 0
-
-    # Set epoch for distributed sampler
-    if val_sampler is not None:
-        val_sampler.set_epoch(0)
-
-    for x, y in tqdm(val_loader, desc="Evaluating", disable=rank != 0):
-        x, y = x.to(device), y.to(device)
-        with torch.amp.autocast("cuda"):
-            logits = model(x)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1))
-        total_loss += loss.item()
-
-    # Gather loss from all processes
-    if dist.is_initialized():
-        dist.all_reduce(torch.tensor([total_loss]).to(device))
-        total_loss /= dist.get_world_size()
-
-    return total_loss / len(val_loader)
-
-
-def save_checkpoint(
-    model,
-    optimizer,
-    scheduler,
-    scaler,
-    epoch,
-    train_loss,
-    val_loss,
-    config,
-    path,
-    rank=0,
-):
-    """Save checkpoint only on rank 0"""
-    if rank == 0:
-        torch.save(
-            {
-                "epoch": epoch,
-                "model_state_dict": model.module.state_dict(),  # Save the inner model
-                "optimizer_state_dict": optimizer.state_dict(),
-                "scheduler_state_dict": scheduler.state_dict(),
-                "scaler_state_dict": scaler.state_dict(),
-                "train_loss": train_loss,
-                "val_loss": val_loss,
-                "config": config.__dict__,
-            },
-            path,
-        )
-        print(f"Saved checkpoint to {path}")
-
-
-class TextDataset(Dataset):
-    def __init__(self, files_pattern, block_size, encoding_name="gpt2"):
-        # Initialize tokenizer
-        self.tokenizer = tiktoken.get_encoding(encoding_name)
-        self.block_size = block_size
-
-        # Get all files matching the pattern
-        self.files = glob(files_pattern)
-        if not self.files:
-            raise ValueError(f"No files found matching pattern: {files_pattern}")
-
-        print(f"Found {len(self.files)} files")
-
-        # Read and tokenize all files
-        self.tokens = []
-        for file_path in self.files:
-            try:
-                with open(file_path, "r", encoding="utf-8") as f:
-                    text = f.read()
-                # Add tokens for this file
-                self.tokens.extend(self.tokenizer.encode(text))
-                # Add an end of text token between files
-                self.tokens.append(self.tokenizer.eot_token)
-            except Exception as e:
-                print(f"Warning: Could not process file {file_path}: {str(e)}")
-
-        print(f"Total tokens: {len(self.tokens)}")
-
-    def __len__(self):
-        return len(self.tokens) - self.block_size
-
-    def __getitem__(self, i):
-        # Get block_size tokens from position i
-        chunk = self.tokens[i : i + self.block_size + 1]  # +1 for the target
-
-        # Convert to torch tensors
-        x = torch.tensor(chunk[:-1], dtype=torch.long)
-        y = torch.tensor(chunk[1:], dtype=torch.long)
-
-        return x, y
-
-
-def create_dataloaders(files_pattern, block_size, batch_size, encoding_name="gpt2"):
-    """Create training and validation dataloaders from multiple files"""
-    dataset = TextDataset(files_pattern, block_size, encoding_name)
-
-    # Split into train/val
-    train_size = int(0.9 * len(dataset))
-    val_size = len(dataset) - train_size
-    train_dataset, val_dataset = torch.utils.data.random_split(
-        dataset, [train_size, val_size]
+    # Checkpoint arguments
+    parser.add_argument(
+        "--save_every_n_epochs",
+        type=int,
+        default=1,
+        help="Save checkpoint every N epochs",
+    )
+    parser.add_argument(
+        "--save_every_n_steps",
+        type=int,
+        default=None,
+        help="Save checkpoint every N steps (optional)",
+    )
+    parser.add_argument(
+        "--checkpoint_dir",
+        type=str,
+        default="checkpoints",
+        help="Directory to save checkpoints",
+    )
+    parser.add_argument(
+        "--load_checkpoint",
+        type=str,
+        default=None,
+        help="Path to checkpoint to load (optional)",
+    )
+    parser.add_argument(
+        "--pretrain",
+        action="store_true",
+        help="Enable pre-training mode where both pathways predict next tokens",
     )
 
-    # Create dataloaders
-    train_loader = DataLoader(
-        train_dataset, batch_size=batch_size, shuffle=True, num_workers=4
-    )
+    args = parser.parse_args()
 
-    val_loader = DataLoader(
-        val_dataset, batch_size=batch_size, shuffle=False, num_workers=4
-    )
+    # Validate arguments
+    if args.main_loss_weight < 0 or args.main_loss_weight > 1:
+        raise ValueError("main_loss_weight must be between 0 and 1")
 
-    return train_loader, val_loader
+    if args.lateral_dim > args.n_embd:
+        raise ValueError("lateral_dim cannot be larger than n_embd")
 
+    if args.max_thought_length > args.block_size:
+        raise ValueError("max_thought_length cannot be larger than block_size")
 
-# When creating your GPT model, use the tokenizer's vocab size
-def get_vocab_size(encoding_name="gpt2"):
-    tokenizer = tiktoken.get_encoding(encoding_name)
-    return tokenizer.n_vocab
+    return args
 
 
-def setup_instruction_finetuning(pretrained_path, config, device, rank=0):
-    """
-    Setup model for instruction fine-tuning from pretrained weights
-    """
-    # Load the pretrained checkpoint
-    checkpoint = torch.load(pretrained_path, map_location="cpu")
-
-    # Create model with same config as pretrained
-    pretrained_config = GPTConfig(**checkpoint["config"])
-    model = GPT(pretrained_config)
-
-    # Load pretrained weights
-    model.load_state_dict(checkpoint["model_state_dict"])
-    model = model.to(device)
-
-    if rank == 0:
-        print("\nLoaded pretrained model with config:")
-        for key, value in pretrained_config.__dict__.items():
-            print(f"{key}: {value}")
-
-    # Create optimizer with fine-tuning specific parameters
-    optimizer = bnb.optim.AdamW(
-        model.parameters(),
-        lr=2e-5,  # Lower learning rate for fine-tuning
-        weight_decay=0.1,
-        optim_bits=8,
-        block_wise=True,
-        is_paged=True,
-    )
-
-    # Create scheduler with shorter warmup and decay
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-        optimizer,
-        T_0=1000,  # Shorter cycle length for fine-tuning
-        T_mult=2,
-        eta_min=1e-6,
-    )
-
-    return model, optimizer, scheduler
-
-
-# Example usage:
 if __name__ == "__main__":
     args = get_args()
     torch.backends.cudnn.benchmark = True
-
-    # parser.add_argument("--pretrained_path", type=str, required=True,
-    #                    help="Path to pretrained model checkpoint")
-    # parser.add_argument("--instruction_data", type=str, required=True,
-    #                    help="Path to instruction dataset JSON files")
 
     # Setup distributed training
     rank, world_size, local_rank = setup_distributed()
@@ -574,20 +303,44 @@ if __name__ == "__main__":
     vocab_size = get_vocab_size("gpt2")
     tokenizer = tiktoken.get_encoding("gpt2")
 
-    # Create config
     config = GPTConfig(
-        vocab_size=vocab_size,
-        n_layer=6,
-        n_head=6,
-        n_embd=384,
-        block_size=args.block_size,
-        dropout=0.1,
+        heads=[
+            HeadConfig("primary", vocab_size=vocab_size, weight=1.0),
+            HeadConfig("auxiliary", vocab_size=vocab_size, weight=0.5),
+            # HeadConfig("classification", vocab_size=10, weight=0.3),
+        ]
     )
+
+    # Initialize strategies based on training mode and arguments
+    if args.pretrain:
+        # For pretraining, we can use different strategies for each pathway
+        try:
+            has_mask_token = "<mask>" in tokenizer._special_tokens
+        except AttributeError:
+            has_mask_token = False
+            print(
+                "Warning: Could not check special tokens, using default mask token ID"
+            )
+
+        main_strategy = NextTokenStrategy(tokenizer=tokenizer)
+        second_strategy = NextTokenStrategy(tokenizer=tokenizer)
+    else:
+        # For finetuning, use instruction following for both pathways
+        main_strategy = NextTokenStrategy(tokenizer=tokenizer)
+
+    # Create trainer that will handle the strategies
+
+    # Create trainer with strategies
+    strategies = {
+        "primary": main_strategy,
+        "auxiliary": second_strategy,
+    }
+    trainer = MultiHeadTrainer(strategies=strategies)
 
     # Initialize wandb only on rank 0
     if rank == 0:
         wandb.init(
-            project="gpt-training",
+            project="multihead-gpt-training",
             config={
                 "vocab_size": vocab_size,
                 "n_layer": config.n_layer,
@@ -596,124 +349,187 @@ if __name__ == "__main__":
                 "block_size": config.block_size,
                 "dropout": config.dropout,
                 "learning_rate": args.lr,
-                "batch_size": args.batch_size * (world_size or 1),  # Global batch size
+                "batch_size": args.batch_size * (world_size or 1),
                 "optimizer": "8-bit AdamW",
                 "num_gpus": world_size or 1,
+                "training_mode": "pretrain" if args.pretrain else "finetune",
+                "main_strategy": main_strategy.__class__.__name__,
             },
         )
 
-    # Create model
-    model = GPT(config)
+    model = MultiHeadGPT(config)
     model = model.to(device)
 
-    if rank == 0:  # Only print on main process
+    # Print parameter counts (only on rank 0)
+    if rank == 0:
         param_counts = count_parameters(model)
-        print("\nModel Parameter Counts:")
-        print(f"Total Parameters: {param_counts['total']:,}")
-        print(f"- Embeddings: {param_counts['embeddings']:,}")
-        print(f"- Transformer Layers: {param_counts['transformer_layers']:,}")
-        print(f"- Final Layer Norm: {param_counts['final_ln']:,}")
-        print(f"- Output Head: {param_counts['head']:,}\n")
+        print(f"Total parameters: {param_counts['total_params_M']:.2f}M")
+        print("\nBreakdown by component:")
+        print(f"- Embeddings: {param_counts['embeddings']['total']:,}")
+        print(f"  - Token embeddings: {param_counts['embeddings']['token']:,}")
+        print(f"  - Position embeddings: {param_counts['embeddings']['position']:,}")
+        print(f"- Transformer layers: {param_counts['transformer_layers']:,}")
+        print(f"- Layer norms: {param_counts['layer_norms']:,}")
+        print(f"- Head parameters: {param_counts['heads']:,}")
+
+        print("\nPathway breakdown:")
+        for name, pathway in param_counts["pathways"].items():
+            print(f"\n{name} pathway:")
+            print(f"- Layer norm: {pathway['layer_norm']:,}")
+            print(f"- Head: {pathway['head']:,}")
 
     # Wrap model with DDP
     if world_size is not None:
-        model = DDP(model, device_ids=[local_rank])
+        model = DDP(
+            model, device_ids=[local_rank], find_unused_parameters=False
+        )  # Add this flag
 
-    # Create distributed dataloaders
-    train_loader, val_loader, train_sampler, val_sampler = (
-        create_distributed_dataloaders(
-            args.train_data,
-            block_size=args.block_size,
-            batch_size=args.batch_size,
-            rank=rank,
-            world_size=world_size,
-            num_workers=args.num_workers,
-            prefetch_factor=args.prefetch_factor,
+    # Create dataloaders with strategy-specific collate functions
+    strategies = {
+        "primary": NextTokenStrategy(tokenizer=tokenizer),
+        "auxiliary": NextTokenStrategy(tokenizer=tokenizer),
+    }
+
+    # Create dataloaders
+    train_loader, val_loader, train_sampler, val_sampler = create_dataloaders(
+        files_pattern=args.train_data,
+        block_size=args.block_size,
+        batch_size=args.batch_size,
+        rank=rank,
+        world_size=world_size,
+        strategies=strategies,
+        tokenizer=tokenizer,
+        is_instruction_data=False,
+    )
+
+    if args.load_checkpoint is not None and not args.pretrain:
+        warmup_steps = 100  # Adjust as needed
+        lr = args.lr * 0.1  # Start with lower learning rate
+
+        optimizer = bnb.optim.AdamW(
+            model.parameters(),
+            lr=lr,
+            weight_decay=0.1,
+            optim_bits=8,
+            block_wise=True,
+            is_paged=True,
         )
-    )
 
-    # Create optimizer and scheduler
-    optimizer = bnb.optim.AdamW(
-        model.parameters(),
-        lr=args.lr,
-        weight_decay=0.1,
-        optim_bits=8,  # Enable 8-bit optimization
-        block_wise=True,  # Enable block-wise quantization
-        is_paged=True,  # Enable memory paging
-    )
+        num_training_steps = len(train_loader) * args.epochs
+        scheduler = get_linear_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=warmup_steps,
+            num_training_steps=num_training_steps,
+        )
+    else:
+        # Create optimizer and scheduler
+        optimizer = bnb.optim.AdamW(
+            model.parameters(),
+            lr=args.lr,
+            weight_decay=0.1,
+            optim_bits=8,
+            block_wise=True,
+            is_paged=True,
+        )
 
-    scheduler = CosineAnnealingLR(optimizer, T_max=len(train_loader) * args.epochs)
+        scheduler = CosineAnnealingLR(optimizer, T_max=len(train_loader) * args.epochs)
+
     scaler = GradScaler()
-
-    checkpoint_dir = Path("checkpoints")
-    if rank == 0:  # Only create directory on main process
-        checkpoint_dir.mkdir(exist_ok=True)
 
     # Training loop
     best_val_loss = float("inf")
-    for epoch in range(args.epochs):
-        train_loss = train_one_epoch(
-            model,
-            train_loader,
-            train_sampler,
-            optimizer,
-            scheduler,
-            scaler,
-            device,
-            epoch,
-            tokenizer=tokenizer,
-            gen_every_n_steps=args.gen_every_n_steps,
-            sample_prompts=args.sample_prompts,
-            rank=rank,
+    start_epoch = 0
+
+    if args.load_checkpoint is not None:
+        checkpoint_info = load_checkpoint(
+            args.load_checkpoint, model, optimizer, scheduler, scaler, device
+        )
+        start_epoch = checkpoint_info["epoch"] + 1
+        trainer.set_global_step(checkpoint_info["step"])
+
+    if args.load_checkpoint is not None:
+        checkpoint_info = load_checkpoint(
+            args.load_checkpoint, model, optimizer, scheduler, scaler, device
+        )
+        start_epoch = checkpoint_info["epoch"]
+        trainer.set_global_step(checkpoint_info["step"])
+
+        # Set sampler epoch for distributed training
+        if train_sampler is not None and hasattr(train_sampler, "set_epoch"):
+            train_sampler.set_epoch(start_epoch)
+
+        # Ensure scheduler is at the right step
+        for _ in range(checkpoint_info["step"]):
+            scheduler.step()
+
+        print(f"Resuming from epoch {start_epoch}, step {checkpoint_info['step']}")
+
+    for epoch in range(start_epoch, args.epochs):
+
+        train_metrics = trainer.train_epoch(
+            model=model,
+            train_loader=train_loader,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            scaler=scaler,
+            device=device,
+            epoch=epoch,
             gradient_accumulation_steps=args.gradient_accumulation_steps,
+            save_every_n_steps=args.save_every_n_steps,
+            checkpoint_dir=args.checkpoint_dir,
+            max_grad_norm=1.0,
+            log_every_n_steps=10,
         )
 
-        # Evaluate
-        val_loss = evaluate(model, val_loader, val_sampler, device, rank)
+        val_metrics = trainer.evaluate(
+            model=model, val_loader=val_loader, device=device
+        )
 
-        # Log metrics (only on rank 0)
+        # Log metrics and save checkpoints (only on rank 0)
         if rank == 0:
+            mode_prefix = "pretrain" if args.pretrain else "train"
             wandb.log(
                 {
                     "epoch": epoch,
-                    "train_loss": train_loss,
-                    "val_loss": val_loss,
+                    f"{mode_prefix}/total_loss": train_metrics["total_loss"],
+                    f"{mode_prefix}/primary_loss": train_metrics["primary_loss"],
+                    f"{mode_prefix}/auxiliary_loss": train_metrics["auxiliary_loss"],
+                    "val/total_loss": val_metrics["total_loss"],
+                    "val/primary_loss": val_metrics["primary_loss"],
+                    "val/auxiliary_loss": val_metrics["auxiliary_loss"],
                 }
             )
 
-            print(f"Epoch {epoch + 1}/{args.epochs}")
-            print(f"Train Loss: {train_loss:.4f}")
-            print(f"Val Loss: {val_loss:.4f}")
+            # Save best model
+            if val_metrics["total_loss"] < best_val_loss:
+                best_val_loss = val_metrics["total_loss"]
+                # Create checkpoint directory if it doesn't exist
+                os.makedirs("checkpoints", exist_ok=True)
 
-        # Save checkpoints
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            save_checkpoint(
-                model,
-                optimizer,
-                scheduler,
-                scaler,
-                epoch,
-                train_loss,
-                val_loss,
-                config,
-                checkpoint_dir / "best_model.pt",
-                rank=rank,
-            )
+                # Get the underlying model if using DDP
+                model_state_dict = (
+                    model.module.state_dict()
+                    if hasattr(model, "module")
+                    else model.state_dict()
+                )
 
-        if (epoch + 1) % 10 == 0:
-            save_checkpoint(
-                model,
-                optimizer,
-                scheduler,
-                scaler,
-                epoch,
-                train_loss,
-                val_loss,
-                config,
-                checkpoint_dir / f"checkpoint_epoch_{epoch + 1}.pt",
-                rank=rank,
-            )
+                # Save checkpoint
+                checkpoint = {
+                    "epoch": epoch,
+                    "model_state_dict": model_state_dict,
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "scheduler_state_dict": scheduler.state_dict(),
+                    "scaler_state_dict": scaler.state_dict(),
+                    "train_metrics": train_metrics,
+                    "val_metrics": val_metrics,
+                    "config": config.__dict__,
+                    "best_val_loss": best_val_loss,
+                }
+
+                checkpoint_path = f"checkpoints/best_model_{mode_prefix}.pt"
+                torch.save(checkpoint, checkpoint_path)
+                print(f"\nSaved best model checkpoint to {checkpoint_path}")
+                print(f"Validation loss: {val_metrics['total_loss']:.4f}")
 
     if rank == 0:
         wandb.finish()
@@ -721,21 +537,3 @@ if __name__ == "__main__":
     # Cleanup distributed training
     if dist.is_initialized():
         dist.destroy_process_group()
-
-
-def load_checkpoint(
-    checkpoint_path, model, optimizer=None, scheduler=None, scaler=None
-):
-    checkpoint = torch.load(checkpoint_path)
-    model.load_state_dict(checkpoint["model_state_dict"])
-
-    if optimizer is not None:
-        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-
-    if scheduler is not None:
-        scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
-
-    if scaler is not None:
-        scaler.load_state_dict(checkpoint["scaler_state_dict"])
-
-    return checkpoint["epoch"], checkpoint["train_loss"], checkpoint["val_loss"]

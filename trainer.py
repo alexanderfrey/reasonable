@@ -62,24 +62,21 @@ def print_batch_examples(batch, tokenizer):
     print("\n" + "=" * 100 + "\n")
 
 
-class DualHeadTrainer:
-    """Trainer for dual-head GPT model using NextTokenStrategy for both heads"""
+class MultiHeadTrainer:
+    """Trainer for multi-head GPT model using specified strategies for each head"""
 
-    def __init__(self, main_strategy, second_strategy=None):
+    def __init__(self, strategies):
         """
-        Initialize trainer with strategies for both heads.
+        Initialize trainer with strategies for each head.
 
         Args:
-            main_strategy: Strategy for primary head (NextTokenStrategy instance)
-            second_strategy: Strategy for second head (if None, uses main_strategy)
+            strategies: Dict mapping head names to their respective strategies
         """
-        self.main_strategy = main_strategy
-        self.second_strategy = second_strategy or main_strategy
+        self.strategies = strategies
         self.global_step = 0
 
     def save_checkpoint(self, model, optimizer, scheduler, epoch, step, save_dir):
         """Save model checkpoint and training state"""
-        # Handle distributed training
         model_to_save = model.module if hasattr(model, "module") else model
 
         checkpoint = {
@@ -92,10 +89,7 @@ class DualHeadTrainer:
 
         save_path = f"{save_dir}/checkpoint_epoch{epoch}_step{step}.pt"
         torch.save(checkpoint, save_path)
-
-        # Also save as latest checkpoint
-        latest_path = f"{save_dir}/checkpoint_latest.pt"
-        torch.save(checkpoint, latest_path)
+        torch.save(checkpoint, f"{save_dir}/checkpoint_latest.pt")
 
     def train_epoch(
         self,
@@ -109,12 +103,25 @@ class DualHeadTrainer:
         gradient_accumulation_steps=1,
         save_every_n_steps=None,
         checkpoint_dir=None,
+        max_grad_norm=1.0,
+        log_every_n_steps=10,
     ):
-        """Train for one epoch using the specified strategies
+        """
+        Train for one epoch using the specified strategies with W&B logging.
 
         Args:
-            save_every_n_steps: If not None, save checkpoint every n steps
-            checkpoint_dir: Directory to save checkpoints if save_every_n_steps is set
+            model: The multi-head model
+            train_loader: DataLoader for training data
+            optimizer: The optimizer
+            scheduler: Learning rate scheduler
+            scaler: Gradient scaler for mixed precision
+            device: Device to train on
+            epoch: Current epoch number
+            gradient_accumulation_steps: Number of steps to accumulate gradients
+            save_every_n_steps: Save checkpoint every n steps (if None, don't save)
+            checkpoint_dir: Directory to save checkpoints
+            max_grad_norm: Maximum gradient norm for clipping
+            log_every_n_steps: Log detailed metrics every n steps
         """
         if save_every_n_steps and not checkpoint_dir:
             raise ValueError(
@@ -122,157 +129,313 @@ class DualHeadTrainer:
             )
 
         model.train()
-        total_loss = 0
-        total_main_loss = 0
-        total_second_loss = 0
+        losses = {name: 0.0 for name in self.strategies.keys()}
+        total_loss = 0.0
+
+        # Track moving averages for losses
+        ema_losses = {name: 0.0 for name in self.strategies.keys()}
+        ema_total_loss = 0.0
+        ema_decay = 0.99
 
         progress_bar = tqdm(train_loader, desc=f"Epoch {epoch + 1}")
 
-        # Get aux_head_weight from model, handling DDP case
-        aux_head_weight = (
-            model.module.config.aux_head_weight
-            if hasattr(model, "module")
-            else model.config.aux_head_weight
-        )
+        # Get head weights from model configuration
+        model_unwrapped = model.module if hasattr(model, "module") else model
+        head_weights = model_unwrapped.head_weights
 
-        for batch_idx, batch in enumerate(progress_bar):
-            # Move data to device
-            input_ids = batch["inputs"].to(device)
-            targets = batch["targets"].to(device)
-            targets_second = (
-                targets.clone()
-            )  # Same targets for both heads in pretraining
+        # Initialize grad scaler status tracking
+        grad_scaler_skipped = 0
+        nan_detected = 0
 
-            # Check if this is an accumulation step
-            is_accumulation_step = (batch_idx + 1) % gradient_accumulation_steps != 0
+        try:
+            for batch_idx, batch in enumerate(progress_bar):
+                # Move data to device and handle potential key errors
+                try:
+                    input_ids = batch["inputs"].to(device)
+                    targets = {
+                        name: batch["targets"][name].to(device)
+                        for name in self.strategies.keys()
+                    }
+                except KeyError as e:
+                    print(f"Error in batch data structure: {e}")
+                    continue
+                except RuntimeError as e:
+                    print(f"Error moving batch to device: {e}")
+                    continue
 
-            # Forward pass with autocast
-            with torch.amp.autocast("cuda", dtype=torch.float16):
-                # Get outputs from both heads
-                primary_logits, second_logits, _, _ = model(
-                    input_ids, target_second=targets_second
+                is_accumulation_step = (
+                    batch_idx + 1
+                ) % gradient_accumulation_steps != 0
+
+                try:
+                    with torch.amp.autocast("cuda", dtype=torch.float16):
+                        # Get outputs from all heads
+                        outputs = model(input_ids)
+
+                        # Verify outputs match expected heads
+                        if not all(name in outputs for name in self.strategies):
+                            missing = set(self.strategies) - set(outputs)
+                            raise ValueError(f"Missing outputs for heads: {missing}")
+
+                        # Compute losses for each head
+                        head_losses = {}
+                        for name, strategy in self.strategies.items():
+                            try:
+                                head_losses[name] = strategy.compute_loss(
+                                    outputs[name], targets[name]
+                                )
+
+                                # Check for NaN losses
+                                if torch.isnan(head_losses[name]):
+                                    nan_detected += 1
+                                    print(f"NaN loss detected for head {name}")
+                                    continue
+
+                            except Exception as e:
+                                print(f"Error computing loss for head {name}: {e}")
+                                continue
+
+                        # Compute weighted sum of losses
+                        loss = sum(
+                            head_losses[name] * head_weights[name]
+                            for name in head_losses.keys()
+                        )
+                        loss = loss / gradient_accumulation_steps
+
+                    # Skip backward pass if loss is NaN
+                    if torch.isnan(loss):
+                        nan_detected += 1
+                        print(f"NaN loss detected at step {self.global_step}")
+                        continue
+
+                    # Backward pass with gradient scaling
+                    scaler.scale(loss).backward()
+
+                    if not is_accumulation_step:
+                        # Unscale gradients for clipping
+                        scaler.unscale_(optimizer)
+
+                        # Clip gradients and check for inf/nan
+                        grad_norm = torch.nn.utils.clip_grad_norm_(
+                            model.parameters(), max_grad_norm
+                        )
+
+                        if torch.isfinite(grad_norm):
+                            scaler.step(optimizer)
+                            scaler.update()
+                        else:
+                            grad_scaler_skipped += 1
+                            print(f"Skipped scaler step due to inf/nan gradients")
+
+                        optimizer.zero_grad(
+                            set_to_none=True
+                        )  # More efficient than zero_grad()
+                        scheduler.step()
+                        self.global_step += 1
+
+                        # Log metrics to W&B
+                        if wandb.run is not None:
+                            # Log losses
+                            wandb.log(
+                                {
+                                    "train/total_loss": loss.item(),
+                                    "train/learning_rate": scheduler.get_last_lr()[0],
+                                    "train/grad_norm": (
+                                        grad_norm.item()
+                                        if torch.isfinite(grad_norm)
+                                        else 0
+                                    ),
+                                    "train/grad_scaler_skipped": grad_scaler_skipped,
+                                    "train/nan_detected": nan_detected,
+                                    "train/global_step": self.global_step,
+                                },
+                                step=self.global_step,
+                            )
+
+                            # Log individual head losses
+                            wandb.log(
+                                {
+                                    f"train/{name}_loss": head_losses[name].item()
+                                    for name in head_losses.keys()
+                                },
+                                step=self.global_step,
+                            )
+
+                            # Log gradient statistics
+                            if self.global_step % log_every_n_steps == 0:
+                                grad_stats = {
+                                    "train/grad_mean": 0.0,
+                                    "train/grad_std": 0.0,
+                                    "train/grad_max": 0.0,
+                                }
+                                for name, param in model.named_parameters():
+                                    if param.grad is not None:
+                                        grad = param.grad.data
+                                        if torch.isfinite(grad).all():
+                                            grad_stats[
+                                                "train/grad_mean"
+                                            ] += grad.mean().item()
+                                            grad_stats[
+                                                "train/grad_std"
+                                            ] += grad.std().item()
+                                            grad_stats["train/grad_max"] = max(
+                                                grad_stats["train/grad_max"],
+                                                grad.abs().max().item(),
+                                            )
+                                wandb.log(grad_stats, step=self.global_step)
+
+                        # Save checkpoint if needed
+                        if (
+                            save_every_n_steps
+                            and self.global_step % save_every_n_steps == 0
+                        ):
+                            self.save_checkpoint(
+                                model=model,
+                                optimizer=optimizer,
+                                scheduler=scheduler,
+                                epoch=epoch,
+                                step=self.global_step,
+                                save_dir=checkpoint_dir,
+                            )
+
+                except RuntimeError as e:
+                    print(f"Error during forward/backward pass: {e}")
+                    continue
+
+                # Update metrics and EMA
+                total_loss += loss.item() * gradient_accumulation_steps
+                ema_total_loss = (
+                    ema_decay * ema_total_loss + (1 - ema_decay) * loss.item()
                 )
 
-                # Compute losses using strategies
-                primary_loss = self.main_strategy.compute_loss(primary_logits, targets)
-                second_loss = self.second_strategy.compute_loss(
-                    second_logits, targets_second
-                )
-
-                # Combined loss with aux_head_weight
-                loss = primary_loss + (aux_head_weight * second_loss)
-                loss = loss / gradient_accumulation_steps
-
-            # Backward pass
-            scaler.scale(loss).backward()
-
-            if not is_accumulation_step:
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                scaler.step(optimizer)
-                scaler.update()
-                optimizer.zero_grad()
-                scheduler.step()
-                self.global_step += 1
-
-                # Save checkpoint if needed
-                if save_every_n_steps and self.global_step % save_every_n_steps == 0:
-                    self.save_checkpoint(
-                        model=model,
-                        optimizer=optimizer,
-                        scheduler=scheduler,
-                        epoch=epoch,
-                        step=self.global_step,
-                        save_dir=checkpoint_dir,
+                for name in head_losses:
+                    losses[name] += head_losses[name].item()
+                    ema_losses[name] = (
+                        ema_decay * ema_losses[name]
+                        + (1 - ema_decay) * head_losses[name].item()
                     )
 
-            # Update metrics
-            total_loss += loss.item() * gradient_accumulation_steps
-            total_main_loss += primary_loss.item()
-            total_second_loss += second_loss.item()
+                # Update progress bar with EMA values
+                if batch_idx % log_every_n_steps == 0:
+                    metrics = {
+                        "loss": f"{ema_total_loss:.4f}",
+                        "lr": f"{scheduler.get_last_lr()[0]:.2e}",
+                        "step": self.global_step,
+                    }
+                    metrics.update(
+                        {
+                            f"{name}_loss": f"{ema_losses[name]:.4f}"
+                            for name in self.strategies.keys()
+                        }
+                    )
+                    progress_bar.set_postfix(metrics)
 
-            # Update progress bar
-            current_lr = scheduler.get_last_lr()[0]
-            progress_bar.set_postfix(
+        except Exception as e:
+            print(f"Unexpected error during training: {e}")
+            raise
+
+        finally:
+            # Compute final metrics
+            num_batches = len(train_loader)
+            metrics = {
+                "total_loss": total_loss / num_batches,
+            }
+            metrics.update(
                 {
-                    "loss": f"{loss.item() * gradient_accumulation_steps:.4f}",
-                    "main_loss": f"{primary_loss.item():.4f}",
-                    "second_loss": f"{second_loss.item():.4f}",
-                    "lr": f"{current_lr:.2e}",
-                    "step": self.global_step,
+                    f"{name}_loss": losses[name] / num_batches
+                    for name in self.strategies.keys()
                 }
             )
 
-        # Compute average losses
-        num_batches = len(train_loader)
-        avg_total_loss = total_loss / num_batches
-        avg_main_loss = total_main_loss / num_batches
-        avg_second_loss = total_second_loss / num_batches
+            # Log epoch-level metrics to W&B
+            if wandb.run is not None:
+                wandb.log(
+                    {
+                        "train/epoch": epoch,
+                        "train/epoch_total_loss": metrics["total_loss"],
+                        **{
+                            f"train/epoch_{name}_loss": metrics[f"{name}_loss"]
+                            for name in self.strategies.keys()
+                        },
+                    }
+                )
 
-        return {
-            "total_loss": avg_total_loss,
-            "main_loss": avg_main_loss,
-            "second_loss": avg_second_loss,
-        }
+            return metrics
 
     def evaluate(self, model, val_loader, device):
         """Evaluate the model using the strategies"""
         model.eval()
-        total_loss = 0
-        total_main_loss = 0
-        total_second_loss = 0
+        losses = {name: 0.0 for name in self.strategies.keys()}
+        total_loss = 0.0
 
-        # Get aux_head_weight from model, handling DDP case
-        aux_head_weight = (
-            model.module.config.aux_head_weight
-            if hasattr(model, "module")
-            else model.config.aux_head_weight
-        )
+        # Get head weights from model configuration
+        model_unwrapped = model.module if hasattr(model, "module") else model
+        head_weights = model_unwrapped.head_weights
 
         with torch.no_grad():
             for batch in tqdm(val_loader, desc="Evaluating"):
                 input_ids = batch["inputs"].to(device)
-                targets = batch["targets"].to(device)
-                targets_second = targets.clone()
+                targets = {
+                    name: batch["targets"].to(device) for name in self.strategies.keys()
+                }
 
                 with torch.amp.autocast("cuda", dtype=torch.float16):
-                    primary_logits, second_logits, _, _ = model(
-                        input_ids, target_second=targets_second
-                    )
+                    outputs = model(input_ids)
 
-                    # Compute losses using strategies
-                    primary_loss = self.main_strategy.compute_loss(
-                        primary_logits, targets
-                    )
-                    second_loss = self.second_strategy.compute_loss(
-                        second_logits, targets_second
-                    )
+                    # Compute losses for each head
+                    head_losses = {}
+                    for name, strategy in self.strategies.items():
+                        head_losses[name] = strategy.compute_loss(
+                            outputs[name], targets[name]
+                        )
 
-                    loss = primary_loss + (aux_head_weight * second_loss)
+                    # Compute weighted sum of losses
+                    loss = sum(
+                        head_losses[name] * head_weights[name]
+                        for name in self.strategies.keys()
+                    )
 
                 total_loss += loss.item()
-                total_main_loss += primary_loss.item()
-                total_second_loss += second_loss.item()
+                for name in self.strategies.keys():
+                    losses[name] += head_losses[name].item()
 
         num_batches = len(val_loader)
-        return {
+        metrics = {
             "total_loss": total_loss / num_batches,
-            "main_loss": total_main_loss / num_batches,
-            "second_loss": total_second_loss / num_batches,
         }
+        metrics.update(
+            {
+                f"{name}_loss": losses[name] / num_batches
+                for name in self.strategies.keys()
+            }
+        )
+
+        return metrics
 
     def generate(
-        self, model, input_ids, max_length, temperature=1.0, top_p=0.9, head="primary"
+        self,
+        model,
+        input_ids,
+        max_length,
+        temperature=1.0,
+        top_p=0.9,
+        head_name="primary",
     ):
         """Generate tokens using specified head's strategy"""
-        strategy = self.main_strategy if head == "primary" else self.second_strategy
-        return strategy.generate(
+        if head_name not in self.strategies:
+            raise ValueError(f"Unknown head name: {head_name}")
+
+        return self.strategies[head_name].generate(
             model=model,
             input_ids=input_ids,
             max_length=max_length,
             temperature=temperature,
             top_p=top_p,
         )
+
+    def set_global_step(self, step):
+        """Set the global step counter"""
+        self.global_step = step
 
 
 def log_latent_stats(model):
