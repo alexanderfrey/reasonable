@@ -42,7 +42,6 @@ class MixedStrategy(ModelingStrategy):
     def generate(self, model, input_ids, max_length, **kwargs):
         # Use next-token strategy for generation
         return self.next_token_strategy.generate(model, input_ids, max_length, **kwargs)
-    
 
 
 class NextTokenStrategy(ModelingStrategy):
@@ -51,6 +50,8 @@ class NextTokenStrategy(ModelingStrategy):
     def __init__(self, tokenizer=None):
         super().__init__()
         self.tokenizer = tokenizer
+        # Record the confidence (i.e. probability) of each generated token.
+        self.confidence_history = []
 
     def compute_loss(self, logits, targets, **kwargs):
         return F.cross_entropy(
@@ -66,38 +67,66 @@ class NextTokenStrategy(ModelingStrategy):
         for _ in range(max_length):
             with torch.no_grad():
                 tokens = tokens.to(device)
-                logits = model(tokens)[0]  # Take main path logits
+                logits = model(tokens)[0]  # Get model logits
                 next_token_logits = logits[0, -1:, :].to(device)
 
-                # Apply temperature
+                # Apply temperature scaling if necessary.
                 if temperature != 1.0:
                     next_token_logits = next_token_logits / temperature
 
+                # Sample the next token using top-p filtering.
                 next_token = self.sample_top_p(next_token_logits, top_p)
                 next_token = next_token.to(device)
+
+                # Compute the confidence (probability) for the selected token.
+                probs = F.softmax(next_token_logits, dim=-1)
+                # Extract the probability of the sampled token.
+                confidence = probs[0, 0, next_token.item()].item()
+                self.confidence_history.append(confidence)
+
+                # Append the new token.
                 tokens = torch.cat([tokens, next_token.view(1, 1)], dim=1)
 
-                if next_token.item() == 50256:  # END_TOKEN
+                # Check for EOS token (50256 is hard-coded; adjust if needed).
+                if next_token.item() == 50256:
                     break
 
         return tokens
+
+    def get_stats(self):
+        """Return confidence-related metrics as a dictionary."""
+        if self.confidence_history:
+            avg_confidence = sum(self.confidence_history) / len(self.confidence_history)
+        else:
+            avg_confidence = 0.0
+        return {"avg_confidence": avg_confidence}
 
     @staticmethod
     def sample_top_p(logits, top_p):
         device = logits.device
         probs = F.softmax(logits, dim=-1)
 
+        # Sort probabilities and obtain the corresponding indices.
         sorted_probs, sorted_indices = torch.sort(probs, descending=True)
         cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
 
+        # Create a mask for tokens to remove (those that push cumulative probs above top_p).
         sorted_indices_to_remove = cumulative_probs > top_p
+        # Shift the mask right to keep at least one token.
         sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
         sorted_indices_to_remove[..., 0] = 0
 
-        indices_to_remove = sorted_indices_to_remove.scatter(
+        # Create a new mask and scatter the sorted mask back to the original order.
+        unsorted_indices_to_remove = torch.zeros_like(
+            sorted_indices_to_remove, dtype=torch.bool
+        )
+        unsorted_indices_to_remove = unsorted_indices_to_remove.scatter(
             1, sorted_indices, sorted_indices_to_remove
         )
-        probs = probs.masked_fill(indices_to_remove, 0.0)
+
+        # Zero out the probabilities for the tokens that are filtered out.
+        probs = probs.masked_fill(unsorted_indices_to_remove, 0.0)
+        # Sample one token from the remaining distribution.
         return torch.multinomial(probs, num_samples=1)
 
 
@@ -372,101 +401,6 @@ class SpanPredictionStrategy(ModelingStrategy):
         return NextTokenStrategy.sample_top_p(logits, top_p)
 
 
-class BidirectionalStrategy(ModelingStrategy):
-    """Predict tokens in both directions"""
-
-    def __init__(self, vocab_size):
-        self.vocab_size = vocab_size
-
-    def compute_loss(self, logits, targets, **kwargs):
-        device = logits.device
-
-        # Ensure inputs are on correct device
-        logits = logits.to(device)
-        targets = targets.to(device)
-
-        # Split logits for forward and backward predictions
-        forward_logits, backward_logits = torch.chunk(logits, 2, dim=-1)
-        forward_logits = forward_logits.to(device)
-        backward_logits = backward_logits.to(device)
-
-        # Forward loss
-        forward_loss = F.cross_entropy(
-            forward_logits.view(-1, forward_logits.size(-1)),
-            targets.view(-1),
-            ignore_index=-100,
-        )
-
-        # Backward loss (reverse the targets)
-        backward_targets = torch.flip(targets, [1]).to(device)
-        backward_loss = F.cross_entropy(
-            backward_logits.view(-1, backward_logits.size(-1)),
-            backward_targets.view(-1),
-            ignore_index=-100,
-        )
-
-        return (forward_loss + backward_loss) / 2
-
-    def generate(self, model, input_ids, max_length, top_p=0.9):
-        device = input_ids.device
-        tokens = input_ids.clone().to(device)
-
-        # Generate forward
-        forward_tokens = self.generate_direction(
-            model, tokens, max_length // 2, top_p, forward=True
-        )
-
-        # Generate backward
-        backward_tokens = self.generate_direction(
-            model, tokens, max_length // 2, top_p, forward=False
-        )
-
-        # Combine tokens (remove duplicate center tokens)
-        # Ensure tensors are on same device before combining
-        backward_tokens = backward_tokens.to(device)
-        forward_tokens = forward_tokens.to(device)
-        combined = torch.cat([backward_tokens[:, :-1], forward_tokens], dim=1)
-
-        return combined.to(device)
-
-    def generate_direction(self, model, input_ids, max_length, top_p, forward=True):
-        device = input_ids.device
-        tokens = input_ids.clone().to(device)
-
-        for _ in range(max_length):
-            with torch.no_grad():
-                # Ensure tokens are on correct device before model forward pass
-                tokens = tokens.to(device)
-                logits = model(tokens)[0]
-
-                # Handle logits for forward/backward direction
-                if forward:
-                    next_token_logits = logits[0, -1:, : self.vocab_size // 2].to(
-                        device
-                    )
-                else:
-                    next_token_logits = logits[0, -1:, self.vocab_size // 2 :].to(
-                        device
-                    )
-
-                # Sample and ensure token is on correct device
-                next_token = self.sample_top_p(next_token_logits, top_p)
-                next_token = next_token.to(device)
-                tokens = torch.cat([tokens, next_token.view(1, 1)], dim=1)
-
-                if next_token.item() == 50256:  # END_TOKEN
-                    break
-
-        if not forward:
-            tokens = torch.flip(tokens, [1])
-
-        return tokens.to(device)
-
-    @staticmethod
-    def sample_top_p(logits, top_p):
-        return NextTokenStrategy.sample_top_p(logits, top_p)
-
-
 class InstructionFollowingStrategy(ModelingStrategy):
     """Strategy specialized for instruction-following tasks with proper sequence length handling"""
 
@@ -476,7 +410,7 @@ class InstructionFollowingStrategy(ModelingStrategy):
         instruction_token="[INST]",
         response_token="[/INST]",
         end_token="</s>",
-        max_length=1024  # Add max_length parameter
+        max_length=1024,  # Add max_length parameter
     ):
         self.tokenizer = tokenizer
         self.instruction_token = instruction_token
@@ -489,58 +423,71 @@ class InstructionFollowingStrategy(ModelingStrategy):
         self.response_token_id = self.tokenizer.encode(response_token)[0]
         self.end_token_id = self.tokenizer.encode(end_token)[0]
 
+    def format_instruction(self, instruction, response):
+        formatted = f"{self.instruction_token}{instruction}{self.response_token}{response}{self.end_token}"
+        tokens = self.tokenizer.encode(formatted)
+
+        if len(tokens) > self.max_length:
+            tokens = tokens[: self.max_length]
+
+        tokens = tokens + [0] * (self.max_length - len(tokens))
+        return torch.tensor(tokens, dtype=torch.long)
+
     def compute_loss(self, logits, targets, instruction_mask=None, **kwargs):
         """Compute loss with proper dimension handling"""
         device = logits.device
-        
+
         # Get dimensions
         batch_size, logits_seq_len, vocab_size = logits.shape
         target_seq_len = targets.shape[1]
-        
+
         # Truncate logits to match target length
         if logits_seq_len > target_seq_len:
             logits = logits[:, :target_seq_len, :]
-        
+
         if instruction_mask is None:
             # Create instruction mask - don't compute loss on instruction tokens
             instruction_mask = self._create_instruction_mask(targets)
-        
+
         instruction_mask = instruction_mask.to(device)
-        
+
         # Verify shapes after truncation
-        assert logits.shape[:2] == targets.shape == instruction_mask.shape, \
-            f"Shape mismatch: logits={logits.shape}, targets={targets.shape}, mask={instruction_mask.shape}"
-        
+        assert (
+            logits.shape[:2] == targets.shape == instruction_mask.shape
+        ), f"Shape mismatch: logits={logits.shape}, targets={targets.shape}, mask={instruction_mask.shape}"
+
         # Create loss weights
         loss_weights = torch.where(
             instruction_mask,
             torch.tensor(0.0, device=device),  # Don't train on instructions
             torch.tensor(1.0, device=device),  # Full weight on responses
         )
-        
+
         # Compute cross entropy with masked targets
         masked_targets = torch.where(
             instruction_mask,
             torch.tensor(-100, device=device),  # Ignore instruction tokens
             targets,
         )
-        
+
         # Ensure all tensors are contiguous
         logits = logits.contiguous()
         masked_targets = masked_targets.contiguous()
         loss_weights = loss_weights.contiguous()
-        
+
         # Compute loss
         loss = F.cross_entropy(
             logits.view(-1, vocab_size),
             masked_targets.view(-1),
             reduction="none",
-            ignore_index=-100
+            ignore_index=-100,
         )
-        
+
         # Apply weights and average
-        weighted_loss = (loss * loss_weights.view(-1)).sum() / (loss_weights.sum() + 1e-8)
-        
+        weighted_loss = (loss * loss_weights.view(-1)).sum() / (
+            loss_weights.sum() + 1e-8
+        )
+
         return weighted_loss
 
     def generate(self, model, input_ids, max_length, top_p=0.9, temperature=0.7):
@@ -578,21 +525,25 @@ class InstructionFollowingStrategy(ModelingStrategy):
         """Create attention mask that focuses on instruction portion"""
         batch_size, seq_length = token_ids.shape
         masks = torch.zeros((batch_size, seq_length), dtype=torch.bool)
-        
+
         for i in range(batch_size):
             # Find positions of special tokens
             try:
-                inst_start = (token_ids[i] == self.instruction_token_id).nonzero(as_tuple=True)[0][0]
-                inst_end = (token_ids[i] == self.response_token_id).nonzero(as_tuple=True)[0][0]
-                
+                inst_start = (token_ids[i] == self.instruction_token_id).nonzero(
+                    as_tuple=True
+                )[0][0]
+                inst_end = (token_ids[i] == self.response_token_id).nonzero(
+                    as_tuple=True
+                )[0][0]
+
                 # Set mask to True between instruction tokens
-                masks[i, inst_start:inst_end+1] = True
+                masks[i, inst_start : inst_end + 1] = True
             except IndexError:
                 # If tokens not found, mask everything
                 masks[i, :] = True
-                
+
         return masks
-        
+
     def get_padding_value(self):
         """Return the padding token ID"""
         return self.end_token_id
@@ -603,38 +554,36 @@ class InstructionFollowingStrategy(ModelingStrategy):
         # Tokenize and truncate if needed
         tokens = self.tokenizer.encode(formatted)
         if len(tokens) > self.max_length:
-            tokens = tokens[:self.max_length-1] + [self.end_token_id]
+            tokens = tokens[: self.max_length - 1] + [self.end_token_id]
         return self.tokenizer.decode(tokens)
-        
+
     def prepare_sequence(self, sequence):
         """Prepare and validate sequence length"""
         tokens = self.tokenizer.encode(sequence)
         if len(tokens) > self.max_length:
-            tokens = tokens[:self.max_length-1] + [self.end_token_id]
+            tokens = tokens[: self.max_length - 1] + [self.end_token_id]
         return tokens
-
 
     def sample_top_p(self, logits, top_p):
         """Sample from the distribution with top-p (nucleus) sampling"""
         probs = F.softmax(logits, dim=-1)
         sorted_probs, sorted_indices = torch.sort(probs, descending=True)
         cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
-        
+
         # Remove tokens with cumulative probability above the threshold
         sorted_indices_to_remove = cumulative_probs > top_p
         # Shift the indices to the right to keep also the first token above the threshold
         sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
         sorted_indices_to_remove[..., 0] = 0
-        
-        indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+
+        indices_to_remove = sorted_indices_to_remove.scatter(
+            1, sorted_indices, sorted_indices_to_remove
+        )
         probs = probs.masked_fill(indices_to_remove, 0.0)
-        
+
         # Sample from the filtered distribution
         sample = torch.multinomial(probs, 1)
         return sample
-            
-    
-
 
     @staticmethod
     def sample_top_p(logits, top_p):

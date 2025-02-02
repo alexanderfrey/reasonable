@@ -1,6 +1,6 @@
 import tiktoken
 import argparse
-import os
+import os, math
 from glob import glob
 import bitsandbytes as bnb
 import torch
@@ -12,6 +12,8 @@ from pathlib import Path
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from transformers import get_linear_schedule_with_warmup
+from torch.optim.lr_scheduler import LambdaLR
+
 from model import GPTConfig, GPT, HeadConfig, MultiHeadGPT
 from strategies import (
     SpanMaskingStrategy,
@@ -58,7 +60,7 @@ def load_checkpoint(
 
         return {
             "epoch": checkpoint["epoch"],
-            "step": checkpoint["step"],
+            "global_step": checkpoint["global_step"],
             "train_metrics": checkpoint.get("train_metrics", {}),
             "val_metrics": checkpoint.get("val_metrics", {}),
             "config": checkpoint.get("config", {}),
@@ -291,6 +293,85 @@ def get_args():
     return args
 
 
+def configure_optimizer(model, args, train_loader):
+    num_training_steps = len(train_loader) * args.epochs
+
+    # Adjust parameter groups
+    no_decay = ["bias", "LayerNorm.weight", "ln_f.weight"]
+    optimizer_grouped_params = [
+        {
+            "params": [
+                p
+                for n, p in model.named_parameters()
+                if not any(nd in n for nd in no_decay)
+            ],
+            "weight_decay": 0.005,  # Reduced weight decay
+        },
+        {
+            "params": [
+                p
+                for n, p in model.named_parameters()
+                if any(nd in n for nd in no_decay)
+            ],
+            "weight_decay": 0.0,
+        },
+    ]
+
+    # Increased warmup steps
+    warmup_steps = min(1000, int(num_training_steps * 0.1))
+
+    # Increased learning rate
+    base_lr = 3e-4  # Increased from 1e-4
+
+    optimizer = bnb.optim.AdamW(
+        optimizer_grouped_params,
+        lr=base_lr,
+        betas=(0.95, 0.999),  # Increased beta1
+        eps=1e-8,
+        block_wise=True,
+        is_paged=True,
+    )
+
+    def lr_lambda(current_step):
+        if current_step < warmup_steps:
+            return float(current_step) / float(warmup_steps)
+
+        progress = float(current_step - warmup_steps) / float(
+            max(1, num_training_steps - warmup_steps)
+        )
+        return max(
+            0.01, 0.5 * (1.0 + math.cos(math.pi * progress))
+        )  # Reduced minimum LR
+
+    scheduler = LambdaLR(optimizer, lr_lambda)
+
+    # Add gradient clipping in training loop
+    # torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+    return optimizer, scheduler
+
+
+def get_cosine_schedule_with_warmup(
+    optimizer, num_warmup_steps, num_training_steps, num_cycles=0.5
+):
+    """
+    Create a schedule with a learning rate that decreases following the values of the cosine function
+    between the initial lr set in the optimizer to 0, with warmup.
+    """
+
+    def lr_lambda(current_step):
+        if current_step < num_warmup_steps:
+            return float(current_step) / float(max(1, num_warmup_steps))
+        progress = float(current_step - num_warmup_steps) / float(
+            max(1, num_training_steps - num_warmup_steps)
+        )
+        return max(
+            0.0, 0.5 * (1.0 + math.cos(math.pi * float(num_cycles) * 2.0 * progress))
+        )
+
+    return LambdaLR(optimizer, lr_lambda)
+
+
 if __name__ == "__main__":
     args = get_args()
     torch.backends.cudnn.benchmark = True
@@ -305,15 +386,14 @@ if __name__ == "__main__":
 
     config = GPTConfig(
         heads=[
-            HeadConfig("primary", vocab_size=vocab_size, weight=1.0),
-            HeadConfig("auxiliary", vocab_size=vocab_size, weight=0.5),
-            # HeadConfig("classification", vocab_size=10, weight=0.3),
+            HeadConfig("primary", vocab_size=vocab_size, weight=0.9),
+            HeadConfig("auxiliary", vocab_size=vocab_size, weight=0.1),
         ]
     )
 
     # Initialize strategies based on training mode and arguments
     if args.pretrain:
-        # For pretraining, we can use different strategies for each pathway
+        # For pretraining, we use NextTokenStrategy
         try:
             has_mask_token = "<mask>" in tokenizer._special_tokens
         except AttributeError:
@@ -322,13 +402,18 @@ if __name__ == "__main__":
                 "Warning: Could not check special tokens, using default mask token ID"
             )
 
-        main_strategy = NextTokenStrategy(tokenizer=tokenizer)
-        second_strategy = NextTokenStrategy(tokenizer=tokenizer)
+        main_strategy = NextTokenStrategy(tokenizer)
+        second_strategy = NextTokenStrategy(tokenizer)
     else:
-        # For finetuning, use instruction following for both pathways
+        # For finetuning, use InstructionFollowingStrategy for both pathways
         main_strategy = NextTokenStrategy(tokenizer=tokenizer)
-
-    # Create trainer that will handle the strategies
+        second_strategy = InstructionFollowingStrategy(
+            tokenizer=tokenizer,
+            instruction_token="[INST]",
+            response_token="[/INST]",
+            end_token="</s>",
+            max_length=args.block_size,
+        )
 
     # Create trainer with strategies
     strategies = {
@@ -354,6 +439,8 @@ if __name__ == "__main__":
                 "num_gpus": world_size or 1,
                 "training_mode": "pretrain" if args.pretrain else "finetune",
                 "main_strategy": main_strategy.__class__.__name__,
+                "instruction_token": "[INST]" if not args.pretrain else None,
+                "response_token": "[/INST]" if not args.pretrain else None,
             },
         )
 
@@ -366,8 +453,8 @@ if __name__ == "__main__":
         print(f"Total parameters: {param_counts['total_params_M']:.2f}M")
         print("\nBreakdown by component:")
         print(f"- Embeddings: {param_counts['embeddings']['total']:,}")
-        print(f"  - Token embeddings: {param_counts['embeddings']['token']:,}")
-        print(f"  - Position embeddings: {param_counts['embeddings']['position']:,}")
+        print(f"- Token embeddings: {param_counts['embeddings']['token']:,}")
+        print(f"- Position embeddings: {param_counts['embeddings']['position']:,}")
         print(f"- Transformer layers: {param_counts['transformer_layers']:,}")
         print(f"- Layer norms: {param_counts['layer_norms']:,}")
         print(f"- Head parameters: {param_counts['heads']:,}")
@@ -380,17 +467,9 @@ if __name__ == "__main__":
 
     # Wrap model with DDP
     if world_size is not None:
-        model = DDP(
-            model, device_ids=[local_rank], find_unused_parameters=False
-        )  # Add this flag
+        model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
 
-    # Create dataloaders with strategy-specific collate functions
-    strategies = {
-        "primary": NextTokenStrategy(tokenizer=tokenizer),
-        "auxiliary": NextTokenStrategy(tokenizer=tokenizer),
-    }
-
-    # Create dataloaders
+    # Create dataloaders with appropriate strategies
     train_loader, val_loader, train_sampler, val_sampler = create_dataloaders(
         files_pattern=args.train_data,
         block_size=args.block_size,
@@ -399,40 +478,9 @@ if __name__ == "__main__":
         world_size=world_size,
         strategies=strategies,
         tokenizer=tokenizer,
-        is_instruction_data=False,
     )
 
-    if args.load_checkpoint is not None and not args.pretrain:
-        warmup_steps = 100  # Adjust as needed
-        lr = args.lr * 0.1  # Start with lower learning rate
-
-        optimizer = bnb.optim.AdamW(
-            model.parameters(),
-            lr=lr,
-            weight_decay=0.1,
-            optim_bits=8,
-            block_wise=True,
-            is_paged=True,
-        )
-
-        num_training_steps = len(train_loader) * args.epochs
-        scheduler = get_linear_schedule_with_warmup(
-            optimizer,
-            num_warmup_steps=warmup_steps,
-            num_training_steps=num_training_steps,
-        )
-    else:
-        # Create optimizer and scheduler
-        optimizer = bnb.optim.AdamW(
-            model.parameters(),
-            lr=args.lr,
-            weight_decay=0.1,
-            optim_bits=8,
-            block_wise=True,
-            is_paged=True,
-        )
-
-        scheduler = CosineAnnealingLR(optimizer, T_max=len(train_loader) * args.epochs)
+    optimizer, scheduler = configure_optimizer(model, args, train_loader)
 
     scaler = GradScaler()
 
@@ -445,26 +493,23 @@ if __name__ == "__main__":
             args.load_checkpoint, model, optimizer, scheduler, scaler, device
         )
         start_epoch = checkpoint_info["epoch"] + 1
-        trainer.set_global_step(checkpoint_info["step"])
-
-    if args.load_checkpoint is not None:
-        checkpoint_info = load_checkpoint(
-            args.load_checkpoint, model, optimizer, scheduler, scaler, device
-        )
-        start_epoch = checkpoint_info["epoch"]
-        trainer.set_global_step(checkpoint_info["step"])
+        trainer.set_global_step(checkpoint_info["global_step"])
 
         # Set sampler epoch for distributed training
         if train_sampler is not None and hasattr(train_sampler, "set_epoch"):
             train_sampler.set_epoch(start_epoch)
 
         # Ensure scheduler is at the right step
-        for _ in range(checkpoint_info["step"]):
+        for _ in range(checkpoint_info["global_step"]):
             scheduler.step()
 
-        print(f"Resuming from epoch {start_epoch}, step {checkpoint_info['step']}")
+        print(
+            f"Resuming from epoch {start_epoch}, step {checkpoint_info['global_step']}"
+        )
 
     for epoch in range(start_epoch, args.epochs):
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
 
         train_metrics = trainer.train_epoch(
             model=model,
@@ -474,6 +519,10 @@ if __name__ == "__main__":
             scaler=scaler,
             device=device,
             epoch=epoch,
+            tokenizer=tokenizer,
+            sample_prompts=args.sample_prompts,
+            gen_every_n_steps=args.gen_every_n_steps,
+            max_gen_length=args.max_gen_length,
             gradient_accumulation_steps=args.gradient_accumulation_steps,
             save_every_n_steps=args.save_every_n_steps,
             checkpoint_dir=args.checkpoint_dir,
@@ -487,7 +536,7 @@ if __name__ == "__main__":
 
         # Log metrics and save checkpoints (only on rank 0)
         if rank == 0:
-            mode_prefix = "pretrain" if args.pretrain else "train"
+            mode_prefix = "pretrain" if args.pretrain else "finetune"
             wandb.log(
                 {
                     "epoch": epoch,
@@ -503,17 +552,14 @@ if __name__ == "__main__":
             # Save best model
             if val_metrics["total_loss"] < best_val_loss:
                 best_val_loss = val_metrics["total_loss"]
-                # Create checkpoint directory if it doesn't exist
                 os.makedirs("checkpoints", exist_ok=True)
 
-                # Get the underlying model if using DDP
                 model_state_dict = (
                     model.module.state_dict()
                     if hasattr(model, "module")
                     else model.state_dict()
                 )
 
-                # Save checkpoint
                 checkpoint = {
                     "epoch": epoch,
                     "model_state_dict": model_state_dict,
@@ -524,6 +570,16 @@ if __name__ == "__main__":
                     "val_metrics": val_metrics,
                     "config": config.__dict__,
                     "best_val_loss": best_val_loss,
+                    "strategy_config": (
+                        {
+                            "instruction_token": "[INST]",
+                            "response_token": "[/INST]",
+                            "end_token": "</s>",
+                            "max_sequence_length": args.block_size,
+                        }
+                        if not args.pretrain
+                        else None
+                    ),
                 }
 
                 checkpoint_path = f"checkpoints/best_model_{mode_prefix}.pt"

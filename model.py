@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import math
 from typing import List, Dict, Optional, Union, Tuple
 
@@ -106,6 +107,12 @@ class MultiLatentAttention(nn.Module):
                 "WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0"
             )
 
+        self.gradient_scale = 1.0
+
+        # Add layer normalization to queries and keys
+        self.query_norm = nn.LayerNorm(config.n_embd)
+        self.key_norm = nn.LayerNorm(config.n_embd)
+
     def forward(self, x: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
         B, T, C = x.size()
 
@@ -115,20 +122,30 @@ class MultiLatentAttention(nn.Module):
                 self.head_dim, self.max_seq_len, self.rope_theta
             ).to(x.device)
 
+        # Scale input before projections
+        x = x * 0.1  # Reduce magnitude of input to prevent gradient explosion
+
         # Compute key and value projections
         k = self.key(x).view(B, T, self.n_head, self.head_dim)
         v = self.value(x).view(B, T, self.n_head, self.head_dim)
 
-        # Compute gating weights for latent queries
+        # Normalize k and v for more stable gradients
+        k = self.key_norm(k.view(B, T, -1)).view(B, T, self.n_head, self.head_dim)
+        v = v * 0.1  # Scale down value projections
+
+        # Compute gating weights for latent queries with gradient scaling
         gates = self.gate(x).view(B, T, self.n_head, self.n_latents)
         gates = torch.softmax(gates, dim=-1)  # Normalize over latents
+        gates = gates * 0.5  # Scale down gates
 
-        # Expand latent queries for batch size
-        q = self.latent_queries.expand(
-            B, -1, -1, -1
-        )  # [B, n_latents, n_head, head_dim]
+        # Expand latent queries and normalize
+        q = self.latent_queries.expand(B, -1, -1, -1)
+        q = self.query_norm(q.view(B, self.n_latents, -1)).view(
+            B, self.n_latents, self.n_head, self.head_dim
+        )
+        q = q * 0.1  # Scale down queries
 
-        # Apply rotary embeddings to keys only (latent queries don't need positional info)
+        # Apply rotary embeddings to keys only
         k = apply_rotary_emb(k, self.freqs_cis[:T])
 
         # Rearrange for attention computation
@@ -136,9 +153,8 @@ class MultiLatentAttention(nn.Module):
         k = k.transpose(1, 2)  # [B, n_head, T, head_dim]
         v = v.transpose(1, 2)  # [B, n_head, T, head_dim]
 
-        # Compute attention with latent queries
+        # Compute attention with scaled inputs
         if self.use_flash_attention:
-            # [B, n_head, n_latents, T]
             attn_output = torch.nn.functional.scaled_dot_product_attention(
                 q,
                 k,
@@ -148,21 +164,22 @@ class MultiLatentAttention(nn.Module):
                 is_causal=True,
             )
         else:
-            # Manual attention implementation
-            attn_weights = (q @ k.transpose(-2, -1)) / self.scale
+            attn_weights = (q @ k.transpose(-2, -1)) / (
+                self.scale * 2
+            )  # Additional scaling
             if mask is not None:
                 attn_weights = attn_weights.masked_fill(mask == 0, float("-inf"))
             attn_weights = torch.softmax(attn_weights, dim=-1)
             attn_weights = self.dropout(attn_weights)
             attn_output = attn_weights @ v
 
-        # Apply gating mechanism
+        # Apply gating mechanism with gradient control
         gates = gates.transpose(1, 2)  # [B, n_head, T, n_latents]
         weighted_latents = torch.einsum("bhls,bhtl->bhts", attn_output, gates)
 
-        # Reshape and project output
+        # Reshape and project output with additional scaling
         out = weighted_latents.transpose(1, 2).contiguous().view(B, T, C)
-        out = self.proj(out)
+        out = self.proj(out * 0.1)  # Scale before projection
         out = self.dropout(out)
 
         return out
@@ -176,12 +193,17 @@ class FeedForward(nn.Module):
         self.net = nn.Sequential(
             nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias),
             nn.GELU(),
+            nn.Dropout(config.dropout),
             nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias),
             nn.Dropout(config.dropout),
         )
 
+        self.register_parameter(
+            "layer_scale", nn.Parameter(torch.ones(1, 1, config.n_embd) * 0.3)
+        )
+
     def forward(self, x):
-        return self.net(x)
+        return self.net(x) * self.layer_scale  # Scale output
 
 
 class TransformerBlock(nn.Module):
@@ -278,6 +300,9 @@ class MultiHeadGPT(nn.Module):
         super().__init__()
         self.config = config
 
+        # Calculate single scaling factor based on embedding dimension
+        self.embedding_scale = 1.0 / math.sqrt(config.n_embd)
+
         # Embeddings (shared between heads)
         self.token_embedding = nn.Embedding(config.vocab_size, config.n_embd)
         self.position_embedding = nn.Embedding(config.block_size, config.n_embd)
@@ -292,35 +317,39 @@ class MultiHeadGPT(nn.Module):
             {head.name: nn.LayerNorm(config.n_embd) for head in config.heads}
         )
 
-        self.lm_heads = nn.ModuleDict(
-            {
-                head.name: nn.Linear(config.n_embd, head.vocab_size, bias=config.bias)
-                for head in config.heads
-            }
-        )
+        # Initialize heads with careful scaling
+        self.lm_heads = nn.ModuleDict()
+        for head in config.heads:
+            head_module = nn.Linear(config.n_embd, head.vocab_size, bias=config.bias)
+            # Initialize with scaled xavier/glorot
+            nn.init.xavier_normal_(head_module.weight, gain=0.1)
+            if config.bias:
+                nn.init.zeros_(head_module.bias)
+            self.lm_heads[head.name] = head_module
 
         # Store head weights for loss calculation
         self.head_weights = {head.name: head.weight for head in config.heads}
 
-        # Initialize weights
+        # Initialize all weights with careful scaling
         self._init_weights()
 
-        # Initialize latent queries
-        for block in self.blocks:
-            nn.init.normal_(block.attn.latent_queries, mean=0.0, std=0.02)
-
-        self.gradient_checkpointing = False
+        # Enable gradient checkpointing by default for better memory efficiency
+        self.gradient_checkpointing = True
 
     def _init_weights(self):
-        # Initialize embeddings
+        # Initialize embeddings with smaller standard deviation
         nn.init.normal_(self.token_embedding.weight, mean=0.0, std=0.02)
         nn.init.normal_(self.position_embedding.weight, mean=0.0, std=0.02)
 
-        # Initialize all heads
-        for head in self.lm_heads.values():
-            if self.config.bias:
-                nn.init.zeros_(head.bias)
-            nn.init.normal_(head.weight, mean=0.0, std=0.02)
+        # Initialize latent queries for all blocks
+        for block in self.blocks:
+            if hasattr(block.attn, "latent_queries"):
+                nn.init.normal_(block.attn.latent_queries, mean=0.0, std=0.02)
+
+        # Careful initialization of layer norms
+        for name, module in self.ln_fs.items():
+            nn.init.constant_(module.weight, 0.1)  # Start with smaller scale
+            nn.init.zeros_(module.bias)
 
     def forward(
         self,
@@ -328,92 +357,62 @@ class MultiHeadGPT(nn.Module):
         mask: Optional[torch.Tensor] = None,
         head_names: Optional[List[str]] = None,
     ) -> Union[Dict[str, torch.Tensor], torch.Tensor]:
-        """
-        Forward pass with selective head output.
-
-        Args:
-            idx: Input token indices
-            mask: Optional attention mask
-            head_names: List of head names to compute. If None, compute all heads.
-
-        Returns:
-            If multiple heads requested:
-                dict: Mapping of head names to their logits
-            If single head requested:
-                tensor: Logits for the requested head
-        """
         B, T = idx.size()
         if T > self.config.block_size:
             raise ValueError(
                 f"Sequence length {T} exceeds block size {self.config.block_size}"
             )
 
-        # Generate embeddings
+        # Generate embeddings with single scaling
         positions = (
             torch.arange(0, T, dtype=torch.long, device=idx.device)
             .unsqueeze(0)
             .expand(B, -1)
         )
 
-        tok_emb = self.token_embedding(idx)
-        pos_emb = self.position_embedding(positions)
-        x = tok_emb + pos_emb
+        # Apply single scaling factor to combined embeddings
+        x = (
+            self.token_embedding(idx) + self.position_embedding(positions)
+        ) * self.embedding_scale
 
-        # Process through transformer blocks
+        # Process through transformer blocks with gradient checkpointing
         for block in self.blocks:
             if self.gradient_checkpointing and self.training:
                 x = torch.utils.checkpoint.checkpoint(block, x, mask)
             else:
                 x = block(x, mask=mask)
 
-        # Determine which heads to compute
+        # Get head names to compute
         heads_to_compute = (
-            head_names
-            if head_names is not None
-            else [h.name for h in self.config.heads]
+            head_names if head_names is not None else list(self.lm_heads.keys())
         )
 
-        # Generate outputs for requested heads
-        outputs = {
-            name: self.lm_heads[name](self.ln_fs[name](x)) for name in heads_to_compute
-        }
+        # Compute outputs for each head without additional scaling
+        outputs = {}
+        for name in heads_to_compute:
+            normalized = self.ln_fs[name](x)
+            outputs[name] = self.lm_heads[name](normalized)
 
-        # Return dictionary if multiple heads requested, otherwise return single tensor
-        if len(heads_to_compute) == 1:
-            return outputs[heads_to_compute[0]]
-        return outputs
+        return outputs[heads_to_compute[0]] if len(heads_to_compute) == 1 else outputs
 
-    def compute_weighted_loss(
-        self,
-        outputs: Dict[str, torch.Tensor],
-        targets: Dict[str, torch.Tensor],
-        loss_fn: nn.Module = nn.CrossEntropyLoss(),
-    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        """
-        Compute weighted loss across multiple heads.
+    def get_grad_norm(self, norm_type=2.0):
+        """Helper method to get total gradient norm for monitoring."""
+        parameters = [p for p in self.parameters() if p.grad is not None]
+        if len(parameters) == 0:
+            return torch.tensor(0.0)
+        device = parameters[0].grad.device
+        total_norm = torch.norm(
+            torch.stack(
+                [torch.norm(p.grad.detach(), norm_type).to(device) for p in parameters]
+            ),
+            norm_type,
+        )
+        return total_norm
 
-        Args:
-            outputs: Dictionary of head outputs
-            targets: Dictionary of head targets
-            loss_fn: Loss function to use
+    def enable_gradient_checkpointing(self):
+        """Helper method to enable gradient checkpointing."""
+        self.gradient_checkpointing = True
 
-        Returns:
-            tuple: (total weighted loss, dictionary of individual losses)
-        """
-        individual_losses = {}
-        total_loss = 0.0
-
-        for name, output in outputs.items():
-            if name in targets:
-                loss = loss_fn(output.view(-1, output.size(-1)), targets[name].view(-1))
-                weighted_loss = loss * self.head_weights[name]
-                individual_losses[name] = loss
-                total_loss += weighted_loss
-
-        return total_loss, individual_losses
-
-    def forward_single(
-        self, idx: torch.Tensor, head_name: str, mask: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:
-        """Convenience method for single head forward pass."""
-        return self.forward(idx, mask, head_names=[head_name])
+    def disable_gradient_checkpointing(self):
+        """Helper method to disable gradient checkpointing."""
+        self.gradient_checkpointing = False

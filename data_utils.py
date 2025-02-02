@@ -16,72 +16,151 @@ from typing import Dict, List, Optional, Tuple
 
 
 class MultiHeadDataset(Dataset):
-    """Dataset that supports multiple heads with different strategies"""
-
     def __init__(
         self,
         files_pattern: str,
         block_size: int,
         tokenizer,
         strategies: Dict[str, "ModelingStrategy"],
-        is_instruction_data: bool = False,
     ):
         super().__init__()
         self.block_size = block_size
         self.tokenizer = tokenizer
         self.strategies = strategies
-        self.is_instruction_data = is_instruction_data
-
-        if is_instruction_data:
-            self.load_instruction_data(files_pattern)
-        else:
-            self.load_text_data(files_pattern)
-
-    def load_text_data(self, files_pattern: str):
-        """Load and tokenize plain text data"""
+        self.examples = []
         self.tokens = []
+
+        self.is_mixed_strategy = (
+            len(strategies) == 2
+            and isinstance(strategies["primary"], NextTokenStrategy)
+            and isinstance(strategies["auxiliary"], InstructionFollowingStrategy)
+        )
+
+        if self.is_mixed_strategy:
+            self._load_mixed_data(files_pattern)
+        elif any(
+            isinstance(s, InstructionFollowingStrategy) for s in strategies.values()
+        ):
+            self._load_instruction_data(files_pattern)
+        else:
+            self._load_text_data(files_pattern)
+
+    def _load_mixed_data(self, files_pattern: str):
+        """Load data for mixed strategy training"""
+        print("Using mixed strategy loading")
+        for file_path in glob(files_pattern):
+            print(file_path)
+            if not file_path.endswith(".jsonl"):
+                continue
+
+            with open(file_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    example = json.loads(line.strip())
+                    input_tokens = self.tokenizer.encode(example["input"])
+                    self.examples.append(
+                        {
+                            "input_tokens": input_tokens,
+                            "instruction": example["instruction"],
+                            "response": example.get("thought", example.get("response")),
+                        }
+                    )
+
+    def _load_text_data(self, files_pattern: str):
         for file_path in glob(files_pattern):
             with open(file_path, "r", encoding="utf-8") as f:
                 text = f.read()
                 self.tokens.extend(self.tokenizer.encode(text))
 
-    def load_instruction_data(self, files_pattern: str):
-        """Load instruction-response pairs from JSONL files"""
-        self.examples = []
+    def _load_instruction_data(self, files_pattern: str):
         for file_path in glob(files_pattern):
-            with open(file_path, "r", encoding="utf-8") as f:
+            with open(file_path, "r", encoding="utf-8-sig") as f:
                 for line in f:
                     example = json.loads(line.strip())
                     if isinstance(example, dict):
                         self.examples.append(example)
 
     def __len__(self):
-        if self.is_instruction_data:
+        if self.examples:
             return len(self.examples)
-        return len(self.tokens) - self.block_size
+        return max(0, len(self.tokens) - self.block_size)
 
     def __getitem__(self, idx):
-        if self.is_instruction_data:
-            return self.get_instruction_item(idx)
-        return self.get_text_item(idx)
+        if self.is_mixed_strategy:
+            return self._get_mixed_item(idx)
+        elif any(
+            isinstance(s, InstructionFollowingStrategy)
+            for s in self.strategies.values()
+        ):
+            return self._get_instruction_item(idx)
+        return self._get_text_item(idx)
 
-    def get_text_item(self, idx):
-        """Get item for plain text data"""
+    def _get_mixed_item(self, idx):
+        example = self.examples[idx]
+        input_tokens = example["input_tokens"]
+
+        # Next token prediction for primary path
+        max_start_idx = max(0, len(input_tokens) - (self.block_size + 1))
+        start_idx = random.randint(0, max_start_idx) if max_start_idx > 0 else 0
+        chunk = input_tokens[start_idx : start_idx + self.block_size + 1]
+
+        # Pad if necessary
+        if len(chunk) < self.block_size + 1:
+            chunk = chunk + [0] * (self.block_size + 1 - len(chunk))
+
+        # Format instruction
+        input_text = self.tokenizer.decode(input_tokens)
+        instruction = f"{example['instruction']}\n\nInput: {input_text}"
+
+        strategy = self.strategies["auxiliary"]
+        max_length = strategy.max_length
+        instruction_tokens = strategy.tokenizer.encode(instruction)
+        response_tokens = strategy.tokenizer.encode(example["response"])
+
+        # Truncate if needed
+        max_seq_length = max_length - 3  # Account for special tokens
+        if len(instruction_tokens) > max_seq_length:
+            instruction_tokens = instruction_tokens[:max_seq_length]
+        if len(response_tokens) > max_seq_length:
+            response_tokens = response_tokens[:max_seq_length]
+
+        return {
+            "primary": {
+                "input": torch.tensor(chunk[:-1], dtype=torch.long),
+                "target": torch.tensor(chunk[1:], dtype=torch.long),
+            },
+            "auxiliary": {
+                "instruction": strategy.tokenizer.decode(instruction_tokens),
+                "response": strategy.tokenizer.decode(response_tokens),
+            },
+        }
+
+    def _get_text_item(self, idx):
         chunk = self.tokens[idx : idx + self.block_size + 1]
         x = torch.tensor(chunk[:-1])
         y = torch.tensor(chunk[1:])
-
-        # Create data for each head using their respective strategies
         return {"tokens": x, "targets": {name: y for name in self.strategies.keys()}}
 
-    def get_instruction_item(self, idx):
-        """Get item for instruction data"""
+    def _get_instruction_item(self, idx):
         example = self.examples[idx]
-        # Each strategy might process the instruction differently
         return {
             "instruction": example,
             "targets": {name: example for name in self.strategies.keys()},
         }
+
+
+def get_collate_fn(strategies):
+    """Determine which collate function to use based on strategy types."""
+    has_instruction = any(
+        isinstance(s, InstructionFollowingStrategy) for s in strategies.values()
+    )
+    has_next_token = any(isinstance(s, NextTokenStrategy) for s in strategies.values())
+
+    if has_instruction and has_next_token:
+        return lambda x: collate_mixed_batch(x, strategies)
+    elif has_instruction:
+        return lambda x: collate_instruction_batch(x, strategies)
+    else:
+        return lambda x: collate_text_batch(x, strategies)
 
 
 def create_dataloaders(
@@ -94,23 +173,18 @@ def create_dataloaders(
     tokenizer=None,
     num_workers: int = 4,
     prefetch_factor: int = 2,
-    is_instruction_data: bool = False,
 ):
     """Create distributed dataloaders for multi-head processing"""
-
     if tokenizer is None:
         tokenizer = tiktoken.get_encoding("gpt2")
 
-    # Create dataset with all strategies
     dataset = MultiHeadDataset(
         files_pattern=files_pattern,
         block_size=block_size,
         tokenizer=tokenizer,
         strategies=strategies,
-        is_instruction_data=is_instruction_data,
     )
 
-    # Create train/val splits
     generator = torch.Generator().manual_seed(42)
     train_size = int(0.8 * len(dataset))
     val_size = len(dataset) - train_size
@@ -119,7 +193,6 @@ def create_dataloaders(
         dataset, [train_size, val_size], generator=generator
     )
 
-    # Create distributed samplers if needed
     train_sampler = val_sampler = None
     if world_size is not None and world_size > 1:
         train_sampler = DistributedSampler(
@@ -138,13 +211,8 @@ def create_dataloaders(
             seed=42,
         )
 
-    # Create collate function that handles all strategies
-    def collate_multi_head(examples: List[Dict]) -> Dict:
-        if is_instruction_data:
-            return collate_instruction_batch(examples, strategies)
-        return collate_text_batch(examples, strategies)
+    collate_fn = get_collate_fn(strategies)
 
-    # Create dataloaders
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
@@ -154,7 +222,7 @@ def create_dataloaders(
         pin_memory=True,
         prefetch_factor=prefetch_factor,
         persistent_workers=True,
-        collate_fn=collate_multi_head,
+        collate_fn=collate_fn,
         drop_last=True,
         worker_init_fn=lambda worker_id: torch.manual_seed(42 + worker_id),
     )
@@ -168,22 +236,60 @@ def create_dataloaders(
         pin_memory=True,
         prefetch_factor=prefetch_factor,
         persistent_workers=True,
-        collate_fn=collate_multi_head,
+        collate_fn=collate_fn,
         worker_init_fn=lambda worker_id: torch.manual_seed(42 + worker_id),
     )
 
     return train_loader, val_loader, train_sampler, val_sampler
 
 
-def collate_text_batch(
-    examples: List[Dict], strategies: Dict[str, "ModelingStrategy"]
-) -> Dict:
-    """Collate function for text data that handles all heads"""
-    # Get and pad token sequences
+def collate_mixed_batch(examples, strategies):
+    primary_inputs = []
+    primary_targets = []
+    aux_inputs = []
+    aux_targets = []
+
+    max_length = max(len(ex["primary"]["input"]) for ex in examples)
+    aux_strategy = strategies["auxiliary"]
+
+    for ex in examples:
+        # Pad primary inputs/targets
+        primary_inputs.append(
+            torch.nn.functional.pad(
+                ex["primary"]["input"],
+                (0, max_length - len(ex["primary"]["input"])),
+                value=0,
+            )
+        )
+        primary_targets.append(
+            torch.nn.functional.pad(
+                ex["primary"]["target"],
+                (0, max_length - len(ex["primary"]["target"])),
+                value=0,
+            )
+        )
+
+        # Process auxiliary data
+        aux_tokens = aux_strategy.format_instruction(
+            ex["auxiliary"]["instruction"], ex["auxiliary"]["response"]
+        )
+        aux_inputs.append(aux_tokens[:-1])
+        aux_targets.append(aux_tokens[1:])
+
+    # Stack tensors and return in standard format
+    return {
+        "inputs": torch.stack(primary_inputs),
+        "targets": {
+            "primary": torch.stack(primary_targets),
+            "auxiliary": torch.stack(aux_targets),
+        },
+    }
+
+
+def collate_text_batch(examples, strategies):
     tokens = [ex["tokens"] for ex in examples]
     padded = torch.nn.utils.rnn.pad_sequence(tokens, batch_first=True, padding_value=0)
 
-    # Create targets dictionary for each head
     targets = {}
     for name, strategy in strategies.items():
         head_targets = torch.nn.utils.rnn.pad_sequence(
@@ -197,6 +303,7 @@ def collate_text_batch(
             else head_targets
         )
 
+    # Return in standard format
     return {"inputs": padded, "targets": targets}
 
 
@@ -231,69 +338,6 @@ def collate_instruction_batch(
             head_targets[name] = targets
 
     return {"inputs": head_inputs, "targets": head_targets}
-
-
-class MaskingDataset(Dataset):
-    """Dataset for span masking strategies"""
-
-    def __init__(self, files_pattern, block_size, tokenizer, main_strategy):
-        super().__init__()
-        self.block_size = block_size
-        self.tokenizer = tokenizer
-        self.main_strategy = main_strategy
-
-        # Load and tokenize texts
-        self.examples = []
-        for file_path in glob(files_pattern):
-            with open(file_path, "r", encoding="utf-8") as f:
-                text = f.read()
-                # Tokenize the full text
-                tokens = self.tokenizer.encode(text)
-                # Create overlapping chunks of appropriate size
-                for i in range(0, len(tokens) - block_size + 1, block_size // 2):
-                    chunk = tokens[i : i + block_size]
-                    if len(chunk) == block_size:  # Only keep full-size chunks
-                        self.examples.append(torch.tensor(chunk))
-
-    def __len__(self):
-        return len(self.examples)
-
-    def __getitem__(self, idx):
-        return {"tokens": self.examples[idx]}
-
-
-# Dataset class for finetuning with input-thought pairs
-class BilateralDataset(Dataset):
-    """Dataset for bilateral model training with input text and thought annotations"""
-
-    def __init__(self, files_pattern, block_size, encoding_name="gpt2"):
-        super().__init__()
-        self.block_size = block_size
-        self.encoding_name = encoding_name
-        self.tokenizer = tiktoken.get_encoding(encoding_name)
-
-        # Load all JSONL files matching the pattern
-        self.examples = []
-        for filepath in glob(files_pattern):
-            with open(filepath, "r", encoding="utf-8") as f:
-                for line in f:
-                    try:
-                        # Parse each line as a separate JSON object
-                        example = json.loads(line.strip())
-                        if isinstance(example, dict):
-                            self.examples.append(example)
-                    except json.JSONDecodeError as e:
-                        print(f"Warning: Skipping invalid JSON line in {filepath}: {e}")
-                        continue
-
-        print(f"Loaded {len(self.examples)} examples from {files_pattern}")
-
-    def __len__(self):
-        return len(self.examples)
-
-    def __getitem__(self, idx):
-        example = self.examples[idx]
-        return {"input": example["input"], "thought": example["thought"]}
 
 
 class MixedStrategyDataset(Dataset):
