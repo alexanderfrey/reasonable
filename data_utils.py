@@ -42,7 +42,7 @@ class SingleHeadDataset(Dataset):
         for file_path in glob(files_pattern):
             try:
                 with open(file_path, "r", encoding="utf-8") as f:
-                    text = f.read()
+                    text = f.read()  # [:5000]
                     if text.strip():  # Check if text is not empty
                         self.tokens.extend(self.tokenizer.encode(text))
             except Exception as e:

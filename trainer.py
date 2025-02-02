@@ -1,4 +1,4 @@
-import os
+import os, math
 import torch
 from tqdm.auto import tqdm
 import wandb
@@ -1042,13 +1042,6 @@ def log_latent_stats(model):
             )
 
 
-import torch
-import torch.nn.functional as F
-import wandb
-from tqdm import tqdm
-import math
-
-
 class SingleHeadTrainer:
     """Trainer for single-head GPT model using specified strategy"""
 
@@ -1182,247 +1175,111 @@ class SingleHeadTrainer:
         max_grad_norm=1.0,
         log_every_n_steps=10,
     ):
-        """Train for one epoch with comprehensive logging and monitoring"""
-        if gen_every_n_steps and (tokenizer is None or not sample_prompts):
-            raise ValueError(
-                "tokenizer and sample_prompts must be provided if gen_every_n_steps is set"
-            )
-
+        """Memory-optimized training for one epoch"""
         model.train()
-        total_loss = 0.0
-        total_perplexity = 0.0
+
+        # Use lightweight metric tracking
+        running_loss = RunningAverage()
+        running_ppl = RunningAverage()
 
         # Training monitoring
-        grad_scaler_skipped = 0
-        nan_detected = 0
-        consecutive_nan_count = 0
-        max_consecutive_nan = 5
+        grad_norm_total = 0
+        num_steps = 0
 
-        # Exponential moving averages
-        ema_loss = 0.0
-        ema_perplexity = 0.0
-        ema_decay = 0.99
-
-        # Temperature annealing for loss stability
-        temperature = max(0.8, 1.0 - epoch * 0.1)
+        # Batch accumulation state
+        optimizer.zero_grad(set_to_none=True)  # More efficient than zero_grad()
 
         progress_bar = tqdm(train_loader, desc=f"Epoch {epoch + 1}")
 
-        try:
-            for batch_idx, batch in enumerate(progress_bar):
-                try:
-                    input_ids = batch["inputs"].to(device)
-                    targets = batch["targets"].to(device)
+        for batch_idx, batch in enumerate(progress_bar):
+            # Efficient device transfer
+            with torch.cuda.stream(torch.cuda.Stream()):
+                input_ids = batch["inputs"].to(device, non_blocking=True)
+                targets = batch["targets"].to(device, non_blocking=True)
 
-                    if input_ids.shape[0] == 0:
-                        continue
+            is_accumulation_step = (batch_idx + 1) % gradient_accumulation_steps != 0
 
-                    is_accumulation_step = (
-                        batch_idx + 1
-                    ) % gradient_accumulation_steps != 0
+            # Compute loss with mixed precision
+            with torch.cuda.amp.autocast():
+                outputs = model(input_ids)
+                loss = self.strategy.compute_loss(outputs, targets)
+                loss = loss / gradient_accumulation_steps
 
-                    with torch.amp.autocast("cuda", dtype=torch.float16):
-                        outputs = model(input_ids)
+            # Backward pass
+            scaler.scale(loss).backward()
 
-                        # Check and stabilize outputs
-                        if torch.isnan(outputs).any() or torch.isinf(outputs).any():
-                            print("Warning: Found nan/inf in model output")
-                            self._debug_loss_components(outputs, targets)
-                            outputs = torch.nan_to_num(
-                                outputs, nan=0.0, posinf=100.0, neginf=-100.0
-                            )
+            # Update metrics
+            with torch.no_grad():
+                running_loss.update(loss.item() * gradient_accumulation_steps)
+                running_ppl.update(torch.exp(loss).item() * gradient_accumulation_steps)
 
-                        # Apply temperature scaling
-                        scaled_outputs = outputs / temperature
-                        loss = self.strategy.compute_loss(scaled_outputs, targets)
+            # Gradient update step
+            if not is_accumulation_step:
+                # Gradient clipping
+                scaler.unscale_(optimizer)
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), max_grad_norm
+                )
+                grad_norm_total += grad_norm.item()
+                num_steps += 1
 
-                        # Debug loss components if needed
-                        if batch_idx % log_every_n_steps == 0:
-                            self._debug_loss_components(scaled_outputs, targets)
+                # Optimizer step
+                scaler.step(optimizer)
+                scaler.update()
+                scheduler.step()
 
-                        # Validate loss
-                        if torch.isnan(loss) or torch.isinf(loss):
-                            print("Warning: Invalid loss detected")
-                            self._log_perplexity_debug_info(scaled_outputs, targets)
-                            loss = torch.tensor(
-                                1.0, device=loss.device, requires_grad=True
-                            )
+                # Reset gradients
+                optimizer.zero_grad(set_to_none=True)
 
-                        # Early detection of problematic loss
-                        if loss.item() > 100 or torch.isnan(loss) or torch.isinf(loss):
-                            nan_detected += 1
-                            consecutive_nan_count += 1
-                            print(
-                                f"Anomalous loss detected: {loss.item()} at step {self.global_step}"
-                            )
+                # Log metrics
+                if self.global_step % log_every_n_steps == 0 and wandb.run is not None:
+                    metrics = {
+                        "train/loss": running_loss.get_average(),
+                        "train/perplexity": running_ppl.get_average(),
+                        "train/learning_rate": scheduler.get_last_lr()[0],
+                        "train/grad_norm_avg": grad_norm_total / max(1, num_steps),
+                        "train/global_step": self.global_step,
+                    }
+                    wandb.log(metrics, step=self.global_step)
 
-                            if consecutive_nan_count >= max_consecutive_nan:
-                                print(
-                                    "Too many consecutive anomalous losses. Implementing recovery..."
-                                )
-                                optimizer.zero_grad(set_to_none=True)
-                                for param_group in optimizer.param_groups:
-                                    param_group["lr"] = param_group["lr"] * 0.5
-                                consecutive_nan_count = 0
-                                continue
-                        else:
-                            consecutive_nan_count = 0
+                # Update progress bar
+                progress_bar.set_postfix(
+                    {
+                        "loss": f"{running_loss.get_average():.4f}",
+                        "ppl": f"{running_ppl.get_average():.2f}",
+                        "lr": f"{scheduler.get_last_lr()[0]:.2e}",
+                    }
+                )
 
-                        # Scale loss for gradient accumulation
-                        loss = loss / gradient_accumulation_steps
+                # Sample generations periodically
+                if gen_every_n_steps and self.global_step % gen_every_n_steps == 0:
+                    self._generate_and_log_samples(
+                        model, tokenizer, sample_prompts, max_gen_length, device
+                    )
 
-                    # Backward pass with gradient scaling
-                    scaler.scale(loss).backward()
+                # Save checkpoint periodically
+                if save_every_n_steps and self.global_step % save_every_n_steps == 0:
+                    self.save_checkpoint(
+                        model,
+                        optimizer,
+                        scheduler,
+                        epoch,
+                        self.global_step,
+                        checkpoint_dir,
+                    )
 
-                    if not is_accumulation_step:
-                        # Gradient stabilization and clipping
-                        # self._log_gradient_norms(model, max_grad_norm)
+                self.global_step += 1
 
-                        # Global gradient norm check
-                        grad_norm = torch.nn.utils.clip_grad_norm_(
-                            model.parameters(), max_grad_norm
-                        )
-
-                        if torch.isfinite(grad_norm):
-                            # Add minimal gradient noise for stability
-                            noise_scale = 1e-5 * min(1.0, self.global_step / 1000)
-                            for param in model.parameters():
-                                if param.grad is not None:
-                                    noise = torch.randn_like(param.grad) * noise_scale
-                                    param.grad.add_(noise)
-
-                            scaler.step(optimizer)
-                            scaler.update()
-                        else:
-                            grad_scaler_skipped += 1
-                            print(
-                                f"Skipped scaler step due to inf/nan gradients at step {self.global_step}"
-                            )
-                            self._log_gradient_issues(model)
-                            continue
-
-                        optimizer.zero_grad(set_to_none=True)
-                        scheduler.step()
-
-                        # Compute perplexity
-                        with torch.no_grad():
-                            ppl = self._compute_perplexity(scaled_outputs, targets)
-                            total_perplexity += ppl
-                            ema_perplexity = (
-                                ema_decay * ema_perplexity + (1 - ema_decay) * ppl
-                            )
-
-                        # Update metrics
-                        total_loss += loss.item() * gradient_accumulation_steps
-                        ema_loss = ema_decay * ema_loss + (1 - ema_decay) * loss.item()
-
-                        # Log metrics
-                        if wandb.run is not None:
-                            metrics = {
-                                "train/loss": loss.item(),
-                                "train/perplexity": ema_perplexity,
-                                "train/learning_rate": scheduler.get_last_lr()[0],
-                                "train/grad_norm": (
-                                    grad_norm.item() if torch.isfinite(grad_norm) else 0
-                                ),
-                                "train/grad_scaler_skipped": grad_scaler_skipped,
-                                "train/nan_detected": nan_detected,
-                                "train/global_step": self.global_step,
-                                "train/temperature": temperature,
-                            }
-
-                            # Add detailed gradient stats
-                            if self.global_step % log_every_n_steps == 0:
-                                grad_stats = self._compute_gradient_stats(model)
-                                metrics.update(grad_stats)
-
-                            wandb.log(metrics, step=self.global_step)
-
-                        # Update progress bar
-                        progress_bar.set_postfix(
-                            {
-                                "loss": f"{ema_loss:.4f}",
-                                "ppl": f"{ema_perplexity:.2f}",
-                                "lr": f"{scheduler.get_last_lr()[0]:.2e}",
-                                "grad_norm": (
-                                    f"{grad_norm.item():.2f}"
-                                    if torch.isfinite(grad_norm)
-                                    else "inf"
-                                ),
-                            }
-                        )
-
-                        # Optional generation and checkpointing
-                        if (
-                            gen_every_n_steps
-                            and self.global_step % gen_every_n_steps == 0
-                        ):
-                            self._generate_and_log_samples(
-                                model, tokenizer, sample_prompts, max_gen_length, device
-                            )
-
-                        if (
-                            save_every_n_steps
-                            and self.global_step % save_every_n_steps == 0
-                        ):
-                            self.save_checkpoint(
-                                model,
-                                optimizer,
-                                scheduler,
-                                epoch,
-                                self.global_step,
-                                checkpoint_dir,
-                            )
-
-                        self.global_step += 1
-
-                except RuntimeError as e:
-                    print(f"Error during training step {self.global_step}: {e}")
-                    continue
-
-        except Exception as e:
-            print(f"Unexpected training error: {e}")
-            raise
+            # Explicit cleanup
+            del outputs
+            del loss
 
         return {
             "epoch": epoch,
-            "total_loss": total_loss / len(train_loader),
-            "total_perplexity": total_perplexity / len(train_loader),
-            "grad_scaler_skipped": grad_scaler_skipped,
-            "nan_detected": nan_detected,
+            "final_loss": running_loss.get_average(),
+            "final_perplexity": running_ppl.get_average(),
+            "grad_norm_avg": grad_norm_total / max(1, num_steps),
         }
-
-    def _debug_loss_components(self, logits, targets):
-        """Debug loss computation components"""
-        with torch.no_grad():
-            # Flatten and mask
-            flat_logits = logits.view(-1, logits.size(-1))
-            flat_targets = targets.view(-1)
-            mask = flat_targets != -100
-
-            # Get valid examples
-            valid_logits = flat_logits[mask]
-            valid_targets = flat_targets[mask]
-
-            # Basic stats
-            print("\nLoss Components Debug:")
-            print(
-                f"Valid logits range: [{valid_logits.min().item():.2f}, {valid_logits.max().item():.2f}]"
-            )
-
-            # Check probs
-            probs = torch.softmax(valid_logits, dim=-1)
-            target_probs = probs.gather(1, valid_targets.unsqueeze(1))
-            print(
-                f"Target probs range: [{target_probs.min().item():.2e}, {target_probs.max().item():.2e}]"
-            )
-
-            # Check log probs
-            log_probs = torch.log_softmax(valid_logits, dim=-1)
-            target_log_probs = log_probs.gather(1, valid_targets.unsqueeze(1))
-            print(
-                f"Target log probs range: [{target_log_probs.min().item():.2f}, {target_log_probs.max().item():.2f}]"
-            )
 
     def _log_perplexity_debug_info(self, logits, targets):
         """Log detailed perplexity calculation information"""
@@ -1631,3 +1488,96 @@ class SingleHeadTrainer:
     def set_global_step(self, step):
         """Set the global step counter"""
         self.global_step = step
+
+    def evaluate(self, model, val_loader, device):
+        """
+        Evaluate model on validation dataset.
+
+        Args:
+            model: Model to evaluate
+            val_loader: Validation data loader
+            device: Device to run evaluation on
+
+        Returns:
+            dict: Dictionary containing evaluation metrics including total_loss, primary_loss,
+                and auxiliary_loss for compatibility with the training script
+        """
+        model.eval()
+        total_loss = 0.0
+        total_perplexity = 0.0
+        num_batches = len(val_loader)
+
+        # Store original step
+        original_step = self.global_step
+
+        with torch.no_grad():
+            for batch in tqdm(val_loader, desc="Evaluating"):
+                try:
+                    input_ids = batch["inputs"].to(device)
+                    targets = batch["targets"].to(device)
+
+                    if input_ids.shape[0] == 0:
+                        continue
+
+                    with torch.amp.autocast("cuda", dtype=torch.float16):
+                        outputs = model(input_ids)
+
+                        # Apply temperature scaling as in training
+                        temperature = 1.2
+                        scaled_outputs = outputs / temperature
+
+                        # Compute loss
+                        loss = self.strategy.compute_loss(scaled_outputs, targets)
+
+                        # Compute perplexity
+                        ppl = self._compute_perplexity(scaled_outputs, targets)
+
+                        if torch.isfinite(loss):
+                            total_loss += loss.item()
+                            total_perplexity += ppl
+
+                except RuntimeError as e:
+                    print(f"Error during evaluation: {e}")
+                    continue
+
+        # Calculate averages
+        avg_loss = total_loss / num_batches
+        avg_perplexity = total_perplexity / num_batches
+
+        # Since this is a single-head model, we set primary_loss equal to total_loss
+        # and auxiliary_loss to 0 for compatibility with the training script
+        metrics = {
+            "total_loss": avg_loss,
+            "primary_loss": avg_loss,  # Same as total_loss for single-head
+            "auxiliary_loss": 0.0,  # No auxiliary loss in single-head model
+            "perplexity": avg_perplexity,
+        }
+
+        # Log metrics
+        if wandb.run is not None:
+            wandb.log(
+                {
+                    "eval/total_loss": metrics["total_loss"],
+                    "eval/primary_loss": metrics["primary_loss"],
+                    "eval/auxiliary_loss": metrics["auxiliary_loss"],
+                    "eval/perplexity": metrics["perplexity"],
+                },
+                step=original_step,
+            )
+
+        return metrics
+
+
+class RunningAverage:
+    """Efficient running average calculation"""
+
+    def __init__(self):
+        self.total = 0
+        self.count = 0
+
+    def update(self, value):
+        self.total += value
+        self.count += 1
+
+    def get_average(self):
+        return self.total / max(1, self.count)

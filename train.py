@@ -153,9 +153,6 @@ def get_args():
         "--block_size", type=int, default=1024, help="Maximum sequence length"
     )
     parser.add_argument(
-        "--lateral_dim", type=int, default=192, help="Dimension of lateral connections"
-    )
-    parser.add_argument(
         "--dropout", type=float, default=0.1, help="Dropout probability"
     )
 
@@ -273,12 +270,6 @@ def get_args():
     if args.main_loss_weight < 0 or args.main_loss_weight > 1:
         raise ValueError("main_loss_weight must be between 0 and 1")
 
-    if args.lateral_dim > args.n_embd:
-        raise ValueError("lateral_dim cannot be larger than n_embd")
-
-    if args.max_thought_length > args.block_size:
-        raise ValueError("max_thought_length cannot be larger than block_size")
-
     return args
 
 
@@ -319,6 +310,7 @@ def configure_optimizer(model, args, train_loader):
         eps=1e-8,
         block_wise=True,
         is_paged=True,
+        optim_bits=8,
     )
 
     def lr_lambda(current_step):
@@ -340,27 +332,6 @@ def configure_optimizer(model, args, train_loader):
     return optimizer, scheduler
 
 
-def get_cosine_schedule_with_warmup(
-    optimizer, num_warmup_steps, num_training_steps, num_cycles=0.5
-):
-    """
-    Create a schedule with a learning rate that decreases following the values of the cosine function
-    between the initial lr set in the optimizer to 0, with warmup.
-    """
-
-    def lr_lambda(current_step):
-        if current_step < num_warmup_steps:
-            return float(current_step) / float(max(1, num_warmup_steps))
-        progress = float(current_step - num_warmup_steps) / float(
-            max(1, num_training_steps - num_warmup_steps)
-        )
-        return max(
-            0.0, 0.5 * (1.0 + math.cos(math.pi * float(num_cycles) * 2.0 * progress))
-        )
-
-    return LambdaLR(optimizer, lr_lambda)
-
-
 if __name__ == "__main__":
     args = get_args()
     torch.backends.cudnn.benchmark = True
@@ -375,10 +346,10 @@ if __name__ == "__main__":
 
     config = GPTConfig(
         vocab_size=vocab_size,  # Remove heads configuration
-        n_layer=12,  # Add your desired number of layers
-        n_head=12,  # Add your desired number of heads
-        n_embd=768,  # Add your desired embedding dimension
-        block_size=1024,  # Add your desired block size
+        n_layer=args.n_layer,  # Add your desired number of layers
+        n_head=args.n_head,  # Add your desired number of heads
+        n_embd=args.n_embd,  # Add your desired embedding dimension
+        block_size=args.block_size,  # Add your desired block size
         dropout=0.1,  # Add your desired dropout rate
         bias=True,  # Add if you want bias in linear layers
     )
@@ -528,11 +499,9 @@ if __name__ == "__main__":
                 {
                     "epoch": epoch,
                     f"{mode_prefix}/total_loss": train_metrics["total_loss"],
-                    f"{mode_prefix}/primary_loss": train_metrics["primary_loss"],
-                    f"{mode_prefix}/auxiliary_loss": train_metrics["auxiliary_loss"],
+                    f"{mode_prefix}/perplexity": train_metrics["total_perplexity"],
                     "val/total_loss": val_metrics["total_loss"],
-                    "val/primary_loss": val_metrics["primary_loss"],
-                    "val/auxiliary_loss": val_metrics["auxiliary_loss"],
+                    "val/perplexity": val_metrics["perplexity"],
                 }
             )
 
