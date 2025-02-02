@@ -15,6 +15,141 @@ from strategies import (
 from typing import Dict, List, Optional, Tuple
 
 
+class SingleHeadDataset(Dataset):
+    def __init__(
+        self,
+        files_pattern: str,
+        block_size: int,
+        tokenizer,
+        strategy: "ModelingStrategy",
+    ):
+        super().__init__()
+        self.block_size = block_size
+        self.tokenizer = tokenizer
+        self.strategy = strategy
+        self.examples = []
+        self.tokens = []
+
+        # Determine loading strategy based on the type of strategy
+        if isinstance(strategy, InstructionFollowingStrategy):
+            self._load_instruction_data(files_pattern)
+        else:
+            self._load_text_data(files_pattern)
+
+    def _load_text_data(self, files_pattern: str):
+        """Load data for next-token prediction"""
+        print("Loading text data for next-token prediction")
+        for file_path in glob(files_pattern):
+            try:
+                with open(file_path, "r", encoding="utf-8") as f:
+                    text = f.read()
+                    if text.strip():  # Check if text is not empty
+                        self.tokens.extend(self.tokenizer.encode(text))
+            except Exception as e:
+                print(f"Error loading file {file_path}: {e}")
+                continue
+
+    def _load_instruction_data(self, files_pattern: str):
+        """Load data for instruction following"""
+        print("Loading instruction data")
+        for file_path in glob(files_pattern):
+            if file_path.endswith(".jsonl"):
+                self._load_jsonl_instructions(file_path)
+            else:
+                self._load_text_as_instruction(file_path)
+
+    def _load_jsonl_instructions(self, file_path: str):
+        """Load JSONL formatted instruction data"""
+        try:
+            with open(file_path, "r", encoding="utf-8-sig") as f:
+                for line in f:
+                    example = json.loads(line.strip())
+                    if isinstance(example, dict):
+                        # Handle different instruction formats
+                        instruction = example.get("instruction", "")
+                        response = example.get("response", example.get("thought", ""))
+                        input_text = example.get("input", "")
+
+                        if instruction and response:
+                            formatted_instruction = (
+                                f"{instruction}\n\nInput: {input_text}"
+                                if input_text
+                                else instruction
+                            )
+                            self.examples.append(
+                                {
+                                    "instruction": formatted_instruction,
+                                    "response": response,
+                                }
+                            )
+        except Exception as e:
+            print(f"Error loading JSONL file {file_path}: {e}")
+
+    def _load_text_as_instruction(self, file_path: str):
+        """Load regular text file as instruction data"""
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                text = f.read()
+                if text.strip():  # Check if text is not empty
+                    chunks = self._split_text_into_chunks(text)
+                    for chunk in chunks:
+                        self.examples.append(
+                            {"instruction": "Continue the text:", "response": chunk}
+                        )
+        except Exception as e:
+            print(f"Error loading text file {file_path}: {e}")
+
+    def _split_text_into_chunks(self, text: str, chunk_size: int = 512):
+        """Split text into reasonable chunks for instruction format"""
+        tokens = self.tokenizer.encode(text)
+        chunks = []
+
+        for i in range(0, len(tokens), chunk_size):
+            chunk_tokens = tokens[i : i + chunk_size]
+            chunk_text = self.tokenizer.decode(chunk_tokens)
+            if chunk_text.strip():  # Only add non-empty chunks
+                chunks.append(chunk_text)
+
+        return chunks
+
+    def __len__(self):
+        if self.examples:  # For instruction following
+            return len(self.examples)
+        return max(0, len(self.tokens) - self.block_size)  # For next-token prediction
+
+    def __getitem__(self, idx):
+        if isinstance(self.strategy, InstructionFollowingStrategy):
+            return self._get_instruction_item(idx)
+        return self._get_text_item(idx)
+
+    def _get_text_item(self, idx):
+        """Get item for next-token prediction"""
+        # Get sequence and target
+        chunk = self.tokens[idx : idx + self.block_size + 1]
+
+        # Pad if necessary
+        if len(chunk) < self.block_size + 1:
+            chunk = chunk + [0] * (self.block_size + 1 - len(chunk))
+
+        x = torch.tensor(chunk[:-1], dtype=torch.long)
+        y = torch.tensor(chunk[1:], dtype=torch.long)
+
+        return {"inputs": x, "targets": y}
+
+    def _get_instruction_item(self, idx):
+        """Get item for instruction following"""
+        example = self.examples[idx]
+        instruction = example["instruction"]
+        response = example["response"]
+
+        # Format according to the strategy's requirements
+        tokens = self.strategy.prepare_sample(
+            instruction=instruction, response=response, max_length=self.block_size
+        )
+
+        return {"inputs": tokens["input_ids"], "targets": tokens["target_ids"]}
+
+
 class MultiHeadDataset(Dataset):
     def __init__(
         self,
@@ -169,20 +304,20 @@ def create_dataloaders(
     batch_size: int,
     rank: Optional[int],
     world_size: Optional[int],
-    strategies: Dict[str, "ModelingStrategy"],
+    strategy: "ModelingStrategy",
     tokenizer=None,
     num_workers: int = 4,
     prefetch_factor: int = 2,
 ):
-    """Create distributed dataloaders for multi-head processing"""
+    """Create distributed dataloaders for single-head processing"""
     if tokenizer is None:
         tokenizer = tiktoken.get_encoding("gpt2")
 
-    dataset = MultiHeadDataset(
+    dataset = SingleHeadDataset(
         files_pattern=files_pattern,
         block_size=block_size,
         tokenizer=tokenizer,
-        strategies=strategies,
+        strategy=strategy,
     )
 
     generator = torch.Generator().manual_seed(42)
@@ -211,7 +346,16 @@ def create_dataloaders(
             seed=42,
         )
 
-    collate_fn = get_collate_fn(strategies)
+    def collate_fn(batch):
+        """Collate function for single head processing"""
+        if not batch:
+            return {"inputs": [], "targets": []}
+
+        # Stack inputs and targets
+        inputs = torch.stack([item["inputs"] for item in batch])
+        targets = torch.stack([item["targets"] for item in batch])
+
+        return {"inputs": inputs, "targets": targets}
 
     train_loader = DataLoader(
         train_dataset,

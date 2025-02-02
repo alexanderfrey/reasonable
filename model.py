@@ -35,11 +35,11 @@ class HeadConfig:
 
 
 class GPTConfig:
-    """Configuration class for multi-head GPT model with multi-latent attention."""
+    """Configuration class for GPT model with rotary position embeddings."""
 
     def __init__(
         self,
-        heads: List[HeadConfig],
+        vocab_size: int,
         n_layer: int = 6,
         n_head: int = 6,
         n_embd: int = 384,
@@ -49,7 +49,21 @@ class GPTConfig:
         rope_theta: float = 10000.0,
         n_latents: int = 64,
     ):
-        self.heads = heads
+        """
+        Initialize GPT configuration.
+
+        Args:
+            vocab_size (int): Size of the vocabulary
+            n_layer (int): Number of transformer layers
+            n_head (int): Number of attention heads
+            n_embd (int): Embedding dimension
+            block_size (int): Maximum sequence length
+            bias (bool): Whether to use bias in linear layers
+            dropout (float): Dropout probability
+            rope_theta (float): Base for rotary position embedding
+            n_latents (int): Number of latent queries for attention
+        """
+        self.vocab_size = vocab_size
         self.n_layer = n_layer
         self.n_head = n_head
         self.n_embd = n_embd
@@ -59,8 +73,21 @@ class GPTConfig:
         self.rope_theta = rope_theta
         self.n_latents = n_latents
 
-        # For backward compatibility, use the first head's vocab size for embeddings
-        self.vocab_size = heads[0].vocab_size
+    def __repr__(self):
+        """String representation of the configuration."""
+        return (
+            f"GPTConfig(\n"
+            f"  vocab_size: {self.vocab_size}\n"
+            f"  n_layer: {self.n_layer}\n"
+            f"  n_head: {self.n_head}\n"
+            f"  n_embd: {self.n_embd}\n"
+            f"  block_size: {self.block_size}\n"
+            f"  bias: {self.bias}\n"
+            f"  dropout: {self.dropout}\n"
+            f"  rope_theta: {self.rope_theta}\n"
+            f"  n_latents: {self.n_latents}\n"
+            ")"
+        )
 
 
 class MultiLatentAttention(nn.Module):

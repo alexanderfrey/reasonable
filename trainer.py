@@ -1040,3 +1040,594 @@ def log_latent_stats(model):
                     f"{name}_latent_k_norm": latent_k_norm,
                 }
             )
+
+
+import torch
+import torch.nn.functional as F
+import wandb
+from tqdm import tqdm
+import math
+
+
+class SingleHeadTrainer:
+    """Trainer for single-head GPT model using specified strategy"""
+
+    def __init__(self, strategy):
+        """
+        Initialize trainer with a single strategy.
+
+        Args:
+            strategy: Training strategy to use
+        """
+        self.strategy = strategy
+        self.global_step = 0
+
+    def save_checkpoint(self, model, optimizer, scheduler, epoch, step, save_dir):
+        """Save model checkpoint and training state"""
+        model_to_save = model.module if hasattr(model, "module") else model
+
+        checkpoint = {
+            "epoch": epoch,
+            "global_step": self.global_step,
+            "model_state_dict": model_to_save.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "scheduler_state_dict": scheduler.state_dict(),
+        }
+
+        save_path = f"{save_dir}/checkpoint_epoch{epoch}_step{step}.pt"
+        torch.save(checkpoint, save_path)
+        torch.save(checkpoint, f"{save_dir}/checkpoint_latest.pt")
+
+    def _compute_perplexity(self, logits, targets, ignore_index=-100):
+        """
+        Compute perplexity with numerical stability safeguards
+        """
+        with torch.no_grad():
+            # Add temperature scaling to soften the logits
+            temperature = 1.2
+            logits = logits / temperature
+
+            # Flatten and mask
+            flat_logits = logits.view(-1, logits.size(-1))
+            flat_targets = targets.view(-1)
+            mask = flat_targets != ignore_index
+
+            if not mask.any():
+                return float("inf")
+
+            # Get valid examples
+            valid_logits = flat_logits[mask]
+            valid_targets = flat_targets[mask]
+
+            # Compute log softmax with better numerical stability
+            log_probs = F.log_softmax(valid_logits, dim=-1)
+            target_log_probs = log_probs.gather(1, valid_targets.unsqueeze(1))
+
+            # Clamp extreme values
+            target_log_probs = torch.clamp(target_log_probs, min=-10, max=0)
+
+            # Average negative log likelihood
+            nll = -target_log_probs.mean()
+
+            if not torch.isfinite(nll):
+                return float("inf")
+
+            # Compute perplexity with safeguards
+            perplexity = torch.exp(torch.clamp(nll, min=0, max=10)).item()
+
+            return min(perplexity, 1000.0)
+
+    def _generate_samples(
+        self, model, tokenizer, prompts, max_length, temperature, device
+    ):
+        """Generate samples from the model"""
+        model.eval()
+        generations = []
+
+        with torch.no_grad():
+            for prompt in prompts:
+                input_ids = tokenizer.encode(prompt)
+                input_tensor = torch.tensor(input_ids).unsqueeze(0).to(device)
+
+                # Generate with standard sampling
+                output_ids = []
+                for _ in range(max_length):
+                    outputs = model(input_tensor)
+                    next_token_logits = outputs[0, -1, :] / temperature
+                    probs = F.softmax(next_token_logits, dim=-1)
+                    next_token = torch.multinomial(probs, num_samples=1)
+                    output_ids.append(next_token.item())
+                    input_tensor = torch.cat(
+                        [input_tensor, next_token.unsqueeze(0)], dim=1
+                    )
+
+                generated_text = tokenizer.decode(output_ids)
+                generations.append({"prompt": prompt, "generated": generated_text})
+
+        return generations
+
+    def _log_generations_to_wandb(self, generations):
+        """Log generated samples to W&B"""
+        if wandb.run is not None:
+            log_data = []
+            for gen in generations:
+                log_data.append(
+                    f"Prompt: {gen['prompt']}\nGenerated: {gen['generated']}\n"
+                )
+            wandb.log(
+                {
+                    "generations": wandb.Table(
+                        data=[["\n".join(log_data)]], columns=["Generated Text"]
+                    )
+                },
+                step=self.global_step,
+            )
+
+    def train_epoch(
+        self,
+        model,
+        train_loader,
+        optimizer,
+        scheduler,
+        scaler,
+        device,
+        epoch,
+        tokenizer=None,
+        sample_prompts=None,
+        gen_every_n_steps=None,
+        max_gen_length=100,
+        gradient_accumulation_steps=4,
+        save_every_n_steps=None,
+        checkpoint_dir=None,
+        max_grad_norm=1.0,
+        log_every_n_steps=10,
+    ):
+        """Train for one epoch with comprehensive logging and monitoring"""
+        if gen_every_n_steps and (tokenizer is None or not sample_prompts):
+            raise ValueError(
+                "tokenizer and sample_prompts must be provided if gen_every_n_steps is set"
+            )
+
+        model.train()
+        total_loss = 0.0
+        total_perplexity = 0.0
+
+        # Training monitoring
+        grad_scaler_skipped = 0
+        nan_detected = 0
+        consecutive_nan_count = 0
+        max_consecutive_nan = 5
+
+        # Exponential moving averages
+        ema_loss = 0.0
+        ema_perplexity = 0.0
+        ema_decay = 0.99
+
+        # Temperature annealing for loss stability
+        temperature = max(0.8, 1.0 - epoch * 0.1)
+
+        progress_bar = tqdm(train_loader, desc=f"Epoch {epoch + 1}")
+
+        try:
+            for batch_idx, batch in enumerate(progress_bar):
+                try:
+                    input_ids = batch["inputs"].to(device)
+                    targets = batch["targets"].to(device)
+
+                    if input_ids.shape[0] == 0:
+                        continue
+
+                    is_accumulation_step = (
+                        batch_idx + 1
+                    ) % gradient_accumulation_steps != 0
+
+                    with torch.amp.autocast("cuda", dtype=torch.float16):
+                        outputs = model(input_ids)
+
+                        # Check and stabilize outputs
+                        if torch.isnan(outputs).any() or torch.isinf(outputs).any():
+                            print("Warning: Found nan/inf in model output")
+                            self._debug_loss_components(outputs, targets)
+                            outputs = torch.nan_to_num(
+                                outputs, nan=0.0, posinf=100.0, neginf=-100.0
+                            )
+
+                        # Apply temperature scaling
+                        scaled_outputs = outputs / temperature
+                        loss = self.strategy.compute_loss(scaled_outputs, targets)
+
+                        # Debug loss components if needed
+                        if batch_idx % log_every_n_steps == 0:
+                            self._debug_loss_components(scaled_outputs, targets)
+
+                        # Validate loss
+                        if torch.isnan(loss) or torch.isinf(loss):
+                            print("Warning: Invalid loss detected")
+                            self._log_perplexity_debug_info(scaled_outputs, targets)
+                            loss = torch.tensor(
+                                1.0, device=loss.device, requires_grad=True
+                            )
+
+                        # Early detection of problematic loss
+                        if loss.item() > 100 or torch.isnan(loss) or torch.isinf(loss):
+                            nan_detected += 1
+                            consecutive_nan_count += 1
+                            print(
+                                f"Anomalous loss detected: {loss.item()} at step {self.global_step}"
+                            )
+
+                            if consecutive_nan_count >= max_consecutive_nan:
+                                print(
+                                    "Too many consecutive anomalous losses. Implementing recovery..."
+                                )
+                                optimizer.zero_grad(set_to_none=True)
+                                for param_group in optimizer.param_groups:
+                                    param_group["lr"] = param_group["lr"] * 0.5
+                                consecutive_nan_count = 0
+                                continue
+                        else:
+                            consecutive_nan_count = 0
+
+                        # Scale loss for gradient accumulation
+                        loss = loss / gradient_accumulation_steps
+
+                    # Backward pass with gradient scaling
+                    scaler.scale(loss).backward()
+
+                    if not is_accumulation_step:
+                        # Gradient stabilization and clipping
+                        # self._log_gradient_norms(model, max_grad_norm)
+
+                        # Global gradient norm check
+                        grad_norm = torch.nn.utils.clip_grad_norm_(
+                            model.parameters(), max_grad_norm
+                        )
+
+                        if torch.isfinite(grad_norm):
+                            # Add minimal gradient noise for stability
+                            noise_scale = 1e-5 * min(1.0, self.global_step / 1000)
+                            for param in model.parameters():
+                                if param.grad is not None:
+                                    noise = torch.randn_like(param.grad) * noise_scale
+                                    param.grad.add_(noise)
+
+                            scaler.step(optimizer)
+                            scaler.update()
+                        else:
+                            grad_scaler_skipped += 1
+                            print(
+                                f"Skipped scaler step due to inf/nan gradients at step {self.global_step}"
+                            )
+                            self._log_gradient_issues(model)
+                            continue
+
+                        optimizer.zero_grad(set_to_none=True)
+                        scheduler.step()
+
+                        # Compute perplexity
+                        with torch.no_grad():
+                            ppl = self._compute_perplexity(scaled_outputs, targets)
+                            total_perplexity += ppl
+                            ema_perplexity = (
+                                ema_decay * ema_perplexity + (1 - ema_decay) * ppl
+                            )
+
+                        # Update metrics
+                        total_loss += loss.item() * gradient_accumulation_steps
+                        ema_loss = ema_decay * ema_loss + (1 - ema_decay) * loss.item()
+
+                        # Log metrics
+                        if wandb.run is not None:
+                            metrics = {
+                                "train/loss": loss.item(),
+                                "train/perplexity": ema_perplexity,
+                                "train/learning_rate": scheduler.get_last_lr()[0],
+                                "train/grad_norm": (
+                                    grad_norm.item() if torch.isfinite(grad_norm) else 0
+                                ),
+                                "train/grad_scaler_skipped": grad_scaler_skipped,
+                                "train/nan_detected": nan_detected,
+                                "train/global_step": self.global_step,
+                                "train/temperature": temperature,
+                            }
+
+                            # Add detailed gradient stats
+                            if self.global_step % log_every_n_steps == 0:
+                                grad_stats = self._compute_gradient_stats(model)
+                                metrics.update(grad_stats)
+
+                            wandb.log(metrics, step=self.global_step)
+
+                        # Update progress bar
+                        progress_bar.set_postfix(
+                            {
+                                "loss": f"{ema_loss:.4f}",
+                                "ppl": f"{ema_perplexity:.2f}",
+                                "lr": f"{scheduler.get_last_lr()[0]:.2e}",
+                                "grad_norm": (
+                                    f"{grad_norm.item():.2f}"
+                                    if torch.isfinite(grad_norm)
+                                    else "inf"
+                                ),
+                            }
+                        )
+
+                        # Optional generation and checkpointing
+                        if (
+                            gen_every_n_steps
+                            and self.global_step % gen_every_n_steps == 0
+                        ):
+                            self._generate_and_log_samples(
+                                model, tokenizer, sample_prompts, max_gen_length, device
+                            )
+
+                        if (
+                            save_every_n_steps
+                            and self.global_step % save_every_n_steps == 0
+                        ):
+                            self.save_checkpoint(
+                                model,
+                                optimizer,
+                                scheduler,
+                                epoch,
+                                self.global_step,
+                                checkpoint_dir,
+                            )
+
+                        self.global_step += 1
+
+                except RuntimeError as e:
+                    print(f"Error during training step {self.global_step}: {e}")
+                    continue
+
+        except Exception as e:
+            print(f"Unexpected training error: {e}")
+            raise
+
+        return {
+            "epoch": epoch,
+            "total_loss": total_loss / len(train_loader),
+            "total_perplexity": total_perplexity / len(train_loader),
+            "grad_scaler_skipped": grad_scaler_skipped,
+            "nan_detected": nan_detected,
+        }
+
+    def _debug_loss_components(self, logits, targets):
+        """Debug loss computation components"""
+        with torch.no_grad():
+            # Flatten and mask
+            flat_logits = logits.view(-1, logits.size(-1))
+            flat_targets = targets.view(-1)
+            mask = flat_targets != -100
+
+            # Get valid examples
+            valid_logits = flat_logits[mask]
+            valid_targets = flat_targets[mask]
+
+            # Basic stats
+            print("\nLoss Components Debug:")
+            print(
+                f"Valid logits range: [{valid_logits.min().item():.2f}, {valid_logits.max().item():.2f}]"
+            )
+
+            # Check probs
+            probs = torch.softmax(valid_logits, dim=-1)
+            target_probs = probs.gather(1, valid_targets.unsqueeze(1))
+            print(
+                f"Target probs range: [{target_probs.min().item():.2e}, {target_probs.max().item():.2e}]"
+            )
+
+            # Check log probs
+            log_probs = torch.log_softmax(valid_logits, dim=-1)
+            target_log_probs = log_probs.gather(1, valid_targets.unsqueeze(1))
+            print(
+                f"Target log probs range: [{target_log_probs.min().item():.2f}, {target_log_probs.max().item():.2f}]"
+            )
+
+    def _log_perplexity_debug_info(self, logits, targets):
+        """Log detailed perplexity calculation information"""
+        with torch.no_grad():
+            print("\nPerplexity debug info:")
+
+            # Basic stats
+            print(f"Logits shape: {logits.shape}")
+            print(
+                f"Logits - min: {logits.min().item():.2f}, max: {logits.max().item():.2f}, mean: {logits.mean().item():.2f}"
+            )
+
+            # Check for any inf/nan in logits
+            inf_mask = torch.isinf(logits)
+            nan_mask = torch.isnan(logits)
+            print(f"Inf values in logits: {inf_mask.sum().item()}")
+            print(f"NaN values in logits: {nan_mask.sum().item()}")
+
+            # Compute and check probabilities
+            probs = torch.softmax(logits.view(-1, logits.size(-1)), dim=-1)
+            zero_probs = (probs == 0).float().mean().item()
+            print(f"Proportion of zero probabilities: {zero_probs:.4f}")
+
+            # Target distribution
+            valid_mask = targets != -100
+            valid_targets = targets[valid_mask]
+            if valid_targets.numel() > 0:
+                target_probs = probs[valid_mask].gather(1, valid_targets.unsqueeze(1))
+                print(
+                    f"Target probs - min: {target_probs.min().item():.2e}, max: {target_probs.max().item():.2e}"
+                )
+                print(
+                    f"Log probs - min: {torch.log(target_probs).min().item():.2f}, max: {torch.log(target_probs).max().item():.2f}"
+                )
+
+            print("-" * 40)
+
+    def _log_gradient_norms(self, model, max_grad_norm):
+        """Log gradient norms for monitoring"""
+        layer_norms = {}
+        for name, param in model.named_parameters():
+            if param.grad is not None:
+                norm = param.grad.norm().item()
+                layer_norms[name] = norm
+                if norm > max_grad_norm * 0.5:  # Alert on high gradients
+                    print(f"High gradient in {name}: {norm}")
+        return layer_norms
+
+    def _log_gradient_issues(self, model):
+        """Detailed logging of problematic gradients"""
+        for name, param in model.named_parameters():
+            if param.grad is not None:
+                grad = param.grad
+                if not torch.isfinite(grad).all():
+                    print(f"Non-finite gradients in {name}")
+                    print(
+                        f"Gradient stats - min: {grad.min()}, max: {grad.max()}, mean: {grad.mean()}"
+                    )
+
+    def _generate_and_log_samples(
+        self, model, tokenizer, sample_prompts, max_gen_length, device
+    ):
+        """Generate and log sample outputs"""
+        # Store original state
+        was_training = model.training
+
+        # Clear cached states and gradients
+        model.zero_grad(set_to_none=True)
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        try:
+            model.eval()
+            print("\n" + "=" * 80)
+            print(f"Generation samples at step {self.global_step}:")
+            print("=" * 80)
+
+            with torch.no_grad():
+                generations = []
+                for prompt in sample_prompts:
+                    input_ids = tokenizer.encode(prompt)
+                    input_tensor = torch.tensor(input_ids).unsqueeze(0).to(device)
+
+                    # Generate with temperature sampling
+                    output_ids = []
+                    temperature = 0.7  # Adjust as needed
+
+                    for _ in range(max_gen_length):
+                        outputs = model(input_tensor)
+                        next_token_logits = outputs[0, -1, :] / temperature
+                        probs = torch.softmax(next_token_logits, dim=-1)
+                        next_token = torch.multinomial(probs, num_samples=1)
+                        output_ids.append(next_token.item())
+                        input_tensor = torch.cat(
+                            [input_tensor, next_token.unsqueeze(0)], dim=1
+                        )
+
+                    generated_text = tokenizer.decode(output_ids)
+                    generations.append({"prompt": prompt, "generated": generated_text})
+
+                    print(f"\nPrompt: {prompt}")
+                    print(f"Generated: {generated_text}")
+                    print("-" * 40)
+
+                print("=" * 80 + "\n")
+
+                if wandb.run is not None:
+                    self._log_generations_to_wandb(generations)
+
+        finally:
+            # Restore original state
+            if was_training:
+                model.train()
+
+            # Clear states
+            model.zero_grad(set_to_none=True)
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+    def _log_generations_to_wandb(self, generations):
+        """Log generated samples to W&B"""
+        if wandb.run is not None:
+            try:
+                gen_table = wandb.Table(columns=["prompt", "generated"])
+                for gen in generations:
+                    gen_table.add_data(gen["prompt"], gen["generated"])
+                wandb.log({"generations": gen_table}, step=self.global_step)
+            except Exception as e:
+                print(f"Warning: Failed to log generations to W&B: {e}")
+
+    def _compute_gradient_stats(self, model):
+        """Compute detailed gradient statistics"""
+        grad_stats = {}
+        total_norm = 0.0
+
+        # Collect norms by layer type
+        layer_norms = {
+            "embedding": [],
+            "attention": [],
+            "mlp": [],
+            "layernorm": [],
+            "head": [],
+        }
+
+        for name, param in model.named_parameters():
+            if param.grad is not None:
+                grad_norm = param.grad.norm().item()
+                total_norm += grad_norm**2
+
+                # Categorize by layer type
+                if "embedding" in name:
+                    layer_norms["embedding"].append(grad_norm)
+                elif "attn" in name:
+                    layer_norms["attention"].append(grad_norm)
+                elif "mlp" in name:
+                    layer_norms["mlp"].append(grad_norm)
+                elif "ln" in name or "norm" in name:
+                    layer_norms["layernorm"].append(grad_norm)
+                elif "head" in name:
+                    layer_norms["head"].append(grad_norm)
+
+        # Compute statistics for each layer type
+        for layer_type, norms in layer_norms.items():
+            if norms:
+                grad_stats[f"grad_norm/{layer_type}/mean"] = np.mean(norms)
+                grad_stats[f"grad_norm/{layer_type}/max"] = np.max(norms)
+                grad_stats[f"grad_norm/{layer_type}/min"] = np.min(norms)
+
+        grad_stats["grad_norm/total"] = np.sqrt(total_norm)
+        return grad_stats
+
+    def _compute_gradient_stats(self, model):
+        """Compute detailed gradient statistics"""
+        grad_stats = {}
+        layer_types = {
+            "embedding": [],
+            "attention": [],
+            "mlp": [],
+            "layernorm": [],
+            "head": [],
+        }
+
+        for name, param in model.named_parameters():
+            if param.grad is not None:
+                # Categorize gradient by layer type
+                if "embedding" in name:
+                    layer_types["embedding"].append(param.grad.norm().item())
+                elif "attn" in name:
+                    layer_types["attention"].append(param.grad.norm().item())
+                elif "mlp" in name:
+                    layer_types["mlp"].append(param.grad.norm().item())
+                elif "ln" in name or "norm" in name:
+                    layer_types["layernorm"].append(param.grad.norm().item())
+                elif "head" in name:
+                    layer_types["head"].append(param.grad.norm().item())
+
+        # Compute statistics for each layer type
+        for layer_type, norms in layer_types.items():
+            if norms:
+                grad_stats[f"grad_norm/{layer_type}/mean"] = np.mean(norms)
+                grad_stats[f"grad_norm/{layer_type}/max"] = np.max(norms)
+                grad_stats[f"grad_norm/{layer_type}/min"] = np.min(norms)
+
+        return grad_stats
+
+    def set_global_step(self, step):
+        """Set the global step counter"""
+        self.global_step = step

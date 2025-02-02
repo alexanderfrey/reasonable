@@ -21,7 +21,7 @@ from strategies import (
     NextTokenStrategy,
     MixedStrategy,
 )
-from trainer import MultiHeadTrainer
+from trainer import MultiHeadTrainer, SingleHeadTrainer
 from data_utils import create_dataloaders
 
 
@@ -73,7 +73,7 @@ def load_checkpoint(
 
 def count_parameters(model):
     """
-    Count the number of trainable parameters in the multi-head model.
+    Count the number of trainable parameters in the single-head GPT model.
     Returns total params and a breakdown of parameters by component.
     """
     # Get the unwrapped model if using DDP
@@ -92,39 +92,28 @@ def count_parameters(model):
     )
     total_layer_params = layer_params * len(model.blocks)
 
-    # Count layer norm parameters for each head
-    ln_params = {
-        name: sum(p.numel() for p in ln.parameters() if p.requires_grad)
-        for name, ln in model.ln_fs.items()
-    }
-    total_ln_params = sum(ln_params.values())
+    # Count final layer norm and head parameters
+    ln_params = sum(p.numel() for p in model.ln_f.parameters() if p.requires_grad)
+    head_params = sum(p.numel() for p in model.lm_head.parameters() if p.requires_grad)
 
-    # Count head parameters for each head
-    head_params = {
-        name: sum(p.numel() for p in head.parameters() if p.requires_grad)
-        for name, head in model.lm_heads.items()
-    }
-    total_head_params = sum(head_params.values())
-
-    # Create detailed breakdown by pathway
-    pathway_breakdown = {
-        name: {"layer_norm": ln_params[name], "head": head_params[name]}
-        for name in model.lm_heads.keys()
-    }
+    # Add attention parameters
+    attention_params = sum(
+        sum(p.numel() for p in block.attn.parameters() if p.requires_grad)
+        for block in model.blocks
+    )
 
     return {
-        "total": total_params,
+        "total_params_M": total_params / 1_000_000,
         "embeddings": {
             "total": total_emb_params,
             "token": token_emb_params,
             "position": pos_emb_params,
         },
         "transformer_layers": total_layer_params,
-        "layer_norms": total_ln_params,
-        "heads": total_head_params,
-        "pathways": pathway_breakdown,
-        # Add parameters per million for easy reference
-        "total_params_M": total_params / 1_000_000,
+        "layer_norms": ln_params,
+        "head": head_params,
+        "attention": attention_params,
+        "total": total_params,
     }
 
 
@@ -385,11 +374,18 @@ if __name__ == "__main__":
     tokenizer = tiktoken.get_encoding("gpt2")
 
     config = GPTConfig(
-        heads=[
-            HeadConfig("primary", vocab_size=vocab_size, weight=0.9),
-            HeadConfig("auxiliary", vocab_size=vocab_size, weight=0.1),
-        ]
+        vocab_size=vocab_size,  # Remove heads configuration
+        n_layer=12,  # Add your desired number of layers
+        n_head=12,  # Add your desired number of heads
+        n_embd=768,  # Add your desired embedding dimension
+        block_size=1024,  # Add your desired block size
+        dropout=0.1,  # Add your desired dropout rate
+        bias=True,  # Add if you want bias in linear layers
     )
+
+    # 2. Replace MultiHeadGPT with GPT
+    model = GPT(config)  # Use the single head GPT class instead of MultiHeadGPT
+    model = model.to(device)
 
     # Initialize strategies based on training mode and arguments
     if args.pretrain:
@@ -416,11 +412,10 @@ if __name__ == "__main__":
         )
 
     # Create trainer with strategies
-    strategies = {
-        "primary": main_strategy,
-        "auxiliary": second_strategy,
-    }
-    trainer = MultiHeadTrainer(strategies=strategies)
+    strategy = NextTokenStrategy(
+        tokenizer
+    )  # Or InstructionFollowingStrategy based on your needs
+    trainer = SingleHeadTrainer(strategy=strategy)
 
     # Initialize wandb only on rank 0
     if rank == 0:
@@ -444,9 +439,6 @@ if __name__ == "__main__":
             },
         )
 
-    model = MultiHeadGPT(config)
-    model = model.to(device)
-
     # Print parameter counts (only on rank 0)
     if rank == 0:
         param_counts = count_parameters(model)
@@ -456,14 +448,9 @@ if __name__ == "__main__":
         print(f"- Token embeddings: {param_counts['embeddings']['token']:,}")
         print(f"- Position embeddings: {param_counts['embeddings']['position']:,}")
         print(f"- Transformer layers: {param_counts['transformer_layers']:,}")
-        print(f"- Layer norms: {param_counts['layer_norms']:,}")
-        print(f"- Head parameters: {param_counts['heads']:,}")
-
-        print("\nPathway breakdown:")
-        for name, pathway in param_counts["pathways"].items():
-            print(f"\n{name} pathway:")
-            print(f"- Layer norm: {pathway['layer_norm']:,}")
-            print(f"- Head: {pathway['head']:,}")
+        print(f"- Layer norm: {param_counts['layer_norms']:,}")
+        print(f"- Head: {param_counts['head']:,}")
+        print(f"- Attention total: {param_counts['attention']:,}")
 
     # Wrap model with DDP
     if world_size is not None:
@@ -476,7 +463,7 @@ if __name__ == "__main__":
         batch_size=args.batch_size,
         rank=rank,
         world_size=world_size,
-        strategies=strategies,
+        strategy=strategy,
         tokenizer=tokenizer,
     )
 
