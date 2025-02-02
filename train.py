@@ -73,33 +73,51 @@ def load_checkpoint(
 
 def count_parameters(model):
     """
-    Count the number of trainable parameters in the single-head GPT model.
+    Count the number of trainable parameters in the memory-efficient GPT model.
     Returns total params and a breakdown of parameters by component.
+    Handles weight tying and shared parameters correctly.
     """
     # Get the unwrapped model if using DDP
     model = model.module if hasattr(model, "module") else model
 
-    total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-
-    # Count embedding parameters
+    # Count embedding parameters (accounting for weight tying)
+    # Since we use weight tying, token embedding and head share weights
     token_emb_params = model.token_embedding.weight.numel()
     pos_emb_params = model.position_embedding.weight.numel()
     total_emb_params = token_emb_params + pos_emb_params
 
-    # Count parameters per transformer block
-    layer_params = sum(
-        p.numel() for p in model.blocks[0].parameters() if p.requires_grad
-    )
-    total_layer_params = layer_params * len(model.blocks)
-
-    # Count final layer norm and head parameters
-    ln_params = sum(p.numel() for p in model.ln_f.parameters() if p.requires_grad)
-    head_params = sum(p.numel() for p in model.lm_head.parameters() if p.requires_grad)
-
-    # Add attention parameters
+    # Count attention parameters separately first
     attention_params = sum(
         sum(p.numel() for p in block.attn.parameters() if p.requires_grad)
         for block in model.blocks
+    )
+
+    # Count feed-forward parameters separately
+    ff_params = sum(
+        sum(p.numel() for p in block.ff.parameters() if p.requires_grad)
+        for block in model.blocks
+    )
+
+    # Calculate total layer parameters (excluding attention which we count separately)
+    layer_params_no_attn = ff_params + sum(
+        sum(p.numel() for p in block.ln1.parameters() if p.requires_grad)
+        + sum(p.numel() for p in block.ln2.parameters() if p.requires_grad)
+        for block in model.blocks
+    )
+
+    # Count final layer norm parameters
+    ln_params = sum(p.numel() for p in model.ln_f.parameters() if p.requires_grad)
+
+    # For head parameters, don't count the weight matrix since it's tied to embeddings
+    head_params = 0 if not model.lm_head.bias is None else model.lm_head.bias.numel()
+
+    # Calculate total parameters (accounting for weight tying)
+    total_params = (
+        total_emb_params  # Embeddings
+        + attention_params  # Attention layers
+        + layer_params_no_attn  # Non-attention layer parameters
+        + ln_params  # Final layer norm
+        + head_params  # Head (only bias if present)
     )
 
     return {
@@ -109,7 +127,7 @@ def count_parameters(model):
             "token": token_emb_params,
             "position": pos_emb_params,
         },
-        "transformer_layers": total_layer_params,
+        "transformer_layers": layer_params_no_attn,
         "layer_norms": ln_params,
         "head": head_params,
         "attention": attention_params,

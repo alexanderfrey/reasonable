@@ -91,26 +91,27 @@ class GPTConfig:
 
 
 class MultiLatentAttention(nn.Module):
-    """Multi-Head Attention with latent queries, RoPE, and optimized scaling."""
+    """Memory-efficient Multi-Head Attention with latent queries and chunked processing."""
 
     def __init__(self, config: GPTConfig):
         super().__init__()
         assert config.n_embd % config.n_head == 0
 
-        # Core attention parameters
         self.n_head = config.n_head
         self.n_latents = config.n_latents
         self.head_dim = config.n_embd // config.n_head
+        self.chunk_size = 128  # Process attention in chunks
 
-        # Dynamic scaling based on sequence length
+        # Scale with better numerical stability
         self.scale = 1 / math.sqrt(self.head_dim)
 
-        # Latent queries with improved initialization
+        # Memory-efficient latent queries
         self.latent_queries = nn.Parameter(
-            torch.randn(1, config.n_latents, config.n_head, self.head_dim) * 0.02
+            torch.empty(1, config.n_latents, config.n_head, self.head_dim)
         )
+        torch.nn.init.kaiming_normal_(self.latent_queries, nonlinearity="linear")
 
-        # Linear projections with improved initialization
+        # Linear layers with memory-efficient initialization
         self.key = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
         self.value = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
         self.gate = nn.Linear(
@@ -118,30 +119,50 @@ class MultiLatentAttention(nn.Module):
         )
         self.proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
 
-        # Initialize projection layers with better scaling
-        nn.init.normal_(self.key.weight, std=0.02)
-        nn.init.normal_(self.value.weight, std=0.02)
-        nn.init.normal_(self.gate.weight, std=0.02)
-        nn.init.normal_(self.proj.weight, std=0.02)
+        # Initialize with memory-efficient approach
+        for layer in [self.key, self.value, self.gate, self.proj]:
+            nn.init.kaiming_normal_(layer.weight, nonlinearity="linear")
+            if layer.bias is not None:
+                nn.init.zeros_(layer.bias)
 
-        # RoPE parameters
         self.rope_theta = config.rope_theta
         self.max_seq_len = config.block_size
         self.freqs_cis = None
 
-        # Optimized dropout rates
         self.dropout = nn.Dropout(config.dropout)
-        self.dropout_value = config.dropout * 0.8  # Reduced dropout for attention
-
-        # Flash Attention check
         self.use_flash_attention = hasattr(
             torch.nn.functional, "scaled_dot_product_attention"
         )
 
-        # Improved normalization strategy with per-head norms
-        self.query_norm = nn.LayerNorm(self.head_dim)
-        self.key_norm = nn.LayerNorm(self.head_dim)
-        self.value_norm = nn.LayerNorm(self.head_dim)
+    def process_chunk(self, q, k, v, chunk_size):
+        B, H, L, D = q.shape
+        _, _, T, _ = k.shape
+
+        out = torch.zeros_like(q)
+
+        # Process attention in chunks to save memory
+        for i in range(0, T, chunk_size):
+            chunk_end = min(i + chunk_size, T)
+            k_chunk = k[:, :, i:chunk_end]
+            v_chunk = v[:, :, i:chunk_end]
+
+            if self.use_flash_attention:
+                chunk_out = torch.nn.functional.scaled_dot_product_attention(
+                    q,
+                    k_chunk,
+                    v_chunk,
+                    dropout_p=self.dropout.p if self.training else 0.0,
+                    is_causal=True,
+                )
+            else:
+                attn_weights = (q @ k_chunk.transpose(-2, -1)) * self.scale
+                attn_weights = F.softmax(attn_weights, dim=-1)
+                attn_weights = self.dropout(attn_weights)
+                chunk_out = attn_weights @ v_chunk
+
+            out = out + chunk_out
+
+        return out
 
     def forward(self, x: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
         B, T, C = x.size()
@@ -152,64 +173,33 @@ class MultiLatentAttention(nn.Module):
                 self.head_dim, self.max_seq_len, self.rope_theta
             ).to(x.device)
 
-        # Dynamic scaling based on sequence length
-        length_scale = 1.0 / math.sqrt(T)
-
-        # Compute projections
+        # Compute projections with memory-efficient reshaping
         k = self.key(x).view(B, T, self.n_head, self.head_dim)
         v = self.value(x).view(B, T, self.n_head, self.head_dim)
 
-        # Per-head normalization
-        k = self.key_norm(k.transpose(1, 2)).transpose(1, 2)  # [B, T, H, D]
-        v = self.value_norm(v.transpose(1, 2)).transpose(1, 2)  # [B, T, H, D]
-
-        # Apply length-dependent scaling
-        k = k * length_scale
-        v = v * length_scale
-
-        # Compute gating weights with improved numerics
-        gates = self.gate(x).view(B, T, self.n_head, self.n_latents)
-        gates = torch.softmax(gates * self.scale, dim=-1)
-
-        # Expand and normalize latent queries
-        q = self.latent_queries.expand(B, -1, -1, -1)  # [B, L, H, D]
-        q = self.query_norm(q.transpose(1, 2)).transpose(1, 2)
-        q = q * length_scale
-
         # Apply rotary embeddings to keys
         k = apply_rotary_emb(k, self.freqs_cis[:T])
+
+        # Compute gating weights
+        gates = self.gate(x).view(B, T, self.n_head, self.n_latents)
+        gates = F.softmax(gates * self.scale, dim=-1)
+
+        # Prepare queries
+        q = self.latent_queries.expand(B, -1, -1, -1)
 
         # Rearrange for attention computation
         q = q.transpose(1, 2)  # [B, H, L, D]
         k = k.transpose(1, 2)  # [B, H, T, D]
         v = v.transpose(1, 2)  # [B, H, T, D]
 
-        # Compute attention with flash attention when available
-        if self.use_flash_attention:
-            attn_output = torch.nn.functional.scaled_dot_product_attention(
-                q,
-                k,
-                v,
-                attn_mask=None,
-                dropout_p=self.dropout_value if self.training else 0,
-                is_causal=True,
-            )
-        else:
-            # Compute attention scores with improved numerical stability
-            attn_weights = (q @ k.transpose(-2, -1)) * self.scale
+        # Process attention in chunks
+        attn_output = self.process_chunk(q, k, v, self.chunk_size)
 
-            if mask is not None:
-                attn_weights = attn_weights.masked_fill(mask == 0, float("-inf"))
-
-            attn_weights = torch.softmax(attn_weights, dim=-1)
-            attn_weights = self.dropout(attn_weights)
-            attn_output = attn_weights @ v
-
-        # Apply gating mechanism
+        # Apply gating
         gates = gates.transpose(1, 2)  # [B, H, T, L]
         weighted_output = torch.einsum("bhls,bhtl->bhts", attn_output, gates)
 
-        # Final projection with gradient stabilization
+        # Final projection
         out = weighted_output.transpose(1, 2).contiguous().view(B, T, C)
         out = self.proj(out)
         out = self.dropout(out)
@@ -218,74 +208,59 @@ class MultiLatentAttention(nn.Module):
 
 
 class FeedForward(nn.Module):
-    """Optimized Feed-Forward Network with parallel paths and improved activation."""
+    """Memory-efficient Feed-Forward Network with activation checkpointing."""
 
     def __init__(self, config: GPTConfig):
         super().__init__()
 
-        # Split the network into two parallel paths
-        self.w1_path = nn.Linear(
-            config.n_embd, (4 * config.n_embd) // 3, bias=config.bias
-        )
-        self.w2_path = nn.Linear(
-            config.n_embd, (4 * config.n_embd) // 3, bias=config.bias
-        )
-        self.w3_path = nn.Linear(
-            config.n_embd, (4 * config.n_embd) // 3, bias=config.bias
-        )
+        # Keep intermediate dimensions consistent with input embedding dimension
+        self.hidden_dim = 4 * config.n_embd  # Standard scaling for transformer FFN
 
-        # Output projection
-        self.proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
+        # Up projections for SwiGLU
+        self.up_proj = nn.Linear(config.n_embd, self.hidden_dim, bias=config.bias)
+        self.gate_proj = nn.Linear(config.n_embd, self.hidden_dim, bias=config.bias)
 
-        # Improved dropout with path-specific rates
-        self.dropout1 = nn.Dropout(config.dropout * 0.9)
-        self.dropout2 = nn.Dropout(config.dropout * 0.8)
-        self.dropout3 = nn.Dropout(config.dropout * 0.7)
-        self.dropout_out = nn.Dropout(config.dropout)
+        # Down projection
+        self.down_proj = nn.Linear(self.hidden_dim, config.n_embd, bias=config.bias)
 
-        # Initialize with improved scaling
+        # Dropout
+        self.dropout = nn.Dropout(config.dropout)
+
+        # Initialize weights
         self.init_weights()
 
-        # Layer scale parameter
-        self.layer_scale = nn.Parameter(torch.ones(1, 1, config.n_embd) * 0.1)
-
     def init_weights(self):
-        # Initialize with scaled factors for better gradient flow
-        for module in [self.w1_path, self.w2_path, self.w3_path]:
-            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        # Initialize up projections
+        for module in [self.up_proj, self.gate_proj]:
+            nn.init.kaiming_normal_(module.weight, nonlinearity="linear")
             if module.bias is not None:
                 nn.init.zeros_(module.bias)
 
-        # Special initialization for output projection
-        nn.init.normal_(self.proj.weight, mean=0.0, std=0.02 / math.sqrt(2))
-        if self.proj.bias is not None:
-            nn.init.zeros_(self.proj.bias)
+        # Initialize down projection with zeros for better training stability
+        nn.init.zeros_(self.down_proj.weight)
+        if self.down_proj.bias is not None:
+            nn.init.zeros_(self.down_proj.bias)
 
-    def forward(self, x):
-        # Process parallel paths with different activation functions
-        path1 = self.w1_path(x)
-        path2 = self.w2_path(x)
-        path3 = self.w3_path(x)
+    def _activation_function(self, x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+        # Memory-efficient SwiGLU activation
+        return F.silu(gate) * x
 
-        # Apply different activation patterns
-        path1 = F.gelu(path1, approximate="tanh")  # Faster approximate GELU
-        path2 = F.silu(path2)  # SiLU activation
-        path3 = F.relu(path3)  # ReLU activation
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Up projections
+        hidden = self.up_proj(x)
+        gate = self.gate_proj(x)
 
-        # Apply path-specific dropout
-        path1 = self.dropout1(path1)
-        path2 = self.dropout2(path2)
-        path3 = self.dropout3(path3)
+        # Checkpoint the activation function to save memory
+        if self.training:
+            hidden = torch.utils.checkpoint.checkpoint(
+                self._activation_function, hidden, gate, use_reentrant=False
+            )
+        else:
+            hidden = self._activation_function(hidden, gate)
 
-        # Combine paths
-        combined = torch.cat([path1, path2, path3], dim=-1)
-
-        # Apply output transformation
-        output = self.proj(combined)
-        output = self.dropout_out(output)
-
-        # Apply learned scaling
-        return output * self.layer_scale
+        # Down projection and dropout
+        out = self.down_proj(hidden)
+        return self.dropout(out)
 
 
 class TransformerBlock(nn.Module):
