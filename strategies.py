@@ -45,17 +45,42 @@ class MixedStrategy(ModelingStrategy):
 
 
 class NextTokenStrategy(ModelingStrategy):
-    """Standard next-token prediction strategy"""
+    """Next-token prediction strategy with MoE support and multi-token prediction"""
 
-    def __init__(self, tokenizer=None):
+    def __init__(self, tokenizer=None, predict_last_n=1):
+        """
+        Initialize the strategy
+        Args:
+            tokenizer: Tokenizer instance
+            predict_last_n: Number of tokens at the end to predict (default: 1)
+        """
         super().__init__()
         self.tokenizer = tokenizer
-        # Record the confidence (i.e. probability) of each generated token.
+        self.predict_last_n = predict_last_n
         self.confidence_history = []
 
     def compute_loss(self, logits, targets, **kwargs):
+        """
+        Compute cross entropy loss for next token prediction
+        Now supports predicting multiple tokens at the end
+        """
+        # For MoE models, logits might be packed with auxiliary loss
+        if isinstance(logits, tuple):
+            logits, _ = logits  # Unpack if MoE model output
+
+        # Reshape logits and targets for loss computation
+        _, _, vocab_size = logits.shape
+        
+        # Only consider the last n positions for loss computation
+        if self.predict_last_n > 1:
+            # Take the last n positions of logits and targets
+            logits = logits[:, -self.predict_last_n:, :]
+            targets = targets[:, -self.predict_last_n:]
+
         return F.cross_entropy(
-            logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-100
+            logits.reshape(-1, vocab_size), 
+            targets.reshape(-1), 
+            ignore_index=-100
         )
 
     def generate(
@@ -63,60 +88,89 @@ class NextTokenStrategy(ModelingStrategy):
     ):
         device = input_ids.device
         tokens = input_ids.clone()
-
-        for _ in range(max_length):
+        
+        # Generate in chunks of predict_last_n tokens
+        remaining_length = max_length
+        while remaining_length > 0:
             with torch.no_grad():
                 tokens = tokens.to(device)
-                logits = model(tokens)[0]  # Get model logits
-                next_token_logits = logits[0, -1:, :].to(device)
+                outputs = model(tokens)  # Get model outputs
 
-                # Apply temperature scaling if necessary.
+                # Handle MoE model output
+                if isinstance(outputs, tuple):
+                    logits, _ = outputs
+                else:
+                    logits = outputs
+
+                # Get logits for last n positions
+                # Note: we take min in case remaining_length < predict_last_n
+                n_tokens = min(self.predict_last_n, remaining_length)
+                next_token_logits = logits[0, -n_tokens:, :].to(device)
+
+                # Apply temperature scaling
                 if temperature != 1.0:
                     next_token_logits = next_token_logits / temperature
 
-                # Sample the next token using top-p filtering.
-                next_token = self.sample_top_p(next_token_logits, top_p)
-                next_token = next_token.to(device)
+                # Generate n tokens at once
+                generated_tokens = []
+                for position_logits in next_token_logits:
+                    # Sample next token using top-p filtering
+                    position_logits = position_logits.unsqueeze(0).unsqueeze(0)  # Reshape for sampling
+                    next_token = self.sample_top_p(position_logits, top_p)
+                    next_token = next_token.to(device)
+                    
+                    # Compute confidence for selected token
+                    probs = F.softmax(position_logits, dim=-1)
+                    confidence = probs[0, 0, next_token.item()].item()
+                    self.confidence_history.append(confidence)
+                    
+                    generated_tokens.append(next_token)
 
-                # Compute the confidence (probability) for the selected token.
-                probs = F.softmax(next_token_logits, dim=-1)
-                # Extract the probability of the sampled token.
-                confidence = probs[0, 0, next_token.item()].item()
-                self.confidence_history.append(confidence)
+                    # Check for EOS token
+                    if next_token.item() == 50256:  # Adjust if using different tokenizer
+                        remaining_length = 0
+                        break
 
-                # Append the new token.
-                tokens = torch.cat([tokens, next_token.view(1, 1)], dim=1)
-
-                # Check for EOS token (50256 is hard-coded; adjust if needed).
-                if next_token.item() == 50256:
-                    break
+                # Combine and append new tokens
+                if generated_tokens:
+                    next_tokens = torch.cat(generated_tokens, dim=0).unsqueeze(0)
+                    tokens = torch.cat([tokens, next_tokens], dim=1)
+                    remaining_length -= len(generated_tokens)
 
         return tokens
 
     def get_stats(self):
-        """Return confidence-related metrics as a dictionary."""
+        """Return confidence-related metrics"""
         if self.confidence_history:
             avg_confidence = sum(self.confidence_history) / len(self.confidence_history)
+            # Add stats specific to multi-token prediction
+            stats = {
+                "avg_confidence": avg_confidence,
+                "predict_last_n": self.predict_last_n
+            }
         else:
-            avg_confidence = 0.0
-        return {"avg_confidence": avg_confidence}
+            stats = {
+                "avg_confidence": 0.0,
+                "predict_last_n": self.predict_last_n
+            }
+        return stats
 
     @staticmethod
     def sample_top_p(logits, top_p):
+        """Sample from top-p (nucleus) filtered distribution"""
         device = logits.device
         probs = F.softmax(logits, dim=-1)
 
-        # Sort probabilities and obtain the corresponding indices.
+        # Sort probabilities and get indices
         sorted_probs, sorted_indices = torch.sort(probs, descending=True)
         cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
 
-        # Create a mask for tokens to remove (those that push cumulative probs above top_p).
+        # Create removal mask for tokens above top_p
         sorted_indices_to_remove = cumulative_probs > top_p
-        # Shift the mask right to keep at least one token.
         sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
         sorted_indices_to_remove[..., 0] = 0
 
-        # Create a new mask and scatter the sorted mask back to the original order.
+        # Create and scatter mask back to original order
         unsorted_indices_to_remove = torch.zeros_like(
             sorted_indices_to_remove, dtype=torch.bool
         )
@@ -124,9 +178,8 @@ class NextTokenStrategy(ModelingStrategy):
             1, sorted_indices, sorted_indices_to_remove
         )
 
-        # Zero out the probabilities for the tokens that are filtered out.
+        # Zero out filtered probabilities and sample
         probs = probs.masked_fill(unsorted_indices_to_remove, 0.0)
-        # Sample one token from the remaining distribution.
         return torch.multinomial(probs, num_samples=1)
 
 
@@ -611,3 +664,290 @@ class InstructionFollowingStrategy(ModelingStrategy):
 
         probs = probs.masked_fill(indices_to_remove, 0.0)
         return torch.multinomial(probs, num_samples=1)
+
+
+
+
+import torch
+import torch.nn.functional as F
+from typing import Optional, Tuple, List, Dict
+import math
+
+class GRPOStrategy(NextTokenStrategy):
+    """
+    Implements Group Relative Policy Optimization (GRPO) for token sampling.
+    GRPO optimizes policies by comparing relative performance within groups
+    of similar contexts/states rather than using absolute reward values.
+    """
+    
+    def __init__(
+        self,
+        tokenizer=None,
+        group_size: int = 16,
+        learning_rate: float = 1e-4,
+        relative_clip: float = 0.2,
+        entropy_weight: float = 0.01,
+        context_embedding_dim: int = 768,
+        wait_token_id: Optional[int] = None,  # Add wait_token_id
+        uncertainty_threshold: float = 2.0,  # Add uncertainty_threshold, tune this
+        exploration_temperature_after_wait: float = 1.5, # Add exploration temp after wait, tune
+        wait_token_exploration_steps: int = 3 # Steps to explore after wait, tune
+    ):
+        super().__init__(tokenizer=tokenizer)
+        self.group_size = group_size
+        self.relative_clip = relative_clip
+        self.entropy_weight = entropy_weight
+        self.wait_token_id = wait_token_id  # Store wait_token_id
+        self.uncertainty_threshold = uncertainty_threshold # Store uncertainty_threshold
+        self.exploration_temperature_after_wait = exploration_temperature_after_wait # Store exploration temp
+        self.wait_token_exploration_steps = wait_token_exploration_steps # Store exploration steps
+        self.current_exploration_steps_remaining = 0 # Track exploration steps after wait
+
+        # Policy network for sampling decisions
+        self.policy_net = torch.nn.Sequential(
+            torch.nn.Linear(context_embedding_dim + 2, 128),  # context + entropy signals
+            torch.nn.LayerNorm(128),
+            torch.nn.ReLU(),
+            torch.nn.Linear(128, 64),
+            torch.nn.LayerNorm(64),
+            torch.nn.ReLU(),
+            torch.nn.Linear(64, 1)  # Outputs relative advantage estimate
+        )
+
+        self.optimizer = torch.optim.Adam(self.policy_net.parameters(), lr=learning_rate)
+        
+    def compute_context_similarity(
+        self,
+        context_embeddings: torch.Tensor,
+        reference_embedding: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Compute similarity scores between a reference context and a batch of contexts.
+        Used for grouping similar contexts together.
+        """
+        # Normalize embeddings
+        context_embeddings = F.normalize(context_embeddings, dim=-1)
+        reference_embedding = F.normalize(reference_embedding, dim=-1)
+        
+        # Compute cosine similarity
+        similarity = torch.matmul(context_embeddings, reference_embedding.transpose(-2, -1))
+        return similarity.squeeze(-1)
+    
+    def form_context_groups(
+        self,
+        context_embeddings: torch.Tensor,
+        entropy_signals: torch.Tensor
+    ) -> List[Dict[str, torch.Tensor]]:
+        """
+        Form groups of similar contexts for relative optimization.
+        Returns list of groups, each containing context embeddings and entropy signals.
+        """
+        num_contexts = context_embeddings.size(0)
+        groups = []
+        used_indices = set()
+        
+        while len(used_indices) < num_contexts:
+            # Find unused reference context
+            reference_idx = None
+            for i in range(num_contexts):
+                if i not in used_indices:
+                    reference_idx = i
+                    break
+                    
+            if reference_idx is None:
+                break
+                
+            # Compute similarities with reference
+            similarities = self.compute_context_similarity(
+                context_embeddings,
+                context_embeddings[reference_idx:reference_idx+1]
+            )
+            
+            # Find most similar contexts not yet used
+            _, similar_indices = similarities.topk(
+                min(self.group_size, num_contexts - len(used_indices))
+            )
+            
+            # Filter out already used indices
+            group_indices = [
+                idx.item() for idx in similar_indices 
+                if idx.item() not in used_indices
+            ]
+            
+            # Form group
+            group = {
+                'embeddings': context_embeddings[group_indices],
+                'entropy_signals': entropy_signals[group_indices]
+            }
+            groups.append(group)
+            
+            # Mark indices as used
+            used_indices.update(group_indices)
+            
+        return groups
+    
+    def compute_relative_advantages(
+        self,
+        group: Dict[str, torch.Tensor],
+        outcomes: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Compute relative advantages within a group based on outcomes.
+        """
+        # Get policy values for group
+        policy_input = torch.cat([
+            group['embeddings'],
+            group['entropy_signals']
+        ], dim=-1)
+        
+        policy_values = self.policy_net(policy_input).squeeze(-1)
+        
+        # Compute relative advantages
+        outcome_ranks = torch.argsort(torch.argsort(outcomes))
+        outcome_ranks = outcome_ranks.float() / (len(outcomes) - 1)  # Normalize to [0, 1]
+        
+        relative_advantages = outcome_ranks - policy_values
+        return relative_advantages
+    
+    def update_policy(
+        self,
+        groups: List[Dict[str, torch.Tensor]],
+        all_outcomes: List[torch.Tensor]
+    ):
+        """
+        Update policy using GRPO algorithm on grouped contexts.
+        """
+        total_loss = 0
+        
+        for group, outcomes in zip(groups, all_outcomes):
+            relative_advantages = self.compute_relative_advantages(group, outcomes)
+            
+            # Get policy values
+            policy_input = torch.cat([
+                group['embeddings'],
+                group['entropy_signals']
+            ], dim=-1)
+            
+            policy_values = self.policy_net(policy_input).squeeze(-1)
+            
+            # Compute GRPO loss with clipping
+            ratio = torch.exp(policy_values - policy_values.detach())
+            surr1 = ratio * relative_advantages
+            surr2 = torch.clamp(
+                ratio,
+                1 - self.relative_clip,
+                1 + self.relative_clip
+            ) * relative_advantages
+            
+            policy_loss = -torch.min(surr1, surr2).mean()
+            
+            # Add entropy regularization
+            probs = F.softmax(policy_values, dim=-1)
+            entropy = -(probs * torch.log(probs + 1e-10)).sum(dim=-1).mean()
+            loss = policy_loss - self.entropy_weight * entropy
+            
+            total_loss += loss
+            
+        # Update policy
+        self.optimizer.zero_grad()
+        total_loss.backward()
+        self.optimizer.step()
+    
+    def generate(
+        self,
+        model,
+        input_ids: torch.Tensor,
+        max_length: int,
+        temperature: float = 1.0, # Standard temperature
+        top_p: float = 0.9,
+        **kwargs
+    ) -> torch.Tensor:
+        """
+        Generate tokens using GRPO-guided sampling with 'wait' token injection.
+        """
+        device = input_ids.device
+        tokens = input_ids.clone()
+
+        # Track context information for group formation
+        context_embeddings = []
+        entropy_signals = []
+        outcomes = []
+
+        self.current_exploration_steps_remaining = 0 # Reset exploration counter for each generation
+
+        while tokens.size(1) < max_length:
+            with torch.no_grad():
+                outputs = model(tokens)
+                if isinstance(outputs, tuple):
+                    logits, hidden_states = outputs
+                else:
+                    logits = outputs
+                    hidden_states = None
+
+                next_token_logits = logits[0, -1:, :].to(device)
+
+                # Get context embedding and entropy signals
+                if hidden_states is not None:
+                    context_emb = hidden_states[-1][:, -1]  # Last layer, last position
+                else:
+                    context_emb = self.token_embedding(tokens)[:, -1]
+
+                entropy = self.compute_entropy(next_token_logits)
+                varentropy = self.compute_varentropy(model, tokens)
+                entropy_signal = torch.cat([entropy, varentropy.unsqueeze(0)], dim=-1)
+
+                # Store for group formation
+                context_embeddings.append(context_emb)
+                entropy_signals.append(entropy_signal)
+
+                # Check for 'wait' token injection condition
+                if self.wait_token_id is not None and entropy > self.uncertainty_threshold and self.current_exploration_steps_remaining <= 0: # Check if we are not already in exploration phase
+                    next_token = torch.tensor([[self.wait_token_id]], device=device) # Force 'wait' token
+                    current_temperature = self.exploration_temperature_after_wait # Set exploration temp
+                    self.current_exploration_steps_remaining = self.wait_token_exploration_steps # Set exploration steps counter
+                    print(f"Wait token injected at step {tokens.size(1)}, entropy: {entropy.item()}") # Optional print for debugging
+                else:
+                    # Determine temperature, using exploration temp if in exploration phase, otherwise policy-adjusted temp
+                    if self.current_exploration_steps_remaining > 0:
+                        current_temperature = self.exploration_temperature_after_wait
+                    else:
+                        policy_input = torch.cat([context_emb, entropy_signal], dim=-1)
+                        policy_value = self.policy_net(policy_input)
+                        current_temperature = temperature * torch.sigmoid(policy_value).item() # Policy adjusted temp
+
+                    next_token = self.sample_top_p(
+                        next_token_logits / current_temperature,
+                        top_p
+                    )
+                    self.current_exploration_steps_remaining = max(0, self.current_exploration_steps_remaining - 1) # Decrement exploration counter
+
+
+                # Track outcome (e.g., token likelihood)
+                probs = F.softmax(next_token_logits / temperature, dim=-1) # Use standard temperature for outcome calculation for consistency? Or current_temperature? - using standard temp for now
+                outcome = torch.log(probs[0, 0, next_token.item()])
+                outcomes.append(outcome)
+
+                # Append token and check for EOS
+                tokens = torch.cat([tokens, next_token], dim=1)
+                if next_token.item() == 50256:  # Assuming GPT-2 tokenizer
+                    break
+
+        # Form groups and update policy
+        if context_embeddings:
+            context_embeddings = torch.stack(context_embeddings)
+            entropy_signals = torch.stack(entropy_signals)
+            outcomes = torch.stack(outcomes)
+
+            groups = self.form_context_groups(context_embeddings, entropy_signals)
+            all_outcomes = []
+
+            # Split outcomes by group
+            start_idx = 0
+            for group in groups:
+                group_size = group['embeddings'].size(0)
+                all_outcomes.append(outcomes[start_idx:start_idx + group_size])
+                start_idx += group_size
+
+            self.update_policy(groups, all_outcomes)
+
+        return tokens
