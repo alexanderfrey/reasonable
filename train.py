@@ -3,7 +3,7 @@ import argparse
 import os, math
 from glob import glob
 from graphviz import Digraph
-
+from typing import List, Dict, Optional, Union, Tuple
 import bitsandbytes as bnb
 import torch
 import torch.nn.functional as F
@@ -521,6 +521,8 @@ def get_args():
         default=0,
         help="Number of steps to train on each file before adding next one",
     )
+    parser.add_argument("--dataset_split", type=str, default="train", help="Dataset split for HuggingFace datasets")
+    parser.add_argument("--dataset_revision", type=str, default="main", help="Dataset revision for HuggingFace datasets")
 
     args = parser.parse_args()
 
@@ -603,51 +605,45 @@ if __name__ == "__main__":
     tokenizer = tiktoken.get_encoding("gpt2")
 
     config = GPTConfig(
-        vocab_size=vocab_size,  # Remove heads configuration
-        n_layer=args.n_layer,  # Add your desired number of layers
-        n_head=args.n_head,  # Add your desired number of heads
-        n_embd=args.n_embd,  # Add your desired embedding dimension
-        block_size=args.block_size,  # Add your desired block size
-        dropout=0.1,  # Add your desired dropout rate
-        bias=True,  # Add if you want bias in linear layers
+        vocab_size=vocab_size,
+        n_layer=args.n_layer,
+        n_head=args.n_head,
+        n_embd=args.n_embd,
+        block_size=args.block_size,
+        dropout=0.1,
+        bias=True,
         n_aux_heads=args.n_aux_heads,
     )
 
     if args.num_experts == 0:
-        model = GPT(config)  # Use the single head GPT class instead of MultiHeadGPT
+        model = GPT(config)
     else:
         model = MoEGPT(
             config,
-            num_experts=args.num_experts,  # Number of experts
-            top_k=args.num_experts // 2,  # Number of experts to route to
-            moe_layers=None#[1, 3, 5],  # Specific layers to use MoE
+            num_experts=args.num_experts,
+            top_k=args.num_experts // 2,
+            moe_layers=None
         )
     model = model.to(device)
 
     # Initialize strategies based on training mode and arguments
-    # if args.pretrain:
-    #     # For pretraining, we use NextTokenStrategy
-    #     try:
-    #         has_mask_token = "<mask>" in tokenizer._special_tokens
-    #     except AttributeError:
-    #         has_mask_token = False
-    #         print(
-    #             "Warning: Could not check special tokens, using default mask token ID"
-    #         )
+    if args.pretrain:
+        try:
+            has_mask_token = "<mask>" in tokenizer._special_tokens
+        except AttributeError:
+            has_mask_token = False
+            print("Warning: Could not check special tokens, using default mask token ID")
 
-    #     main_strategy = NextTokenStrategy(tokenizer, predict_last_n=3)
-    # else:
-    #     # For finetuning, use InstructionFollowingStrategy for both pathways
-    #     main_strategy = NextTokenStrategy(tokenizer=tokenizer)
-    #     second_strategy = InstructionFollowingStrategy(
-    #         tokenizer=tokenizer,
-    #         instruction_token="[INST]",
-    #         response_token="[/INST]",
-    #         end_token="</s>",
-    #         max_length=args.block_size,
-    #     )
+        strategy = NextTokenStrategy(tokenizer, predict_last_n=1)
+    else:
+        strategy = InstructionFollowingStrategy(
+            tokenizer=tokenizer,
+            instruction_token="[INST]",
+            response_token="[/INST]",
+            end_token="</s>",
+            max_length=args.block_size,
+        )
 
-    strategy = NextTokenStrategy(tokenizer, predict_last_n=1)  # Or InstructionFollowingStrategy
     if args.use_curriculum:
         curriculum_schedule = {"steps_per_file": args.steps_per_file}
         trainer = CurriculumTrainer(
@@ -658,24 +654,34 @@ if __name__ == "__main__":
 
     # Initialize wandb only on rank 0
     if rank == 0:
+        wandb_config = {
+            "vocab_size": vocab_size,
+            "n_layer": config.n_layer,
+            "n_head": config.n_head,
+            "n_embd": config.n_embd,
+            "block_size": config.block_size,
+            "dropout": config.dropout,
+            "learning_rate": args.lr,
+            "batch_size": args.batch_size * (world_size or 1),
+            "optimizer": "8-bit AdamW",
+            "num_gpus": world_size or 1,
+            "training_mode": "pretrain" if args.pretrain else "finetune",
+            "instruction_token": "[INST]" if not args.pretrain else None,
+            "response_token": "[/INST]" if not args.pretrain else None,
+        }
+        
+        # Add dataset info to wandb config
+        if args.train_data.startswith(("hf://", "huggingface://")):
+            wandb_config.update({
+                "dataset_source": "huggingface",
+                "dataset_name": args.train_data.split("://")[1],
+                "dataset_split": args.dataset_split,
+                "dataset_revision": args.dataset_revision
+            })
+        
         wandb.init(
             project="multihead-gpt-training",
-            config={
-                "vocab_size": vocab_size,
-                "n_layer": config.n_layer,
-                "n_head": config.n_head,
-                "n_embd": config.n_embd,
-                "block_size": config.block_size,
-                "dropout": config.dropout,
-                "learning_rate": args.lr,
-                "batch_size": args.batch_size * (world_size or 1),
-                "optimizer": "8-bit AdamW",
-                "num_gpus": world_size or 1,
-                "training_mode": "pretrain" if args.pretrain else "finetune",
-                # "main_strategy": main_strategy.__class__.__name__,
-                "instruction_token": "[INST]" if not args.pretrain else None,
-                "response_token": "[/INST]" if not args.pretrain else None,
-            },
+            config=wandb_config,
         )
 
     # Print parameter counts (only on rank 0)
@@ -684,11 +690,19 @@ if __name__ == "__main__":
         print_parameter_summary(param_dict)
         visualize_model_architecture(model)
 
-        
-
     # Wrap model with DDP
     if world_size is not None:
         model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
+
+    # Prepare dataset configuration
+    if args.train_data.startswith(("hf://", "huggingface://")):
+        dataset_config = {
+            "path": args.train_data.split("://")[1],
+            "split": args.dataset_split,
+            "revision": args.dataset_revision
+        }
+    else:
+        dataset_config = args.train_data
 
     if args.use_curriculum:
         train_loader, val_loader, train_sampler, val_sampler, curriculum_dataset = (
@@ -704,7 +718,7 @@ if __name__ == "__main__":
         )
     else:
         train_loader, val_loader, train_sampler, val_sampler = create_dataloaders(
-            files_pattern=args.train_data,
+            files_pattern=dataset_config,
             block_size=args.block_size,
             batch_size=args.batch_size,
             rank=rank,
@@ -715,17 +729,14 @@ if __name__ == "__main__":
         )
 
     if rank == 0 and args.use_curriculum:
-        wandb.config.update(
-            {
-                "curriculum_learning": True,
-                "steps_per_file": args.steps_per_file,
-                "initial_files": len(curriculum_dataset.active_files),
-                "total_file_patterns": len(args.train_data_patterns),
-            }
-        )
+        wandb.config.update({
+            "curriculum_learning": True,
+            "steps_per_file": args.steps_per_file,
+            "initial_files": len(curriculum_dataset.active_files),
+            "total_file_patterns": len(args.train_data_patterns),
+        })
 
     optimizer, scheduler = configure_optimizer(model, args, train_loader)
-
     scaler = GradScaler(enabled=True)
 
     # Training loop
@@ -739,17 +750,13 @@ if __name__ == "__main__":
         start_epoch = checkpoint_info["epoch"] + 1
         trainer.set_global_step(checkpoint_info["global_step"])
 
-        # Set sampler epoch for distributed training
         if train_sampler is not None and hasattr(train_sampler, "set_epoch"):
             train_sampler.set_epoch(start_epoch)
 
-        # Ensure scheduler is at the right step
         for _ in range(checkpoint_info["global_step"]):
             scheduler.step()
 
-        print(
-            f"Resuming from epoch {start_epoch}, step {checkpoint_info['global_step']}"
-        )
+        print(f"Resuming from epoch {start_epoch}, step {checkpoint_info['global_step']}")
 
     for epoch in range(start_epoch, args.epochs):
         if train_sampler is not None:
@@ -773,7 +780,7 @@ if __name__ == "__main__":
             max_grad_norm=1.0,
             log_every_n_steps=10,
             use_moe=args.num_experts > 0,
-            num_aux_heads=args.n_aux_heads
+            num_aux_heads=args.n_aux_heads,
         )
 
         val_metrics = trainer.evaluate(

@@ -13,3 +13,5 @@ env/
 venv/
 .env
 wandb/
+books/
+text_files/

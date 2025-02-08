@@ -3,6 +3,7 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 import random
+from typing import List, Dict, Optional, Union, Tuple
 
 
 class ModelingStrategy(ABC):
@@ -70,31 +71,33 @@ class NextTokenStrategy(ModelingStrategy):
 
         # Reshape logits and targets for loss computation
         _, _, vocab_size = logits.shape
-        
+
         # Only consider the last n positions for loss computation
         if self.predict_last_n > 1:
             # Take the last n positions of logits and targets
-            logits = logits[:, -self.predict_last_n:, :]
-            targets = targets[:, -self.predict_last_n:]
+            logits = logits[:, -self.predict_last_n :, :]
+            targets = targets[:, -self.predict_last_n :]
 
         return F.cross_entropy(
-            logits.reshape(-1, vocab_size), 
-            targets.reshape(-1), 
-            ignore_index=-100
+            logits.reshape(-1, vocab_size), targets.reshape(-1), ignore_index=-100
         )
 
     def generate(
         self, model, input_ids, max_length, top_p=0.9, temperature=1.0, **kwargs
     ):
-        device = input_ids.device
-        tokens = input_ids.clone()
-        
-        # Generate in chunks of predict_last_n tokens
-        remaining_length = max_length
-        while remaining_length > 0:
-            with torch.no_grad():
-                tokens = tokens.to(device)
-                outputs = model(tokens)  # Get model outputs
+        """Generate tokens with consistent device management"""
+        # Get device from model and ensure input_ids is on the same device
+        device = next(model.parameters()).device
+        tokens = input_ids.clone().to(device)
+
+        # Track remaining length for generation
+        remaining_length = max_length - tokens.size(1)
+        generated_sequence = tokens
+
+        with torch.no_grad():
+            while remaining_length > 0:
+                # Model forward pass - tokens already on correct device
+                outputs = model(generated_sequence)
 
                 # Handle MoE model output
                 if isinstance(outputs, tuple):
@@ -103,41 +106,79 @@ class NextTokenStrategy(ModelingStrategy):
                     logits = outputs
 
                 # Get logits for last n positions
-                # Note: we take min in case remaining_length < predict_last_n
                 n_tokens = min(self.predict_last_n, remaining_length)
-                next_token_logits = logits[0, -n_tokens:, :].to(device)
+                next_token_logits = logits[
+                    :, -n_tokens:, :
+                ]  # Already on correct device
 
                 # Apply temperature scaling
                 if temperature != 1.0:
                     next_token_logits = next_token_logits / temperature
 
-                # Generate n tokens at once
+                # Generate tokens for all positions at once
                 generated_tokens = []
-                for position_logits in next_token_logits:
+                for position_logits in next_token_logits[
+                    0
+                ]:  # Iterate over last n positions
+                    # Keep logits on device and avoid unnecessary transfers
+                    position_logits = position_logits.unsqueeze(
+                        0
+                    )  # Add batch dimension
+
                     # Sample next token using top-p filtering
-                    position_logits = position_logits.unsqueeze(0).unsqueeze(0)  # Reshape for sampling
-                    next_token = self.sample_top_p(position_logits, top_p)
-                    next_token = next_token.to(device)
-                    
-                    # Compute confidence for selected token
+                    next_token = self.sample_top_p(position_logits.unsqueeze(0), top_p)
+
+                    # Compute confidence (all operations remain on device)
                     probs = F.softmax(position_logits, dim=-1)
-                    confidence = probs[0, 0, next_token.item()].item()
+                    confidence = probs[
+                        0, next_token.item()
+                    ].item()  # Only transfer scalar to CPU
                     self.confidence_history.append(confidence)
-                    
+
                     generated_tokens.append(next_token)
 
-                    # Check for EOS token
-                    if next_token.item() == 50256:  # Adjust if using different tokenizer
+                    # Check for EOS token - only transfer scalar for comparison
+                    if next_token.item() == self.tokenizer.eos_token_id:
                         remaining_length = 0
                         break
 
-                # Combine and append new tokens
+                # Combine generated tokens efficiently
                 if generated_tokens:
-                    next_tokens = torch.cat(generated_tokens, dim=0).unsqueeze(0)
-                    tokens = torch.cat([tokens, next_tokens], dim=1)
+                    next_tokens = torch.cat(generated_tokens, dim=0).unsqueeze(
+                        0
+                    )  # Keep on device
+                    generated_sequence = torch.cat(
+                        [generated_sequence, next_tokens], dim=1
+                    )
                     remaining_length -= len(generated_tokens)
 
-        return tokens
+        return generated_sequence
+
+    @staticmethod
+    def sample_top_p(logits, top_p):
+        """Sample from top-p (nucleus) filtered distribution with consistent device handling"""
+        # Use device from input logits
+        device = logits.device
+        probs = F.softmax(logits, dim=-1)
+
+        # Sort probabilities and get indices - operations stay on device
+        sorted_probs, sorted_indices = torch.sort(probs, descending=True)
+        cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+
+        # Create removal mask for tokens above top_p - stay on device
+        sorted_indices_to_remove = cumulative_probs > top_p
+        sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+        sorted_indices_to_remove[..., 0] = 0
+
+        # Create and scatter mask back to original order - stay on device
+        unsorted_indices_to_remove = torch.zeros_like(
+            sorted_indices_to_remove, dtype=torch.bool, device=device
+        )
+        unsorted_indices_to_remove.scatter_(1, sorted_indices, sorted_indices_to_remove)
+
+        # Zero out filtered probabilities and sample - stay on device
+        probs = probs.masked_fill(unsorted_indices_to_remove, 0.0)
+        return torch.multinomial(probs, num_samples=1)
 
     def get_stats(self):
         """Return confidence-related metrics"""
@@ -146,41 +187,298 @@ class NextTokenStrategy(ModelingStrategy):
             # Add stats specific to multi-token prediction
             stats = {
                 "avg_confidence": avg_confidence,
-                "predict_last_n": self.predict_last_n
+                "predict_last_n": self.predict_last_n,
             }
         else:
-            stats = {
-                "avg_confidence": 0.0,
-                "predict_last_n": self.predict_last_n
-            }
+            stats = {"avg_confidence": 0.0, "predict_last_n": self.predict_last_n}
         return stats
+
+
+class InstructionFollowingStrategy(ModelingStrategy):
+    """Strategy specialized for instruction-following tasks with proper sequence length handling"""
+
+    def __init__(
+        self,
+        tokenizer,
+        instruction_token="[INST]",
+        response_token="[/INST]",
+        end_token="</s>",
+        max_length=1024,
+        pad_token_id=0,
+        format_type="alpaca",  # Can be "alpaca" or "thinking"
+    ):
+        super().__init__()
+        self.tokenizer = tokenizer
+        self.instruction_token = instruction_token
+        self.response_token = response_token
+        self.end_token = end_token
+        self.max_length = max_length
+        self.format_type = format_type
+
+        # Cache token IDs
+        self.instruction_token_id = self.tokenizer.encode(instruction_token)[0]
+        self.response_token_id = self.tokenizer.encode(response_token)[0]
+        self.end_token_id = self.tokenizer.encode(end_token)[0]
+
+        self.pad_token_id = pad_token_id
+        self.device = None
+
+    def get_padding_value(self):
+        """Return the padding token ID"""
+        return self.pad_token_id
+
+    def format_instruction(
+        self,
+        instruction: str,
+        response: str,
+        input_context: str = None,
+        thinking: str = None,
+        system: str = None,
+    ) -> str:
+        """Format instruction based on specified format type"""
+        # Ensure inputs are strings
+        instruction = str(instruction) if instruction is not None else ""
+        response = str(response) if response is not None else ""
+
+        if self.format_type == "thinking":
+            formatted = self._format_thinking(instruction, thinking, response)
+        else:  # default to alpaca format
+            formatted = self._format_alpaca(
+                instruction, response, input_context, system
+            )
+
+        return formatted
+
+    def _format_alpaca(
+        self,
+        instruction: str,
+        response: str,
+        input_context: str = None,
+        system: str = None,
+    ) -> str:
+        """Format using Alpaca style with optional system prompt"""
+        formatted = f"{self.instruction_token}"
+
+        # Add system prompt if provided
+        if system:
+            formatted += f"### System:\n{system}\n\n"
+
+        formatted += f"### Instruction:\n{instruction}\n"
+
+        if input_context:
+            formatted += f"\n### Input:\n{input_context}\n"
+
+        formatted += f"\n### Response:\n{response}{self.response_token}{self.end_token}"
+        return formatted
+
+    def tokenize_and_pad(self, text: str) -> List[int]:
+        """Tokenize text and handle padding with our special pad token"""
+        tokens = self.tokenizer.encode(text)
+        if len(tokens) < self.max_length:
+            padding = [self.pad_token_id] * (self.max_length - len(tokens))
+            tokens.extend(padding)
+        return tokens[: self.max_length]
+
+    def to(self, device):
+        """Add device management method"""
+        self.device = device
+        return self
+
+    def reset_state(self):
+        """Reset any internal state"""
+        self.generation_history = []
+        self.current_sequence = None
+
+    def get_state(self):
+        """Return current state for debugging"""
+        return {
+            "device": self.device,
+            "max_length": self.max_length,
+            "current_sequence": self.current_sequence,
+        }
+
+    def compute_loss(self, logits, targets, instruction_mask=None, **kwargs):
+        # Vectorized mask creation if not provided
+        if instruction_mask is None:
+            instruction_mask = self._create_instruction_mask_vectorized(targets)
+
+        # Use einsum for more efficient computation
+        loss = F.cross_entropy(
+            logits.view(-1, logits.size(-1)), targets.view(-1), reduction="none"
+        ).view_as(targets)
+
+        # Apply mask efficiently
+        masked_loss = loss * (~instruction_mask).float()
+        return masked_loss.sum() / (~instruction_mask).float().sum()
+
+    def _create_instruction_mask_vectorized(self, token_ids):
+        """Vectorized mask creation"""
+        batch_size, seq_length = token_ids.shape
+        inst_positions = (token_ids == self.instruction_token_id).nonzero(as_tuple=True)
+        resp_positions = (token_ids == self.response_token_id).nonzero(as_tuple=True)
+
+        mask = torch.zeros_like(token_ids, dtype=torch.bool)
+        for b in range(batch_size):
+            batch_insts = inst_positions[0] == b
+            batch_resps = resp_positions[0] == b
+            if batch_insts.any() and batch_resps.any():
+                start = inst_positions[1][batch_insts][0]
+                end = resp_positions[1][batch_resps][0]
+                mask[b, start : end + 1] = True
+        return mask
+
+    def validate_tokens(self, tokens):
+        """Validate token sequence structure"""
+        has_inst = self.instruction_token_id in tokens
+        has_resp = self.response_token_id in tokens
+        has_end = self.end_token_id in tokens
+
+        if not (has_inst and has_resp):
+            raise ValueError("Missing instruction or response tokens")
+
+        try:
+            inst_pos = tokens.index(self.instruction_token_id)
+            resp_pos = tokens.index(self.response_token_id)
+        except (
+            ValueError
+        ):  # Should not happen now because of 'in' checks, but as a safeguard
+            raise ValueError("Missing instruction or response tokens (index error)")
+
+        if inst_pos >= resp_pos:
+            raise ValueError("Invalid token sequence order")
+
+    def validate_instruction_format(self, text: str) -> bool:
+        """Validate instruction format before tokenization"""
+        # Check basic structure
+        has_inst_token = self.instruction_token in text
+        has_resp_token = self.response_token in text
+        has_end_token = self.end_token in text
+
+        if not (has_inst_token and has_resp_token):
+            print(
+                f"Warning: Missing instruction/response tokens in text: {text[:100]}..."
+            )
+            return False
+
+        # Check token order
+        inst_pos = text.find(self.instruction_token)
+        resp_pos = text.find(self.response_token)
+        end_pos = text.find(self.end_token)
+
+        if not (0 <= inst_pos < resp_pos):
+            print(
+                f"Warning: Invalid instruction/response token order at positions {inst_pos}, {resp_pos}"
+            )
+            return False
+
+        if end_pos >= 0 and not (resp_pos < end_pos):
+            print(
+                f"Warning: End token appears before response token at position {end_pos}"
+            )
+            return False
+
+        return True
+
+    def prepare_input(self, instruction, response=None):
+        """
+        Unified method for preparing input sequences.
+        Can handle both instruction-only (for inference) and instruction-response pairs (for training).
+
+        Args:
+            instruction (str): The instruction text
+            response (str, optional): The response text for training
+
+        Returns:
+            torch.Tensor: Properly formatted and tokenized sequence
+        """
+        if response is not None:
+            # Training mode - include both instruction and response
+            sequence = f"{self.instruction_token}{instruction}{self.response_token}{response}{self.end_token}"
+        else:
+            # Inference mode - include only instruction
+            sequence = f"{self.instruction_token}{instruction}{self.response_token}"
+
+        tokens = self.tokenizer.encode(sequence)
+
+        # Handle length constraints
+        if len(tokens) > self.max_length:
+            if response is None:
+                # For inference, keep space for generation
+                tokens = tokens[: self.max_length - 1]
+            else:
+                # For training, include end token
+                tokens = tokens[: self.max_length - 1] + [self.end_token_id]
+
+        return torch.tensor(tokens, dtype=torch.long, device=self.device)
+
+    def generate(self, model, input_ids, max_length, top_p=0.9, temperature=0.7):
+        self.to(input_ids.device)
+        tokens = input_ids.clone()
+        generated_tokens = []
+
+        with torch.no_grad():
+            for _ in range(max_length):
+                outputs = (
+                    model(tokens) if not generated_tokens else model(tokens[:, -1:])
+                )
+                logits = outputs[0] if isinstance(outputs, tuple) else outputs
+                next_token_logits = logits[:, -1, :]  # Shape: [batch_size, vocab_size]
+                scaled_logits = next_token_logits / temperature
+                next_token = self.sample_top_p(
+                    scaled_logits, top_p
+                )  # Shape: [batch_size, 1]
+                tokens = torch.cat([tokens, next_token], dim=1)
+                generated_tokens.append(next_token)
+
+                # Check if end token was generated
+                if next_token.item() == self.end_token_id:
+                    break
+
+        return tokens
 
     @staticmethod
     def sample_top_p(logits, top_p):
         """Sample from top-p (nucleus) filtered distribution"""
-        device = logits.device
+        # Ensure logits are 2D: [batch_size, vocab_size]
+        if len(logits.shape) == 3:
+            logits = logits.squeeze(1)
+
+        # Get probabilities
         probs = F.softmax(logits, dim=-1)
 
-        # Sort probabilities and get indices
-        sorted_probs, sorted_indices = torch.sort(probs, descending=True)
+        # Sort probabilities in descending order
+        sorted_probs, sorted_indices = torch.sort(probs, descending=True, dim=-1)
         cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
 
-        # Create removal mask for tokens above top_p
+        # Create mask for tokens to remove
         sorted_indices_to_remove = cumulative_probs > top_p
-        sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+        # Keep at least one token
         sorted_indices_to_remove[..., 0] = 0
 
-        # Create and scatter mask back to original order
-        unsorted_indices_to_remove = torch.zeros_like(
-            sorted_indices_to_remove, dtype=torch.bool
-        )
-        unsorted_indices_to_remove = unsorted_indices_to_remove.scatter(
+        # Scatter mask back to original indices
+        indices_to_remove = sorted_indices_to_remove.scatter(
             1, sorted_indices, sorted_indices_to_remove
         )
 
-        # Zero out filtered probabilities and sample
-        probs = probs.masked_fill(unsorted_indices_to_remove, 0.0)
-        return torch.multinomial(probs, num_samples=1)
+        # Filter distribution
+        probs = probs.masked_fill(indices_to_remove, 0.0)
+        # Renormalize probabilities
+        probs = probs / probs.sum(dim=-1, keepdim=True)
+
+        # Sample from filtered distribution
+        next_token = torch.multinomial(probs, num_samples=1)
+        return next_token  # Shape: [batch_size, 1]
+
+    def collect_metrics(self):
+        """Collect generation metrics"""
+        return {
+            "avg_sequence_length": sum(len(s) for s in self.generation_history)
+            / len(self.generation_history),
+            "total_generations": len(self.generation_history),
+            "unique_tokens_used": len(
+                set(t for s in self.generation_history for t in s)
+            ),
+        }
 
 
 class SpanMaskingStrategy(ModelingStrategy):
@@ -454,232 +752,13 @@ class SpanPredictionStrategy(ModelingStrategy):
         return NextTokenStrategy.sample_top_p(logits, top_p)
 
 
-class InstructionFollowingStrategy(ModelingStrategy):
-    """Strategy specialized for instruction-following tasks with proper sequence length handling"""
-
-    def __init__(
-        self,
-        tokenizer,
-        instruction_token="[INST]",
-        response_token="[/INST]",
-        end_token="</s>",
-        max_length=1024,  # Add max_length parameter
-    ):
-        self.tokenizer = tokenizer
-        self.instruction_token = instruction_token
-        self.response_token = response_token
-        self.end_token = end_token
-        self.max_length = max_length
-
-        # Cache token IDs
-        self.instruction_token_id = self.tokenizer.encode(instruction_token)[0]
-        self.response_token_id = self.tokenizer.encode(response_token)[0]
-        self.end_token_id = self.tokenizer.encode(end_token)[0]
-
-    def format_instruction(self, instruction, response):
-        formatted = f"{self.instruction_token}{instruction}{self.response_token}{response}{self.end_token}"
-        tokens = self.tokenizer.encode(formatted)
-
-        if len(tokens) > self.max_length:
-            tokens = tokens[: self.max_length]
-
-        tokens = tokens + [0] * (self.max_length - len(tokens))
-        return torch.tensor(tokens, dtype=torch.long)
-
-    def compute_loss(self, logits, targets, instruction_mask=None, **kwargs):
-        """Compute loss with proper dimension handling"""
-        device = logits.device
-
-        # Get dimensions
-        batch_size, logits_seq_len, vocab_size = logits.shape
-        target_seq_len = targets.shape[1]
-
-        # Truncate logits to match target length
-        if logits_seq_len > target_seq_len:
-            logits = logits[:, :target_seq_len, :]
-
-        if instruction_mask is None:
-            # Create instruction mask - don't compute loss on instruction tokens
-            instruction_mask = self._create_instruction_mask(targets)
-
-        instruction_mask = instruction_mask.to(device)
-
-        # Verify shapes after truncation
-        assert (
-            logits.shape[:2] == targets.shape == instruction_mask.shape
-        ), f"Shape mismatch: logits={logits.shape}, targets={targets.shape}, mask={instruction_mask.shape}"
-
-        # Create loss weights
-        loss_weights = torch.where(
-            instruction_mask,
-            torch.tensor(0.0, device=device),  # Don't train on instructions
-            torch.tensor(1.0, device=device),  # Full weight on responses
-        )
-
-        # Compute cross entropy with masked targets
-        masked_targets = torch.where(
-            instruction_mask,
-            torch.tensor(-100, device=device),  # Ignore instruction tokens
-            targets,
-        )
-
-        # Ensure all tensors are contiguous
-        logits = logits.contiguous()
-        masked_targets = masked_targets.contiguous()
-        loss_weights = loss_weights.contiguous()
-
-        # Compute loss
-        loss = F.cross_entropy(
-            logits.view(-1, vocab_size),
-            masked_targets.view(-1),
-            reduction="none",
-            ignore_index=-100,
-        )
-
-        # Apply weights and average
-        weighted_loss = (loss * loss_weights.view(-1)).sum() / (
-            loss_weights.sum() + 1e-8
-        )
-
-        return weighted_loss
-
-    def generate(self, model, input_ids, max_length, top_p=0.9, temperature=0.7):
-        device = input_ids.device
-        tokens = input_ids.clone().to(device)
-
-        with torch.no_grad():
-            response_started = False
-            for _ in range(max_length):
-                tokens = tokens.to(device)
-                logits = model(tokens)[0]
-                next_token_logits = logits[0, -1:, :].to(device)
-
-                # Apply temperature scaling
-                next_token_logits = next_token_logits / temperature
-
-                # If we haven't started response yet, force response token
-                if not response_started and tokens[-1][-1] == self.instruction_token_id:
-                    next_token = torch.tensor([[self.response_token_id]], device=device)
-                    response_started = True
-                else:
-                    # Sample next token
-                    next_token = self.sample_top_p(next_token_logits, top_p)
-                    next_token = next_token.to(device)
-
-                tokens = torch.cat([tokens, next_token.view(1, 1)], dim=1)
-
-                # Stop if we hit the end token
-                if next_token.item() == self.end_token_id:
-                    break
-
-        return tokens
-
-    def _create_instruction_mask(self, token_ids):
-        """Create attention mask that focuses on instruction portion"""
-        batch_size, seq_length = token_ids.shape
-        masks = torch.zeros((batch_size, seq_length), dtype=torch.bool)
-
-        for i in range(batch_size):
-            # Find positions of special tokens
-            try:
-                inst_start = (token_ids[i] == self.instruction_token_id).nonzero(
-                    as_tuple=True
-                )[0][0]
-                inst_end = (token_ids[i] == self.response_token_id).nonzero(
-                    as_tuple=True
-                )[0][0]
-
-                # Set mask to True between instruction tokens
-                masks[i, inst_start : inst_end + 1] = True
-            except IndexError:
-                # If tokens not found, mask everything
-                masks[i, :] = True
-
-        return masks
-
-    def get_padding_value(self):
-        """Return the padding token ID"""
-        return self.end_token_id
-
-    def format_prompt(self, instruction):
-        """Format instruction with special tokens and length constraint"""
-        formatted = f"{self.instruction_token}{instruction}{self.response_token}"
-        # Tokenize and truncate if needed
-        tokens = self.tokenizer.encode(formatted)
-        if len(tokens) > self.max_length:
-            tokens = tokens[: self.max_length - 1] + [self.end_token_id]
-        return self.tokenizer.decode(tokens)
-
-    def prepare_sequence(self, sequence):
-        """Prepare and validate sequence length"""
-        tokens = self.tokenizer.encode(sequence)
-        if len(tokens) > self.max_length:
-            tokens = tokens[: self.max_length - 1] + [self.end_token_id]
-        return tokens
-
-    def sample_top_p(self, logits, top_p):
-        """Sample from the distribution with top-p (nucleus) sampling"""
-        probs = F.softmax(logits, dim=-1)
-        sorted_probs, sorted_indices = torch.sort(probs, descending=True)
-        cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
-
-        # Remove tokens with cumulative probability above the threshold
-        sorted_indices_to_remove = cumulative_probs > top_p
-        # Shift the indices to the right to keep also the first token above the threshold
-        sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-        sorted_indices_to_remove[..., 0] = 0
-
-        indices_to_remove = sorted_indices_to_remove.scatter(
-            1, sorted_indices, sorted_indices_to_remove
-        )
-        probs = probs.masked_fill(indices_to_remove, 0.0)
-
-        # Sample from the filtered distribution
-        sample = torch.multinomial(probs, 1)
-        return sample
-
-    @staticmethod
-    def sample_top_p(logits, top_p):
-        device = logits.device
-        probs = F.softmax(logits, dim=-1)
-        probs = probs.to(device)
-
-        sorted_probs, sorted_indices = torch.sort(probs, descending=True)
-        sorted_probs = sorted_probs.to(device)
-        sorted_indices = sorted_indices.to(device)
-
-        cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
-        cumulative_probs = cumulative_probs.to(device)
-
-        # Remove tokens with cumulative probability above threshold
-        sorted_indices_to_remove = cumulative_probs > top_p
-        sorted_indices_to_remove = sorted_indices_to_remove.to(device)
-        sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-        sorted_indices_to_remove[..., 0] = 0
-
-        indices_to_remove = sorted_indices_to_remove.scatter(
-            1, sorted_indices, sorted_indices_to_remove
-        )
-        indices_to_remove = indices_to_remove.to(device)
-
-        probs = probs.masked_fill(indices_to_remove, 0.0)
-        return torch.multinomial(probs, num_samples=1)
-
-
-
-
-import torch
-import torch.nn.functional as F
-from typing import Optional, Tuple, List, Dict
-import math
-
 class GRPOStrategy(NextTokenStrategy):
     """
     Implements Group Relative Policy Optimization (GRPO) for token sampling.
     GRPO optimizes policies by comparing relative performance within groups
     of similar contexts/states rather than using absolute reward values.
     """
-    
+
     def __init__(
         self,
         tokenizer=None,
@@ -690,36 +769,46 @@ class GRPOStrategy(NextTokenStrategy):
         context_embedding_dim: int = 768,
         wait_token_id: Optional[int] = None,  # Add wait_token_id
         uncertainty_threshold: float = 2.0,  # Add uncertainty_threshold, tune this
-        exploration_temperature_after_wait: float = 1.5, # Add exploration temp after wait, tune
-        wait_token_exploration_steps: int = 3 # Steps to explore after wait, tune
+        exploration_temperature_after_wait: float = 1.5,  # Add exploration temp after wait, tune
+        wait_token_exploration_steps: int = 3,  # Steps to explore after wait, tune
     ):
         super().__init__(tokenizer=tokenizer)
         self.group_size = group_size
         self.relative_clip = relative_clip
         self.entropy_weight = entropy_weight
         self.wait_token_id = wait_token_id  # Store wait_token_id
-        self.uncertainty_threshold = uncertainty_threshold # Store uncertainty_threshold
-        self.exploration_temperature_after_wait = exploration_temperature_after_wait # Store exploration temp
-        self.wait_token_exploration_steps = wait_token_exploration_steps # Store exploration steps
-        self.current_exploration_steps_remaining = 0 # Track exploration steps after wait
+        self.uncertainty_threshold = (
+            uncertainty_threshold  # Store uncertainty_threshold
+        )
+        self.exploration_temperature_after_wait = (
+            exploration_temperature_after_wait  # Store exploration temp
+        )
+        self.wait_token_exploration_steps = (
+            wait_token_exploration_steps  # Store exploration steps
+        )
+        self.current_exploration_steps_remaining = (
+            0  # Track exploration steps after wait
+        )
 
         # Policy network for sampling decisions
         self.policy_net = torch.nn.Sequential(
-            torch.nn.Linear(context_embedding_dim + 2, 128),  # context + entropy signals
+            torch.nn.Linear(
+                context_embedding_dim + 2, 128
+            ),  # context + entropy signals
             torch.nn.LayerNorm(128),
             torch.nn.ReLU(),
             torch.nn.Linear(128, 64),
             torch.nn.LayerNorm(64),
             torch.nn.ReLU(),
-            torch.nn.Linear(64, 1)  # Outputs relative advantage estimate
+            torch.nn.Linear(64, 1),  # Outputs relative advantage estimate
         )
 
-        self.optimizer = torch.optim.Adam(self.policy_net.parameters(), lr=learning_rate)
-        
+        self.optimizer = torch.optim.Adam(
+            self.policy_net.parameters(), lr=learning_rate
+        )
+
     def compute_context_similarity(
-        self,
-        context_embeddings: torch.Tensor,
-        reference_embedding: torch.Tensor
+        self, context_embeddings: torch.Tensor, reference_embedding: torch.Tensor
     ) -> torch.Tensor:
         """
         Compute similarity scores between a reference context and a batch of contexts.
@@ -728,15 +817,15 @@ class GRPOStrategy(NextTokenStrategy):
         # Normalize embeddings
         context_embeddings = F.normalize(context_embeddings, dim=-1)
         reference_embedding = F.normalize(reference_embedding, dim=-1)
-        
+
         # Compute cosine similarity
-        similarity = torch.matmul(context_embeddings, reference_embedding.transpose(-2, -1))
+        similarity = torch.matmul(
+            context_embeddings, reference_embedding.transpose(-2, -1)
+        )
         return similarity.squeeze(-1)
-    
+
     def form_context_groups(
-        self,
-        context_embeddings: torch.Tensor,
-        entropy_signals: torch.Tensor
+        self, context_embeddings: torch.Tensor, entropy_signals: torch.Tensor
     ) -> List[Dict[str, torch.Tensor]]:
         """
         Form groups of similar contexts for relative optimization.
@@ -745,7 +834,7 @@ class GRPOStrategy(NextTokenStrategy):
         num_contexts = context_embeddings.size(0)
         groups = []
         used_indices = set()
-        
+
         while len(used_indices) < num_contexts:
             # Find unused reference context
             reference_idx = None
@@ -753,114 +842,108 @@ class GRPOStrategy(NextTokenStrategy):
                 if i not in used_indices:
                     reference_idx = i
                     break
-                    
+
             if reference_idx is None:
                 break
-                
+
             # Compute similarities with reference
             similarities = self.compute_context_similarity(
                 context_embeddings,
-                context_embeddings[reference_idx:reference_idx+1]
+                context_embeddings[reference_idx : reference_idx + 1],
             )
-            
+
             # Find most similar contexts not yet used
             _, similar_indices = similarities.topk(
                 min(self.group_size, num_contexts - len(used_indices))
             )
-            
+
             # Filter out already used indices
             group_indices = [
-                idx.item() for idx in similar_indices 
-                if idx.item() not in used_indices
+                idx.item() for idx in similar_indices if idx.item() not in used_indices
             ]
-            
+
             # Form group
             group = {
-                'embeddings': context_embeddings[group_indices],
-                'entropy_signals': entropy_signals[group_indices]
+                "embeddings": context_embeddings[group_indices],
+                "entropy_signals": entropy_signals[group_indices],
             }
             groups.append(group)
-            
+
             # Mark indices as used
             used_indices.update(group_indices)
-            
+
         return groups
-    
+
     def compute_relative_advantages(
-        self,
-        group: Dict[str, torch.Tensor],
-        outcomes: torch.Tensor
+        self, group: Dict[str, torch.Tensor], outcomes: torch.Tensor
     ) -> torch.Tensor:
         """
         Compute relative advantages within a group based on outcomes.
         """
         # Get policy values for group
-        policy_input = torch.cat([
-            group['embeddings'],
-            group['entropy_signals']
-        ], dim=-1)
-        
+        policy_input = torch.cat(
+            [group["embeddings"], group["entropy_signals"]], dim=-1
+        )
+
         policy_values = self.policy_net(policy_input).squeeze(-1)
-        
+
         # Compute relative advantages
         outcome_ranks = torch.argsort(torch.argsort(outcomes))
-        outcome_ranks = outcome_ranks.float() / (len(outcomes) - 1)  # Normalize to [0, 1]
-        
+        outcome_ranks = outcome_ranks.float() / (
+            len(outcomes) - 1
+        )  # Normalize to [0, 1]
+
         relative_advantages = outcome_ranks - policy_values
         return relative_advantages
-    
+
     def update_policy(
-        self,
-        groups: List[Dict[str, torch.Tensor]],
-        all_outcomes: List[torch.Tensor]
+        self, groups: List[Dict[str, torch.Tensor]], all_outcomes: List[torch.Tensor]
     ):
         """
         Update policy using GRPO algorithm on grouped contexts.
         """
         total_loss = 0
-        
+
         for group, outcomes in zip(groups, all_outcomes):
             relative_advantages = self.compute_relative_advantages(group, outcomes)
-            
+
             # Get policy values
-            policy_input = torch.cat([
-                group['embeddings'],
-                group['entropy_signals']
-            ], dim=-1)
-            
+            policy_input = torch.cat(
+                [group["embeddings"], group["entropy_signals"]], dim=-1
+            )
+
             policy_values = self.policy_net(policy_input).squeeze(-1)
-            
+
             # Compute GRPO loss with clipping
             ratio = torch.exp(policy_values - policy_values.detach())
             surr1 = ratio * relative_advantages
-            surr2 = torch.clamp(
-                ratio,
-                1 - self.relative_clip,
-                1 + self.relative_clip
-            ) * relative_advantages
-            
+            surr2 = (
+                torch.clamp(ratio, 1 - self.relative_clip, 1 + self.relative_clip)
+                * relative_advantages
+            )
+
             policy_loss = -torch.min(surr1, surr2).mean()
-            
+
             # Add entropy regularization
             probs = F.softmax(policy_values, dim=-1)
             entropy = -(probs * torch.log(probs + 1e-10)).sum(dim=-1).mean()
             loss = policy_loss - self.entropy_weight * entropy
-            
+
             total_loss += loss
-            
+
         # Update policy
         self.optimizer.zero_grad()
         total_loss.backward()
         self.optimizer.step()
-    
+
     def generate(
         self,
         model,
         input_ids: torch.Tensor,
         max_length: int,
-        temperature: float = 1.0, # Standard temperature
+        temperature: float = 1.0,  # Standard temperature
         top_p: float = 0.9,
-        **kwargs
+        **kwargs,
     ) -> torch.Tensor:
         """
         Generate tokens using GRPO-guided sampling with 'wait' token injection.
@@ -873,7 +956,9 @@ class GRPOStrategy(NextTokenStrategy):
         entropy_signals = []
         outcomes = []
 
-        self.current_exploration_steps_remaining = 0 # Reset exploration counter for each generation
+        self.current_exploration_steps_remaining = (
+            0  # Reset exploration counter for each generation
+        )
 
         while tokens.size(1) < max_length:
             with torch.no_grad():
@@ -901,11 +986,23 @@ class GRPOStrategy(NextTokenStrategy):
                 entropy_signals.append(entropy_signal)
 
                 # Check for 'wait' token injection condition
-                if self.wait_token_id is not None and entropy > self.uncertainty_threshold and self.current_exploration_steps_remaining <= 0: # Check if we are not already in exploration phase
-                    next_token = torch.tensor([[self.wait_token_id]], device=device) # Force 'wait' token
-                    current_temperature = self.exploration_temperature_after_wait # Set exploration temp
-                    self.current_exploration_steps_remaining = self.wait_token_exploration_steps # Set exploration steps counter
-                    print(f"Wait token injected at step {tokens.size(1)}, entropy: {entropy.item()}") # Optional print for debugging
+                if (
+                    self.wait_token_id is not None
+                    and entropy > self.uncertainty_threshold
+                    and self.current_exploration_steps_remaining <= 0
+                ):  # Check if we are not already in exploration phase
+                    next_token = torch.tensor(
+                        [[self.wait_token_id]], device=device
+                    )  # Force 'wait' token
+                    current_temperature = (
+                        self.exploration_temperature_after_wait
+                    )  # Set exploration temp
+                    self.current_exploration_steps_remaining = (
+                        self.wait_token_exploration_steps
+                    )  # Set exploration steps counter
+                    print(
+                        f"Wait token injected at step {tokens.size(1)}, entropy: {entropy.item()}"
+                    )  # Optional print for debugging
                 else:
                     # Determine temperature, using exploration temp if in exploration phase, otherwise policy-adjusted temp
                     if self.current_exploration_steps_remaining > 0:
@@ -913,17 +1010,21 @@ class GRPOStrategy(NextTokenStrategy):
                     else:
                         policy_input = torch.cat([context_emb, entropy_signal], dim=-1)
                         policy_value = self.policy_net(policy_input)
-                        current_temperature = temperature * torch.sigmoid(policy_value).item() # Policy adjusted temp
+                        current_temperature = (
+                            temperature * torch.sigmoid(policy_value).item()
+                        )  # Policy adjusted temp
 
                     next_token = self.sample_top_p(
-                        next_token_logits / current_temperature,
-                        top_p
+                        next_token_logits / current_temperature, top_p
                     )
-                    self.current_exploration_steps_remaining = max(0, self.current_exploration_steps_remaining - 1) # Decrement exploration counter
-
+                    self.current_exploration_steps_remaining = max(
+                        0, self.current_exploration_steps_remaining - 1
+                    )  # Decrement exploration counter
 
                 # Track outcome (e.g., token likelihood)
-                probs = F.softmax(next_token_logits / temperature, dim=-1) # Use standard temperature for outcome calculation for consistency? Or current_temperature? - using standard temp for now
+                probs = F.softmax(
+                    next_token_logits / temperature, dim=-1
+                )  # Use standard temperature for outcome calculation for consistency? Or current_temperature? - using standard temp for now
                 outcome = torch.log(probs[0, 0, next_token.item()])
                 outcomes.append(outcome)
 
@@ -944,8 +1045,8 @@ class GRPOStrategy(NextTokenStrategy):
             # Split outcomes by group
             start_idx = 0
             for group in groups:
-                group_size = group['embeddings'].size(0)
-                all_outcomes.append(outcomes[start_idx:start_idx + group_size])
+                group_size = group["embeddings"].size(0)
+                all_outcomes.append(outcomes[start_idx : start_idx + group_size])
                 start_idx += group_size
 
             self.update_policy(groups, all_outcomes)

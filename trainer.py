@@ -7,6 +7,7 @@ import torch.nn.functional as F
 from model import MoELayer, MoETransformerBlock
 from typing import List, Dict, Optional, Union, Tuple
 from data_utils import CurriculumDataset
+from strategies import InstructionFollowingStrategy
 
 
 class ExpertUsageTracker:
@@ -83,8 +84,21 @@ class SingleHeadTrainer:
         self.global_step = 0
 
     def save_checkpoint(self, model, optimizer, scheduler, epoch, step, save_dir):
-        """Save model checkpoint and training state"""
+        """
+        Save model checkpoint and training state
+
+        Args:
+            model: The model to save
+            optimizer: The optimizer state to save
+            scheduler: The scheduler state to save
+            epoch: Current epoch number
+            step: Current step number
+            save_dir: Directory to save the checkpoint
+        """
         model_to_save = model.module if hasattr(model, "module") else model
+
+        # Get strategy name from class name
+        strategy_name = self.strategy.__class__.__name__
 
         checkpoint = {
             "epoch": epoch,
@@ -92,11 +106,16 @@ class SingleHeadTrainer:
             "model_state_dict": model_to_save.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "scheduler_state_dict": scheduler.state_dict(),
+            "strategy": strategy_name,  # Add strategy name to checkpoint
         }
 
-        save_path = f"{save_dir}/checkpoint_epoch{epoch}_step{step}.pt"
+        # Include strategy name in the checkpoint filename
+        save_path = f"{save_dir}/checkpoint_{strategy_name}_epoch{epoch}_step{step}.pt"
         torch.save(checkpoint, save_path)
-        torch.save(checkpoint, f"{save_dir}/checkpoint_latest.pt")
+
+        # Also update the latest checkpoint with strategy name
+        latest_path = f"{save_dir}/checkpoint_{strategy_name}_latest.pt"
+        torch.save(checkpoint, latest_path)
 
     def _compute_perplexity(self, logits, targets, ignore_index=-100):
         """
@@ -154,84 +173,110 @@ class SingleHeadTrainer:
         max_grad_norm=1.0,
         log_every_n_steps=10,
         aux_loss_weight=0.1,
-        num_aux_heads=0,  # New parameter for number of auxiliary heads
+        num_aux_heads=0,
         use_moe=True,
+        dataset_source=None,
     ):
-        """Memory-optimized training with multi-head future prediction support"""
+        """Memory-optimized training with enhanced debugging information"""
         model.train()
-
-        # Training monitoring
         grad_norm_total = 0
         num_steps = 0
-
-        # Track final metrics
         final_total_loss = 0.0
         final_main_loss = 0.0
-        final_aux_losses = [0.0] * num_aux_heads  # Track each aux head separately
+        final_aux_losses = [0.0] * num_aux_heads
 
-        # Batch accumulation state
         optimizer.zero_grad(set_to_none=True)
-
         progress_bar = tqdm(train_loader, desc=f"Epoch {epoch + 1}")
+        is_instruction_mode = isinstance(self.strategy, InstructionFollowingStrategy)
 
         for batch_idx, batch in enumerate(progress_bar):
-            # Efficient device transfer
+            # Transfer data to device
             with torch.cuda.stream(torch.cuda.Stream()):
                 input_ids = batch["inputs"].to(device, non_blocking=True)
                 targets = batch["targets"].to(device, non_blocking=True)
-                # Get future targets for auxiliary heads
                 future_targets = [
                     t.to(device, non_blocking=True) for t in batch["future_targets"]
                 ]
 
             is_accumulation_step = (batch_idx + 1) % gradient_accumulation_steps != 0
 
-            # Compute loss with mixed precision
-            with torch.cuda.amp.autocast():
-                # Get model outputs
-                outputs = model(input_ids)
+            # Debug information logging
+            if gen_every_n_steps and self.global_step % gen_every_n_steps == 0:
+                # Temporarily set model to eval mode for generation
+                model.eval()
 
+                sample_idx = torch.randint(0, input_ids.shape[0], (1,)).item()
+                input_tokens = self._remove_padding(
+                    input_ids[sample_idx].cpu().tolist()
+                )
+                target_tokens = self._remove_padding(targets[sample_idx].cpu().tolist())
+
+                print("\n" + "=" * 80)
+                print(f"Step {self.global_step} Debug Information:")
+                print("=" * 80)
+
+                if is_instruction_mode:
+                    input_text = tokenizer.decode(input_tokens)
+                    print("Complete input text:", input_text, "\n\n", "-" * 80)
+
+                    system, instruction, response, input_context = (
+                        self._parse_instruction_format(input_text)
+                    )
+
+                    # Pass input_context to debug logger
+                    self._log_instruction_debug(
+                        model,
+                        tokenizer,
+                        input_tokens,
+                        instruction,
+                        response,
+                        system,
+                        input_context,
+                    )
+                else:
+                    self._log_next_token_debug(
+                        model,
+                        tokenizer,
+                        input_tokens,
+                        target_tokens,
+                        self.strategy,
+                        future_targets,
+                        sample_idx,
+                        num_aux_heads,
+                    )
+                print("=" * 80 + "\n")
+
+                # Set model back to training mode
+                model.train()
+
+            # Forward pass and loss computation
+            with torch.cuda.amp.autocast():
+                outputs = model(input_ids)
                 if num_aux_heads > 0:
                     main_logits, aux_outputs = outputs
                 else:
                     main_logits = outputs
                     aux_outputs = []
 
-                # Main task loss
                 main_loss = self.strategy.compute_loss(main_logits, targets)
-
-                # Auxiliary losses for future prediction
                 aux_losses = []
                 if num_aux_heads > 0:
-                    for idx, (aux_output, future_target) in enumerate(
-                        zip(aux_outputs, future_targets)
-                    ):
+                    for aux_output, future_target in zip(aux_outputs, future_targets):
                         aux_loss = self.strategy.compute_loss(aux_output, future_target)
                         aux_losses.append(aux_loss)
-                        final_aux_losses[idx] = (
-                            aux_loss.item()
-                        )  # Track individual aux losses
 
-                # Combine all losses
+                total_loss = main_loss
                 if aux_losses:
                     aux_loss_sum = sum(aux_losses) / len(aux_losses)
                     total_loss = main_loss + (aux_loss_weight * aux_loss_sum)
-                else:
-                    total_loss = main_loss
 
-                # Update final metrics
-                final_total_loss = total_loss.item()
-                final_main_loss = main_loss.item()
-
-                # Scale for gradient accumulation
                 scaled_loss = total_loss / gradient_accumulation_steps
 
             # Backward pass
             scaler.scale(scaled_loss).backward()
 
-            # Gradient update step
+            # Optimization step
             if not is_accumulation_step:
-                # Gradient clipping
                 scaler.unscale_(optimizer)
                 grad_norm = torch.nn.utils.clip_grad_norm_(
                     model.parameters(), max_grad_norm
@@ -239,17 +284,20 @@ class SingleHeadTrainer:
                 grad_norm_total += grad_norm.item()
                 num_steps += 1
 
-                # Optimizer step
                 scaler.step(optimizer)
                 scaler.update()
                 scheduler.step()
-
-                # Reset gradients
                 optimizer.zero_grad(set_to_none=True)
 
-                # Log metrics
-                if self.global_step % log_every_n_steps == 0 and wandb.run is not None:
-                    # Base training metrics
+                # Update progress bar
+                progress_bar.set_postfix(
+                    self._get_progress_bar_metrics(
+                        total_loss, main_loss, scheduler, aux_losses
+                    )
+                )
+
+                # Regular logging
+                if self.global_step % log_every_n_steps == 0:
                     metrics = {
                         "train/main_loss": main_loss.item(),
                         "train/total_loss": total_loss.item(),
@@ -258,132 +306,14 @@ class SingleHeadTrainer:
                         "train/grad_norm_avg": grad_norm_total / max(1, num_steps),
                         "train/global_step": self.global_step,
                     }
-
-                    # Add auxiliary head metrics
+                    if dataset_source:
+                        metrics["train/dataset_source"] = dataset_source
                     if num_aux_heads > 0:
                         for idx, aux_loss in enumerate(aux_losses):
                             metrics[f"train/aux_loss_{idx+1}"] = aux_loss.item()
-                        metrics["train/avg_aux_loss"] = sum(
-                            l.item() for l in aux_losses
-                        ) / len(aux_losses)
+                    self._log_metrics(metrics, self.global_step)
 
-                    # Add MoE metrics if enabled
-                    if use_moe:
-                        expert_metrics = self.monitor_expert_usage(model, input_ids)
-
-                        # Process and add MoE metrics
-                        for layer_name, layer_metrics in expert_metrics.items():
-                            # Expert utilization
-                            for expert_id, count in layer_metrics[
-                                "expert_counts"
-                            ].items():
-                                metrics[f"{layer_name}/{expert_id}"] = count
-                            for expert_id, util in layer_metrics[
-                                "expert_utilization"
-                            ].items():
-                                metrics[f"{layer_name}/{expert_id}_util"] = util
-
-                            # Router confidence
-                            for metric_name, value in layer_metrics[
-                                "router_confidence"
-                            ].items():
-                                metrics[f"{layer_name}/router_{metric_name}"] = value
-
-                            # Load balancing
-                            for metric_name, value in layer_metrics[
-                                "load_balancing"
-                            ].items():
-                                metrics[f"{layer_name}/{metric_name}"] = value
-
-                            # Routing patterns
-                            for metric_name, value in layer_metrics[
-                                "routing_patterns"
-                            ].items():
-                                metrics[f"{layer_name}/{metric_name}"] = value
-
-                            # Capacity metrics if available
-                            if "capacity_metrics" in layer_metrics:
-                                for expert_id, over_cap in layer_metrics[
-                                    "capacity_metrics"
-                                ].items():
-                                    metrics[
-                                        f"{layer_name}/{expert_id}_over_capacity"
-                                    ] = over_cap
-
-                    wandb.log(metrics, step=self.global_step)
-
-                # Update progress bar with key metrics
-                progress_bar_metrics = {
-                    "loss": f"{total_loss.item():.4f}",
-                    "ppl": f"{torch.exp(main_loss).item():.2f}",
-                    "lr": f"{scheduler.get_last_lr()[0]:.2e}",
-                }
-                if num_aux_heads > 0:
-                    progress_bar_metrics["aux_avg"] = (
-                        f"{sum(l.item() for l in aux_losses) / len(aux_losses):.4f}"
-                    )
-
-                progress_bar.set_postfix(progress_bar_metrics)
-
-                # Sample generations and logging remain the same...
-                if gen_every_n_steps and self.global_step % gen_every_n_steps == 0:
-                    # if tokenizer is not None:
-                    #     # Get a random sample from the batch
-                    #     sample_idx = torch.randint(0, input_ids.shape[0], (1,)).item()
-
-                    #     print("\n" + "="*50)
-                    #     print(f"Debug Info at Step {self.global_step}, Sample Index: {sample_idx}")
-
-                    #     # Debug input sequence
-                    #     input_tokens = input_ids[sample_idx].cpu().tolist()
-                    #     print("\nInput sequence:")
-                    #     print(f"Raw tokens: {input_tokens[:50]}")
-                    #     print(f"Decoded text: {tokenizer.decode(input_tokens)}")
-
-                    #     # Debug main target (t+1)
-                    #     target_tokens = targets[sample_idx].cpu().tolist()
-                    #     print("\nMain target (t+1):")
-                    #     print(f"Raw tokens: {target_tokens[:50]}")
-                    #     print(f"Decoded text: {tokenizer.decode(target_tokens)}")
-
-                    #     # Debug auxiliary head targets
-                    #     if num_aux_heads > 0 and future_targets:
-                    #         print("\nAuxiliary head targets:")
-                    #         for i, future_target in enumerate(future_targets):
-                    #             fut_tokens = future_target[sample_idx].cpu().tolist()
-                    #             print(f"\nHead {i+1} (t+{i+2}):")
-                    #             print(f"Raw tokens: {fut_tokens[:50]}")
-                    #             print(f"Decoded text: {tokenizer.decode(fut_tokens)}")
-
-                    #     print("\nLosses:")
-                    #     print(f"Main loss (t+1): {main_loss.item():.4f}")
-                    #     if num_aux_heads > 0 and aux_losses:
-                    #         for i, aux_loss in enumerate(aux_losses):
-                    #             print(f"Aux head {i+1} loss (t+{i+2}): {aux_loss.item():.4f}")
-                    #     print(f"Total loss: {total_loss.item():.4f}")
-                    #     print("="*50 + "\n")
-
-                    #     # Original wandb logging code
-                    #     if wandb.run is not None:
-                    #         wandb.log({
-                    #             "debug/input_text": wandb.Html(f"<pre>{html.escape(tokenizer.decode(input_tokens)[:1000])}</pre>"),
-                    #             "debug/target_text": wandb.Html(f"<pre>{html.escape(tokenizer.decode(target_tokens)[:1000])}</pre>"),
-                    #             "debug/input_tokens": wandb.Table(
-                    #                 data=[[i, t] for i, t in enumerate(input_tokens[:20])],
-                    #                 columns=["position", "token_id"]
-                    #             ),
-                    #             "debug/target_tokens": wandb.Table(
-                    #                 data=[[i, t] for i, t in enumerate(target_tokens[:20])],
-                    #                 columns=["position", "token_id"]
-                    #             )
-                    #         }, step=self.global_step)
-
-                    # Continue with normal generation sampling
-                    self._generate_and_log_samples(
-                        model, tokenizer, sample_prompts, max_gen_length, device
-                    )
-
-                # Checkpoint saving remains the same...
+                # Save checkpoint if needed
                 if save_every_n_steps and self.global_step % save_every_n_steps == 0:
                     self.save_checkpoint(
                         model,
@@ -396,60 +326,21 @@ class SingleHeadTrainer:
 
                 self.global_step += 1
 
-            # Explicit cleanup
-            del outputs
-            del main_loss
+            # Cleanup
+            del outputs, main_loss
             if aux_losses:
                 del aux_losses
-            del total_loss
-            del scaled_loss
-
-        # Calculate final metrics
-        final_perplexity = torch.exp(torch.tensor(final_main_loss)).item()
+            del total_loss, scaled_loss
 
         return {
             "epoch": epoch,
             "grad_norm_avg": grad_norm_total / max(1, num_steps),
-            "final_total_loss": final_total_loss,
-            "final_perplexity": final_perplexity,
-            "final_aux_losses": final_aux_losses if num_aux_heads > 0 else None,
+            "final_total_loss": total_loss.item(),
+            "final_perplexity": torch.exp(main_loss).item(),
+            "final_aux_losses": (
+                [loss.item() for loss in aux_losses] if num_aux_heads > 0 else None
+            ),
         }
-
-    def _log_perplexity_debug_info(self, logits, targets):
-        """Log detailed perplexity calculation information"""
-        with torch.no_grad():
-            print("\nPerplexity debug info:")
-
-            # Basic stats
-            print(f"Logits shape: {logits.shape}")
-            print(
-                f"Logits - min: {logits.min().item():.2f}, max: {logits.max().item():.2f}, mean: {logits.mean().item():.2f}"
-            )
-
-            # Check for any inf/nan in logits
-            inf_mask = torch.isinf(logits)
-            nan_mask = torch.isnan(logits)
-            print(f"Inf values in logits: {inf_mask.sum().item()}")
-            print(f"NaN values in logits: {nan_mask.sum().item()}")
-
-            # Compute and check probabilities
-            probs = torch.softmax(logits.view(-1, logits.size(-1)), dim=-1)
-            zero_probs = (probs == 0).float().mean().item()
-            print(f"Proportion of zero probabilities: {zero_probs:.4f}")
-
-            # Target distribution
-            valid_mask = targets != -100
-            valid_targets = targets[valid_mask]
-            if valid_targets.numel() > 0:
-                target_probs = probs[valid_mask].gather(1, valid_targets.unsqueeze(1))
-                print(
-                    f"Target probs - min: {target_probs.min().item():.2e}, max: {target_probs.max().item():.2e}"
-                )
-                print(
-                    f"Log probs - min: {torch.log(target_probs).min().item():.2f}, max: {torch.log(target_probs).max().item():.2f}"
-                )
-
-            print("-" * 40)
 
     def _log_gradient_norms(self, model, max_grad_norm):
         """Log gradient norms for monitoring"""
@@ -472,6 +363,276 @@ class SingleHeadTrainer:
                     print(
                         f"Gradient stats - min: {grad.min()}, max: {grad.max()}, mean: {grad.mean()}"
                     )
+
+    def _log_metrics(self, metrics, step):
+        """Log metrics to wandb if available"""
+        if wandb.run is not None:
+            wandb.log(metrics, step=step)
+
+    def _get_progress_bar_metrics(
+        self, total_loss, main_loss, scheduler, aux_losses=None
+    ):
+        """Get metrics for the progress bar"""
+        metrics = {
+            "loss": f"{total_loss.item():.4f}",
+            "ppl": f"{torch.exp(main_loss).item():.2f}",
+            "lr": f"{scheduler.get_last_lr()[0]:.2e}",
+        }
+        if aux_losses:
+            metrics["aux_avg"] = (
+                f"{sum(l.item() for l in aux_losses) / len(aux_losses):.4f}"
+            )
+        return metrics
+
+    def _log_instruction_debug(
+        self,
+        model,
+        tokenizer,
+        input_tokens,
+        instruction_text,
+        response_text=None,
+        system_text=None,
+        input_context=None,
+    ):
+        """Log debug information for instruction following mode with consistent formatting"""
+
+        # First, log the complete raw input for debugging
+        raw_input = tokenizer.decode(input_tokens)
+        print("\nRaw Input Text:")
+        print("-" * 40)
+        print(raw_input)
+        print("-" * 40)
+
+        # Then log the parsed components
+        print("\nParsed Components:")
+        print("-" * 40)
+
+        if system_text:
+            print("System:")
+            print(system_text.strip())
+            print()
+
+        print("Instruction:")
+        print(instruction_text.strip() if instruction_text else "")
+        print()
+
+        if input_context:
+            print("Input:")
+            print(input_context.strip())
+            print()
+
+        if response_text:
+            print("Response:")
+            print(response_text.strip())
+
+        # Token statistics section with better error handling and validation
+        print("\nToken Statistics:")
+        print("-" * 40)
+        try:
+            # For instruction tokens
+            instruction_token_count = 0
+            if instruction_text:
+                # Add debug printing
+                instruction_tokens = tokenizer.encode(instruction_text.strip())
+                instruction_token_count = len(instruction_tokens)
+                print(f"Instruction text being counted: '{instruction_text.strip()}'")
+
+            # For response tokens
+            response_token_count = 0
+            if response_text:
+                # Add debug printing
+                response_tokens = tokenizer.encode(response_text.strip())
+                response_token_count = len(response_tokens)
+                print(f"Response text being counted: '{response_text.strip()}'")
+
+            # For input context tokens
+            input_context_token_count = 0
+            if input_context:
+                input_context_tokens = tokenizer.encode(input_context.strip())
+                input_context_token_count = len(input_context_tokens)
+
+            # Print all token counts
+            print(f"Total tokens (without padding): {len(input_tokens)}")
+            print(f"Instruction tokens: {instruction_token_count}")
+            if input_context:
+                print(f"Input context tokens: {input_context_token_count}")
+            print(f"Response tokens: {response_token_count}")
+
+        except Exception as e:
+            print(f"Error calculating token statistics: {str(e)}")
+
+        # Generate and log model's response if appropriate
+        if response_text:
+            print("\nModel Generation:")
+            print("-" * 40)
+            try:
+                with torch.no_grad():
+                    input_tensor = torch.tensor(
+                        [input_tokens], device=next(model.parameters()).device
+                    )
+                    generated = self.strategy.generate(
+                        model,
+                        input_tensor,
+                        max_length=100,
+                        temperature=0.7,
+                        top_p=0.9,
+                    )
+                    generated_tokens = generated[0].cpu().tolist()
+                    generated_text = tokenizer.decode(generated_tokens)
+
+                    # Extract just the model's response part
+                    if "[/INST]" in generated_text:
+                        generated_response = generated_text.split("[/INST]")[1].strip()
+                        generated_response = generated_response.replace(
+                            "</s>", ""
+                        ).strip()
+                        print(f"Generated response:\n{generated_response}")
+                    else:
+                        print(f"Complete generation:\n{generated_text}")
+
+                    # Log special tokens for debugging
+                    print("\nSpecial tokens in generation:")
+                    print(f"Contains [/INST]: {'[/INST]' in generated_text}")
+                    print(f"Contains </s>: {'</s>' in generated_text}")
+
+            except Exception as e:
+                print(f"Generation failed: {str(e)}")
+
+        print("\n" + "=" * 80 + "\n")
+
+    def _log_next_token_debug(
+        self,
+        model,
+        tokenizer,
+        input_tokens,
+        target_tokens,
+        strategy,
+        future_targets=None,
+        sample_idx=None,
+        num_aux_heads=0,
+    ):
+        """Log debug information for next token prediction mode"""
+        print("\nNext Token Prediction Mode Debug:")
+        print("-" * 40)
+        print(f"\nInput sequence (last 100 tokens decoded):")
+        print(tokenizer.decode(input_tokens[-100:]))
+        print(f"\nTarget token(s):")
+        print(tokenizer.decode(target_tokens[-strategy.predict_last_n :]))
+
+        # Generate model's prediction
+        try:
+            with torch.no_grad():
+                input_tensor = torch.tensor(
+                    [input_tokens], device=next(model.parameters()).device
+                )
+                generated = strategy.generate(
+                    model,
+                    input_tensor,
+                    max_length=strategy.predict_last_n,
+                    temperature=0.7,
+                    top_p=0.9,
+                )
+                generated_tokens = generated[0].cpu().tolist()
+                print(f"\nModel prediction:")
+                print(tokenizer.decode(generated_tokens[-strategy.predict_last_n :]))
+        except Exception as e:
+            print(f"Generation failed: {str(e)}")
+
+        print("\nPrediction Statistics:")
+        print(f"Predicting last {strategy.predict_last_n} tokens")
+        print(f"Input sequence length (without padding): {len(input_tokens)}")
+
+        if hasattr(strategy, "confidence_history") and strategy.confidence_history:
+            recent_confidence = strategy.confidence_history[-5:]
+            print(
+                f"Recent prediction confidences: {[f'{c:.3f}' for c in recent_confidence]}"
+            )
+
+        # Log auxiliary head information
+        if num_aux_heads > 0 and future_targets:
+            print("\nAuxiliary Head Predictions:")
+            print("-" * 40)
+            for i, future_target in enumerate(future_targets):
+                fut_tokens = future_target[sample_idx].cpu().tolist()
+                fut_tokens = self._remove_padding(fut_tokens)
+                print(f"\nHead {i+1} (t+{i+2}):")
+                print(f"Target: {tokenizer.decode(fut_tokens[-10:])}")
+
+    @staticmethod
+    def _remove_padding(tokens):
+        """Remove padding tokens (0) from sequence"""
+        try:
+            first_pad = tokens.index(0)
+            return tokens[:first_pad]
+        except ValueError:
+            return tokens
+
+    def _parse_instruction_format(self, input_text):
+        """Parse instruction format from input text"""
+        try:
+            # Check for required tokens
+            if "[INST]" not in input_text or "[/INST]" not in input_text:
+                print(f"Warning: Missing [INST] or [/INST] tokens in input")
+                return None, None, None, None
+
+            # Split on [INST] first
+            main_content = input_text.split("[INST]", 1)[1]
+
+            # Split on ### Response: to separate instruction and response parts
+            if "### Response:" in main_content:
+                pre_response, response_part = main_content.split("### Response:", 1)
+
+                # Clean up the response part
+                response = response_part.split("[/INST]", 1)[0].strip()
+
+                # Process the instruction part
+                if "### Instruction:" in pre_response:
+                    instruction = pre_response.split("### Instruction:", 1)[1].strip()
+                else:
+                    instruction = pre_response.strip()
+
+                # Handle system if present
+                system = None
+                if "### System:" in pre_response:
+                    system_part = pre_response.split("### System:", 1)[1]
+                    system = system_part.split("### Instruction:", 1)[0].strip()
+
+                # Handle input if present
+                input_context = None
+                if "### Input:" in instruction:
+                    instruction, input_context = instruction.split("### Input:", 1)
+                    instruction = instruction.strip()
+                    input_context = input_context.strip()
+
+                # Add debug output
+                print("\nParsing Results:")
+                print(f"System present: {'Yes' if system else 'No'}")
+                print(f"Input context present: {'Yes' if input_context else 'No'}")
+                print(f"Instruction length: {len(instruction) if instruction else 0}")
+                print(f"Response length: {len(response) if response else 0}")
+                print("\nParsed sections preview:")
+                print(
+                    "Instruction:",
+                    (
+                        instruction[:100] + "..."
+                        if len(instruction) > 100
+                        else instruction
+                    ),
+                )
+                print(
+                    "Response:",
+                    response[:100] + "..." if len(response) > 100 else response,
+                )
+
+                return system, instruction, response, input_context
+            else:
+                print("Warning: No '### Response:' marker found in text")
+                return None, None, None, None
+
+        except Exception as e:
+            print(f"Error parsing instruction format: {str(e)}")
+            print(f"Input text preview: {input_text[:100]}...")
+            return None, None, None, None
 
     def monitor_expert_usage(self, model, input_ids):
         """
