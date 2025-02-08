@@ -3,10 +3,11 @@ import os
 import json
 import time
 import random
-import requests
 from typing import List, Dict, Any
 from dataclasses import dataclass
 import argparse
+import logging
+from openai import OpenAI
 
 
 @dataclass
@@ -21,25 +22,35 @@ class LanguageTask:
     skills_tested: List[str]
 
 
-class OllamaAPI:
+class VLLMAPI:
     def __init__(
-        self, model_name: str = "llama2", base_url: str = "http://localhost:11434"
+        self,
+        model_id: str = "Qwen/Qwen-7B-Chat",
+        openai_api_base: str = "http://localhost:8000/v1",
+        max_tokens: int = 4096,
+        show_logs: bool = True,
     ):
-        self.model_name = model_name
-        self.base_url = base_url.rstrip("/")
-        self.generate_url = f"{self.base_url}/api/generate"
+        self.model_id = model_id
+        self.openai_api_base = openai_api_base
+        self.max_tokens = max_tokens
+        self.show_logs = show_logs
 
         try:
             self._test_connection()
-        except requests.RequestException as e:
-            raise ConnectionError(f"Failed to connect to Ollama API: {e}")
+        except Exception as e:
+            raise ConnectionError(f"Failed to connect to VLLM API: {e}")
 
     def _test_connection(self):
-        response = requests.get(f"{self.base_url}/api/tags")
-        if response.status_code != 200:
-            raise ConnectionError(
-                f"Failed to connect to Ollama API. Status: {response.status_code}"
+        try:
+            client = OpenAI(api_key="EMPTY", base_url=self.openai_api_base)
+            # Simple test completion
+            completion = client.chat.completions.create(
+                model=self.model_id,
+                messages=[{"role": "user", "content": "test"}],
+                max_tokens=10,
             )
+        except Exception as e:
+            raise ConnectionError(f"Failed to connect to VLLM API: {e}")
 
     def generate(
         self,
@@ -48,32 +59,30 @@ class OllamaAPI:
         max_retries: int = 3,
         retry_delay: float = 1.0,
     ) -> str:
-        data = {
-            "model": self.model_name,
-            "prompt": prompt,
-            "temperature": temperature,
-            "format": "json",
-        }
+        messages = [
+            {
+                "role": "system",
+                "content": "You are Qwen, created by Alibaba Cloud. You are a helpful assistant.",
+            },
+            {"role": "user", "content": prompt},
+        ]
 
         for attempt in range(max_retries):
             try:
-                response = requests.post(self.generate_url, json=data)
-                response.raise_for_status()
+                client = OpenAI(api_key="EMPTY", base_url=self.openai_api_base)
+                completion = client.chat.completions.create(
+                    model=self.model_id,
+                    messages=messages,
+                    max_tokens=self.max_tokens,
+                    temperature=temperature,
+                )
+                return completion.choices[0].message.content
 
-                try:
-                    lines = response.text.strip().split("\n")
-                    last_response = json.loads(lines[-1])
-                    return last_response["response"]
-                except (json.JSONDecodeError, KeyError) as e:
-                    if attempt == max_retries - 1:
-                        raise ValueError(f"Failed to parse Ollama response: {e}")
-
-            except requests.RequestException as e:
+            except Exception as e:
                 if attempt == max_retries - 1:
                     raise ConnectionError(
                         f"Failed to generate after {max_retries} attempts: {e}"
                     )
-
                 time.sleep(retry_delay)
                 continue
 
@@ -91,6 +100,11 @@ class EducationalLevelFramework:
                     "basic_writing",
                     "sight_words",
                     "listening_comprehension",
+                    "rhyming_words",
+                    "letter_sounds",
+                    "uppercase_lowercase",
+                    "word_families",
+                    "oral_vocabulary",
                 ],
             },
             "first_grade": {
@@ -101,6 +115,41 @@ class EducationalLevelFramework:
                     "basic_punctuation",
                     "vocabulary",
                     "reading_comprehension",
+                    "phonemic_awareness",
+                    "spelling_patterns",
+                    "story_elements",
+                    "descriptive_language",
+                    "verb_tenses",
+                ],
+            },
+            "second_grade": {
+                "age_range": "7-8",
+                "skill_categories": [
+                    "compound_words",
+                    "prefixes_suffixes",
+                    "grammar_basics",
+                    "reading_fluency",
+                    "main_idea",
+                    "context_clues",
+                    "paragraph_writing",
+                    "synonyms_antonyms",
+                    "contractions",
+                    "comprehension_strategies",
+                ],
+            },
+            "third_grade": {
+                "age_range": "8-9",
+                "skill_categories": [
+                    "reading_strategies",
+                    "writing_process",
+                    "vocabulary_context",
+                    "text_features",
+                    "parts_of_speech",
+                    "figurative_language",
+                    "summarizing",
+                    "editing_revising",
+                    "research_skills",
+                    "advanced_punctuation",
                 ],
             },
         }
@@ -179,130 +228,189 @@ class EducationalLevelFramework:
             task_type = random.choice(list(self.task_types.keys()))
 
             prompt = self.generate_prompt_template(grade, category, task_type)
-            response = llm_api.generate(prompt, temperature=temperature)
 
             try:
-                task_data = json.loads(response)
-                task = LanguageTask(
-                    grade_level=grade,
-                    skill_category=category,
-                    task_type=task_type,
-                    prompt=task_data["prompt"],
-                    thoughts=task_data["thoughts"],
-                    correct_response=task_data["correct_response"],
-                    difficulty=task_data["difficulty"],
-                    skills_tested=task_data["skills_tested"],
-                )
-                tasks.append(task)
-            except json.JSONDecodeError:
-                print(f"Failed to parse LLM response: {response}")
+                response = llm_api.generate(prompt, temperature=temperature)
+                # Clean the response - remove any leading/trailing whitespace and non-JSON text
+                response = response.strip()
+                # Try to find JSON content between curly braces if there's other text
+                if not response.startswith("{"):
+                    start = response.find("{")
+                    end = response.rfind("}") + 1
+                    if start != -1 and end != 0:
+                        response = response[start:end]
+
+                try:
+                    task_data = json.loads(response)
+                    # Validate required fields
+                    required_fields = [
+                        "prompt",
+                        "thoughts",
+                        "correct_response",
+                        "difficulty",
+                        "skills_tested",
+                    ]
+                    if all(field in task_data for field in required_fields):
+                        task = LanguageTask(
+                            grade_level=grade,
+                            skill_category=category,
+                            task_type=task_type,
+                            prompt=task_data["prompt"],
+                            thoughts=task_data["thoughts"],
+                            correct_response=task_data["correct_response"],
+                            difficulty=task_data["difficulty"],
+                            skills_tested=task_data["skills_tested"],
+                        )
+                        tasks.append(task)
+                    else:
+                        logging.warning(
+                            f"Missing required fields in response: {response[:100]}..."
+                        )
+                except json.JSONDecodeError as e:
+                    logging.error(f"Failed to parse LLM response as JSON: {str(e)}")
+                    logging.error(f"Response received: {response[:100]}...")
+            except Exception as e:
+                logging.error(f"Error generating task: {str(e)}")
                 continue
 
         return tasks
 
-    def save_tasks_to_jsonl(self, tasks: List[LanguageTask], base_filename: str):
-        """Save generated tasks to a JSONL file with appropriate naming"""
-        grade_levels = sorted(set(task.grade_level for task in tasks))
-        num_tasks = len(tasks)
+    def create_output_filename(
+        self, base_filename: str, grade_levels: List[str]
+    ) -> str:
         timestamp = time.strftime("%Y%m%d_%H%M%S")
-
         grades_str = (
             "_".join(grade_levels)
             if len(grade_levels) <= 3
             else f"{len(grade_levels)}grades"
         )
-        filename = f"language_tasks_{grades_str}_{num_tasks}tasks_{timestamp}.jsonl"
+        filename = f"language_tasks_{grades_str}_{timestamp}.jsonl"
+        output_dir = "training_data"
+        output_path = os.path.join(output_dir, filename)
+        os.makedirs(output_dir, exist_ok=True)
+        return output_path
 
-        if os.path.dirname(base_filename):
-            filename = os.path.join(os.path.dirname(base_filename), filename)
-
-        os.makedirs(
-            os.path.dirname(filename) if os.path.dirname(filename) else ".",
-            exist_ok=True,
-        )
-
-        with open(filename, "w", encoding="utf-8") as f:
-            for task in tasks:
-                task_dict = {
-                    "grade_level": task.grade_level,
-                    "skill_category": task.skill_category,
-                    "task_type": task.task_type,
-                    "prompt": task.prompt,
-                    "thoughts": task.thoughts,
-                    "correct_response": task.correct_response,
-                    "difficulty": task.difficulty,
-                    "skills_tested": task.skills_tested,
-                }
-                f.write(json.dumps(task_dict, ensure_ascii=False) + "\n")
-
-        return filename
+    def save_task(self, task: LanguageTask, file_handle) -> None:
+        task_dict = {
+            "grade_level": task.grade_level,
+            "skill_category": task.skill_category,
+            "task_type": task.task_type,
+            "prompt": task.prompt,
+            "thoughts": task.thoughts,
+            "correct_response": task.correct_response,
+            "difficulty": task.difficulty,
+            "skills_tested": task.skills_tested,
+        }
+        file_handle.write(json.dumps(task_dict, ensure_ascii=False) + "\n")
+        file_handle.flush()
 
 
 def main(
     output_file: str,
-    model_name: str = "llama2",
+    model_id: str = "Qwen/Qwen-7B-Chat",
+    openai_api_base: str = "http://localhost:8000/v1",
     num_tasks_per_grade: int = 100,
     grades: List[str] = None,
     categories: List[str] = None,
     temperature: float = 0.7,
     verbose: bool = False,
 ):
+    # Configure logging
+    log_level = logging.INFO if verbose else logging.WARNING
+    logging.basicConfig(
+        level=log_level, format="%(asctime)s - %(levelname)s - %(message)s"
+    )
 
     framework = EducationalLevelFramework()
-    llm_api = OllamaAPI(model_name=model_name)
+    llm_api = VLLMAPI(
+        model_id=model_id, openai_api_base=openai_api_base, show_logs=verbose
+    )
 
     if grades is None:
         grades = list(framework.grade_levels.keys())
 
     total_tasks = len(grades) * num_tasks_per_grade
-    generated_tasks = []
+    tasks_generated = 0
+
+    output_filename = framework.create_output_filename(output_file, grades)
+    logging.info(f"Writing output to: {output_filename}")
 
     try:
-        for grade in grades:
-            if verbose:
-                print(f"\nGenerating tasks for {grade}...")
-
-            grade_categories = (
-                categories or framework.grade_levels[grade]["skill_categories"]
-            )
-            tasks_per_category = num_tasks_per_grade // len(grade_categories)
-
-            for category in grade_categories:
+        with open(output_filename, "w", encoding="utf-8") as f:
+            for grade in grades:
                 if verbose:
-                    print(f"Generating {tasks_per_category} tasks for {category}...")
+                    logging.info(f"\nGenerating tasks for {grade}...")
 
-                new_tasks = framework.generate_tasks_with_llm(
-                    llm_api,
-                    num_tasks=tasks_per_category,
-                    specific_grade=grade,
-                    specific_category=category,
-                    temperature=temperature,
+                grade_categories = (
+                    categories or framework.grade_levels[grade]["skill_categories"]
                 )
 
-                generated_tasks.extend(new_tasks)
+                base_tasks_per_category = max(
+                    1, num_tasks_per_grade // len(grade_categories)
+                )
+                remaining_tasks = num_tasks_per_grade - (
+                    base_tasks_per_category * len(grade_categories)
+                )
 
-                if verbose:
-                    print(f"Generated {len(generated_tasks)}/{total_tasks} tasks...")
+                for i, category in enumerate(grade_categories):
+                    current_category_tasks = (
+                        base_tasks_per_category + 1
+                        if i < remaining_tasks
+                        else base_tasks_per_category
+                    )
+
+                    if verbose:
+                        logging.info(
+                            f"Generating {current_category_tasks} tasks for {category}..."
+                        )
+
+                    for _ in range(current_category_tasks):
+                        try:
+                            tasks = framework.generate_tasks_with_llm(
+                                llm_api,
+                                num_tasks=1,
+                                specific_grade=grade,
+                                specific_category=category,
+                                temperature=temperature,
+                            )
+
+                            if tasks:
+                                framework.save_task(tasks[0], f)
+                                tasks_generated += 1
+
+                                if verbose:
+                                    logging.info(
+                                        f"Generated {tasks_generated}/{total_tasks} tasks..."
+                                    )
+
+                        except Exception as e:
+                            logging.error(f"Error generating task: {str(e)}")
+                            continue
 
     except KeyboardInterrupt:
-        print("\nGeneration interrupted by user. Saving progress...")
+        logging.warning(
+            "\nGeneration interrupted by user. Tasks saved up to this point."
+        )
 
     finally:
-        if generated_tasks:
-            final_file = framework.save_tasks_to_jsonl(generated_tasks, output_file)
-            if verbose:
-                print(f"\nGeneration complete:")
-                print(f"- Successfully generated {len(generated_tasks)} tasks")
-                print(f"- Results saved to {final_file}")
+        if verbose:
+            logging.info(f"\nGeneration complete:")
+            logging.info(f"- Successfully generated {tasks_generated} tasks")
+            logging.info(f"- Results saved to {output_filename}")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Generate educational language tasks using Ollama LLM"
+        description="Generate educational language tasks using VLLM"
     )
     parser.add_argument("output_file", help="Path to save generated tasks")
     parser.add_argument(
-        "--model", default="llama2", help="Ollama model name to use (default: llama2)"
+        "--model-id",
+        default="Qwen/Qwen-7B-Chat",
+        help="VLLM model ID to use (default: Qwen/Qwen-7B-Chat)",
+    )
+    parser.add_argument(
+        "--api-base", default="http://localhost:8000/v1", help="VLLM API base URL"
     )
     parser.add_argument(
         "--tasks-per-grade",
@@ -330,7 +438,8 @@ if __name__ == "__main__":
 
     main(
         output_file=args.output_file,
-        model_name=args.model,
+        model_id=args.model_id,
+        openai_api_base=args.api_base,
         num_tasks_per_grade=args.tasks_per_grade,
         grades=args.grades,
         categories=args.categories,
