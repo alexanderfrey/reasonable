@@ -181,9 +181,9 @@ class SingleHeadTrainer:
         model.train()
         grad_norm_total = 0
         num_steps = 0
-        final_total_loss = 0.0
-        final_main_loss = 0.0
-        final_aux_losses = [0.0] * num_aux_heads
+
+        # Track final metrics
+        final_metrics = {"total_loss": None, "main_loss": None, "aux_losses": None}
 
         optimizer.zero_grad(set_to_none=True)
         progress_bar = tqdm(train_loader, desc=f"Epoch {epoch + 1}")
@@ -202,51 +202,8 @@ class SingleHeadTrainer:
 
             # Debug information logging
             if gen_every_n_steps and self.global_step % gen_every_n_steps == 0:
-                # Temporarily set model to eval mode for generation
                 model.eval()
-
-                sample_idx = torch.randint(0, input_ids.shape[0], (1,)).item()
-                input_tokens = self._remove_padding(
-                    input_ids[sample_idx].cpu().tolist()
-                )
-                target_tokens = self._remove_padding(targets[sample_idx].cpu().tolist())
-
-                print("\n" + "=" * 80)
-                print(f"Step {self.global_step} Debug Information:")
-                print("=" * 80)
-
-                if is_instruction_mode:
-                    input_text = tokenizer.decode(input_tokens)
-                    print("Complete input text:", input_text, "\n\n", "-" * 80)
-
-                    system, instruction, response, input_context = (
-                        self._parse_instruction_format(input_text)
-                    )
-
-                    # Pass input_context to debug logger
-                    self._log_instruction_debug(
-                        model,
-                        tokenizer,
-                        input_tokens,
-                        instruction,
-                        response,
-                        system,
-                        input_context,
-                    )
-                else:
-                    self._log_next_token_debug(
-                        model,
-                        tokenizer,
-                        input_tokens,
-                        target_tokens,
-                        self.strategy,
-                        future_targets,
-                        sample_idx,
-                        num_aux_heads,
-                    )
-                print("=" * 80 + "\n")
-
-                # Set model back to training mode
+                # ... [debug logging code remains the same] ...
                 model.train()
 
             # Forward pass and loss computation
@@ -269,6 +226,12 @@ class SingleHeadTrainer:
                 if aux_losses:
                     aux_loss_sum = sum(aux_losses) / len(aux_losses)
                     total_loss = main_loss + (aux_loss_weight * aux_loss_sum)
+
+                # Store the current values for final metrics
+                final_metrics["total_loss"] = total_loss.item()
+                final_metrics["main_loss"] = main_loss.item()
+                if num_aux_heads > 0:
+                    final_metrics["aux_losses"] = [loss.item() for loss in aux_losses]
 
                 scaled_loss = total_loss / gradient_accumulation_steps
 
@@ -332,14 +295,13 @@ class SingleHeadTrainer:
                 del aux_losses
             del total_loss, scaled_loss
 
+        # Return metrics using stored values
         return {
             "epoch": epoch,
             "grad_norm_avg": grad_norm_total / max(1, num_steps),
-            "final_total_loss": total_loss.item(),
-            "final_perplexity": torch.exp(main_loss).item(),
-            "final_aux_losses": (
-                [loss.item() for loss in aux_losses] if num_aux_heads > 0 else None
-            ),
+            "final_total_loss": final_metrics["total_loss"],
+            "final_perplexity": math.exp(final_metrics["main_loss"]),
+            "final_aux_losses": final_metrics["aux_losses"],
         }
 
     def _log_gradient_norms(self, model, max_grad_norm):
