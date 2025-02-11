@@ -2,6 +2,7 @@ import os, math, html
 import torch
 from tqdm.auto import tqdm
 import wandb
+import random
 import torch.distributed as dist
 import torch.nn.functional as F
 from model import MoELayer, MoETransformerBlock
@@ -190,6 +191,16 @@ class SingleHeadTrainer:
         is_instruction_mode = isinstance(self.strategy, InstructionFollowingStrategy)
 
         for batch_idx, batch in enumerate(progress_bar):
+
+            if batch_idx < 2: # Print for the first 3 batches
+                print(f"\n--- Batch {batch_idx} ---")
+                print("Input IDs (CPU, first example):", batch["inputs"][0])
+                print("Target IDs (CPU, first example):", batch["targets"][0])
+                # Convert tensors to lists before decoding
+                input_tokens_list = batch["inputs"][0].tolist()
+                target_tokens_list = batch["targets"][0].tolist()
+                print("Input Text (decoded, first example):", tokenizer.decode(input_tokens_list)[:-100])
+                print("Target Text (decoded, first example):", tokenizer.decode(target_tokens_list)[:-100])
             # Transfer data to device
             with torch.cuda.stream(torch.cuda.Stream()):
                 input_ids = batch["inputs"].to(device, non_blocking=True)
@@ -203,42 +214,97 @@ class SingleHeadTrainer:
             # Debug information logging
             if gen_every_n_steps and self.global_step % gen_every_n_steps == 0:
                 model.eval()
-                # ... [debug logging code remains the same] ...
+                with torch.no_grad():
+                    # Sample a random batch for generation
+                    # if sample_prompts:
+                    #     # Use provided sample prompts
+                    #     input_text = random.choice(sample_prompts)
+                    #     input_tokens = tokenizer.encode(input_text)
+                    #     input_tensor = torch.tensor([input_tokens], device=device)
+                    # else:
+                    # Use current batch
+
+
+                    # input_tensor = input_ids[:1]
+                    input_tokens = input_ids[0].cpu().tolist()
+                    target_tokens = targets[0].cpu().tolist()
+
+                    if is_instruction_mode:
+                        # Parse and log instruction format
+                        raw_text = tokenizer.decode(input_tokens)
+                        system, instruction, response, input_context = (
+                            self._parse_instruction_format(raw_text)
+                        )
+                        self._log_instruction_debug(
+                            model,
+                            tokenizer,
+                            input_tokens,
+                            instruction,
+                            response,
+                            system,
+                            input_context,
+                        )
+                    else:
+                        print("\n=== Debug Logging at Step {} ===".format(self.global_step))
+                        print("Input/Target Token Check:")
+                        print("Input tokens (last 5):", input_tokens[-5:])
+                        print("Target tokens (last 5):", target_tokens[-5:])
+                        print("Input (last 5) decoded:", tokenizer.decode(input_tokens[-25:]))
+                        print("Target (last 5) decoded:", tokenizer.decode(target_tokens[-25:]))
+                        
+                        self._log_next_token_debug(
+                            model,
+                            tokenizer,
+                            input_tokens,
+                            target_tokens,
+                            self.strategy,
+                            future_targets=[ft[0] for ft in future_targets] if future_targets else None,
+                            sample_idx=0,
+                            num_aux_heads=num_aux_heads,
+                        )
                 model.train()
 
             # Forward pass and loss computation
+            # Inside train_epoch:
             with torch.cuda.amp.autocast():
                 outputs = model(input_ids)
+                
+                # Unpack outputs based on whether we have auxiliary heads
                 if num_aux_heads > 0:
                     main_logits, aux_outputs = outputs
                 else:
                     main_logits = outputs
                     aux_outputs = []
 
-                main_loss = self.strategy.compute_loss(main_logits, targets)
-                aux_losses = []
-                if num_aux_heads > 0:
-                    for aux_output, future_target in zip(aux_outputs, future_targets):
-                        aux_loss = self.strategy.compute_loss(aux_output, future_target)
-                        aux_losses.append(aux_loss)
+                # Compute main and auxiliary losses with proper offsets
+                main_loss, aux_losses = self.strategy.compute_all_losses(
+                    main_logits,
+                    aux_outputs,
+                    targets,
+                    future_targets
+                )
 
+                # Compute total loss with auxiliary loss weighting
                 total_loss = main_loss
                 if aux_losses:
                     aux_loss_sum = sum(aux_losses) / len(aux_losses)
                     total_loss = main_loss + (aux_loss_weight * aux_loss_sum)
 
-                # Store the current values for final metrics
-                final_metrics["total_loss"] = total_loss.item()
-                final_metrics["main_loss"] = main_loss.item()
-                if num_aux_heads > 0:
-                    final_metrics["aux_losses"] = [loss.item() for loss in aux_losses]
+                # Store metrics for logging
+                final_metrics.update({
+                    "total_loss": total_loss.item(),
+                    "main_loss": main_loss.item(),
+                    "aux_losses": [loss.item() for loss in aux_losses] if aux_losses else None
+                })
 
+                # Scale loss for gradient accumulation
                 scaled_loss = total_loss / gradient_accumulation_steps
 
-            # Backward pass
-            scaler.scale(scaled_loss).backward()
+            # Scale the loss and perform backward pass OUTSIDE autocast
+            scaled_loss = scaler.scale(scaled_loss)
+            scaled_loss.backward()
 
-            # Optimization step
+            # Only perform optimization step if not in accumulation phase
             if not is_accumulation_step:
                 scaler.unscale_(optimizer)
                 grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -303,6 +369,16 @@ class SingleHeadTrainer:
             "final_perplexity": math.exp(final_metrics["main_loss"]),
             "final_aux_losses": final_metrics["aux_losses"],
         }
+    
+    def _log_prediction_analysis(self, tokenizer, input_seq, main_pred, aux_preds, targets):
+        print("\nPrediction Analysis:")
+        print(f"Input context (last 5 tokens): {tokenizer.decode(input_seq[-5:])}")
+        print(f"Main head (t+1) prediction: {tokenizer.decode([main_pred])}")
+        print(f"Expected t+1: {tokenizer.decode([targets[0]])}")
+        
+        for idx, (aux_pred, target) in enumerate(zip(aux_preds, targets[1:])):
+            print(f"Aux head {idx+1} (t+{idx+2}) prediction: {tokenizer.decode([aux_pred])}")
+            print(f"Expected t+{idx+2}: {tokenizer.decode([target])}")
 
     def _log_gradient_norms(self, model, max_grad_norm):
         """Log gradient norms for monitoring"""
@@ -462,6 +538,23 @@ class SingleHeadTrainer:
 
         print("\n" + "=" * 80 + "\n")
 
+    @staticmethod
+    def _remove_padding(tokens):
+        """Remove padding tokens (0) from sequence"""
+        # Handle case where tokens is a single integer
+        if isinstance(tokens, int):
+            return [tokens] if tokens != 0 else []
+
+        # Handle case where tokens is a list or tensor
+        try:
+            if isinstance(tokens, torch.Tensor):
+                tokens = tokens.cpu().tolist()
+
+            first_pad = tokens.index(0)
+            return tokens[:first_pad]
+        except (ValueError, AttributeError):
+            return tokens
+
     def _log_next_token_debug(
         self,
         model,
@@ -473,61 +566,82 @@ class SingleHeadTrainer:
         sample_idx=None,
         num_aux_heads=0,
     ):
-        """Log debug information for next token prediction mode"""
+        """Log debug information for next token prediction mode with clear token alignment"""
         print("\nNext Token Prediction Mode Debug:")
         print("-" * 40)
-        print(f"\nInput sequence (last 100 tokens decoded):")
-        print(tokenizer.decode(input_tokens[-100:]))
-        print(f"\nTarget token(s):")
-        print(tokenizer.decode(target_tokens[-strategy.predict_last_n :]))
+
+        # Show the last few tokens of input for context
+        context_size = 20  # Show last 20 tokens for context
+        print("\nInput context (last few tokens):")
+        last_tokens = input_tokens[-context_size:]
+        context_text = tokenizer.decode(last_tokens)
+        print(f"...{context_text}")
+
+        # Show the exact last input token and its target
+        last_input_token = input_tokens[-1]
+        target_token = target_tokens[-1]  # First target token corresponds to last input token
+        
+        print("\nToken-by-token alignment:")
+        print(f"Last input token: '{tokenizer.decode([last_input_token])}'")
+        print(f"Expected next token: '{tokenizer.decode([target_token])}'")
 
         # Generate model's prediction
         try:
             with torch.no_grad():
-                input_tensor = torch.tensor(
-                    [input_tokens], device=next(model.parameters()).device
-                )
-                generated = strategy.generate(
-                    model,
-                    input_tensor,
-                    max_length=strategy.predict_last_n,
-                    temperature=0.7,
-                    top_p=0.9,
-                )
-                generated_tokens = generated[0].cpu().tolist()
-                print(f"\nModel prediction:")
-                print(tokenizer.decode(generated_tokens[-strategy.predict_last_n :]))
+                input_tensor = torch.tensor([input_tokens], device=next(model.parameters()).device)
+                outputs = model(input_tensor)
+                
+                if isinstance(outputs, tuple):
+                    logits, _ = outputs
+                else:
+                    logits = outputs
+
+                # Get predictions for the last position
+                last_pos_logits = logits[0, -1, :]
+                probs = F.softmax(last_pos_logits, dim=-1)
+                
+                # Get top 5 predictions with probabilities
+                top_probs, top_tokens = torch.topk(probs, k=5)
+                
+                print("\nModel's top 5 predictions for next token:")
+                print("-" * 40)
+                for prob, token in zip(top_probs.tolist(), top_tokens.tolist()):
+                    token_text = tokenizer.decode([token])
+                    print(f"'{token_text}': {prob:.4f} probability")
+                    if token == target_token:
+                        print("  ^ This is the correct token!")
+
+                full_sequence = tokenizer.decode(input_tokens)
+                # print(f"\nFull sequence verification: '{full_sequence}'")
+        
         except Exception as e:
             print(f"Generation failed: {str(e)}")
 
+        # Show auxiliary head predictions if available
+        # if num_aux_heads > 0 and future_targets:
+        #     print("\nAuxiliary Head Predictions:")
+        #     print("-" * 40)
+            
+        #     for i, future_target in enumerate(future_targets, 1):
+        #         try:
+        #             if isinstance(future_target, torch.Tensor):
+        #                 future_target = future_target.cpu().tolist()
+                    
+        #             print(f"\nHead {i} (predicting token t+{i+1}):")
+        #             print(f"Target: '{tokenizer.decode([future_target[0]])}'")
+                    
+        #             # Show the sequence of predictions
+        #             print(f"Sequence: Current → {' → '.join(tokenizer.decode([t]) for t in [target_token] + future_targets[:i][0].cpu().tolist())}")
+                    
+        #         except Exception as e:
+        #             print(f"Error processing auxiliary head {i}: {str(e)}")
+
         print("\nPrediction Statistics:")
-        print(f"Predicting last {strategy.predict_last_n} tokens")
-        print(f"Input sequence length (without padding): {len(input_tokens)}")
+        print("-" * 40)
+        print(f"Input sequence length: {len(input_tokens)}")
+        print(f"Number of auxiliary heads: {num_aux_heads}")
 
-        if hasattr(strategy, "confidence_history") and strategy.confidence_history:
-            recent_confidence = strategy.confidence_history[-5:]
-            print(
-                f"Recent prediction confidences: {[f'{c:.3f}' for c in recent_confidence]}"
-            )
 
-        # Log auxiliary head information
-        if num_aux_heads > 0 and future_targets:
-            print("\nAuxiliary Head Predictions:")
-            print("-" * 40)
-            for i, future_target in enumerate(future_targets):
-                fut_tokens = future_target[sample_idx].cpu().tolist()
-                fut_tokens = self._remove_padding(fut_tokens)
-                print(f"\nHead {i+1} (t+{i+2}):")
-                print(f"Target: {tokenizer.decode(fut_tokens[-10:])}")
-
-    @staticmethod
-    def _remove_padding(tokens):
-        """Remove padding tokens (0) from sequence"""
-        try:
-            first_pad = tokens.index(0)
-            return tokens[:first_pad]
-        except ValueError:
-            return tokens
 
     def _parse_instruction_format(self, input_text):
         """Parse instruction format from input text"""

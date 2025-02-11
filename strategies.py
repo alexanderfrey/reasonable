@@ -3,7 +3,7 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 import random
-from typing import List, Dict, Optional, Union, Tuple
+from typing import List, Dict, Optional, Union, Tuple, Any
 
 
 class ModelingStrategy(ABC):
@@ -46,15 +46,7 @@ class MixedStrategy(ModelingStrategy):
 
 
 class NextTokenStrategy(ModelingStrategy):
-    """Next-token prediction strategy with MoE support and multi-token prediction"""
-
     def __init__(self, tokenizer=None, predict_last_n=1):
-        """
-        Initialize the strategy
-        Args:
-            tokenizer: Tokenizer instance
-            predict_last_n: Number of tokens at the end to predict (default: 1)
-        """
         super().__init__()
         self.tokenizer = tokenizer
         self.predict_last_n = predict_last_n
@@ -62,137 +54,143 @@ class NextTokenStrategy(ModelingStrategy):
 
     def compute_loss(self, logits, targets, **kwargs):
         """
-        Compute cross entropy loss for next token prediction
-        Now supports predicting multiple tokens at the end
+        Compute loss for next token prediction.
+        
+        Args:
+            logits: Tensor of shape [batch_size, seq_len, vocab_size] 
+                   containing prediction for each position
+            targets: Tensor of shape [batch_size, seq_len] 
+                    containing target tokens for each position
+            
+        Returns:
+            torch.Tensor: Scalar loss value
         """
-        # For MoE models, logits might be packed with auxiliary loss
         if isinstance(logits, tuple):
-            logits, _ = logits  # Unpack if MoE model output
-
+            logits, _ = logits
+            
+        # Validate input shapes
+        if len(logits.shape) != 3:
+            raise ValueError(
+                f"Expected logits shape [batch_size, seq_len, vocab_size], got {logits.shape}"
+            )
+            
+        if len(targets.shape) != 2:
+            raise ValueError(
+                f"Expected targets shape [batch_size, seq_len], got {targets.shape}"
+            )
+            
+        batch_size, seq_len, vocab_size = logits.shape
+        target_batch, target_seq = targets.shape
+        
+        if batch_size != target_batch or seq_len != target_seq:
+            raise ValueError(
+                f"Shape mismatch: logits {logits.shape} vs targets {targets.shape}"
+            )
+            
         # Reshape logits and targets for loss computation
-        _, _, vocab_size = logits.shape
+        # From [batch_size, seq_len, vocab_size] to [batch_size * seq_len, vocab_size]
+        logits_view = logits.view(-1, vocab_size)
+        # From [batch_size, seq_len] to [batch_size * seq_len]
+        targets_view = targets.view(-1)
+        
+        return F.cross_entropy(logits_view, targets_view, ignore_index=-100)
 
-        # Only consider the last n positions for loss computation
-        if self.predict_last_n > 1:
-            # Take the last n positions of logits and targets
-            logits = logits[:, -self.predict_last_n :, :]
-            targets = targets[:, -self.predict_last_n :]
+    def compute_all_losses(self, main_logits, aux_outputs, targets, future_targets):
+        """
+        Compute losses for main prediction and auxiliary heads.
+        
+        Args:
+            main_logits: Tensor of shape [batch_size, seq_len, vocab_size]
+            aux_outputs: List of tensors, each [batch_size, seq_len, vocab_size]
+            targets: Tensor of shape [batch_size, seq_len]
+            future_targets: List of tensors, each [batch_size, seq_len]
+            
+        Returns:
+            tuple: (main_loss, list_of_aux_losses)
+        """
+        # Compute main loss
+        main_loss = self.compute_loss(main_logits, targets)
+        aux_losses = []
+        
+        # Process auxiliary heads if present
+        if aux_outputs and future_targets:
+            if len(aux_outputs) != len(future_targets):
+                raise ValueError(
+                    f"Number of aux_outputs ({len(aux_outputs)}) must match "
+                    f"number of future_targets ({len(future_targets)})"
+                )
+                
+            for idx, (aux_output, future_target) in enumerate(zip(aux_outputs, future_targets)):
+                # Validate shapes
+                if aux_output.shape != main_logits.shape:
+                    raise ValueError(
+                        f"Auxiliary output {idx} should have same shape as main logits, "
+                        f"got {aux_output.shape} vs {main_logits.shape}"
+                    )
+                
+                if future_target.shape != targets.shape:
+                    raise ValueError(
+                        f"Future target {idx} should have same shape as main targets, "
+                        f"got {future_target.shape} vs {targets.shape}"
+                    )
+                
+                aux_loss = self.compute_loss(aux_output, future_target)
+                aux_losses.append(aux_loss)
+                
+        return main_loss, aux_losses
 
-        return F.cross_entropy(
-            logits.reshape(-1, vocab_size), targets.reshape(-1), ignore_index=-100
-        )
-
-    def generate(
-        self, model, input_ids, max_length, top_p=0.9, temperature=1.0, **kwargs
-    ):
-        """Generate tokens with consistent device management"""
-        # Get device from model and ensure input_ids is on the same device
+    def generate(self, model, input_ids, max_length, top_p=0.9, temperature=1.0, **kwargs):
+        """Generate next tokens using main and auxiliary heads.
+        
+        Note: During generation, we only use the last position's prediction.
+        """
         device = next(model.parameters()).device
         tokens = input_ids.clone().to(device)
-
-        # Track remaining length for generation
-        remaining_length = max_length - tokens.size(1)
-        generated_sequence = tokens
-
+        
         with torch.no_grad():
-            while remaining_length > 0:
-                # Model forward pass - tokens already on correct device
-                outputs = model(generated_sequence)
-
-                # Handle MoE model output
-                if isinstance(outputs, tuple):
-                    logits, _ = outputs
-                else:
-                    logits = outputs
-
-                # Get logits for last n positions
-                n_tokens = min(self.predict_last_n, remaining_length)
-                next_token_logits = logits[
-                    :, -n_tokens:, :
-                ]  # Already on correct device
-
-                # Apply temperature scaling
-                if temperature != 1.0:
-                    next_token_logits = next_token_logits / temperature
-
-                # Generate tokens for all positions at once
-                generated_tokens = []
-                for position_logits in next_token_logits[
-                    0
-                ]:  # Iterate over last n positions
-                    # Keep logits on device and avoid unnecessary transfers
-                    position_logits = position_logits.unsqueeze(
-                        0
-                    )  # Add batch dimension
-
-                    # Sample next token using top-p filtering
-                    next_token = self.sample_top_p(position_logits.unsqueeze(0), top_p)
-
-                    # Compute confidence (all operations remain on device)
-                    probs = F.softmax(position_logits, dim=-1)
-                    confidence = probs[
-                        0, next_token.item()
-                    ].item()  # Only transfer scalar to CPU
-                    self.confidence_history.append(confidence)
-
-                    generated_tokens.append(next_token)
-
-                    # Check for EOS token - only transfer scalar for comparison
-                    if next_token.item() == self.tokenizer.eos_token_id:
-                        remaining_length = 0
-                        break
-
-                # Combine generated tokens efficiently
-                if generated_tokens:
-                    next_tokens = torch.cat(generated_tokens, dim=0).unsqueeze(
-                        0
-                    )  # Keep on device
-                    generated_sequence = torch.cat(
-                        [generated_sequence, next_tokens], dim=1
-                    )
-                    remaining_length -= len(generated_tokens)
-
+            outputs = model(tokens)
+            
+            if isinstance(outputs, tuple):
+                main_logits, aux_outputs = outputs
+            else:
+                main_logits = outputs
+                aux_outputs = []
+            
+            # For generation, we only care about the last position
+            next_token_logits = main_logits[:, -1, :]
+            
+            if temperature != 1.0:
+                next_token_logits = next_token_logits / temperature
+                
+            next_token = self.sample_top_p(next_token_logits, top_p)
+            
+            # Ensure next_token has sequence dimension
+            if len(next_token.shape) == 1:
+                next_token = next_token.unsqueeze(1)
+                
+            generated_sequence = torch.cat([tokens, next_token], dim=1)
+        
         return generated_sequence
 
-    @staticmethod
-    def sample_top_p(logits, top_p):
-        """Sample from top-p (nucleus) filtered distribution with consistent device handling"""
-        # Use device from input logits
-        device = logits.device
+    def sample_top_p(self, logits, top_p):
+        """Sample from the top-p probability distribution."""
+        if len(logits.shape) != 2:
+            raise ValueError(f"Expected 2D logits tensor [batch_size, vocab_size], got shape {logits.shape}")
+            
         probs = F.softmax(logits, dim=-1)
-
-        # Sort probabilities and get indices - operations stay on device
-        sorted_probs, sorted_indices = torch.sort(probs, descending=True)
-        cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
-
-        # Create removal mask for tokens above top_p - stay on device
-        sorted_indices_to_remove = cumulative_probs > top_p
-        sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-        sorted_indices_to_remove[..., 0] = 0
-
-        # Create and scatter mask back to original order - stay on device
-        unsorted_indices_to_remove = torch.zeros_like(
-            sorted_indices_to_remove, dtype=torch.bool, device=device
-        )
-        unsorted_indices_to_remove.scatter_(1, sorted_indices, sorted_indices_to_remove)
-
-        # Zero out filtered probabilities and sample - stay on device
-        probs = probs.masked_fill(unsorted_indices_to_remove, 0.0)
-        return torch.multinomial(probs, num_samples=1)
-
-    def get_stats(self):
-        """Return confidence-related metrics"""
-        if self.confidence_history:
-            avg_confidence = sum(self.confidence_history) / len(self.confidence_history)
-            # Add stats specific to multi-token prediction
-            stats = {
-                "avg_confidence": avg_confidence,
-                "predict_last_n": self.predict_last_n,
-            }
-        else:
-            stats = {"avg_confidence": 0.0, "predict_last_n": self.predict_last_n}
-        return stats
-
+        sorted_probs, sorted_indices = torch.sort(probs, dim=-1, descending=True)
+        cumsum_probs = torch.cumsum(sorted_probs, dim=-1)
+        
+        mask = cumsum_probs <= top_p
+        mask[:, 0] = True  # Always include top probability token
+        
+        filtered_probs = torch.where(mask, sorted_probs, torch.zeros_like(sorted_probs))
+        filtered_probs = filtered_probs / filtered_probs.sum(dim=-1, keepdim=True)
+        
+        sample_indices = torch.multinomial(filtered_probs, num_samples=1)
+        selected_indices = torch.gather(sorted_indices, -1, sample_indices)
+        
+        return selected_indices
 
 class InstructionFollowingStrategy(ModelingStrategy):
     """Strategy specialized for instruction-following tasks with proper sequence length handling"""

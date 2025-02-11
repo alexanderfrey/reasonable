@@ -27,7 +27,7 @@ from trainer import SingleHeadTrainer, CurriculumTrainer
 from data_utils import create_dataloaders, create_curriculum_dataloaders
 
 
-def visualize_model_architecture(model, output_path='model_architecture.png'):
+def visualize_model_architecture(model, output_path="model_architecture.png"):
     """
     Create a visual representation of the model architecture including auxiliary heads
     Args:
@@ -35,105 +35,105 @@ def visualize_model_architecture(model, output_path='model_architecture.png'):
         output_path: Path to save the visualization
     """
     # Create a new directed graph
-    dot = Digraph(comment='Model Architecture')
-    dot.attr(rankdir='TB')  # Top to bottom layout
-    
+    dot = Digraph(comment="Model Architecture")
+    dot.attr(rankdir="TB")  # Top to bottom layout
+
     # Global graph attributes
-    dot.attr('node', shape='box', style='rounded,filled', fillcolor='lightblue')
-    
+    dot.attr("node", shape="box", style="rounded,filled", fillcolor="lightblue")
+
     # Add input node
-    dot.node('input', 'Input\nTokens', fillcolor='lightgreen')
-    
+    dot.node("input", "Input\nTokens", fillcolor="lightgreen")
+
     # Add embedding layers
-    with dot.subgraph(name='cluster_0') as c:
-        c.attr(label='Embeddings')
-        c.node('token_emb', 'Token\nEmbedding')
-        c.node('pos_emb', 'Position\nEmbedding')
-        c.node('emb_sum', '+', shape='circle')
-    
-    dot.edge('input', 'token_emb')
-    dot.edge('token_emb', 'emb_sum')
-    dot.edge('pos_emb', 'emb_sum')
-    
+    with dot.subgraph(name="cluster_0") as c:
+        c.attr(label="Embeddings")
+        c.node("token_emb", "Token\nEmbedding")
+        c.node("pos_emb", "Position\nEmbedding")
+        c.node("emb_sum", "+", shape="circle")
+
+    dot.edge("input", "token_emb")
+    dot.edge("token_emb", "emb_sum")
+    dot.edge("pos_emb", "emb_sum")
+
     # Add transformer blocks
-    prev_node = 'emb_sum'
+    prev_node = "emb_sum"
     num_blocks = len(model.blocks)
-    
+
     for i in range(num_blocks):
-        cluster_name = f'cluster_{i+1}'
+        cluster_name = f"cluster_{i+1}"
         with dot.subgraph(name=cluster_name) as c:
-            c.attr(label=f'Transformer Block {i+1}')
-            
+            c.attr(label=f"Transformer Block {i+1}")
+
             # Layer norm 1
-            ln1_name = f'ln1_{i}'
-            c.node(ln1_name, 'LayerNorm')
-            
+            ln1_name = f"ln1_{i}"
+            c.node(ln1_name, "LayerNorm")
+
             # Attention
-            attn_name = f'attn_{i}'
-            c.node(attn_name, 'Multi-Head\nAttention')
-            
+            attn_name = f"attn_{i}"
+            c.node(attn_name, "Multi-Head\nAttention")
+
             # Add residual connection
-            add1_name = f'add1_{i}'
-            c.node(add1_name, '+', shape='circle')
-            
+            add1_name = f"add1_{i}"
+            c.node(add1_name, "+", shape="circle")
+
             # Layer norm 2
-            ln2_name = f'ln2_{i}'
-            c.node(ln2_name, 'LayerNorm')
-            
+            ln2_name = f"ln2_{i}"
+            c.node(ln2_name, "LayerNorm")
+
             # Feed forward (check if MoE)
-            if hasattr(model.blocks[i], 'moe'):
-                ff_name = f'moe_{i}'
-                c.node(ff_name, 'MoE Layer\n(Experts)', fillcolor='lightsalmon')
-                c.node(f'router_{i}', 'Router', fillcolor='lightpink')
-                dot.edge(f'router_{i}', ff_name)
+            if hasattr(model.blocks[i], "moe"):
+                ff_name = f"moe_{i}"
+                c.node(ff_name, "MoE Layer\n(Experts)", fillcolor="lightsalmon")
+                c.node(f"router_{i}", "Router", fillcolor="lightpink")
+                dot.edge(f"router_{i}", ff_name)
             else:
-                ff_name = f'ff_{i}'
-                c.node(ff_name, 'Feed\nForward')
-            
+                ff_name = f"ff_{i}"
+                c.node(ff_name, "Feed\nForward")
+
             # Add residual connection
-            add2_name = f'add2_{i}'
-            c.node(add2_name, '+', shape='circle')
-            
+            add2_name = f"add2_{i}"
+            c.node(add2_name, "+", shape="circle")
+
             # Connect nodes within block
             dot.edge(prev_node, ln1_name)
             dot.edge(ln1_name, attn_name)
             dot.edge(attn_name, add1_name)
             dot.edge(prev_node, add1_name)
             dot.edge(add1_name, ln2_name)
-            if hasattr(model.blocks[i], 'moe'):
-                dot.edge(ln2_name, f'router_{i}')
+            if hasattr(model.blocks[i], "moe"):
+                dot.edge(ln2_name, f"router_{i}")
             else:
                 dot.edge(ln2_name, ff_name)
             dot.edge(ff_name, add2_name)
             dot.edge(add1_name, add2_name)
-            
+
             prev_node = add2_name
-    
+
     # Final layer norm
-    dot.node('ln_f', 'Final\nLayerNorm')
-    dot.edge(prev_node, 'ln_f')
-    
+    dot.node("ln_f", "Final\nLayerNorm")
+    dot.edge(prev_node, "ln_f")
+
     # Main language modeling head
-    dot.node('lm_head', 'LM Head', fillcolor='lightgreen')
-    dot.edge('ln_f', 'lm_head')
-    
+    dot.node("lm_head", "LM Head", fillcolor="lightgreen")
+    dot.edge("ln_f", "lm_head")
+
     # Add auxiliary heads if present
-    if hasattr(model, 'aux_heads'):
+    if hasattr(model, "aux_heads"):
         num_aux_heads = len(model.aux_heads)
-        with dot.subgraph(name='cluster_aux') as c:
-            c.attr(label='Auxiliary Heads')
+        with dot.subgraph(name="cluster_aux") as c:
+            c.attr(label="Auxiliary Heads")
             for i in range(num_aux_heads):
-                aux_name = f'aux_head_{i}'
-                c.node(aux_name, f'Aux Head {i+1}\n(t+{i+2})', fillcolor='lightyellow')
-                dot.edge('ln_f', aux_name)
-    
+                aux_name = f"aux_head_{i}"
+                c.node(aux_name, f"Aux Head {i+1}\n(t+{i+2})", fillcolor="lightyellow")
+                dot.edge("ln_f", aux_name)
+
     # Save the visualization
     try:
-        dot.render(output_path, format='png', cleanup=True)
+        dot.render(output_path, format="png", cleanup=True)
         print(f"Architecture visualization saved to {output_path}.png")
     except Exception as e:
         print(f"Error saving visualization: {e}")
-        
+
     return dot
 
 
@@ -182,11 +182,12 @@ def load_checkpoint(
         print(f"Error loading checkpoint: {str(e)}")
         raise
 
+
 def print_parameter_summary(param_dict):
     """Print a detailed summary of model parameters including auxiliary heads"""
     print("\n=== Model Parameter Summary ===")
     print(f"Total Parameters: {param_dict['total_params_M']:.2f}M")
-    
+
     print("\nBreakdown:")
     print(f"  Embeddings: {param_dict['embeddings']['total']:,}")
     print(f"  Attention Mechanisms: {param_dict['attention']:,}")
@@ -215,9 +216,11 @@ def print_parameter_summary(param_dict):
     print(f"  Router Parameters: {moe['router_params']:,}")
     print(f"  MoE Parameter %: {moe['moe_param_percent']:.2f}%")
 
+
 # Usage example:
 # param_dict = count_parameters(model)
 # print_parameter_summary(param_dict)
+
 
 def count_parameters(model):
     """
@@ -287,11 +290,13 @@ def count_parameters(model):
     head_params = 0 if not model.lm_head.bias is None else model.lm_head.bias.numel()
 
     # Count auxiliary head parameters if they exist
-    num_aux_heads = len(model.aux_heads) if hasattr(model, 'aux_heads') else 0
+    num_aux_heads = len(model.aux_heads) if hasattr(model, "aux_heads") else 0
     if num_aux_heads > 0:
         aux_head_params = sum(
-            p.numel() for head in model.aux_heads 
-            for p in head.parameters() if p.requires_grad
+            p.numel()
+            for head in model.aux_heads
+            for p in head.parameters()
+            if p.requires_grad
         )
 
     # Calculate total parameters (accounting for weight tying)
@@ -335,8 +340,12 @@ def count_parameters(model):
         "auxiliary_heads": {
             "num_heads": num_aux_heads,
             "total_params": aux_head_params,
-            "params_per_head": aux_head_params / num_aux_heads if num_aux_heads > 0 else 0,
-            "param_percent": (aux_head_params / total_params) * 100 if num_aux_heads > 0 else 0,
+            "params_per_head": (
+                aux_head_params / num_aux_heads if num_aux_heads > 0 else 0
+            ),
+            "param_percent": (
+                (aux_head_params / total_params) * 100 if num_aux_heads > 0 else 0
+            ),
         },
         "moe_stats": {
             "num_moe_blocks": moe_blocks,
@@ -347,6 +356,7 @@ def count_parameters(model):
             "moe_param_percent": (moe_params / total_params) * 100,
         },
     }
+
 
 def setup_distributed():
     """Initialize distributed training"""
@@ -521,8 +531,18 @@ def get_args():
         default=0,
         help="Number of steps to train on each file before adding next one",
     )
-    parser.add_argument("--dataset_split", type=str, default="train", help="Dataset split for HuggingFace datasets")
-    parser.add_argument("--dataset_revision", type=str, default="main", help="Dataset revision for HuggingFace datasets")
+    parser.add_argument(
+        "--dataset_split",
+        type=str,
+        default="train",
+        help="Dataset split for HuggingFace datasets",
+    )
+    parser.add_argument(
+        "--dataset_revision",
+        type=str,
+        default="main",
+        help="Dataset revision for HuggingFace datasets",
+    )
 
     args = parser.parse_args()
 
@@ -561,7 +581,7 @@ def configure_optimizer(model, args, train_loader):
     warmup_steps = min(1000, int(num_training_steps * 0.1))
 
     # Increased learning rate
-    base_lr = args.lr  
+    base_lr = args.lr
 
     optimizer = bnb.optim.AdamW(
         optimizer_grouped_params,
@@ -622,7 +642,7 @@ if __name__ == "__main__":
             config,
             num_experts=args.num_experts,
             top_k=args.num_experts // 2,
-            moe_layers=None
+            moe_layers=None,
         )
     model = model.to(device)
 
@@ -632,7 +652,9 @@ if __name__ == "__main__":
             has_mask_token = "<mask>" in tokenizer._special_tokens
         except AttributeError:
             has_mask_token = False
-            print("Warning: Could not check special tokens, using default mask token ID")
+            print(
+                "Warning: Could not check special tokens, using default mask token ID"
+            )
 
         strategy = NextTokenStrategy(tokenizer, predict_last_n=1)
     else:
@@ -641,6 +663,7 @@ if __name__ == "__main__":
             instruction_token="[INST]",
             response_token="[/INST]",
             end_token="</s>",
+            pad_token_id=vocab_size,
             max_length=args.block_size,
         )
 
@@ -669,16 +692,18 @@ if __name__ == "__main__":
             "instruction_token": "[INST]" if not args.pretrain else None,
             "response_token": "[/INST]" if not args.pretrain else None,
         }
-        
+
         # Add dataset info to wandb config
         if args.train_data.startswith(("hf://", "huggingface://")):
-            wandb_config.update({
-                "dataset_source": "huggingface",
-                "dataset_name": args.train_data.split("://")[1],
-                "dataset_split": args.dataset_split,
-                "dataset_revision": args.dataset_revision
-            })
-        
+            wandb_config.update(
+                {
+                    "dataset_source": "huggingface",
+                    "dataset_name": args.train_data.split("://")[1],
+                    "dataset_split": args.dataset_split,
+                    "dataset_revision": args.dataset_revision,
+                }
+            )
+
         wandb.init(
             project="multihead-gpt-training",
             config=wandb_config,
@@ -699,7 +724,7 @@ if __name__ == "__main__":
         dataset_config = {
             "path": args.train_data.split("://")[1],
             "split": args.dataset_split,
-            "revision": args.dataset_revision
+            "revision": args.dataset_revision,
         }
     else:
         dataset_config = args.train_data
@@ -725,16 +750,18 @@ if __name__ == "__main__":
             world_size=world_size,
             strategy=strategy,
             tokenizer=tokenizer,
-            n_aux_heads=args.n_aux_heads
+            n_aux_heads=args.n_aux_heads,
         )
 
     if rank == 0 and args.use_curriculum:
-        wandb.config.update({
-            "curriculum_learning": True,
-            "steps_per_file": args.steps_per_file,
-            "initial_files": len(curriculum_dataset.active_files),
-            "total_file_patterns": len(args.train_data_patterns),
-        })
+        wandb.config.update(
+            {
+                "curriculum_learning": True,
+                "steps_per_file": args.steps_per_file,
+                "initial_files": len(curriculum_dataset.active_files),
+                "total_file_patterns": len(args.train_data_patterns),
+            }
+        )
 
     optimizer, scheduler = configure_optimizer(model, args, train_loader)
     scaler = GradScaler(enabled=True)
@@ -756,7 +783,9 @@ if __name__ == "__main__":
         for _ in range(checkpoint_info["global_step"]):
             scheduler.step()
 
-        print(f"Resuming from epoch {start_epoch}, step {checkpoint_info['global_step']}")
+        print(
+            f"Resuming from epoch {start_epoch}, step {checkpoint_info['global_step']}"
+        )
 
     for epoch in range(start_epoch, args.epochs):
         if train_sampler is not None:

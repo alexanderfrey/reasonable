@@ -2,6 +2,7 @@ import tiktoken
 import json
 from datasets import load_dataset
 from glob import glob
+from collections import defaultdict
 from torch.utils.data.distributed import DistributedSampler
 import torch
 import random
@@ -206,58 +207,176 @@ class SingleHeadDataset(Dataset):
                 return " ".join(str(v) for v in item.values())
         return str(item)
 
-    def _load_local_instruction_files(self, files_pattern: str):
-        """Load instruction data from local files"""
-        print("Loading instruction data from local files")
-        for file_path in glob(files_pattern):
+    def _load_local_instruction_files(
+        self, files_pattern: str, include_thoughts: bool = False
+    ):
+        """Load instruction data from local JSONL files.
+
+        Args:
+            files_pattern: Glob pattern for JSONL files containing instruction data
+        """
+        import json
+        import glob
+
+        print(f"\nLoading local instruction files matching pattern: {files_pattern}")
+
+        files = glob.glob(files_pattern)
+        if not files:
+            raise ValueError(f"No files found matching pattern: {files_pattern}")
+
+        print(f"Found {len(files)} files to process")
+
+        successful_chunks = 0
+        total_tokens = 0
+        skipped_long = 0
+        skipped_short = 0
+        total_examples = 0
+
+        for file_path in files:
             try:
                 with open(file_path, "r", encoding="utf-8") as f:
-                    text = f.read()
-                    if text.strip():
-                        tokens = self.tokenizer.encode(text)
-                        if tokens:
-                            chunks = []
-                            chunk_size = self.block_size + self.max_future_tokens
-                            stride = self.block_size // 24
+                    for line_num, line in enumerate(f, 1):
+                        try:
+                            item = json.loads(line)
+                            total_examples += 1
 
-                            for start in range(0, len(tokens) - chunk_size + 1, stride):
-                                chunk = tokens[start : start + chunk_size]
-                                if len(chunk) == chunk_size:
-                                    chunks.append(chunk)
+                            # Extract prompt and response from the JSONL format
+                            if "prompt" not in item or "correct_response" not in item:
+                                print(
+                                    f"Warning: Missing required fields in line {line_num} of {file_path}"
+                                )
+                                continue
+
+                            # Format the instruction using the strategy
+                            formatted_text = self.strategy.format_instruction(
+                                instruction=item["prompt"],
+                                response=item["correct_response"],
+                                thinking=(
+                                    "\n".join(item["thoughts"])
+                                    if include_thoughts
+                                    else None
+                                ),
+                            )
+
+                            if not formatted_text.strip():
+                                continue
+
+                            tokens = self.tokenizer.encode(formatted_text)
+                            total_tokens += len(tokens)
+
+                            if not tokens:
+                                continue
+
+                            # Process each example as a single chunk
+                            chunk_size = self.block_size + self.max_future_tokens
+                            min_sequence_length = 32  # Minimum reasonable length
+
+                            chunks = []
+                            if len(tokens) < min_sequence_length:
+                                skipped_short += 1
+
+                            elif len(tokens) <= chunk_size:
+                                # Pad sequence to chunk_size
+                                padded_chunk = tokens + [
+                                    self.strategy.get_padding_value()
+                                ] * (chunk_size - len(tokens))
+                                chunks.append(padded_chunk)
+
+                            else:
+                                # For long sequences, take the first chunk_size tokens
+                                chunk = tokens[:chunk_size]
+                                chunks.append(chunk)
+                                skipped_long += 1
 
                             if chunks:
-                                self.chunks_per_file[file_path] = chunks
+                                self.chunks_per_file[f"{file_path}_line_{line_num}"] = (
+                                    chunks
+                                )
+                                successful_chunks += len(chunks)
+
+                            if total_examples % 1000 == 0:
+                                print(
+                                    f"Processed {total_examples} examples, created {successful_chunks} chunks"
+                                )
+
+                        except json.JSONDecodeError as e:
+                            print(
+                                f"Error decoding JSON at line {line_num} in {file_path}: {str(e)}"
+                            )
+                            continue
+                        except Exception as e:
+                            print(
+                                f"Error processing line {line_num} in {file_path}: {str(e)}"
+                            )
+                            continue
+
             except Exception as e:
-                print(f"Error loading file {file_path}: {e}")
+                print(f"Error processing file {file_path}: {str(e)}")
                 continue
 
+        # Final statistics
+        print(f"\nLocal Files Processing Statistics:")
+        print(f"Total files processed: {len(files)}")
+        print(f"Total examples processed: {total_examples}")
+        print(f"Total tokens across all examples: {total_tokens}")
+        print(
+            f"Average tokens per example: {total_tokens/total_examples:.2f}"
+            if total_examples > 0
+            else "No examples processed"
+        )
+        print(f"Successful chunks created: {successful_chunks}")
+        print(f"Examples skipped (too short): {skipped_short}")
+        print(f"Examples skipped (too long): {skipped_long}")
+        if total_examples > skipped_short + skipped_long:
+            print(
+                f"Average chunks per successful example: {successful_chunks/(total_examples-skipped_short-skipped_long):.2f}"
+            )
+
     def _load_text_data(self, files_pattern: str):
-        """Load data and split into chunks while maintaining sequence continuity"""
+        """Load data and split into chunks with streaming approach"""
         print("Loading text data for next-token prediction")
+        
+        # Instead of loading all tokens at once, process files in batches
+        self.chunks_per_file = defaultdict(list)
+        chunk_size = self.block_size + self.max_future_tokens
+        stride = self.block_size // 2
+        
+        def process_file_chunks(tokens, file_path):
+            chunks = []
+            for start in range(0, len(tokens) - chunk_size + 1, stride):
+                chunk = tokens[start : start + chunk_size]
+                if len(chunk) == chunk_size:
+                    chunks.append(chunk)
+            return chunks
+            
         for file_path in glob(files_pattern):
             try:
+                # Process each file separately to manage memory
                 with open(file_path, "r", encoding="utf-8") as f:
-                    text = f.read()
-                    if text.strip():
-                        # Tokenize the entire text
-                        tokens = self.tokenizer.encode(text)
-                        if tokens:
-                            # Split into overlapping chunks
-                            chunks = []
-                            chunk_size = self.block_size + self.max_future_tokens
-                            stride = (
-                                self.block_size // 24
-                            )  # Use overlap to maintain context
-
-                            for start in range(0, len(tokens) - chunk_size + 1, stride):
-                                chunk = tokens[start : start + chunk_size]
-                                if (
-                                    len(chunk) == chunk_size
-                                ):  # Only keep complete chunks
-                                    chunks.append(chunk)
-
-                            if chunks:
-                                self.chunks_per_file[file_path] = chunks
+                    # Process file in smaller segments
+                    buffer_size = 1024 * 1024  # 1MB buffer
+                    tokens = []
+                    
+                    while True:
+                        text = f.read(buffer_size)
+                        if not text:
+                            break
+                            
+                        new_tokens = self.tokenizer.encode(text)
+                        tokens.extend(new_tokens)
+                        
+                        # Process chunks when we have enough tokens
+                        if len(tokens) >= chunk_size * 100:
+                            new_chunks = process_file_chunks(tokens, file_path)
+                            self.chunks_per_file[file_path].extend(new_chunks)
+                            # Keep remainder that might connect with next buffer
+                            tokens = tokens[-chunk_size:]
+                    
+                    # Process any remaining tokens
+                    if tokens:
+                        new_chunks = process_file_chunks(tokens, file_path)
+                        self.chunks_per_file[file_path].extend(new_chunks)
+                        
             except Exception as e:
                 print(f"Error loading file {file_path}: {e}")
                 continue
@@ -312,12 +431,15 @@ class SingleHeadDataset(Dataset):
             SingleHeadTrainDataset(
                 train_chunks,
                 self.block_size,
+                self.tokenizer,
                 strategy=self.strategy,
                 n_aux_heads=self.n_aux_heads,
+
             ),
             SingleHeadValDataset(
                 val_chunks,
                 self.block_size,
+                self.tokenizer,
                 strategy=self.strategy,
                 n_aux_heads=self.n_aux_heads,
             ),
@@ -325,57 +447,61 @@ class SingleHeadDataset(Dataset):
 
 
 class SingleHeadTrainDataset(Dataset):
-    def __init__(self, data, block_size, strategy=None, n_aux_heads=0):
-        self.data = data  # Now contains complete chunks
+    def __init__(self, data, block_size, tokenizer, strategy=None, n_aux_heads=0):
+        self.data = data
         self.block_size = block_size
         self.strategy = strategy
         self.n_aux_heads = n_aux_heads
         self.max_future_tokens = n_aux_heads + 1 if n_aux_heads > 0 else 1
+        self.tokenizer = tokenizer
 
     def __len__(self):
-        return len(self.data)  # Length is now number of chunks
+        return len(self.data)
 
     def __getitem__(self, idx):
         chunk = self.data[idx]
-
-        # Input sequence
-        x = torch.tensor(chunk[: self.block_size], dtype=torch.long)
-
-        # Create targets for main and auxiliary heads
-        targets = []
-        for i in range(self.max_future_tokens):
-            target = torch.tensor(
-                chunk[i + 1 : i + 1 + self.block_size], dtype=torch.long
+        
+        # Validate chunk size
+        required_length = self.block_size + self.max_future_tokens
+        if len(chunk) < required_length:
+            raise ValueError(
+                f"Chunk {idx} is too small: {len(chunk)} < {required_length}. "
+                f"Need {self.block_size} tokens for input + {self.max_future_tokens} tokens for predictions"
             )
-            targets.append(target)
+        
+        # Input sequence (tokens 0 to block_size-1)
+        inputs = chunk[:self.block_size]
+        x = torch.tensor(inputs, dtype=torch.long)
+        
+        # Targets are the shifted sequence (tokens 1 to block_size)
+        targets = chunk[1:self.block_size + 1]
+        targets = torch.tensor(targets, dtype=torch.long)
 
+        # print(f"Last input token: {self.tokenizer.decode([inputs[-1]])}")
+        # print(f"First target token: {self.tokenizer.decode([targets[0]])}")
+        
+        # Future targets for auxiliary heads
+        future_targets = []
+        for i in range(1, self.n_aux_heads + 1):
+            start_idx = i + 1
+            end_idx = self.block_size + i + 1
+            if end_idx <= len(chunk):
+                future_target = chunk[start_idx:end_idx]
+                future_target = torch.tensor(future_target, dtype=torch.long)
+                future_targets.append(future_target)
+            else:
+                # If we don't have enough tokens, pad with -100 (ignore_index for cross_entropy)
+                pad_length = end_idx - len(chunk)
+                valid_tokens = chunk[start_idx:] if start_idx < len(chunk) else []
+                padding = [-100] * pad_length
+                future_target = torch.tensor(valid_tokens + padding, dtype=torch.long)
+                future_targets.append(future_target)
+        
         return {
             "inputs": x,
-            "targets": targets[0],
-            "future_targets": targets[1:] if self.n_aux_heads > 0 else [],
+            "targets": targets,
+            "future_targets": future_targets
         }
-
-    def _get_text_item(self, idx):
-        # Get the pre-made chunk
-        chunk = self.data[idx]
-
-        # Input sequence
-        x = torch.tensor(chunk[: self.block_size], dtype=torch.long)
-
-        # Create targets for main and auxiliary heads
-        targets = []
-        for i in range(self.max_future_tokens):
-            target = torch.tensor(
-                chunk[i + 1 : i + 1 + self.block_size], dtype=torch.long
-            )
-            targets.append(target)
-
-        return {
-            "inputs": x,
-            "targets": targets[0],
-            "future_targets": targets[1:] if self.n_aux_heads > 0 else [],
-        }
-
 
 class SingleHeadValDataset(SingleHeadTrainDataset):
     pass

@@ -1,7 +1,7 @@
 import torch
 from colorama import init, Fore, Style
 import argparse
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Any
 from torch.nn import functional as F
 import tiktoken
 
@@ -9,13 +9,54 @@ import tiktoken
 from model import GPTConfig, MoEGPT, GPT  # Assuming model.py contains your model code
 
 
+class AlpacaFormatter:
+    def __init__(
+        self,
+        instruction_token: str = "[INST]",
+        response_token: str = "[/INST]",
+        end_token: str = "</s>",
+        max_length: int = 1024,
+        pad_token_id: int = 0,
+    ):
+        self.instruction_token = instruction_token
+        self.response_token = response_token
+        self.end_token = end_token
+        self.max_length = max_length
+        self.pad_token_id = pad_token_id
+
+    def format_prompt(
+        self,
+        instruction: str,
+        response: str = "",
+        input_context: str = None,
+        system: str = None,
+    ) -> str:
+        """Format using Alpaca style with optional system prompt"""
+        formatted = f"{self.instruction_token}"
+
+        # Add system prompt if provided
+        if system:
+            formatted += f"### System:\n{system}\n\n"
+
+        formatted += f"### Instruction:\n{instruction}\n"
+
+        if input_context:
+            formatted += f"\n### Input:\n{input_context}\n"
+
+        if response:
+            formatted += f"\n### Response:\n{response}"
+
+        formatted += f"{self.response_token}{self.end_token}"
+        return formatted
+
+
 def get_config_from_checkpoint(checkpoint_path: str) -> Tuple[GPTConfig, int]:
     """
     Infer config parameters from checkpoint state dict, including auxiliary heads configuration.
-    
+
     Args:
         checkpoint_path: Path to the model checkpoint
-        
+
     Returns:
         tuple: (GPTConfig, number of experts)
     """
@@ -23,7 +64,12 @@ def get_config_from_checkpoint(checkpoint_path: str) -> Tuple[GPTConfig, int]:
     state_dict = ckpt["model_state_dict"] if "model_state_dict" in ckpt else ckpt
 
     # Count number of blocks
-    n_layer = max([int(k.split(".")[1]) for k in state_dict.keys() if k.startswith("blocks.")]) + 1
+    n_layer = (
+        max(
+            [int(k.split(".")[1]) for k in state_dict.keys() if k.startswith("blocks.")]
+        )
+        + 1
+    )
 
     # Check if bias is used
     has_bias = any(["bias" in k for k in state_dict.keys()])
@@ -40,11 +86,23 @@ def get_config_from_checkpoint(checkpoint_path: str) -> Tuple[GPTConfig, int]:
 
     # Count number of auxiliary heads
     aux_head_keys = [k for k in state_dict.keys() if k.startswith("aux_heads.")]
-    n_aux_heads = len(set([int(k.split(".")[1]) for k in aux_head_keys if k.split(".")[-1] == "weight"]))
+    n_aux_heads = len(
+        set(
+            [
+                int(k.split(".")[1])
+                for k in aux_head_keys
+                if k.split(".")[-1] == "weight"
+            ]
+        )
+    )
 
     # Determine number of experts
     expert_keys = [k for k in state_dict.keys() if "experts" in k]
-    n_experts = len(set([int(k.split("experts.")[1].split(".")[0]) for k in expert_keys])) if expert_keys else 0
+    n_experts = (
+        len(set([int(k.split("experts.")[1].split(".")[0]) for k in expert_keys]))
+        if expert_keys
+        else 0
+    )
 
     # Create config with auxiliary heads
     config = GPTConfig(
@@ -79,13 +137,19 @@ def load_model(checkpoint_path: str, is_moe: bool = False) -> MoEGPT:
 
     # Load checkpoint
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
-    state_dict = checkpoint["model_state_dict"] if "model_state_dict" in checkpoint else checkpoint
+    state_dict = (
+        checkpoint["model_state_dict"]
+        if "model_state_dict" in checkpoint
+        else checkpoint
+    )
 
     # Handle missing auxiliary heads in the state dict
     if config.n_aux_heads > 0:
         aux_head_keys = [k for k in state_dict.keys() if k.startswith("aux_heads.")]
         if not aux_head_keys:
-            print("Warning: Auxiliary heads specified in config but not found in checkpoint")
+            print(
+                "Warning: Auxiliary heads specified in config but not found in checkpoint"
+            )
 
     # Load state dict
     model.load_state_dict(state_dict)
@@ -128,18 +192,29 @@ def get_next_token_probs(
 
 
 def generate_sequence(
-    model: GPT,
-    tokenizer,  # tiktoken encoder
+    model: Any,
+    tokenizer,
     prompt: str,
+    formatter: Optional[AlpacaFormatter] = None,
+    instruction_mode: bool = False,
     max_new_tokens: int = 100,
     temperature: float = 0.8,
     top_k: Optional[int] = 50,
     top_p: Optional[float] = 0.9,
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
 ) -> str:
-    """Generate text sequence from prompt."""
+    """Generate text sequence from prompt with optional instruction formatting."""
     model.to(device)
     model.eval()
+
+    # Apply instruction formatting if requested
+    if instruction_mode and formatter:
+        # Default simple instruction task if none provided
+        if "### Instruction:" not in prompt:
+            prompt = formatter.format_prompt(
+                instruction="Complete the following creative writing prompt",
+                input_context=prompt,
+            )
 
     # Tokenize prompt with tiktoken
     tokens = tokenizer.encode(prompt)
@@ -156,22 +231,31 @@ def generate_sequence(
         # Sample next token and reshape to match input_ids dimensions [1, 1]
         next_token = torch.multinomial(next_token_probs, num_samples=1).view(1, 1)
 
+        # Check for end token if using instruction format
+        if (
+            instruction_mode
+            and formatter
+            and next_token.item() == tokenizer.encode(formatter.end_token)[0]
+        ):
+            break
+
         # Append to generated sequence
         generated_tokens.append(next_token.item())
-        input_ids = torch.cat([input_ids, next_token], dim=1)  # Both are [1, seq_len]
+        input_ids = torch.cat([input_ids, next_token], dim=1)
 
     # Decode generated tokens with tiktoken
     generated_text = tokenizer.decode(generated_tokens)
     return generated_text
 
+
 def analyze_expert_usage_detailed(
     model: MoEGPT,
     input_text: str,
     tokenizer,
-    device: str = "cuda" if torch.cuda.is_available() else "cpu"
+    device: str = "cuda" if torch.cuda.is_available() else "cpu",
 ) -> dict:
     """Analyze expert utilization with detailed metrics including gating weights and load balancing.
-    
+
     Returns:
         dict: Dictionary containing detailed statistics for each MoE layer
     """
@@ -196,16 +280,14 @@ def analyze_expert_usage_detailed(
             if hasattr(block, "moe"):
                 # Get layer normalized input for router
                 normalized_input = block.ln2(x)
-                
+
                 # Get router logits and gate values
                 router_logits = block.moe.router(normalized_input)
                 gate_values = torch.softmax(router_logits, dim=-1)
-                
+
                 # Get top-k experts and their gate values
                 top_gates, top_indices = torch.topk(
-                    gate_values, 
-                    k=block.moe.top_k, 
-                    dim=-1
+                    gate_values, k=block.moe.top_k, dim=-1
                 )
 
                 # Initialize layer statistics
@@ -215,43 +297,49 @@ def analyze_expert_usage_detailed(
                     "seq_length": seq_len,
                     "expert_stats": {},
                     "load_balancing": {
-                        "capacity_fulfillment": torch.zeros(block.moe.num_experts, device=device),
+                        "capacity_fulfillment": torch.zeros(
+                            block.moe.num_experts, device=device
+                        ),
                         "unused_expert_count": 0,
-                        "overflow_expert_count": 0
-                    }
+                        "overflow_expert_count": 0,
+                    },
                 }
 
                 # Calculate ideal balanced load per expert
                 # Each token activates top_k experts, so total activations = seq_len * top_k
-                ideal_load_per_expert = (seq_len * block.moe.top_k) / block.moe.num_experts
+                ideal_load_per_expert = (
+                    seq_len * block.moe.top_k
+                ) / block.moe.num_experts
 
                 # Analyze each expert
                 for expert_idx in range(block.moe.num_experts):
                     # Get mask for where this expert was selected
-                    expert_mask = (top_indices == expert_idx)
-                    
+                    expert_mask = top_indices == expert_idx
+
                     # Get gate values when this expert was selected
                     expert_gates = torch.where(
-                        expert_mask, 
-                        top_gates, 
-                        torch.zeros_like(top_gates)
+                        expert_mask, top_gates, torch.zeros_like(top_gates)
                     )
 
                     # Calculate statistics
                     total_selections = expert_mask.sum().item()
                     avg_gate_value = (
-                        expert_gates.sum().item() / total_selections 
-                        if total_selections > 0 else 0
+                        expert_gates.sum().item() / total_selections
+                        if total_selections > 0
+                        else 0
                     )
-                    
+
                     # Calculate load metrics
                     capacity_fulfillment = total_selections / ideal_load_per_expert
-                    
+
                     layer_stats[i]["expert_stats"][expert_idx] = {
                         "total_selections": total_selections,
-                        "selection_percentage": (total_selections / (seq_len * block.moe.top_k)) * 100,
+                        "selection_percentage": (
+                            total_selections / (seq_len * block.moe.top_k)
+                        )
+                        * 100,
                         "avg_gate_value": avg_gate_value,
-                        "capacity_fulfillment": capacity_fulfillment
+                        "capacity_fulfillment": capacity_fulfillment,
                     }
 
                     # Update load balancing metrics
@@ -261,13 +349,20 @@ def analyze_expert_usage_detailed(
                         layer_stats[i]["load_balancing"]["overflow_expert_count"] += 1
 
                 # Calculate load balancing metrics
-                expert_loads = torch.tensor([
-                    stats["total_selections"] 
-                    for stats in layer_stats[i]["expert_stats"].values()
-                ], dtype=torch.float32)
-                
+                expert_loads = torch.tensor(
+                    [
+                        stats["total_selections"]
+                        for stats in layer_stats[i]["expert_stats"].values()
+                    ],
+                    dtype=torch.float32,
+                )
+
                 # Calculate coefficient of variation (CV) as a measure of load balance
-                cv = torch.std(expert_loads) / torch.mean(expert_loads) if torch.mean(expert_loads) > 0 else torch.tensor(0.0)
+                cv = (
+                    torch.std(expert_loads) / torch.mean(expert_loads)
+                    if torch.mean(expert_loads) > 0
+                    else torch.tensor(0.0)
+                )
                 layer_stats[i]["load_balancing"]["coefficient_of_variation"] = cv.item()
 
             # Process through the block
@@ -278,15 +373,16 @@ def analyze_expert_usage_detailed(
 
     return layer_stats
 
+
 def print_expert_analysis(stats: dict):
     """Pretty print the expert analysis statistics."""
     print("\nDetailed Expert Utilization Analysis:")
     print("=" * 80)
-    
+
     for layer_idx, layer_data in stats.items():
         print(f"\nLayer {layer_idx}:")
         print("-" * 40)
-        
+
         # Print expert-specific stats
         print("\nExpert Statistics:")
         for expert_idx, expert_stats in layer_data["expert_stats"].items():
@@ -294,32 +390,73 @@ def print_expert_analysis(stats: dict):
             print(f"  Selections: {expert_stats['total_selections']} tokens")
             print(f"  Selection %: {expert_stats['selection_percentage']:.2f}%")
             print(f"  Avg Gate Value: {expert_stats['avg_gate_value']:.4f}")
-            print(f"  Capacity Fulfillment: {expert_stats['capacity_fulfillment']:.2f}x ideal load")
-        
+            print(
+                f"  Capacity Fulfillment: {expert_stats['capacity_fulfillment']:.2f}x ideal load"
+            )
+
         # Print load balancing metrics
         print("\nLoad Balancing Metrics:")
         lb_stats = layer_data["load_balancing"]
         print(f"  Coefficient of Variation: {lb_stats['coefficient_of_variation']:.4f}")
         print(f"  Unused Experts: {lb_stats['unused_expert_count']}")
         print(f"  Overloaded Experts: {lb_stats['overflow_expert_count']}")
-        
+
         print("\nSequence Info:")
         print(f"  Sequence Length: {layer_data['seq_length']}")
         print(f"  Number of Experts: {layer_data['num_experts']}")
         print(f"  Top-k: {layer_data['top_k']}")
 
+
 def main():
     init()  # Initialize colorama
-    parser = argparse.ArgumentParser(description=f"{Fore.CYAN}Test MoE GPT model{Style.RESET_ALL}")
-    parser.add_argument("--checkpoint", type=str, required=True, help="Path to model checkpoint")
-    parser.add_argument("--prompt", type=str, default="Once upon a time", help="Text prompt for generation")
-    parser.add_argument("--max_tokens", type=int, default=100, help="Maximum number of tokens to generate")
-    parser.add_argument("--temperature", type=float, default=0.8, help="Sampling temperature")
-    parser.add_argument("--top_k", type=int, default=50, help="Top-k sampling parameter")
-    parser.add_argument("--top_p", type=float, default=0.9, help="Nucleus sampling parameter")
-    parser.add_argument("--analyze_experts", action="store_true", help="Analyze expert utilization")
-    parser.add_argument("--encoding", type=str, default="gpt2", choices=["gpt2", "cl100k_base"], help="Tiktoken encoding to use")
-    parser.add_argument("--is_moe", action="store_true", help="Enable pre-training mode where both pathways predict next tokens")
+    parser = argparse.ArgumentParser(
+        description=f"{Fore.CYAN}Test MoE GPT model{Style.RESET_ALL}"
+    )
+    parser.add_argument(
+        "--checkpoint", type=str, required=True, help="Path to model checkpoint"
+    )
+    parser.add_argument(
+        "--prompt",
+        type=str,
+        default="Once upon a time",
+        help="Text prompt for generation",
+    )
+    parser.add_argument(
+        "--instruction_mode", action="store_true", help="Use Alpaca instruction format"
+    )
+    parser.add_argument(
+        "--system_prompt", type=str, help="Optional system prompt for instruction mode"
+    )
+    parser.add_argument(
+        "--max_tokens",
+        type=int,
+        default=100,
+        help="Maximum number of tokens to generate",
+    )
+    parser.add_argument(
+        "--temperature", type=float, default=0.8, help="Sampling temperature"
+    )
+    parser.add_argument(
+        "--top_k", type=int, default=50, help="Top-k sampling parameter"
+    )
+    parser.add_argument(
+        "--top_p", type=float, default=0.9, help="Nucleus sampling parameter"
+    )
+    parser.add_argument(
+        "--analyze_experts", action="store_true", help="Analyze expert utilization"
+    )
+    parser.add_argument(
+        "--encoding",
+        type=str,
+        default="gpt2",
+        choices=["gpt2", "cl100k_base"],
+        help="Tiktoken encoding to use",
+    )
+    parser.add_argument(
+        "--is_moe",
+        action="store_true",
+        help="Enable pre-training mode where both pathways predict next tokens",
+    )
     args = parser.parse_args()
 
     # Load model with inferred config
@@ -331,8 +468,18 @@ def main():
     # Initialize tokenizer
     tokenizer = tiktoken.get_encoding(args.encoding)
     if tokenizer.n_vocab != model.config.vocab_size:
-        print(f"\n{Fore.YELLOW}Warning: Tokenizer vocab size ({tokenizer.n_vocab}) doesn't match model vocab size ({model.config.vocab_size})")
-        print(f"You might want to use a different tiktoken encoding that matches your model's vocabulary.{Style.RESET_ALL}")
+        print(
+            f"\n{Fore.YELLOW}Warning: Tokenizer vocab size ({tokenizer.n_vocab}) doesn't match model vocab size ({model.config.vocab_size})"
+        )
+        print(
+            f"You might want to use a different tiktoken encoding that matches your model's vocabulary.{Style.RESET_ALL}"
+        )
+
+    # Initialize Alpaca formatter if using instruction mode
+    formatter = None
+    if args.instruction_mode:
+        formatter = AlpacaFormatter()
+        print(f"\n{Fore.BLUE}Using Alpaca instruction format{Style.RESET_ALL}")
 
     if args.analyze_experts:
         print(f"\n{Fore.BLUE}Analyzing expert utilization...{Style.RESET_ALL}")
@@ -345,11 +492,13 @@ def main():
         model,
         tokenizer,
         args.prompt,
-        args.max_tokens,
-        args.temperature,
-        args.top_k,
-        args.top_p,
-        device,
+        formatter=formatter,
+        instruction_mode=args.instruction_mode,
+        max_new_tokens=args.max_tokens,
+        temperature=args.temperature,
+        top_k=args.top_k,
+        top_p=args.top_p,
+        device=device,
     )
 
     print(f"\n{Fore.MAGENTA}Prompt:{Style.RESET_ALL} {args.prompt}")
