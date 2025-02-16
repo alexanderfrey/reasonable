@@ -46,11 +46,9 @@ class MixedStrategy(ModelingStrategy):
 
 
 class NextTokenStrategy(ModelingStrategy):
-    def __init__(self, tokenizer=None, predict_last_n=1):
+    def __init__(self, tokenizer=None):
         super().__init__()
         self.tokenizer = tokenizer
-        self.predict_last_n = predict_last_n
-        self.confidence_history = []
 
     def compute_loss(self, logits, targets, **kwargs):
         """
@@ -225,26 +223,50 @@ class InstructionFollowingStrategy(ModelingStrategy):
         """Return the padding token ID"""
         return self.pad_token_id
 
-    def format_instruction(
-        self,
-        instruction: str,
-        response: str,
-        input_context: str = None,
-        thinking: str = None,
-        system: str = None,
-    ) -> str:
-        """Format instruction based on specified format type"""
-        # Ensure inputs are strings
-        instruction = str(instruction) if instruction is not None else ""
-        response = str(response) if response is not None else ""
-
-        if self.format_type == "thinking":
-            formatted = self._format_thinking(instruction, thinking, response)
-        else:  # default to alpaca format
-            formatted = self._format_alpaca(
-                instruction, response, input_context, system
-            )
-
+    def format_instruction(self, instruction, response, input_context=None, thinking=None, system=None):
+        """Format instruction including thinking tags within the response section"""
+        
+        # Helper function to convert various types to string
+        def to_string(value):
+            if value is None:
+                return ""
+            elif isinstance(value, (list, tuple)):
+                return "\n".join(str(item) for item in value)
+            elif isinstance(value, dict):
+                return "\n".join(f"{k}: {v}" for k, v in value.items())
+            else:
+                return str(value)
+        
+        # Convert all inputs to strings
+        instruction = to_string(instruction)
+        response = to_string(response)
+        input_context = to_string(input_context) if input_context is not None else None
+        thinking = to_string(thinking) if thinking is not None else None
+        system = to_string(system) if system is not None else None
+        
+        # Build formatted string
+        formatted = f"{self.instruction_token}"
+        
+        if system:
+            formatted += f"### System:\n{system}\n\n"
+        
+        formatted += f"### Instruction:\n{instruction}\n"
+        
+        if input_context:
+            formatted += f"\n### Input:\n{input_context}\n"
+        
+        formatted += "\n### Response:\n"
+        
+        # Add thinking section if provided
+        if thinking:
+            formatted += f"<thinking>{thinking}</thinking>\n"
+        
+        # Add the actual response
+        formatted += response
+        
+        # Add closing tokens
+        formatted += f"{self.response_token}{self.end_token}"
+        
         return formatted
 
     def _format_alpaca(
@@ -269,14 +291,6 @@ class InstructionFollowingStrategy(ModelingStrategy):
         formatted += f"\n### Response:\n{response}{self.response_token}{self.end_token}"
         return formatted
 
-    def tokenize_and_pad(self, text: str) -> List[int]:
-        """Tokenize text and handle padding with our special pad token"""
-        tokens = self.tokenizer.encode(text)
-        if len(tokens) < self.max_length:
-            padding = [self.pad_token_id] * (self.max_length - len(tokens))
-            tokens.extend(padding)
-        return tokens[: self.max_length]
-
     def to(self, device):
         """Add device management method"""
         self.device = device
@@ -296,140 +310,115 @@ class InstructionFollowingStrategy(ModelingStrategy):
         }
 
     def compute_loss(self, logits, targets, instruction_mask=None, **kwargs):
-        # Vectorized mask creation if not provided
+        """Compute loss with proper handling of padding tokens"""
         if instruction_mask is None:
             instruction_mask = self._create_instruction_mask_vectorized(targets)
 
-        # Use einsum for more efficient computation
+        # Create padding mask (1 for non-padding tokens, 0 for padding)
+        padding_mask = (targets != self.pad_token_id).float()
+        
+        # Compute loss
         loss = F.cross_entropy(
-            logits.view(-1, logits.size(-1)), targets.view(-1), reduction="none"
+            logits.view(-1, logits.size(-1)), 
+            targets.view(-1), 
+            reduction="none",
+            ignore_index=self.pad_token_id  # Ignore padding tokens in loss
         ).view_as(targets)
 
-        # Apply mask efficiently
-        masked_loss = loss * (~instruction_mask).float()
-        return masked_loss.sum() / (~instruction_mask).float().sum()
+        # Apply both instruction and padding masks
+        final_mask = (~instruction_mask).float() * padding_mask
+        masked_loss = loss * final_mask
+        
+        # Normalize by number of non-masked tokens
+        return masked_loss.sum() / (final_mask.sum() + 1e-8)
+    
+    
+    def compute_all_losses(self, main_logits, aux_outputs, targets, future_targets):
+        return self.compute_loss(main_logits, targets), []
 
     def _create_instruction_mask_vectorized(self, token_ids):
-        """Vectorized mask creation"""
+        """Create instruction mask with padding consideration"""
         batch_size, seq_length = token_ids.shape
         inst_positions = (token_ids == self.instruction_token_id).nonzero(as_tuple=True)
         resp_positions = (token_ids == self.response_token_id).nonzero(as_tuple=True)
+        pad_positions = (token_ids == self.pad_token_id).nonzero(as_tuple=True)
 
         mask = torch.zeros_like(token_ids, dtype=torch.bool)
         for b in range(batch_size):
             batch_insts = inst_positions[0] == b
             batch_resps = resp_positions[0] == b
+            batch_pads = pad_positions[0] == b
+            
             if batch_insts.any() and batch_resps.any():
                 start = inst_positions[1][batch_insts][0]
                 end = resp_positions[1][batch_resps][0]
-                mask[b, start : end + 1] = True
+                mask[b, start:end + 1] = True
+            
+            # Mask out padding tokens
+            if batch_pads.any():
+                pad_start = pad_positions[1][batch_pads][0]
+                mask[b, pad_start:] = False
+
         return mask
 
-    def validate_tokens(self, tokens):
-        """Validate token sequence structure"""
-        has_inst = self.instruction_token_id in tokens
-        has_resp = self.response_token_id in tokens
-        has_end = self.end_token_id in tokens
-
-        if not (has_inst and has_resp):
-            raise ValueError("Missing instruction or response tokens")
-
-        try:
-            inst_pos = tokens.index(self.instruction_token_id)
-            resp_pos = tokens.index(self.response_token_id)
-        except (
-            ValueError
-        ):  # Should not happen now because of 'in' checks, but as a safeguard
-            raise ValueError("Missing instruction or response tokens (index error)")
-
-        if inst_pos >= resp_pos:
-            raise ValueError("Invalid token sequence order")
-
-    def validate_instruction_format(self, text: str) -> bool:
-        """Validate instruction format before tokenization"""
-        # Check basic structure
-        has_inst_token = self.instruction_token in text
-        has_resp_token = self.response_token in text
-        has_end_token = self.end_token in text
-
-        if not (has_inst_token and has_resp_token):
-            print(
-                f"Warning: Missing instruction/response tokens in text: {text[:100]}..."
-            )
-            return False
-
-        # Check token order
-        inst_pos = text.find(self.instruction_token)
-        resp_pos = text.find(self.response_token)
-        end_pos = text.find(self.end_token)
-
-        if not (0 <= inst_pos < resp_pos):
-            print(
-                f"Warning: Invalid instruction/response token order at positions {inst_pos}, {resp_pos}"
-            )
-            return False
-
-        if end_pos >= 0 and not (resp_pos < end_pos):
-            print(
-                f"Warning: End token appears before response token at position {end_pos}"
-            )
-            return False
-
-        return True
-
-    def prepare_input(self, instruction, response=None):
-        """
-        Unified method for preparing input sequences.
-        Can handle both instruction-only (for inference) and instruction-response pairs (for training).
-
-        Args:
-            instruction (str): The instruction text
-            response (str, optional): The response text for training
-
-        Returns:
-            torch.Tensor: Properly formatted and tokenized sequence
-        """
-        if response is not None:
-            # Training mode - include both instruction and response
-            sequence = f"{self.instruction_token}{instruction}{self.response_token}{response}{self.end_token}"
-        else:
-            # Inference mode - include only instruction
-            sequence = f"{self.instruction_token}{instruction}{self.response_token}"
-
-        tokens = self.tokenizer.encode(sequence)
-
-        # Handle length constraints
-        if len(tokens) > self.max_length:
-            if response is None:
-                # For inference, keep space for generation
-                tokens = tokens[: self.max_length - 1]
-            else:
-                # For training, include end token
-                tokens = tokens[: self.max_length - 1] + [self.end_token_id]
-
-        return torch.tensor(tokens, dtype=torch.long, device=self.device)
-
-    def generate(self, model, input_ids, max_length, top_p=0.9, temperature=0.7):
+    def generate(self, model, input_ids, max_length, top_p=0.9, temperature=0.7, debug=False):
+        """Generate with proper handling of special tokens and removing padding"""
         self.to(input_ids.device)
+        
+        # Remove padding tokens from input sequence
+        padding_mask = input_ids[0] != self.pad_token_id
+        if not padding_mask.all():
+            # Find last non-padding token
+            last_token_pos = padding_mask.nonzero()[-1]
+            input_ids = input_ids[:, :last_token_pos + 1]
+            if debug:
+                print(f"Removed padding. New input length: {input_ids.size(1)}")
+        
         tokens = input_ids.clone()
-        generated_tokens = []
-
+        response_started = False
+        
         with torch.no_grad():
-            for _ in range(max_length):
-                outputs = (
-                    model(tokens) if not generated_tokens else model(tokens[:, -1:])
-                )
+            for step in range(max_length):
+                # Get model outputs
+                outputs = model(tokens) if not response_started else model(tokens[:, -1:])
                 logits = outputs[0] if isinstance(outputs, tuple) else outputs
-                next_token_logits = logits[:, -1, :]  # Shape: [batch_size, vocab_size]
-                scaled_logits = next_token_logits / temperature
-                next_token = self.sample_top_p(
-                    scaled_logits, top_p
-                )  # Shape: [batch_size, 1]
-                tokens = torch.cat([tokens, next_token], dim=1)
-                generated_tokens.append(next_token)
+                next_token_logits = logits[:, -1, :]
 
-                # Check if end token was generated
-                if next_token.item() == self.end_token_id:
+                # After [/INST], prevent generating instruction-related tokens
+                if response_started:
+                    next_token_logits[:, self.instruction_token_id] = float('-inf')
+                    next_token_logits[:, self.response_token_id] = float('-inf')
+                    next_token_logits[:, self.pad_token_id] = float('-inf')
+                
+                # Sample next token
+                scaled_logits = next_token_logits / temperature
+                next_token = self.sample_top_p(scaled_logits, top_p)
+                
+                if debug:
+                    try:
+                        print(f"Step {step}: Generated token {next_token.item()} -> '{self.tokenizer.decode([next_token.item()])}'")
+                    except Exception as e:
+                        print(f"Step {step}: Error decoding token {next_token.item()}: {e}")
+                
+                # Check if we're starting the response
+                if not response_started and next_token.item() == self.response_token_id:
+                    response_started = True
+                    if debug:
+                        print("Response generation started")
+                
+                # Add token to sequence
+                tokens = torch.cat([tokens, next_token], dim=1)
+                
+                # Stop if we generate end token or pad token
+                if next_token.item() in [self.end_token_id, self.pad_token_id]:
+                    if debug:
+                        print(f"Stopping generation: Generated {'end' if next_token.item() == self.end_token_id else 'pad'} token")
+                    break
+
+                # Check sequence length
+                if tokens.size(1) >= self.max_length:
+                    if debug:
+                        print(f"Stopping generation: Reached maximum length {self.max_length}")
                     break
 
         return tokens

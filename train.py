@@ -23,11 +23,13 @@ from strategies import (
     NextTokenStrategy,
     MixedStrategy,
 )
-from trainer import SingleHeadTrainer, CurriculumTrainer
-from data_utils import create_dataloaders, create_curriculum_dataloaders
+from trainer import SingleHeadTrainer
+from data_utils import create_dataloaders
 
+from clearml import Task
+task = Task.init(project_name="reasonable", task_name="misty_bird")
 
-def visualize_model_architecture(model, output_path="model_architecture.png"):
+def visualize_model_architecture(model, output_path="model_architecture"):
     """
     Create a visual representation of the model architecture including auxiliary heads
     Args:
@@ -467,7 +469,7 @@ def get_args():
     parser.add_argument(
         "--prefetch_factor",
         type=int,
-        default=2,
+        default=4,
         help="Number of batches to prefetch per worker",
     )
     parser.add_argument(
@@ -601,7 +603,7 @@ def configure_optimizer(model, args, train_loader):
             max(1, num_training_steps - warmup_steps)
         )
         return max(
-            0.01, 0.5 * (1.0 + math.cos(math.pi * progress))
+            0.1, 0.5 * (1.0 + math.cos(math.pi * progress))
         )  # Reduced minimum LR
 
     scheduler = LambdaLR(optimizer, lr_lambda)
@@ -656,24 +658,18 @@ if __name__ == "__main__":
                 "Warning: Could not check special tokens, using default mask token ID"
             )
 
-        strategy = NextTokenStrategy(tokenizer, predict_last_n=1)
+        strategy = NextTokenStrategy(tokenizer)
     else:
         strategy = InstructionFollowingStrategy(
             tokenizer=tokenizer,
             instruction_token="[INST]",
             response_token="[/INST]",
             end_token="</s>",
-            pad_token_id=vocab_size,
+            pad_token_id=50256,
             max_length=args.block_size,
         )
 
-    if args.use_curriculum:
-        curriculum_schedule = {"steps_per_file": args.steps_per_file}
-        trainer = CurriculumTrainer(
-            strategy=strategy, curriculum_schedule=curriculum_schedule
-        )
-    else:
-        trainer = SingleHeadTrainer(strategy=strategy)
+    trainer = SingleHeadTrainer(strategy=strategy)
 
     # Initialize wandb only on rank 0
     if rank == 0:
@@ -729,39 +725,20 @@ if __name__ == "__main__":
     else:
         dataset_config = args.train_data
 
-    if args.use_curriculum:
-        train_loader, val_loader, train_sampler, val_sampler, curriculum_dataset = (
-            create_curriculum_dataloaders(
-                file_patterns=args.train_data_patterns,
-                block_size=args.block_size,
-                batch_size=args.batch_size,
-                rank=rank,
-                world_size=world_size,
-                strategy=strategy,
-                tokenizer=tokenizer,
-            )
-        )
-    else:
-        train_loader, val_loader, train_sampler, val_sampler = create_dataloaders(
-            files_pattern=dataset_config,
-            block_size=args.block_size,
-            batch_size=args.batch_size,
-            rank=rank,
-            world_size=world_size,
-            strategy=strategy,
-            tokenizer=tokenizer,
-            n_aux_heads=args.n_aux_heads,
-        )
 
-    if rank == 0 and args.use_curriculum:
-        wandb.config.update(
-            {
-                "curriculum_learning": True,
-                "steps_per_file": args.steps_per_file,
-                "initial_files": len(curriculum_dataset.active_files),
-                "total_file_patterns": len(args.train_data_patterns),
-            }
-        )
+    train_loader, val_loader, train_sampler, val_sampler = create_dataloaders(
+        files_pattern=dataset_config,
+        block_size=args.block_size,
+        batch_size=args.batch_size,
+        rank=rank,
+        world_size=world_size,
+        strategy=strategy,
+        tokenizer=tokenizer,
+        n_aux_heads=args.n_aux_heads,
+        prefetch_factor=args.prefetch_factor,
+        num_workers=args.num_workers
+    )
+
 
     optimizer, scheduler = configure_optimizer(model, args, train_loader)
     scaler = GradScaler(enabled=True)

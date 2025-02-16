@@ -7,8 +7,22 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from model import MoELayer, MoETransformerBlock
 from typing import List, Dict, Optional, Union, Tuple
-from data_utils import CurriculumDataset
 from strategies import InstructionFollowingStrategy
+
+
+def safe_decode(tokenizer, tokens, max_length=100):
+    """Safely decode tokens with error handling"""
+    try:
+        # Convert to list if tensor
+        if torch.is_tensor(tokens):
+            tokens = tokens.tolist()
+        # Filter out padding and special tokens if needed
+        tokens = [t for t in tokens if t != tokenizer.pad_token_id]
+        decoded = tokenizer.decode(tokens)
+        # Truncate if needed
+        return decoded[:max_length] + ("..." if len(decoded) > max_length else "")
+    except Exception as e:
+        return f"<decode_error: {str(e)}>"
 
 
 class ExpertUsageTracker:
@@ -118,43 +132,6 @@ class SingleHeadTrainer:
         latest_path = f"{save_dir}/checkpoint_{strategy_name}_latest.pt"
         torch.save(checkpoint, latest_path)
 
-    def _compute_perplexity(self, logits, targets, ignore_index=-100):
-        """
-        Compute perplexity with numerical stability safeguards
-        """
-        with torch.no_grad():
-            logits = logits
-
-            # Flatten and mask
-            flat_logits = logits.view(-1, logits.size(-1))
-            flat_targets = targets.view(-1)
-            mask = flat_targets != ignore_index
-
-            if not mask.any():
-                return float("inf")
-
-            # Get valid examples
-            valid_logits = flat_logits[mask]
-            valid_targets = flat_targets[mask]
-
-            # Compute log softmax with better numerical stability
-            log_probs = F.log_softmax(valid_logits, dim=-1)
-            target_log_probs = log_probs.gather(1, valid_targets.unsqueeze(1))
-
-            # Clamp extreme values
-            target_log_probs = torch.clamp(target_log_probs, min=-10, max=0)
-
-            # Average negative log likelihood
-            nll = -target_log_probs.mean()
-
-            if not torch.isfinite(nll):
-                return float("inf")
-
-            # Compute perplexity with safeguards
-            perplexity = torch.exp(torch.clamp(nll, min=0, max=10)).item()
-
-            return min(perplexity, 1000.0)
-
     def train_epoch(
         self,
         model,
@@ -183,6 +160,10 @@ class SingleHeadTrainer:
         grad_norm_total = 0
         num_steps = 0
 
+        # Create persistent streams for data transfer and computation
+        data_stream = torch.cuda.Stream()
+        compute_stream = torch.cuda.default_stream()
+
         # Track final metrics
         final_metrics = {"total_loss": None, "main_loss": None, "aux_losses": None}
 
@@ -190,47 +171,35 @@ class SingleHeadTrainer:
         progress_bar = tqdm(train_loader, desc=f"Epoch {epoch + 1}")
         is_instruction_mode = isinstance(self.strategy, InstructionFollowingStrategy)
 
+        # Pre-allocate tensors for accumulation
+        accumulated_loss = torch.zeros(1, device=device)
+
         for batch_idx, batch in enumerate(progress_bar):
+            # Transfer data to device - moved outside stream context for guaranteed access
+            input_ids = batch["inputs"].to(device, non_blocking=True)
+            targets = batch["targets"].to(device, non_blocking=True)
+            future_targets = [
+                t.to(device, non_blocking=True) for t in batch["future_targets"]
+            ]
 
-            if batch_idx < 2: # Print for the first 3 batches
-                print(f"\n--- Batch {batch_idx} ---")
-                print("Input IDs (CPU, first example):", batch["inputs"][0])
-                print("Target IDs (CPU, first example):", batch["targets"][0])
-                # Convert tensors to lists before decoding
-                input_tokens_list = batch["inputs"][0].tolist()
-                target_tokens_list = batch["targets"][0].tolist()
-                print("Input Text (decoded, first example):", tokenizer.decode(input_tokens_list)[:-100])
-                print("Target Text (decoded, first example):", tokenizer.decode(target_tokens_list)[:-100])
-            # Transfer data to device
-            with torch.cuda.stream(torch.cuda.Stream()):
-                input_ids = batch["inputs"].to(device, non_blocking=True)
-                targets = batch["targets"].to(device, non_blocking=True)
-                future_targets = [
-                    t.to(device, non_blocking=True) for t in batch["future_targets"]
-                ]
+            # Debug logging for first two batches
+            # if batch_idx < 2:
+            #     print(f"\n--- Batch {batch_idx} ---")
+            #     input_tokens_list = batch["inputs"][0].tolist()
+            #     target_tokens_list = batch["targets"][0].tolist()
+            #     print("Input Text (decoded, first example):",
+            #         safe_decode(tokenizer, input_tokens_list))
+            #     print("Target Text (decoded, first example):",
+            #         safe_decode(tokenizer, target_tokens_list))
 
-            is_accumulation_step = (batch_idx + 1) % gradient_accumulation_steps != 0
-
-            # Debug information logging
+            # Handle generation and debugging if needed
             if gen_every_n_steps and self.global_step % gen_every_n_steps == 0:
                 model.eval()
                 with torch.no_grad():
-                    # Sample a random batch for generation
-                    # if sample_prompts:
-                    #     # Use provided sample prompts
-                    #     input_text = random.choice(sample_prompts)
-                    #     input_tokens = tokenizer.encode(input_text)
-                    #     input_tensor = torch.tensor([input_tokens], device=device)
-                    # else:
-                    # Use current batch
-
-
-                    # input_tensor = input_ids[:1]
-                    input_tokens = input_ids[0].cpu().tolist()
-                    target_tokens = targets[0].cpu().tolist()
+                    input_tokens = batch["inputs"][0].cpu().tolist()
+                    target_tokens = batch["targets"][0].cpu().tolist()
 
                     if is_instruction_mode:
-                        # Parse and log instruction format
                         raw_text = tokenizer.decode(input_tokens)
                         system, instruction, response, input_context = (
                             self._parse_instruction_format(raw_text)
@@ -245,121 +214,152 @@ class SingleHeadTrainer:
                             input_context,
                         )
                     else:
-                        print("\n=== Debug Logging at Step {} ===".format(self.global_step))
+                        print(
+                            "\n=== Debug Logging at Step {} ===".format(
+                                self.global_step
+                            )
+                        )
                         print("Input/Target Token Check:")
                         print("Input tokens (last 5):", input_tokens[-5:])
                         print("Target tokens (last 5):", target_tokens[-5:])
-                        print("Input (last 5) decoded:", tokenizer.decode(input_tokens[-25:]))
-                        print("Target (last 5) decoded:", tokenizer.decode(target_tokens[-25:]))
-                        
+                        print(
+                            "Input (last 5) decoded:",
+                            tokenizer.decode(input_tokens[-25:]),
+                        )
+                        print(
+                            "Target (last 5) decoded:",
+                            tokenizer.decode(target_tokens[-25:]),
+                        )
+
                         self._log_next_token_debug(
                             model,
                             tokenizer,
                             input_tokens,
                             target_tokens,
                             self.strategy,
-                            future_targets=[ft[0] for ft in future_targets] if future_targets else None,
+                            future_targets=(
+                                [ft[0] for ft in future_targets]
+                                if future_targets
+                                else None
+                            ),
                             sample_idx=0,
                             num_aux_heads=num_aux_heads,
                         )
                 model.train()
 
-            # Forward pass and loss computation
-            # Inside train_epoch:
-            with torch.cuda.amp.autocast():
-                outputs = model(input_ids)
-                
-                # Unpack outputs based on whether we have auxiliary heads
-                if num_aux_heads > 0:
-                    main_logits, aux_outputs = outputs
-                else:
-                    main_logits = outputs
-                    aux_outputs = []
+            # Synchronize data transfer before computation
+            # compute_stream.wait_stream(data_stream)
 
-                # Compute main and auxiliary losses with proper offsets
-                main_loss, aux_losses = self.strategy.compute_all_losses(
-                    main_logits,
-                    aux_outputs,
-                    targets,
-                    future_targets
-                )
+            with torch.cuda.stream(compute_stream):
+                is_accumulation_step = (
+                    batch_idx + 1
+                ) % gradient_accumulation_steps != 0
 
-                # Compute total loss with auxiliary loss weighting
-                total_loss = main_loss
-                if aux_losses:
-                    aux_loss_sum = sum(aux_losses) / len(aux_losses)
-                    total_loss = main_loss + (aux_loss_weight * aux_loss_sum)
+                # Forward pass and loss computation
+                with torch.cuda.amp.autocast():
+                    outputs = model(input_ids)
 
-                # Store metrics for logging
-                final_metrics.update({
-                    "total_loss": total_loss.item(),
-                    "main_loss": main_loss.item(),
-                    "aux_losses": [loss.item() for loss in aux_losses] if aux_losses else None
-                })
-
-                # Scale loss for gradient accumulation
-                scaled_loss = total_loss / gradient_accumulation_steps
-
-            # Scale the loss and perform backward pass OUTSIDE autocast
-            scaled_loss = scaler.scale(scaled_loss)
-            scaled_loss.backward()
-
-            # Only perform optimization step if not in accumulation phase
-            if not is_accumulation_step:
-                scaler.unscale_(optimizer)
-                grad_norm = torch.nn.utils.clip_grad_norm_(
-                    model.parameters(), max_grad_norm
-                )
-                grad_norm_total += grad_norm.item()
-                num_steps += 1
-
-                scaler.step(optimizer)
-                scaler.update()
-                scheduler.step()
-                optimizer.zero_grad(set_to_none=True)
-
-                # Update progress bar
-                progress_bar.set_postfix(
-                    self._get_progress_bar_metrics(
-                        total_loss, main_loss, scheduler, aux_losses
-                    )
-                )
-
-                # Regular logging
-                if self.global_step % log_every_n_steps == 0:
-                    metrics = {
-                        "train/main_loss": main_loss.item(),
-                        "train/total_loss": total_loss.item(),
-                        "train/perplexity": torch.exp(main_loss).item(),
-                        "train/learning_rate": scheduler.get_last_lr()[0],
-                        "train/grad_norm_avg": grad_norm_total / max(1, num_steps),
-                        "train/global_step": self.global_step,
-                    }
-                    if dataset_source:
-                        metrics["train/dataset_source"] = dataset_source
                     if num_aux_heads > 0:
-                        for idx, aux_loss in enumerate(aux_losses):
-                            metrics[f"train/aux_loss_{idx+1}"] = aux_loss.item()
-                    self._log_metrics(metrics, self.global_step)
+                        main_logits, aux_outputs = outputs
+                    else:
+                        main_logits = outputs
+                        aux_outputs = []
 
-                # Save checkpoint if needed
-                if save_every_n_steps and self.global_step % save_every_n_steps == 0:
-                    self.save_checkpoint(
-                        model,
-                        optimizer,
-                        scheduler,
-                        epoch,
-                        self.global_step,
-                        checkpoint_dir,
+                    main_loss, aux_losses = self.strategy.compute_all_losses(
+                        main_logits, aux_outputs, targets, future_targets
                     )
 
-                self.global_step += 1
+                    total_loss = main_loss
+                    if aux_losses:
+                        aux_loss_sum = sum(aux_losses) / len(aux_losses)
+                        total_loss = main_loss + (aux_loss_weight * aux_loss_sum)
 
-            # Cleanup
-            del outputs, main_loss
-            if aux_losses:
-                del aux_losses
-            del total_loss, scaled_loss
+                    # Store metrics for logging
+                    final_metrics.update(
+                        {
+                            "total_loss": total_loss.item(),
+                            "main_loss": main_loss.item(),
+                            "aux_losses": (
+                                [loss.item() for loss in aux_losses]
+                                if aux_losses
+                                else None
+                            ),
+                        }
+                    )
+
+                    # Scale loss for gradient accumulation
+                    scaled_loss = total_loss / gradient_accumulation_steps
+
+                # Backward pass
+                scaled_loss = scaler.scale(scaled_loss)
+                scaled_loss.backward()
+
+                # Update metrics for logging
+                with torch.no_grad():
+                    accumulated_loss += total_loss.detach()
+
+                # Optimization step
+                if not is_accumulation_step:
+                    scaler.unscale_(optimizer)
+                    grad_norm = torch.nn.utils.clip_grad_norm_(
+                        model.parameters(), max_grad_norm
+                    )
+                    grad_norm_total += grad_norm.item()
+                    num_steps += 1
+
+                    scaler.step(optimizer)
+                    scaler.update()
+                    scheduler.step()
+                    optimizer.zero_grad(set_to_none=True)
+
+                    # Reset accumulation
+                    accumulated_loss.zero_()
+
+                    # Update progress bar
+                    progress_bar.set_postfix(
+                        self._get_progress_bar_metrics(
+                            total_loss, main_loss, scheduler, aux_losses
+                        )
+                    )
+
+                    # Regular logging
+                    if self.global_step % log_every_n_steps == 0:
+                        metrics = {
+                            "train/main_loss": main_loss.item(),
+                            "train/total_loss": total_loss.item(),
+                            "train/perplexity": torch.exp(main_loss).item(),
+                            "train/learning_rate": scheduler.get_last_lr()[0],
+                            "train/grad_norm_avg": grad_norm_total / max(1, num_steps),
+                            "train/global_step": self.global_step,
+                        }
+                        if dataset_source:
+                            metrics["train/dataset_source"] = dataset_source
+                        if num_aux_heads > 0:
+                            for idx, aux_loss in enumerate(aux_losses):
+                                metrics[f"train/aux_loss_{idx+1}"] = aux_loss.item()
+                        self._log_metrics(metrics, self.global_step)
+
+                    # Save checkpoint if needed
+                    if (
+                        save_every_n_steps
+                        and self.global_step % save_every_n_steps == 0
+                    ):
+                        self.save_checkpoint(
+                            model,
+                            optimizer,
+                            scheduler,
+                            epoch,
+                            self.global_step,
+                            checkpoint_dir,
+                        )
+
+                    self.global_step += 1
+
+                # Cleanup
+                del outputs, main_loss
+                if aux_losses:
+                    del aux_losses
+                del total_loss, scaled_loss
 
         # Return metrics using stored values
         return {
@@ -369,15 +369,27 @@ class SingleHeadTrainer:
             "final_perplexity": math.exp(final_metrics["main_loss"]),
             "final_aux_losses": final_metrics["aux_losses"],
         }
-    
-    def _log_prediction_analysis(self, tokenizer, input_seq, main_pred, aux_preds, targets):
+
+    def _compute_perplexity(self, logits, targets):
+        """
+        Compute perplexity using strategy's compute_loss
+        """
+        with torch.no_grad():
+            loss = self.strategy.compute_loss(logits, targets)
+            return torch.exp(loss).item()
+
+    def _log_prediction_analysis(
+        self, tokenizer, input_seq, main_pred, aux_preds, targets
+    ):
         print("\nPrediction Analysis:")
         print(f"Input context (last 5 tokens): {tokenizer.decode(input_seq[-5:])}")
         print(f"Main head (t+1) prediction: {tokenizer.decode([main_pred])}")
         print(f"Expected t+1: {tokenizer.decode([targets[0]])}")
-        
+
         for idx, (aux_pred, target) in enumerate(zip(aux_preds, targets[1:])):
-            print(f"Aux head {idx+1} (t+{idx+2}) prediction: {tokenizer.decode([aux_pred])}")
+            print(
+                f"Aux head {idx+1} (t+{idx+2}) prediction: {tokenizer.decode([aux_pred])}"
+            )
             print(f"Expected t+{idx+2}: {tokenizer.decode([target])}")
 
     def _log_gradient_norms(self, model, max_grad_norm):
@@ -436,10 +448,10 @@ class SingleHeadTrainer:
 
         # First, log the complete raw input for debugging
         raw_input = tokenizer.decode(input_tokens)
-        print("\nRaw Input Text:")
-        print("-" * 40)
-        print(raw_input)
-        print("-" * 40)
+        # print("\nRaw Input Text:")
+        # print("-" * 40)
+        # print(raw_input)
+        # print("-" * 40)
 
         # Then log the parsed components
         print("\nParsed Components:")
@@ -579,8 +591,10 @@ class SingleHeadTrainer:
 
         # Show the exact last input token and its target
         last_input_token = input_tokens[-1]
-        target_token = target_tokens[-1]  # First target token corresponds to last input token
-        
+        target_token = target_tokens[
+            -1
+        ]  # First target token corresponds to last input token
+
         print("\nToken-by-token alignment:")
         print(f"Last input token: '{tokenizer.decode([last_input_token])}'")
         print(f"Expected next token: '{tokenizer.decode([target_token])}'")
@@ -588,9 +602,11 @@ class SingleHeadTrainer:
         # Generate model's prediction
         try:
             with torch.no_grad():
-                input_tensor = torch.tensor([input_tokens], device=next(model.parameters()).device)
+                input_tensor = torch.tensor(
+                    [input_tokens], device=next(model.parameters()).device
+                )
                 outputs = model(input_tensor)
-                
+
                 if isinstance(outputs, tuple):
                     logits, _ = outputs
                 else:
@@ -599,10 +615,10 @@ class SingleHeadTrainer:
                 # Get predictions for the last position
                 last_pos_logits = logits[0, -1, :]
                 probs = F.softmax(last_pos_logits, dim=-1)
-                
+
                 # Get top 5 predictions with probabilities
                 top_probs, top_tokens = torch.topk(probs, k=5)
-                
+
                 print("\nModel's top 5 predictions for next token:")
                 print("-" * 40)
                 for prob, token in zip(top_probs.tolist(), top_tokens.tolist()):
@@ -613,7 +629,7 @@ class SingleHeadTrainer:
 
                 full_sequence = tokenizer.decode(input_tokens)
                 # print(f"\nFull sequence verification: '{full_sequence}'")
-        
+
         except Exception as e:
             print(f"Generation failed: {str(e)}")
 
@@ -621,18 +637,18 @@ class SingleHeadTrainer:
         # if num_aux_heads > 0 and future_targets:
         #     print("\nAuxiliary Head Predictions:")
         #     print("-" * 40)
-            
+
         #     for i, future_target in enumerate(future_targets, 1):
         #         try:
         #             if isinstance(future_target, torch.Tensor):
         #                 future_target = future_target.cpu().tolist()
-                    
+
         #             print(f"\nHead {i} (predicting token t+{i+1}):")
         #             print(f"Target: '{tokenizer.decode([future_target[0]])}'")
-                    
+
         #             # Show the sequence of predictions
         #             print(f"Sequence: Current → {' → '.join(tokenizer.decode([t]) for t in [target_token] + future_targets[:i][0].cpu().tolist())}")
-                    
+
         #         except Exception as e:
         #             print(f"Error processing auxiliary head {i}: {str(e)}")
 
@@ -640,8 +656,6 @@ class SingleHeadTrainer:
         print("-" * 40)
         print(f"Input sequence length: {len(input_tokens)}")
         print(f"Number of auxiliary heads: {num_aux_heads}")
-
-
 
     def _parse_instruction_format(self, input_text):
         """Parse instruction format from input text"""
@@ -1027,14 +1041,12 @@ class SingleHeadTrainer:
                             batch_aux_loss = torch.tensor(0.0, device=device)
 
                         # Apply temperature scaling to logits
-                        temperature = 1.2
-                        scaled_logits = main_logits / temperature
 
                         # Compute main task loss
-                        main_loss = self.strategy.compute_loss(scaled_logits, targets)
+                        main_loss = self.strategy.compute_loss(main_logits, targets)
 
                         # Compute perplexity using scaled logits
-                        ppl = self._compute_perplexity(scaled_logits, targets)
+                        ppl = self._compute_perplexity(main_logits, targets)
 
                         if torch.isfinite(main_loss):
                             total_loss += main_loss.item()
@@ -1086,203 +1098,3 @@ class RunningAverage:
 
     def get_average(self):
         return self.total / max(1, self.count)
-
-
-class CurriculumTrainer(SingleHeadTrainer):
-    def __init__(
-        self, strategy: "ModelingStrategy", curriculum_schedule: Optional[Dict] = None
-    ):
-        super().__init__(strategy)
-        self.curriculum_schedule = curriculum_schedule or {}
-        self.current_curriculum_step = 0
-
-    def train_epoch(
-        self,
-        model,
-        train_loader,
-        optimizer,
-        scheduler,
-        scaler,
-        device,
-        epoch,
-        tokenizer=None,
-        sample_prompts=None,
-        gen_every_n_steps=None,
-        max_gen_length=100,
-        gradient_accumulation_steps=4,
-        save_every_n_steps=None,
-        checkpoint_dir=None,
-        max_grad_norm=1.0,
-        log_every_n_steps=10,
-        aux_loss_weight=0.1,
-    ):
-        """Memory-optimized training for one epoch with MoE support"""
-        model.train()
-
-        # Training monitoring
-        grad_norm_total = 0
-        num_steps = 0
-
-        # Track final metrics
-        final_total_loss = 0.0
-        final_main_loss = 0.0
-
-        # Get dataset for curriculum updates
-        dataset = train_loader.dataset
-        if isinstance(dataset, torch.utils.data.Subset):
-            dataset = dataset.dataset
-
-        # Batch accumulation state
-        optimizer.zero_grad(set_to_none=True)
-
-        progress_bar = tqdm(train_loader, desc=f"Epoch {epoch + 1}")
-
-        for batch_idx, batch in enumerate(progress_bar):
-            # Efficient device transfer
-            with torch.cuda.stream(torch.cuda.Stream()):
-                input_ids = batch["inputs"].to(device, non_blocking=True)
-                targets = batch["targets"].to(device, non_blocking=True)
-
-            is_accumulation_step = (batch_idx + 1) % gradient_accumulation_steps != 0
-
-            # Compute loss with mixed precision
-            with torch.cuda.amp.autocast():
-                # MoE model returns both logits and auxiliary loss
-                outputs, aux_loss = model(input_ids)
-
-                # Main task loss
-                main_loss = self.strategy.compute_loss(outputs, targets)
-
-                # Combine losses with weighting
-                total_loss = main_loss + aux_loss_weight * aux_loss
-
-                # Update final metrics
-                final_total_loss = total_loss.item()
-                final_main_loss = main_loss.item()
-
-                # Scale for gradient accumulation
-                scaled_loss = total_loss / gradient_accumulation_steps
-
-            # Backward pass
-            scaler.scale(scaled_loss).backward()
-
-            # Gradient update step
-            if not is_accumulation_step:
-                # Gradient clipping
-                scaler.unscale_(optimizer)
-                grad_norm = torch.nn.utils.clip_grad_norm_(
-                    model.parameters(), max_grad_norm
-                )
-                grad_norm_total += grad_norm.item()
-                num_steps += 1
-
-                # Optimizer step
-                scaler.step(optimizer)
-                scaler.update()
-                scheduler.step()
-
-                # Reset gradients
-                optimizer.zero_grad(set_to_none=True)
-
-                # Log metrics
-                if self.global_step % log_every_n_steps == 0 and wandb.run is not None:
-                    expert_metrics = self.monitor_expert_usage(model, input_ids)
-
-                    # Base training metrics
-                    metrics = {
-                        "train/main_loss": main_loss.item(),
-                        "train/aux_loss": aux_loss.item(),
-                        "train/total_loss": total_loss.item(),
-                        "train/perplexity": torch.exp(main_loss).item(),
-                        "train/learning_rate": scheduler.get_last_lr()[0],
-                        "train/grad_norm_avg": grad_norm_total / max(1, num_steps),
-                        "train/global_step": self.global_step,
-                    }
-
-                    # Add all expert metrics
-                    for layer_name, layer_metrics in expert_metrics.items():
-                        for category, category_metrics in layer_metrics.items():
-                            for metric_name, value in category_metrics.items():
-                                metrics[f"{layer_name}/{category}_{metric_name}"] = (
-                                    value
-                                )
-
-                    # Add curriculum metrics if applicable
-                    if isinstance(dataset, CurriculumDataset):
-                        metrics.update(
-                            {
-                                "curriculum/step": self.current_curriculum_step,
-                                "curriculum/active_files": len(dataset.active_files),
-                            }
-                        )
-
-                    # Log to wandb
-                    wandb.log(metrics, step=self.global_step)
-
-                # Update progress bar
-                progress_bar.set_postfix(
-                    {
-                        "loss": f"{total_loss.item():.4f}",
-                        "aux_loss": f"{aux_loss.item():.4f}",
-                        "ppl": f"{torch.exp(main_loss).item():.2f}",
-                        "lr": f"{scheduler.get_last_lr()[0]:.2e}",
-                    }
-                )
-
-                # Check curriculum update
-                if isinstance(dataset, CurriculumDataset) and self.curriculum_schedule:
-                    steps_per_file = self.curriculum_schedule.get(
-                        "steps_per_file", float("inf")
-                    )
-                    if (
-                        self.global_step // steps_per_file
-                        > self.current_curriculum_step
-                    ):
-                        if dataset.add_next_file_pattern():
-                            self.current_curriculum_step += 1
-                            is_main_process = (
-                                not torch.distributed.is_initialized()
-                                or torch.distributed.get_rank() == 0
-                            )
-                            if is_main_process:
-                                print(
-                                    f"\nUpdated curriculum. Now training on {len(dataset.active_files)} files"
-                                )
-                            progress_bar.total = len(train_loader)
-                            progress_bar.refresh()
-
-                # Sample generations periodically
-                if gen_every_n_steps and self.global_step % gen_every_n_steps == 0:
-                    self._generate_and_log_samples(
-                        model, tokenizer, sample_prompts, max_gen_length, device
-                    )
-
-                # Save checkpoint periodically
-                if save_every_n_steps and self.global_step % save_every_n_steps == 0:
-                    self.save_checkpoint(
-                        model,
-                        optimizer,
-                        scheduler,
-                        epoch,
-                        self.global_step,
-                        checkpoint_dir,
-                    )
-
-                self.global_step += 1
-
-            # Explicit cleanup
-            del outputs
-            del main_loss
-            del aux_loss
-            del total_loss
-            del scaled_loss
-
-        # Calculate final perplexity
-        final_perplexity = torch.exp(torch.tensor(final_main_loss)).item()
-
-        return {
-            "epoch": epoch,
-            "grad_norm_avg": grad_norm_total / max(1, num_steps),
-            "final_total_loss": final_total_loss,
-            "final_perplexity": final_perplexity,
-        }

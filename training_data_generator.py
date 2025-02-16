@@ -197,37 +197,33 @@ class EducationalLevelFramework:
     def __init__(self):
         self.grade_levels = {
             "children": {  # NEW GRADE LEVEL
-                "age_range": "12-15",
+                "age_range": "25-35",
                 "skill_categories": [
                     # Foundational Language Understanding
                     "reading_comprehension",
-                    "following_directions",
+                    # "following_directions",
                     "basic_concept_understanding",  # colors, shapes, numbers, prepositions
                     "intermediate_concept_understanding",
                     "advanced_concept_understanding",
                     "vocabulary_building_early",  # basic nouns, verbs, adjectives
                     "question_understanding_simple",  # who, what, where
-                    
                     # Early Language Acquisition Skills
                     "imitation_and_repetition",  # repeating words and phrases
                     "turn_taking_communication",  # responding in simple exchanges
                     "story_comprehension_simple",  # understanding very short, simple stories
                     "categorization_basic",  # grouping objects and words by simple categories
-                    
                     # Scenario Understanding and Prediction
                     "cause_effect_basic",  # understanding simple if-then relationships
                     "sequence_prediction",  # predicting what comes next in simple sequences
                     "outcome_anticipation",  # anticipating likely outcomes in familiar situations
                     "scenario_completion",  # completing partial scenarios with logical endings
                     "character_intention_basic",  # understanding basic motivations and goals
-                    
                     # Advanced Scenario Development
                     "narrative_continuation",  # extending stories with logical developments
                     "alternative_outcomes",  # generating plausible alternative scenarios
                     "context_extrapolation",  # predicting developments based on context clues
                     "consequence_chain",  # understanding chains of events and their implications
                     "scenario_adaptation",  # modifying scenarios based on changing conditions
-                    
                     # Complex Scenario Analysis
                     "multipath_prediction",  # analyzing multiple possible future developments
                     "probability_reasoning",  # understanding likelihood of different outcomes
@@ -473,21 +469,21 @@ class EducationalLevelFramework:
             #     "response_type": "analyzing emotional meanings of words",
             #     "skills": ["connotation", "word choice", "emotional language"],
             # },
-            # "word_networks": {
-            #     "format": "central concepts for word association",
-            #     "response_type": "building related word groups",
-            #     "skills": [
-            #         "word relationships",
-            #         "semantic networks",
-            #         "vocabulary expansion",
-            #     ],
-            # },
+            "word_networks": {
+                "format": "central concepts for word association",
+                "response_type": "building related word groups",
+                "skills": [
+                    "word relationships",
+                    "semantic networks",
+                    "vocabulary expansion",
+                ],
+            },
             # # Metacognitive Tasks
-            # "strategy_explanation": {
-            #     "format": "reading or writing problems to solve",
-            #     "response_type": "explaining thought process and strategies",
-            #     "skills": ["metacognition", "strategy use", "process explanation"],
-            # },
+            "strategy_explanation": {
+                "format": "reading or writing problems to solve",
+                "response_type": "explaining thought process and strategies",
+                "skills": ["metacognition", "strategy use", "process explanation"],
+            },
             # "error_analysis": {
             #     "format": "texts with deliberate mistakes",
             #     "response_type": "explaining why something is incorrect",
@@ -687,7 +683,6 @@ Task Requirements:
 - Must use specific facts/themes from the article while being self-contained
 - Adapt complex concepts to age-appropriate language and context
 - Focus on {skill_category} while preserving key article information
-- Keep original facts accurate but simplified for comprehension
 - Include necessary factual context required to answer the question accurately
 
 Reasoning Steps (for 'thoughts' JSON field):
@@ -707,15 +702,174 @@ Response Format (JSON):
     "thoughts": ["Step 1: ...", "Step 2: ...", ...],
     "correct_response": "Complete answer with explanation",
     "difficulty": "easy/medium/hard",
-    "skills_tested": ["List skills", "{skill_category}"],
-    "article_elements_used": ["List key facts/themes adapted from article"]
+    "skills_tested": ["List skills", "{skill_category}"]
 }}
 
 Important:
 - Task should clearly reflect article content without direct reference
 - Maintain factual accuracy while simplifying for target age
 - Ensure task type and skill category align naturally
-- Focus on one primary skill while supporting overall comprehension
+- Focus on one primary skill while supporting overall 
+- CRITICAL: All responses must be based solely on information provided in context and prompt
+"""
+        return template
+
+    def generate_university_scenario_template(
+        self,
+        course_level: str,
+        discipline: str,
+        analysis_type: str,
+        article_text: str = None,
+    ) -> str:
+        article_context = (
+            f""" Source Material: {article_text} -------------- """
+            if article_text
+            else ""
+        )
+        template = f"""{article_context}
+    Generate an academic analysis task based on this source material. The task should require students to analyze specific aspects of the content. All necessary information to complete the task must be included in the prompt and context - no external sources should be required.
+
+    Core Requirements:
+    1. Task Construction:
+    - Frame a specific analytical question or problem
+    - Include all necessary background information and definitions
+
+    2. Content Focus:
+    - Incorporate concrete examples from the source material
+    - Require explicit methodological application
+    - Connect theory to empirical evidence
+    - Provide necessary explanations
+
+    3. Analysis Depth:
+    - Require multi-level analysis (e.g., micro/macro perspectives)
+    - Include comparative theoretical analysis
+    - Demand evidence-based argumentation
+    - Ensure all necessary contextual information is provided
+
+    4. Academic Standards:
+    - Include complete explanations of all required concepts
+
+    Response Format (JSON):
+    {{
+        "prompt": "A clear, specific task that requires students to analyze the source material using methodological approaches. The task should include all necessary background information.",
+        "context": "Essential concepts and comprehensive background information needed to complete the analysis.",
+        "thoughts": [
+            "1. Understand task requirements",
+            "2. Identify key themes and evidence from source material",
+            "3. Consider appropriate methodological approaches",
+            "4. Connect evidence to theoretical arguments",
+            "5. Synthesize analysis into coherent conclusions"
+        ],
+        "correct_response": "Give an example answer here that answers the task specified in the prompt.",
+        "difficulty": "intermediate/advanced/expert",
+        "skills_assessed": [
+            "analytical_reasoning",
+            "evidence-based argumentation"
+        ]
+    }}
+
+    Important Requirements:
+    - The prompt must specify a clear, concrete analytical task
+    - All information needed to complete the task must be self-contained within the prompt and context
+    - No external sources or prior knowledge should be required beyond what is provided
+    - Correct response must demonstrate thorough analysis of all task components
+"""
+        return template
+
+    def generate_counterfactual_reasoning_template(self, article_text: str) -> str:
+        template = f"""Given the source material: {article_text}
+
+Transform this real-world scenario into a counterfactual reasoning exercise that tests understanding of complex causal relationships. Create a prompt that presents an alternative scenario where key variables or decisions are changed, requiring analysis of potential outcomes and systemic impacts. The prompt should be completely standalone and not reference the original source material.
+
+Core Requirements:
+1. Scenario Construction:
+- Present a modified version of real events where key variables are altered
+- Maintain realistic constraints and system dynamics
+- Include all necessary background context directly in the prompt
+- Frame the scenario as a standalone hypothetical situation
+
+2. Causal Analysis:
+- Define all relevant stakeholders and their incentives within the prompt
+- Include necessary historical context and system relationships
+- Present the counterfactual as a natural "what-if" scenario
+- Ensure all required information is self-contained
+
+Response Format (JSON):
+{{
+    "prompt": "A completely standalone counterfactual scenario that contains all necessary background and context. For example, instead of referencing real events, use 'Consider a scenario where [alternative condition]. Given [relevant background and system dynamics], analyze the potential outcomes...'",
+    "thoughts": [
+        "1. First, I need to identify the baseline conditions and status quo described in the prompt",
+        "2. Next, I should map out the key variables that have been altered and understand their initial state",
+        "3. I need to analyze the immediate direct effects of these changes on different stakeholders",
+        "4. Then, I should consider how these effects might cascade through the system over time",
+        "5. Finally, I must evaluate potential feedback loops and long-term equilibrium states"
+    ],
+    "correct_response": "Provide the actual, complete analysis of the counterfactual scenario, only referencing information that was provided within the prompt itself.",
+    "difficulty": "intermediate/advanced/expert",
+    "skills_assessed": [
+        "conceptual_understanding",
+        "explanatory_clarity",
+        "relationship_mapping"
+    ]
+}}
+
+Critical Requirements:
+- Prompts must be completely self-contained with no references to external sources
+- All necessary background information must be embedded within the prompt
+- No mention of source materials or articles in the prompt
+- The counterfactual should appear as a natural, standalone scenario
+- The correct_response must provide a complete analysis based solely on information in the prompt
+- Both prompt and response should be independent of any external context
+"""
+        return template
+
+    def generate_concept_explanation_template(
+        self,
+        article_text: str,
+    ) -> str:
+        template = f"""Given the source material: {article_text}
+
+Generate an educational task that builds upon concepts from the source material, but formulate the prompt as a completely standalone question. The prompt should not reference or depend on any external sources, including the source material itself. All necessary information should be directly embedded within the prompt.
+
+Core Requirements:
+1. Task Construction:
+- Create a completely self-contained prompt that includes all necessary context
+- Incorporate key concepts and examples as part of the prompt's background
+- Do not reference or mention any source materials
+- Present the task as if the information is general knowledge in the field
+
+2. Knowledge Integration:
+- Embed necessary background information directly in the prompt
+- Include relevant examples as part of the prompt's scenario
+- Define any technical terms within the prompt itself
+- Present relationships between concepts as part of the question
+
+Response Format (JSON):
+{{
+    "prompt": "A completely standalone question that contains all necessary background, examples, and context. The prompt must not reference any external sources or materials. For example, instead of 'Based on the article...' use 'In the field of X, concept Y is known for...'",
+    "thoughts": [
+        "1. Understand the key concepts and their relationships in the question",
+        "2. Identify the main principles and theories that apply",
+        "3. Consider relevant examples and their implications",
+        "4. Analyze how different components interact",
+        "5. Synthesize information into a coherent explanation"
+    ],
+    "correct_response": "Provide the actual, complete answer to the specific question asked in the prompt. The answer should only reference information that was provided within the prompt itself.",
+    "difficulty": "intermediate/advanced/expert",
+    "skills_assessed": [
+        "conceptual_understanding",
+        "explanatory_clarity",
+        "relationship_mapping"
+    ]
+}}
+
+Critical Requirements:
+- Prompts must be completely self-contained with no references to external sources
+- All necessary information must be embedded within the prompt itself
+- No mention of source materials or articles in the prompt
+- The task should appear as a natural, standalone question
+- The correct_response must be a complete, specific answer to the prompt's question
+- Both prompt and response should be independent of any external context
 """
         return template
 
@@ -731,22 +885,21 @@ Important:
         tasks = []
         for _ in range(num_tasks):
             grade = specific_grade or random.choice(list(self.grade_levels.keys()))
-            category = specific_category or random.choice(
+            skill_category = specific_category or random.choice(
                 self.grade_levels[grade]["skill_categories"]
             )
 
             # Modified task type selection to use format strings
-            response_types = [(key, data["response_type"]) for key, data in self.task_types.items()]
-            task_type, selected_response_type = random.choice(response_types)
-
-            prompt = self.generate_prompt_template_concise(
-                grade,
-                category,
-                selected_response_type,
+            response_types = [
+                (key, data["response_type"]) for key, data in self.task_types.items()
+            ]
+            _, task_type = random.choice(response_types)
+            skill_category = "scenario_completion_and_inference"
+            task_type = "news_scenario_prediction"
+            prompt = self.generate_counterfactual_reasoning_template(
                 article_text=article_text + "..." if article_text else None,
             )
             try:
-                print(prompt)
                 # response = generate_response_with_google(prompt)
                 response = llm_api.generate(prompt, temperature=temperature)
                 # Clean the response - remove any leading/trailing whitespace and non-JSON text
@@ -763,23 +916,23 @@ Important:
                     # Validate required fields
                     required_fields = [
                         "prompt",
-                        "context",
+                        # "context",
                         "thoughts",
                         "correct_response",
                         "difficulty",
-                        "skills_tested",
+                        # "skills_tested",
                     ]
                     if all(field in task_data for field in required_fields):
                         task = LanguageTask(
                             grade_level=grade,
-                            skill_category=category,
+                            skill_category=skill_category,
                             task_type=task_type,
                             prompt=task_data["prompt"],
-                            context=task_data["context"],
+                            context=task_data.get("context"),
                             thoughts=task_data["thoughts"],
                             correct_response=task_data["correct_response"],
                             difficulty=task_data["difficulty"],
-                            skills_tested=task_data["skills_tested"],
+                            skills_tested=task_data.get("skills_tested", []),
                         )
                         tasks.append(task)
                     else:
@@ -847,8 +1000,8 @@ def task_generator_worker(
         for _ in range(num_tasks):
             try:
                 # Get a news article from the queue with timeout
-                article = news_queue.get(timeout=30)
-            except Queue.Empty:
+                article = news_queue.get(timeout=300)
+            except Queue.empty:
                 logging.warning(
                     f"No more news articles available for {grade} {category}"
                 )
@@ -861,7 +1014,7 @@ def task_generator_worker(
                 specific_grade=grade,
                 specific_category=category,
                 temperature=temperature,
-                article_text=article["article"][:2000],
+                article_text=article["article"][:2500],
             )
 
             if tasks:
@@ -892,7 +1045,7 @@ def task_writer_worker(
                 if verbose and tasks_written % 10 == 0:
                     logging.info(f"Written {tasks_written}/{total_tasks} tasks...")
 
-            except Queue.Empty:  # Changed from queue.Empty to Queue.Empty
+            except Queue.empty:
                 logging.warning(
                     "No tasks received for 60 seconds, checking if generation is complete..."
                 )
@@ -912,7 +1065,7 @@ def main(
     temperature: float = 0.7,
     verbose: bool = False,
     news_limit: int = 50000,
-    max_workers: int = 4,  # New parameter for controlling thread pool size
+    max_workers: int = 6,  # New parameter for controlling thread pool size
 ):
     """
     Multi-threaded main function that loads recent news articles and generates educational tasks.
@@ -942,8 +1095,10 @@ def main(
 
     try:
         # Calculate date range for news
-        end_date = datetime.now().strftime("%Y-%m-%d")
-        start_date = (datetime.now() - timedelta(days=120)).strftime("%Y-%m-%d")
+        end_date = (datetime.now() - timedelta(days=620)).strftime(
+            "%Y-%m-%d"
+        )  # datetime.now().strftime("%Y-%m-%d")
+        start_date = (datetime.now() - timedelta(days=720)).strftime("%Y-%m-%d")
 
         # Load news articles
         if verbose:
@@ -954,8 +1109,8 @@ def main(
         )
 
         news_df["word_count"] = news_df["article"].apply(lambda x: len(str(x).split()))
-        news_df = news_df[news_df["word_count"] >= 400]
-
+        news_df = news_df[news_df["word_count"] >= 600]
+        print(news_df)
         # Calculate total tasks needed
         if grades is None:
             grades = list(framework.grade_levels.keys())

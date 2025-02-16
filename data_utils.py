@@ -15,6 +15,7 @@ from strategies import (
     MixedStrategy,
 )
 from typing import Dict, List, Optional, Tuple, Any, Union
+from text_normalizer import TextNormalizer
 
 
 class SingleHeadDataset(Dataset):
@@ -34,6 +35,7 @@ class SingleHeadDataset(Dataset):
         self.max_future_tokens = n_aux_heads + 1 if n_aux_heads > 0 else 1
         self.examples = []
         self.chunks_per_file = {}
+
 
         if isinstance(strategy, InstructionFollowingStrategy):
             self._load_instruction_data(files_pattern)
@@ -215,12 +217,10 @@ class SingleHeadDataset(Dataset):
         Args:
             files_pattern: Glob pattern for JSONL files containing instruction data
         """
-        import json
-        import glob
 
         print(f"\nLoading local instruction files matching pattern: {files_pattern}")
 
-        files = glob.glob(files_pattern)
+        files = glob(files_pattern)
         if not files:
             raise ValueError(f"No files found matching pattern: {files_pattern}")
 
@@ -251,6 +251,7 @@ class SingleHeadDataset(Dataset):
                             formatted_text = self.strategy.format_instruction(
                                 instruction=item["prompt"],
                                 response=item["correct_response"],
+                                input_context=item.get("context"),
                                 thinking=(
                                     "\n".join(item["thoughts"])
                                     if include_thoughts
@@ -260,7 +261,8 @@ class SingleHeadDataset(Dataset):
 
                             if not formatted_text.strip():
                                 continue
-
+                            
+                            # print(formatted_text)
                             tokens = self.tokenizer.encode(formatted_text)
                             total_tokens += len(tokens)
 
@@ -333,10 +335,11 @@ class SingleHeadDataset(Dataset):
             )
 
     def _load_text_data(self, files_pattern: str):
-        """Load data and split into chunks with streaming approach"""
-        print("Loading text data for next-token prediction")
+        """Load and clean data, then split into chunks with streaming approach"""
+        print("Loading and cleaning text data for next-token prediction")
         
-        # Instead of loading all tokens at once, process files in batches
+        # Initialize text normalizer
+        normalizer = TextNormalizer()
         self.chunks_per_file = defaultdict(list)
         chunk_size = self.block_size + self.max_future_tokens
         stride = self.block_size // 2
@@ -349,27 +352,46 @@ class SingleHeadDataset(Dataset):
                     chunks.append(chunk)
             return chunks
             
+        # Rest of the function remains the same, but add cleaning step
         for file_path in glob(files_pattern):
             try:
-                # Process each file separately to manage memory
                 with open(file_path, "r", encoding="utf-8") as f:
-                    # Process file in smaller segments
                     buffer_size = 1024 * 1024  # 1MB buffer
                     tokens = []
+                    text_buffer = ""
                     
                     while True:
                         text = f.read(buffer_size)
                         if not text:
+                            # Clean and process final buffer
+                            if text_buffer:
+                                cleaned_text = normalizer.clean_text(text_buffer)
+                                new_tokens = self.tokenizer.encode(cleaned_text)
+                                tokens.extend(new_tokens)
                             break
+                        
+                        text_buffer += text
+                        
+                        # Only process complete lines/paragraphs
+                        if len(text_buffer) >= buffer_size:
+                            # Find last newline to avoid splitting mid-paragraph
+                            split_pos = text_buffer.rfind('\n')
+                            if split_pos == -1:
+                                split_pos = len(text_buffer)
+                                
+                            # Clean and process the complete portion
+                            to_process = text_buffer[:split_pos]
+                            cleaned_text = normalizer.clean_text(to_process)
+                            new_tokens = self.tokenizer.encode(cleaned_text)
+                            tokens.extend(new_tokens)
                             
-                        new_tokens = self.tokenizer.encode(text)
-                        tokens.extend(new_tokens)
+                            # Keep remainder for next iteration
+                            text_buffer = text_buffer[split_pos:]
                         
                         # Process chunks when we have enough tokens
                         if len(tokens) >= chunk_size * 100:
                             new_chunks = process_file_chunks(tokens, file_path)
                             self.chunks_per_file[file_path].extend(new_chunks)
-                            # Keep remainder that might connect with next buffer
                             tokens = tokens[-chunk_size:]
                     
                     # Process any remaining tokens
@@ -380,30 +402,6 @@ class SingleHeadDataset(Dataset):
             except Exception as e:
                 print(f"Error loading file {file_path}: {e}")
                 continue
-
-    def _get_train_val_splits(self):
-        """Split chunks into train/val while maintaining sequence integrity"""
-        train_chunks = []
-        val_chunks = []
-
-        for file_path, chunks in self.chunks_per_file.items():
-            file_hash = hash(file_path) % 10000
-            generator = torch.Generator().manual_seed(file_hash)
-
-            # Shuffle chunk indices instead of individual tokens
-            n_chunks = len(chunks)
-            train_size = int(0.9 * n_chunks)
-
-            indices = torch.randperm(n_chunks, generator=generator)
-
-            train_indices = indices[:train_size]
-            val_indices = indices[train_size:]
-
-            # Add chunks to respective splits
-            train_chunks.extend([chunks[i] for i in train_indices.tolist()])
-            val_chunks.extend([chunks[i] for i in val_indices.tolist()])
-
-        return train_chunks, val_chunks
 
     def create_train_val_datasets(self):
         """Create separate training and validation datasets"""
@@ -632,489 +630,3 @@ def create_dataloaders(
     return train_loader, val_loader, train_sampler, val_sampler
 
 
-class MixedStrategyDataset(Dataset):
-    """Dataset that handles different strategies for main and analysis paths"""
-
-    def __init__(
-        self, files_pattern, block_size, tokenizer, main_strategy, analysis_strategy
-    ):
-        super().__init__()
-        self.block_size = block_size
-        self.tokenizer = tokenizer
-        self.main_strategy = main_strategy
-        self.analysis_strategy = analysis_strategy
-
-        # Store aligned examples where each item contains both input tokens and instruction data
-        self.aligned_examples = []
-        print(files_pattern, block_size)
-        # Load and process data from files
-        for file_path in glob(files_pattern):
-            print(file_path)
-            if file_path.endswith(".jsonl"):
-                with open(file_path, "r", encoding="utf-8") as f:
-                    for line in f:
-                        example = json.loads(line.strip())
-                        # Tokenize input text for main path
-                        input_text = example["input"]
-                        input_tokens = np.array(self.tokenizer.encode(input_text))
-
-                        # Store all necessary data for both paths together
-                        self.aligned_examples.append(
-                            {
-                                "input_tokens": input_tokens,
-                                "instruction": example["instruction"],
-                                "thought": example["thought"],
-                            }
-                        )
-
-        if not self.aligned_examples:
-            raise ValueError("No valid examples found in the data files")
-
-    def __len__(self):
-        return len(self.aligned_examples)
-
-    def __getitem__(self, idx):
-        """Get item with sequence length handling and proper tokenization"""
-        example = self.aligned_examples[idx]
-
-        # Get main path data using next token prediction on input text
-        if isinstance(self.main_strategy, NextTokenStrategy):
-            # Randomly select a valid starting point if input is longer than block_size
-            input_tokens = example["input_tokens"]
-            max_start_idx = len(input_tokens) - (self.block_size + 1)
-            if max_start_idx > 0:
-                start_idx = random.randint(0, max_start_idx)
-            else:
-                start_idx = 0
-
-            # Get the chunk for next token prediction
-            main_chunk = input_tokens[start_idx : start_idx + self.block_size + 1]
-            main_x = main_chunk[:-1]
-            main_y = main_chunk[1:]
-        else:
-            raise NotImplementedError("Only NextTokenStrategy supported for main path")
-
-        # Get analysis path data from the same example
-        if isinstance(self.analysis_strategy, InstructionFollowingStrategy):
-            # First decode the input tokens to text
-            input_text = self.tokenizer.decode(example["input_tokens"])
-
-            # Format the instruction with the decoded input text
-            instruction = f"{example['instruction']}\n\nInput: {input_text}"
-
-            # Tokenize and handle sequence lengths
-            max_length = self.analysis_strategy.max_length
-            instruction_tokens = self.analysis_strategy.tokenizer.encode(instruction)
-            thought_tokens = self.analysis_strategy.tokenizer.encode(example["thought"])
-
-            # Truncate if needed, leaving room for special tokens
-            max_seq_length = (
-                max_length - 3
-            )  # Account for [INST], [/INST], and </s] tokens
-            if len(instruction_tokens) > max_seq_length:
-                instruction_tokens = instruction_tokens[:max_seq_length]
-            if len(thought_tokens) > max_seq_length:
-                thought_tokens = thought_tokens[:max_seq_length]
-
-            # Decode back to text after truncation
-            instruction = self.analysis_strategy.tokenizer.decode(instruction_tokens)
-            thought = self.analysis_strategy.tokenizer.decode(thought_tokens)
-
-            return {
-                "main_x": main_x,
-                "main_y": main_y,
-                "analysis_instruction": instruction,
-                "analysis_thought": thought,
-            }
-        else:
-            raise NotImplementedError(
-                "Only InstructionFollowingStrategy supported for analysis path"
-            )
-
-
-class CurriculumDataset(Dataset):
-    def __init__(
-        self,
-        file_patterns: List[str],
-        block_size: int,
-        tokenizer,
-        active_files: Optional[List[str]] = None,
-    ):
-        super().__init__()
-        self.block_size = block_size
-        self.tokenizer = tokenizer
-        self.file_patterns = file_patterns
-        self.active_files = active_files or [file_patterns[0]]
-        self.all_files = self._get_all_files()
-        self.tokens_per_file = {}  # Store tokens for each file separately
-        self._load_active_files()
-
-    def _get_all_files(self) -> Dict[str, List[str]]:
-        """Get all files for each pattern for future reference"""
-        all_files = {}
-        for pattern in self.file_patterns:
-            all_files[pattern] = sorted(glob(pattern))
-        return all_files
-
-    def __len__(self):
-        """Return total length of available tokens"""
-        total_tokens = sum(len(tokens) for tokens in self.tokens_per_file.values())
-        if total_tokens <= self.block_size:
-            return 0
-        return total_tokens - self.block_size
-
-    def _load_active_files(self):
-        """Load data from currently active files"""
-        self.tokens_per_file.clear()
-
-        for pattern in self.active_files:
-            for file_path in self.all_files.get(pattern, []):
-                try:
-                    with open(file_path, "r", encoding="utf-8") as f:
-                        text = f.read()
-                        if text.strip():  # Check if text is not empty
-                            file_tokens = self.tokenizer.encode(text)
-                            if file_tokens:  # Only add if we got tokens
-                                self.tokens_per_file[file_path] = file_tokens
-                except Exception as e:
-                    print(f"Error loading file {file_path}: {e}")
-                    continue
-
-    def _get_train_val_splits(self):
-        """Create deterministic train/val splits for each file"""
-        train_tokens = []
-        val_tokens = []
-
-        for file_path, tokens in self.tokens_per_file.items():
-            # Use hash of filename for deterministic split
-            file_hash = hash(file_path) % 10000  # Limit hash size
-            generator = torch.Generator().manual_seed(file_hash)
-
-            # Calculate splits for this file
-            n_tokens = len(tokens)
-            train_size = int(0.8 * n_tokens)
-
-            # Generate permutation for this file
-            indices = torch.randperm(n_tokens, generator=generator)
-
-            # Split tokens for this file
-            train_indices = indices[:train_size]
-            val_indices = indices[train_size:]
-
-            # Add to appropriate sets
-            train_tokens.extend([tokens[i] for i in train_indices.tolist()])
-            val_tokens.extend([tokens[i] for i in val_indices.tolist()])
-
-        return train_tokens, val_tokens
-
-    def create_train_val_datasets(self):
-        """Create separate training and validation datasets"""
-        train_tokens, val_tokens = self._get_train_val_splits()
-        return (
-            SingleHeadTrainDataset(train_tokens, self.block_size),
-            SingleHeadValDataset(val_tokens, self.block_size),
-        )
-
-    def rebuild_dataloaders(
-        self,
-        batch_size: int,
-        world_size: Optional[int] = None,
-        rank: Optional[int] = None,
-        num_workers: int = 4,
-        prefetch_factor: int = 2,
-    ):
-        """Rebuild train and val dataloaders after adding new files"""
-        # Get train and val datasets with consistent splits
-        train_dataset, val_dataset = self.create_train_val_datasets()
-
-        # Create new samplers if using distributed training
-        train_sampler = val_sampler = None
-        if world_size is not None and world_size > 1:
-            train_sampler = DistributedSampler(
-                train_dataset,
-                num_replicas=world_size,
-                rank=rank,
-                shuffle=True,
-                drop_last=True,
-                seed=42,
-            )
-            val_sampler = DistributedSampler(
-                val_dataset,
-                num_replicas=world_size,
-                rank=rank,
-                shuffle=False,
-                seed=42,
-            )
-
-        # Create new dataloaders
-        train_loader = DataLoader(
-            train_dataset,
-            batch_size=batch_size,
-            sampler=train_sampler,
-            shuffle=train_sampler is None,
-            num_workers=num_workers,
-            pin_memory=True,
-            prefetch_factor=prefetch_factor,
-            persistent_workers=True,
-            collate_fn=self.collate_fn,
-            drop_last=True,
-            worker_init_fn=lambda worker_id: torch.manual_seed(42 + worker_id),
-        )
-
-        val_loader = DataLoader(
-            val_dataset,
-            batch_size=batch_size,
-            sampler=val_sampler,
-            shuffle=False,
-            num_workers=num_workers,
-            pin_memory=True,
-            prefetch_factor=prefetch_factor,
-            persistent_workers=True,
-            collate_fn=self.collate_fn,
-            worker_init_fn=lambda worker_id: torch.manual_seed(42 + worker_id),
-        )
-
-        return train_loader, val_loader, train_sampler, val_sampler
-
-    def add_next_file_pattern(
-        self,
-    ) -> bool:
-        """Add next file pattern to curriculum. Returns success boolean"""
-        current_idx = self.file_patterns.index(self.active_files[-1])
-        if current_idx + 1 < len(self.file_patterns):
-            next_pattern = self.file_patterns[current_idx + 1]
-            self.active_files.append(next_pattern)
-            self._load_active_files()
-            return True
-        return False
-
-    @staticmethod
-    def collate_fn(batch):
-        if not batch:
-            return {"inputs": [], "targets": []}
-        inputs = torch.stack([item["inputs"] for item in batch])
-        targets = torch.stack([item["targets"] for item in batch])
-        return {"inputs": inputs, "targets": targets}
-
-    def __getitem__(self, idx):
-        """Get item from the dataset"""
-        all_tokens = []
-        for tokens in self.tokens_per_file.values():
-            all_tokens.extend(tokens)
-
-        chunk = all_tokens[idx : idx + self.block_size + 1]
-        if len(chunk) < self.block_size + 1:
-            chunk = chunk + [0] * (self.block_size + 1 - len(chunk))
-
-        x = torch.tensor(chunk[:-1], dtype=torch.long)
-        y = torch.tensor(chunk[1:], dtype=torch.long)
-
-        return {"inputs": x, "targets": y}
-
-
-def create_curriculum_dataloaders(
-    file_patterns: List[str],
-    block_size: int,
-    batch_size: int,
-    rank: Optional[int],
-    world_size: Optional[int],
-    tokenizer=None,
-    num_workers: int = 4,
-    prefetch_factor: int = 2,
-    active_files: Optional[List[str]] = None,
-):
-    """Create dataloaders with curriculum learning support"""
-    if tokenizer is None:
-        tokenizer = tiktoken.get_encoding("gpt2")
-
-    dataset = CurriculumDataset(
-        file_patterns=file_patterns,
-        block_size=block_size,
-        tokenizer=tokenizer,
-        active_files=active_files,
-    )
-
-    # Create train/val datasets
-    train_dataset, val_dataset = dataset.create_train_val_datasets()
-
-    # Create samplers for distributed training
-    train_sampler = val_sampler = None
-    if world_size is not None and world_size > 1:
-        train_sampler = DistributedSampler(
-            train_dataset,
-            num_replicas=world_size,
-            rank=rank,
-            shuffle=True,
-            drop_last=True,
-            seed=42,
-        )
-        val_sampler = DistributedSampler(
-            val_dataset,
-            num_replicas=world_size,
-            rank=rank,
-            shuffle=False,
-            seed=42,
-        )
-
-    # Create dataloaders
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        sampler=train_sampler,
-        shuffle=train_sampler is None,
-        num_workers=num_workers,
-        pin_memory=True,
-        prefetch_factor=prefetch_factor,
-        persistent_workers=True,
-        collate_fn=CurriculumDataset.collate_fn,
-        drop_last=True,
-        worker_init_fn=lambda worker_id: torch.manual_seed(42 + worker_id),
-    )
-
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=batch_size,
-        sampler=val_sampler,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=True,
-        prefetch_factor=prefetch_factor,
-        persistent_workers=True,
-        collate_fn=CurriculumDataset.collate_fn,
-        worker_init_fn=lambda worker_id: torch.manual_seed(42 + worker_id),
-    )
-
-    return train_loader, val_loader, train_sampler, val_sampler, dataset
-
-
-class MultiHeadDataset(Dataset):
-    def __init__(
-        self,
-        files_pattern: str,
-        block_size: int,
-        tokenizer,
-        strategies: Dict[str, "ModelingStrategy"],
-    ):
-        super().__init__()
-        self.block_size = block_size
-        self.tokenizer = tokenizer
-        self.strategies = strategies
-        self.examples = []
-        self.tokens = []
-
-        self.is_mixed_strategy = (
-            len(strategies) == 2
-            and isinstance(strategies["primary"], NextTokenStrategy)
-            and isinstance(strategies["auxiliary"], InstructionFollowingStrategy)
-        )
-
-        if self.is_mixed_strategy:
-            self._load_mixed_data(files_pattern)
-        elif any(
-            isinstance(s, InstructionFollowingStrategy) for s in strategies.values()
-        ):
-            self._load_instruction_data(files_pattern)
-        else:
-            self._load_text_data(files_pattern)
-
-    def _load_mixed_data(self, files_pattern: str):
-        """Load data for mixed strategy training"""
-        print("Using mixed strategy loading")
-        for file_path in glob(files_pattern):
-            print(file_path)
-            if not file_path.endswith(".jsonl"):
-                continue
-
-            with open(file_path, "r", encoding="utf-8") as f:
-                for line in f:
-                    example = json.loads(line.strip())
-                    input_tokens = self.tokenizer.encode(example["input"])
-                    self.examples.append(
-                        {
-                            "input_tokens": input_tokens,
-                            "instruction": example["instruction"],
-                            "response": example.get("thought", example.get("response")),
-                        }
-                    )
-
-    def _load_text_data(self, files_pattern: str):
-        for file_path in glob(files_pattern):
-            with open(file_path, "r", encoding="utf-8") as f:
-                text = f.read()
-                self.tokens.extend(self.tokenizer.encode(text))
-
-    def _load_instruction_data(self, files_pattern: str):
-        for file_path in glob(files_pattern):
-            with open(file_path, "r", encoding="utf-8-sig") as f:
-                for line in f:
-                    example = json.loads(line.strip())
-                    if isinstance(example, dict):
-                        self.examples.append(example)
-
-    def __len__(self):
-        if self.examples:
-            return len(self.examples)
-        return max(0, len(self.tokens) - self.block_size)
-
-    def __getitem__(self, idx):
-        if self.is_mixed_strategy:
-            return self._get_mixed_item(idx)
-        elif any(
-            isinstance(s, InstructionFollowingStrategy)
-            for s in self.strategies.values()
-        ):
-            return self._get_instruction_item(idx)
-        return self._get_text_item(idx)
-
-    def _get_mixed_item(self, idx):
-        example = self.examples[idx]
-        input_tokens = example["input_tokens"]
-
-        # Next token prediction for primary path
-        max_start_idx = max(0, len(input_tokens) - (self.block_size + 1))
-        start_idx = random.randint(0, max_start_idx) if max_start_idx > 0 else 0
-        chunk = input_tokens[start_idx : start_idx + self.block_size + 1]
-
-        # Pad if necessary
-        if len(chunk) < self.block_size + 1:
-            chunk = chunk + [0] * (self.block_size + 1 - len(chunk))
-
-        # Format instruction
-        input_text = self.tokenizer.decode(input_tokens)
-        instruction = f"{example['instruction']}\n\nInput: {input_text}"
-
-        strategy = self.strategies["auxiliary"]
-        max_length = strategy.max_length
-        instruction_tokens = strategy.tokenizer.encode(instruction)
-        response_tokens = strategy.tokenizer.encode(example["response"])
-
-        # Truncate if needed
-        max_seq_length = max_length - 3  # Account for special tokens
-        if len(instruction_tokens) > max_seq_length:
-            instruction_tokens = instruction_tokens[:max_seq_length]
-        if len(response_tokens) > max_seq_length:
-            response_tokens = response_tokens[:max_seq_length]
-
-        return {
-            "primary": {
-                "input": torch.tensor(chunk[:-1], dtype=torch.long),
-                "target": torch.tensor(chunk[1:], dtype=torch.long),
-            },
-            "auxiliary": {
-                "instruction": strategy.tokenizer.decode(instruction_tokens),
-                "response": strategy.tokenizer.decode(response_tokens),
-            },
-        }
-
-    def _get_text_item(self, idx):
-        chunk = self.tokens[idx : idx + self.block_size + 1]
-        x = torch.tensor(chunk[:-1])
-        y = torch.tensor(chunk[1:])
-        return {"tokens": x, "targets": {name: y for name in self.strategies.keys()}}
-
-    def _get_instruction_item(self, idx):
-        example = self.examples[idx]
-        return {
-            "instruction": example,
-            "targets": {name: example for name in self.strategies.keys()},
-        }

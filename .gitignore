@@ -16,3 +16,4 @@ venv/
 wandb/
 books/
 text_files/
+training_data/

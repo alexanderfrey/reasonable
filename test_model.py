@@ -16,7 +16,7 @@ class AlpacaFormatter:
         response_token: str = "[/INST]",
         end_token: str = "</s>",
         max_length: int = 1024,
-        pad_token_id: int = 0,
+        pad_token_id: int = 50256,
     ):
         self.instruction_token = instruction_token
         self.response_token = response_token
@@ -45,6 +45,8 @@ class AlpacaFormatter:
 
         if response:
             formatted += f"\n### Response:\n{response}"
+        else:
+            formatted += f"\n### Response:\n"
 
         formatted += f"{self.response_token}{self.end_token}"
         return formatted
@@ -212,8 +214,8 @@ def generate_sequence(
         # Default simple instruction task if none provided
         if "### Instruction:" not in prompt:
             prompt = formatter.format_prompt(
-                instruction="Complete the following creative writing prompt",
-                input_context=prompt,
+                instruction="""As a member of an international diplomatic think tank, you are tasked with advising the leaders of NATO on the strategic direction for Ukraine amidst growing tensions with Russia. The recent visit by U.S. Defense Secretary Pete Hegseth to NATO has prompted a reevaluation of Ukraine's future. You must navigate three key decision points: NATO membership for Ukraine, the potential for a negotiated settlement, and the structure of a peacekeeping force. Consider the interests and constraints of stakeholders including Ukraine, Russia, NATO members, and the United States.""",
+                input_context="""context": "After Russia's 2022 invasion of Ukraine, NATO and its allies have been supporting Ukraine with over $126 billion in military assistance. However, the U.S. now suggests that NATO membership for Ukraine is unrealistic and advocates for a negotiated settlement with Russia. Defense Secretary Hegseth proposes a peacekeeping force without U.S. troops and without Article Five protections. The U.K. recently chaired the Ukraine Defense Contact Group, a role previously held by the U.S.""",
             )
 
     # Tokenize prompt with tiktoken
@@ -460,7 +462,7 @@ def main():
     args = parser.parse_args()
 
     # Load model with inferred config
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = "cpu"  # "cuda" if torch.cuda.is_available() else "cpu"
     print(f"\n{Fore.GREEN}Loading model on {device}...{Style.RESET_ALL}")
     model = load_model(args.checkpoint)
     model.to(device)
