@@ -141,6 +141,7 @@ class SingleHeadTrainer:
         scaler,
         device,
         epoch,
+        block_size,
         tokenizer=None,
         sample_prompts=None,
         gen_every_n_steps=None,
@@ -161,7 +162,6 @@ class SingleHeadTrainer:
         num_steps = 0
 
         # Create persistent streams for data transfer and computation
-        data_stream = torch.cuda.Stream()
         compute_stream = torch.cuda.default_stream()
 
         # Track final metrics
@@ -244,6 +244,7 @@ class SingleHeadTrainer:
                             ),
                             sample_idx=0,
                             num_aux_heads=num_aux_heads,
+                            block_size=block_size,
                         )
                 model.train()
 
@@ -577,8 +578,21 @@ class SingleHeadTrainer:
         future_targets=None,
         sample_idx=None,
         num_aux_heads=0,
+        block_size=512,  # Added block_size parameter with default value
     ):
-        """Log debug information for next token prediction mode with clear token alignment"""
+        """Log debug information for next token prediction mode with clear token alignment
+
+        Args:
+            model: The model to use for prediction
+            tokenizer: The tokenizer for encoding/decoding
+            input_tokens: List of input token ids
+            target_tokens: List of target token ids
+            strategy: The prediction strategy
+            future_targets: Optional future target tokens for auxiliary heads
+            sample_idx: Optional sample index
+            num_aux_heads: Number of auxiliary prediction heads (default: 0)
+            block_size: Maximum sequence length for the model (default: 512)
+        """
         print("\nNext Token Prediction Mode Debug:")
         print("-" * 40)
 
@@ -599,14 +613,14 @@ class SingleHeadTrainer:
         print(f"Last input token: '{tokenizer.decode([last_input_token])}'")
         print(f"Expected next token: '{tokenizer.decode([target_token])}'")
 
-        # Generate model's prediction
         try:
             with torch.no_grad():
                 input_tensor = torch.tensor(
                     [input_tokens], device=next(model.parameters()).device
                 )
-                outputs = model(input_tensor)
 
+                # Generate model's initial prediction
+                outputs = model(input_tensor)
                 if isinstance(outputs, tuple):
                     logits, _ = outputs
                 else:
@@ -627,11 +641,59 @@ class SingleHeadTrainer:
                     if token == target_token:
                         print("  ^ This is the correct token!")
 
-                full_sequence = tokenizer.decode(input_tokens)
-                # print(f"\nFull sequence verification: '{full_sequence}'")
+                # Generate next 50 tokens
+                print("\nGenerating next 50 tokens:")
+                print("-" * 40)
+
+                # Start with a truncated version of input tokens if needed
+                tokens_to_generate = 50
+                max_context = (
+                    block_size - tokens_to_generate
+                )  # Reserve space for generation
+                generated_tokens = input_tokens[-max_context:].copy()
+                generated_text = []
+
+                for _ in range(tokens_to_generate):
+                    # Get model prediction for next token
+                    current_input = torch.tensor(
+                        [generated_tokens], device=next(model.parameters()).device
+                    )
+                    with torch.no_grad():
+                        outputs = model(current_input)
+                        if isinstance(outputs, tuple):
+                            logits, _ = outputs
+                        else:
+                            logits = outputs
+
+                        next_token_logits = logits[0, -1, :]
+
+                        # Apply temperature sampling
+                        temperature = 0.7  # Adjustable temperature parameter
+                        scaled_logits = next_token_logits / temperature
+                        probs = F.softmax(scaled_logits, dim=-1)
+
+                        # Sample next token
+                        next_token = torch.multinomial(probs, num_samples=1).item()
+
+                        # Decode and store the token
+                        token_text = tokenizer.decode([next_token])
+                        generated_text.append(token_text)
+
+                        # Add token to generated sequence
+                        generated_tokens.append(next_token)
+
+                        # Truncate sequence if needed
+                        if len(generated_tokens) >= max_context:
+                            generated_tokens = generated_tokens[-max_context:]
+
+                # Print generated sequence as a single flowing text
+                print("\nGenerated sequence:")
+                print("".join(generated_text))
 
         except Exception as e:
             print(f"Generation failed: {str(e)}")
+            print(f"Current sequence length: {len(generated_tokens)}")
+            print(f"Model's maximum sequence length: {block_size}")
 
         # Show auxiliary head predictions if available
         # if num_aux_heads > 0 and future_targets:
@@ -647,15 +709,20 @@ class SingleHeadTrainer:
         #             print(f"Target: '{tokenizer.decode([future_target[0]])}'")
 
         #             # Show the sequence of predictions
-        #             print(f"Sequence: Current → {' → '.join(tokenizer.decode([t]) for t in [target_token] + future_targets[:i][0].cpu().tolist())}")
+        #             print(
+        #                 f"Sequence: Current → {' → '.join(tokenizer.decode([t]) for t in [target_token] + future_targets[:i][0].cpu().tolist())}"
+        #             )
 
         #         except Exception as e:
         #             print(f"Error processing auxiliary head {i}: {str(e)}")
 
         print("\nPrediction Statistics:")
         print("-" * 40)
-        print(f"Input sequence length: {len(input_tokens)}")
+        print(f"Original input length: {len(input_tokens)}")
+        print(f"Working sequence length: {len(generated_tokens)}")
         print(f"Number of auxiliary heads: {num_aux_heads}")
+        print(f"Number of generated tokens: {len(generated_text)}")
+        print(f"Block size: {block_size}")
 
     def _parse_instruction_format(self, input_text):
         """Parse instruction format from input text"""

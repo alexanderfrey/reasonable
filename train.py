@@ -18,16 +18,36 @@ from torch.optim.lr_scheduler import LambdaLR
 
 from model import GPTConfig, GPT, MoEGPT
 from strategies import (
-    SpanMaskingStrategy,
+    TeacherForcingStrategy,
     InstructionFollowingStrategy,
     NextTokenStrategy,
-    MixedStrategy,
 )
 from trainer import SingleHeadTrainer
 from data_utils import create_dataloaders
 
-from clearml import Task
-task = Task.init(project_name="reasonable", task_name="misty_bird")
+# from clearml import Task
+
+# task = Task.init(project_name="reasonable", task_name="misty_bird")
+
+def interpolate_pos_embeddings(old_embeddings, new_length):
+    """
+    Interpolate position embeddings from one length to another.
+    """
+    old_length = old_embeddings.shape[0]
+    hidden_dim = old_embeddings.shape[1]
+    
+    # Create indices for interpolation
+    old_positions = torch.arange(0, old_length).float()
+    new_positions = torch.arange(0, new_length).float() * (old_length - 1) / (new_length - 1)
+    
+    # Interpolate
+    if old_length != new_length:
+        new_embeddings = torch.zeros(new_length, hidden_dim)
+        for dim in range(hidden_dim):
+            old_embedding = old_embeddings[:, dim]
+            new_embeddings[:, dim] = torch.interp(new_positions, old_positions, old_embedding)
+        return new_embeddings
+    return old_embeddings
 
 def visualize_model_architecture(model, output_path="model_architecture"):
     """
@@ -145,19 +165,22 @@ def load_checkpoint(
     """Modified to handle pretrain -> finetune transition"""
     try:
         checkpoint = torch.load(path, map_location="cpu")
-
-        # Load only model weights, skip optimizer state when transitioning
+        state_dict = checkpoint["model_state_dict"]
+        
+        # Remove position embedding from state dict since we're not using it anymore
+        if "position_embedding.weight" in state_dict:
+            del state_dict["position_embedding.weight"]
+        
         if dist.is_initialized():
             model_to_load = model.module if hasattr(model, "module") else model
         else:
             model_to_load = model
-
-        # Load model state dict
-        model_to_load.load_state_dict(checkpoint["model_state_dict"])
-
-        # Don't load optimizer state when transitioning between modes
+            
+        # Load the modified state dict with strict=False to ignore missing position embedding
+        model_to_load.load_state_dict(state_dict, strict=False)
+        
+        # Load optimizer state
         if optimizer is not None and "optimizer_state_dict" in checkpoint:
-
             try:
                 optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
                 if device != "cpu":
@@ -169,7 +192,20 @@ def load_checkpoint(
                 print(f"Warning: Could not load optimizer state: {e}")
                 print("Starting with fresh optimizer state")
 
-        # Set model to training mode
+        # Load scheduler state
+        if scheduler is not None and "scheduler_state_dict" in checkpoint:
+            try:
+                scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+            except ValueError as e:
+                print(f"Warning: Could not load scheduler state: {e}")
+
+        # Load scaler state
+        if scaler is not None and "scaler_state_dict" in checkpoint:
+            try:
+                scaler.load_state_dict(checkpoint["scaler_state_dict"])
+            except ValueError as e:
+                print(f"Warning: Could not load scaler state: {e}")
+
         model.train()
 
         return {
@@ -183,6 +219,7 @@ def load_checkpoint(
     except Exception as e:
         print(f"Error loading checkpoint: {str(e)}")
         raise
+
 
 
 def print_parameter_summary(param_dict):
@@ -234,8 +271,7 @@ def count_parameters(model):
 
     # Count embedding parameters (accounting for weight tying)
     token_emb_params = model.token_embedding.weight.numel()
-    pos_emb_params = model.position_embedding.weight.numel()
-    total_emb_params = token_emb_params + pos_emb_params
+    total_emb_params = token_emb_params  # Removed position embedding
 
     # Initialize counters for components
     attention_params = 0
@@ -303,7 +339,7 @@ def count_parameters(model):
 
     # Calculate total parameters (accounting for weight tying)
     total_params = (
-        total_emb_params  # Embeddings
+        total_emb_params  # Embeddings (now just token embeddings)
         + attention_params  # Attention layers
         + ff_params  # Standard FFN layers
         + moe_params  # MoE layers (including routers and experts)
@@ -327,8 +363,7 @@ def count_parameters(model):
         "embeddings": {
             "total": total_emb_params,
             "token": token_emb_params,
-            "position": pos_emb_params,
-        },
+        },  # Removed position embedding from dict
         "attention": attention_params,
         "feed_forward": {
             "standard_ffn": ff_params,
@@ -358,7 +393,6 @@ def count_parameters(model):
             "moe_param_percent": (moe_params / total_params) * 100,
         },
     }
-
 
 def setup_distributed():
     """Initialize distributed training"""
@@ -658,7 +692,7 @@ if __name__ == "__main__":
                 "Warning: Could not check special tokens, using default mask token ID"
             )
 
-        strategy = NextTokenStrategy(tokenizer)
+        strategy = TeacherForcingStrategy(tokenizer)
     else:
         strategy = InstructionFollowingStrategy(
             tokenizer=tokenizer,
@@ -725,7 +759,6 @@ if __name__ == "__main__":
     else:
         dataset_config = args.train_data
 
-
     train_loader, val_loader, train_sampler, val_sampler = create_dataloaders(
         files_pattern=dataset_config,
         block_size=args.block_size,
@@ -736,9 +769,8 @@ if __name__ == "__main__":
         tokenizer=tokenizer,
         n_aux_heads=args.n_aux_heads,
         prefetch_factor=args.prefetch_factor,
-        num_workers=args.num_workers
+        num_workers=args.num_workers,
     )
-
 
     optimizer, scheduler = configure_optimizer(model, args, train_loader)
     scaler = GradScaler(enabled=True)
@@ -749,8 +781,14 @@ if __name__ == "__main__":
 
     if args.load_checkpoint is not None:
         checkpoint_info = load_checkpoint(
-            args.load_checkpoint, model, optimizer, scheduler, scaler, device
+            path=args.load_checkpoint,
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            scaler=scaler,
+            device=device,
         )
+
         start_epoch = checkpoint_info["epoch"] + 1
         trainer.set_global_step(checkpoint_info["global_step"])
 
@@ -776,6 +814,7 @@ if __name__ == "__main__":
             scaler=scaler,
             device=device,
             epoch=epoch,
+            block_size=args.block_size,
             tokenizer=tokenizer,
             sample_prompts=args.sample_prompts,
             gen_every_n_steps=args.gen_every_n_steps,

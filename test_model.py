@@ -4,6 +4,7 @@ import argparse
 from typing import List, Tuple, Optional, Any
 from torch.nn import functional as F
 import tiktoken
+from text_normalizer import TextNormalizer
 
 # Import your model architecture
 from model import GPTConfig, MoEGPT, GPT  # Assuming model.py contains your model code
@@ -114,7 +115,7 @@ def get_config_from_checkpoint(checkpoint_path: str) -> Tuple[GPTConfig, int]:
         n_embd=n_embd,
         n_aux_heads=n_aux_heads,  # Add number of auxiliary heads
         bias=has_bias,
-        block_size=1024,  # You might want to make this configurable
+        block_size=512,  # You might want to make this configurable
     )
 
     return config, n_experts
@@ -161,93 +162,127 @@ def load_model(checkpoint_path: str, is_moe: bool = False) -> MoEGPT:
 def get_next_token_probs(
     model: GPT,
     input_ids: torch.Tensor,
+    tokenizer,  # Add tokenizer parameter
     temperature: float = 1.0,
     top_k: Optional[int] = None,
     top_p: Optional[float] = None,
 ) -> torch.Tensor:
-    """Get probability distribution over next tokens."""
+    """Get probability distribution over next tokens with decoded token display."""
     with torch.no_grad():
-        logits, _ = model(input_ids)
-        logits = logits[:, -1, :] / temperature
+        # Handle both cases where model returns tuple or single tensor
+        outputs = model(input_ids)
+        if isinstance(outputs, tuple):
+            logits = outputs[0]  # Take main logits only, ignore auxiliary
+        else:
+            logits = outputs
 
-        # Filter by top-k if specified
+        # Get logits for the last position only
+        logits = logits[:, -1, :]
+
+        # Store original logits for debugging
+        original_probs = F.softmax(logits, dim=-1)
+        top_original, top_orig_idx = torch.topk(original_probs, k=5)
+        print("\nTop 5 tokens before processing:")
+        for prob, idx in zip(top_original[0], top_orig_idx[0]):
+            token_text = tokenizer.decode([idx.item()])
+            print(f"Token {idx.item()} ('{token_text}'): {prob.item():.4f}")
+
+        # Apply temperature
+        if temperature != 0:
+            logits = logits / temperature
+        else:
+            # Handle greedy decoding
+            return torch.zeros_like(logits).scatter_(
+                -1, torch.argmax(logits, dim=-1, keepdim=True), 1.0
+            )
+
+        # Apply top-k if specified
         if top_k is not None:
-            v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-            logits[logits < v[:, [-1]]] = float("-inf")
+            values, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+            min_values = values[:, -1].unsqueeze(-1).expand_as(logits)
+            logits = torch.where(
+                logits < min_values, torch.full_like(logits, float("-inf")), logits
+            )
 
-        # Filter by top-p if specified
-        if top_p is not None:
+        # Apply top-p if specified
+        if top_p is not None and top_p < 1.0:
             sorted_logits, sorted_indices = torch.sort(logits, descending=True)
             cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+
+            # Remove tokens with cumulative probability above the threshold
             sorted_indices_to_remove = cumulative_probs > top_p
             sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[
                 ..., :-1
             ].clone()
             sorted_indices_to_remove[..., 0] = 0
-            indices_to_remove = torch.zeros_like(logits, dtype=torch.bool).scatter_(
-                dim=-1, index=sorted_indices, src=sorted_indices_to_remove
+
+            # Scatter sorted tensors to original indexing
+            indices_to_remove = sorted_indices_to_remove.scatter(
+                -1, sorted_indices, sorted_indices_to_remove
             )
             logits[indices_to_remove] = float("-inf")
 
+        # Convert to probabilities
         probs = F.softmax(logits, dim=-1)
+
+        # Debug: print top tokens after processing
+        top_probs, top_indices = torch.topk(probs, k=5)
+        print("\nTop 5 tokens after processing:")
+        for prob, idx in zip(top_probs[0], top_indices[0]):
+            token_text = tokenizer.decode([idx.item()])
+            print(f"Token {idx.item()} ('{token_text}'): {prob.item():.4f}")
+
         return probs
 
 
 def generate_sequence(
-    model: Any,
+    model: GPT,
     tokenizer,
     prompt: str,
-    formatter: Optional[AlpacaFormatter] = None,
-    instruction_mode: bool = False,
     max_new_tokens: int = 100,
     temperature: float = 0.8,
-    top_k: Optional[int] = 50,
-    top_p: Optional[float] = 0.9,
+    top_k: Optional[int] = None,
+    top_p: Optional[float] = None,
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
 ) -> str:
-    """Generate text sequence from prompt with optional instruction formatting."""
+    """Generate text sequence with improved debugging and token decoding."""
     model.to(device)
     model.eval()
 
-    # Apply instruction formatting if requested
-    if instruction_mode and formatter:
-        # Default simple instruction task if none provided
-        if "### Instruction:" not in prompt:
-            prompt = formatter.format_prompt(
-                instruction="""As a member of an international diplomatic think tank, you are tasked with advising the leaders of NATO on the strategic direction for Ukraine amidst growing tensions with Russia. The recent visit by U.S. Defense Secretary Pete Hegseth to NATO has prompted a reevaluation of Ukraine's future. You must navigate three key decision points: NATO membership for Ukraine, the potential for a negotiated settlement, and the structure of a peacekeeping force. Consider the interests and constraints of stakeholders including Ukraine, Russia, NATO members, and the United States.""",
-                input_context="""context": "After Russia's 2022 invasion of Ukraine, NATO and its allies have been supporting Ukraine with over $126 billion in military assistance. However, the U.S. now suggests that NATO membership for Ukraine is unrealistic and advocates for a negotiated settlement with Russia. Defense Secretary Hegseth proposes a peacekeeping force without U.S. troops and without Article Five protections. The U.K. recently chaired the Ukraine Defense Contact Group, a role previously held by the U.S.""",
-            )
-
-    # Tokenize prompt with tiktoken
+    # Tokenize prompt
     tokens = tokenizer.encode(prompt)
-    input_ids = torch.tensor(tokens).unsqueeze(0).to(device)  # [1, seq_len]
+    input_ids = torch.tensor(tokens).unsqueeze(0).to(device)
 
-    # Generate tokens
+    print(f"\nInitial prompt: {prompt}")
+    print(f"Initial tokens: {[(t, tokenizer.decode([t])) for t in tokens]}")
+
     generated_tokens = []
-    for _ in range(max_new_tokens):
+    for i in range(max_new_tokens):
         # Get next token probabilities
         next_token_probs = get_next_token_probs(
-            model, input_ids, temperature, top_k, top_p
+            model, input_ids, tokenizer, temperature, top_k, top_p
         )
 
-        # Sample next token and reshape to match input_ids dimensions [1, 1]
-        next_token = torch.multinomial(next_token_probs, num_samples=1).view(1, 1)
+        # Sample next token
+        next_token = torch.multinomial(next_token_probs, num_samples=1)
 
-        # Check for end token if using instruction format
-        if (
-            instruction_mode
-            and formatter
-            and next_token.item() == tokenizer.encode(formatter.end_token)[0]
-        ):
-            break
+        # Debug: print selected token
+        token_prob = next_token_probs[0, next_token.item()].item()
+        token_text = tokenizer.decode([next_token.item()])
+        print(
+            f"\nStep {i+1} - Selected token {next_token.item()} ('{token_text}') with probability {token_prob:.4f}"
+        )
 
-        # Append to generated sequence
+        # Append to sequence
         generated_tokens.append(next_token.item())
         input_ids = torch.cat([input_ids, next_token], dim=1)
 
-    # Decode generated tokens with tiktoken
-    generated_text = tokenizer.decode(generated_tokens)
-    return generated_text
+        # Print current generation every few tokens
+        if (i + 1) % 10 == 0:
+            print(f"\nCurrent generation ({i+1} tokens):")
+            print(tokenizer.decode(generated_tokens))
+
+    return tokenizer.decode(generated_tokens)
 
 
 def analyze_expert_usage_detailed(
@@ -462,7 +497,7 @@ def main():
     args = parser.parse_args()
 
     # Load model with inferred config
-    device = "cpu"  # "cuda" if torch.cuda.is_available() else "cpu"
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"\n{Fore.GREEN}Loading model on {device}...{Style.RESET_ALL}")
     model = load_model(args.checkpoint)
     model.to(device)
@@ -490,12 +525,15 @@ def main():
 
     # Generate text
     print(f"\n{Fore.CYAN}Generating text...{Style.RESET_ALL}")
+    normalizer = TextNormalizer()
+
+    cleaned_text = normalizer.clean_text(args.prompt)
     generated_text = generate_sequence(
         model,
         tokenizer,
-        args.prompt,
-        formatter=formatter,
-        instruction_mode=args.instruction_mode,
+        cleaned_text,
+        # formatter=formatter,
+        # instruction_mode=args.instruction_mode,
         max_new_tokens=args.max_tokens,
         temperature=args.temperature,
         top_k=args.top_k,

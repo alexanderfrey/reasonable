@@ -36,7 +36,6 @@ class SingleHeadDataset(Dataset):
         self.examples = []
         self.chunks_per_file = {}
 
-
         if isinstance(strategy, InstructionFollowingStrategy):
             self._load_instruction_data(files_pattern)
         else:
@@ -197,7 +196,7 @@ class SingleHeadDataset(Dataset):
             elif "instruction" in item and "output" in item:
                 return self.strategy.format_instruction(
                     instruction=item["instruction"],
-                    input_context=item["input"],
+                    # input_context=item["input"],
                     response=item["output"],
                 )
             elif "text" in item:
@@ -261,7 +260,7 @@ class SingleHeadDataset(Dataset):
 
                             if not formatted_text.strip():
                                 continue
-                            
+
                             # print(formatted_text)
                             tokens = self.tokenizer.encode(formatted_text)
                             total_tokens += len(tokens)
@@ -337,13 +336,13 @@ class SingleHeadDataset(Dataset):
     def _load_text_data(self, files_pattern: str):
         """Load and clean data, then split into chunks with streaming approach"""
         print("Loading and cleaning text data for next-token prediction")
-        
+
         # Initialize text normalizer
         normalizer = TextNormalizer()
         self.chunks_per_file = defaultdict(list)
         chunk_size = self.block_size + self.max_future_tokens
         stride = self.block_size // 2
-        
+
         def process_file_chunks(tokens, file_path):
             chunks = []
             for start in range(0, len(tokens) - chunk_size + 1, stride):
@@ -351,7 +350,7 @@ class SingleHeadDataset(Dataset):
                 if len(chunk) == chunk_size:
                     chunks.append(chunk)
             return chunks
-            
+
         # Rest of the function remains the same, but add cleaning step
         for file_path in glob(files_pattern):
             try:
@@ -359,7 +358,7 @@ class SingleHeadDataset(Dataset):
                     buffer_size = 1024 * 1024  # 1MB buffer
                     tokens = []
                     text_buffer = ""
-                    
+
                     while True:
                         text = f.read(buffer_size)
                         if not text:
@@ -369,36 +368,36 @@ class SingleHeadDataset(Dataset):
                                 new_tokens = self.tokenizer.encode(cleaned_text)
                                 tokens.extend(new_tokens)
                             break
-                        
+
                         text_buffer += text
-                        
+
                         # Only process complete lines/paragraphs
                         if len(text_buffer) >= buffer_size:
                             # Find last newline to avoid splitting mid-paragraph
-                            split_pos = text_buffer.rfind('\n')
+                            split_pos = text_buffer.rfind("\n")
                             if split_pos == -1:
                                 split_pos = len(text_buffer)
-                                
+
                             # Clean and process the complete portion
                             to_process = text_buffer[:split_pos]
                             cleaned_text = normalizer.clean_text(to_process)
                             new_tokens = self.tokenizer.encode(cleaned_text)
                             tokens.extend(new_tokens)
-                            
+
                             # Keep remainder for next iteration
                             text_buffer = text_buffer[split_pos:]
-                        
+
                         # Process chunks when we have enough tokens
                         if len(tokens) >= chunk_size * 100:
                             new_chunks = process_file_chunks(tokens, file_path)
                             self.chunks_per_file[file_path].extend(new_chunks)
                             tokens = tokens[-chunk_size:]
-                    
+
                     # Process any remaining tokens
                     if tokens:
                         new_chunks = process_file_chunks(tokens, file_path)
                         self.chunks_per_file[file_path].extend(new_chunks)
-                        
+
             except Exception as e:
                 print(f"Error loading file {file_path}: {e}")
                 continue
@@ -432,7 +431,6 @@ class SingleHeadDataset(Dataset):
                 self.tokenizer,
                 strategy=self.strategy,
                 n_aux_heads=self.n_aux_heads,
-
             ),
             SingleHeadValDataset(
                 val_chunks,
@@ -458,7 +456,7 @@ class SingleHeadTrainDataset(Dataset):
 
     def __getitem__(self, idx):
         chunk = self.data[idx]
-        
+
         # Validate chunk size
         required_length = self.block_size + self.max_future_tokens
         if len(chunk) < required_length:
@@ -466,18 +464,18 @@ class SingleHeadTrainDataset(Dataset):
                 f"Chunk {idx} is too small: {len(chunk)} < {required_length}. "
                 f"Need {self.block_size} tokens for input + {self.max_future_tokens} tokens for predictions"
             )
-        
+
         # Input sequence (tokens 0 to block_size-1)
-        inputs = chunk[:self.block_size]
+        inputs = chunk[: self.block_size]
         x = torch.tensor(inputs, dtype=torch.long)
-        
+
         # Targets are the shifted sequence (tokens 1 to block_size)
-        targets = chunk[1:self.block_size + 1]
+        targets = chunk[1 : self.block_size + 1]
         targets = torch.tensor(targets, dtype=torch.long)
 
         # print(f"Last input token: {self.tokenizer.decode([inputs[-1]])}")
         # print(f"First target token: {self.tokenizer.decode([targets[0]])}")
-        
+
         # Future targets for auxiliary heads
         future_targets = []
         for i in range(1, self.n_aux_heads + 1):
@@ -494,12 +492,9 @@ class SingleHeadTrainDataset(Dataset):
                 padding = [-100] * pad_length
                 future_target = torch.tensor(valid_tokens + padding, dtype=torch.long)
                 future_targets.append(future_target)
-        
-        return {
-            "inputs": x,
-            "targets": targets,
-            "future_targets": future_targets
-        }
+
+        return {"inputs": x, "targets": targets, "future_targets": future_targets}
+
 
 class SingleHeadValDataset(SingleHeadTrainDataset):
     pass
@@ -628,5 +623,3 @@ def create_dataloaders(
     )
 
     return train_loader, val_loader, train_sampler, val_sampler
-
-

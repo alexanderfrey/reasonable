@@ -1095,10 +1095,10 @@ def main(
 
     try:
         # Calculate date range for news
-        end_date = (datetime.now() - timedelta(days=620)).strftime(
+        end_date = (datetime.now() - timedelta(days=720)).strftime(
             "%Y-%m-%d"
         )  # datetime.now().strftime("%Y-%m-%d")
-        start_date = (datetime.now() - timedelta(days=720)).strftime("%Y-%m-%d")
+        start_date = (datetime.now() - timedelta(days=820)).strftime("%Y-%m-%d")
 
         # Load news articles
         if verbose:

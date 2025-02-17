@@ -190,6 +190,148 @@ class NextTokenStrategy(ModelingStrategy):
         
         return selected_indices
 
+class TeacherForcingStrategy(NextTokenStrategy):
+    def __init__(self, tokenizer=None, teacher_forcing_ratio=0.4, generate_length=8):
+        super().__init__(tokenizer=tokenizer)
+        self.teacher_forcing_ratio = teacher_forcing_ratio
+        self.generate_length = generate_length
+
+    def compute_all_losses(self, main_logits, aux_outputs, targets, future_targets, 
+                          model=None, input_ids=None, attention_mask=None, **kwargs):
+        """
+        Compute losses with teacher forcing, respecting auxiliary head offsets.
+        
+        Args:
+            main_logits: [batch_size, seq_len, vocab_size]
+            aux_outputs: List of [batch_size, seq_len, vocab_size] tensors
+            targets: [batch_size, seq_len]
+            future_targets: List of [batch_size, seq_len] tensors, each shifted by one more position
+            model: The language model
+            input_ids: Original input sequence
+            attention_mask: Optional attention mask
+        """
+        # Standard next token prediction losses
+        main_loss, aux_losses = super().compute_all_losses(
+            main_logits, aux_outputs, targets, future_targets
+        )
+        
+        # Skip teacher forcing if no model provided or during validation
+        if model is None or input_ids is None or not aux_outputs:
+            return main_loss, aux_losses
+            
+        # Randomly apply teacher forcing
+        if torch.rand(1).item() > self.teacher_forcing_ratio:
+            return main_loss, aux_losses
+            
+        batch_size, seq_len = input_ids.size()
+        n_aux_heads = len(aux_outputs)
+        
+        # Context window needs to account for the maximum future prediction
+        context_window = seq_len - self.generate_length - n_aux_heads
+        
+        # Use first part as context
+        context_ids = input_ids[:, :context_window]
+        context_mask = attention_mask[:, :context_window] if attention_mask is not None else None
+        
+        # Generate continuation
+        generated_sequences = self._generate_sequences(model, context_ids, context_mask)
+        
+        # Compute losses on generated sequence
+        gen_main_loss, gen_aux_losses = self._compute_generation_losses(
+            model,
+            generated_sequences,
+            targets[:, context_window:context_window + self.generate_length],
+            [ft[:, context_window:context_window + self.generate_length] for ft in future_targets],
+            attention_mask=attention_mask[:, context_window:context_window + self.generate_length] 
+                if attention_mask is not None else None
+        )
+        
+        # Combine losses
+        combined_main_loss = main_loss + 0.5 * gen_main_loss
+        combined_aux_losses = [
+            aux_loss + 0.5 * gen_aux_loss 
+            for aux_loss, gen_aux_loss in zip(aux_losses, gen_aux_losses)
+        ]
+        
+        return combined_main_loss, combined_aux_losses
+
+    def _compute_generation_losses(self, model, generated_sequences, targets, future_targets, attention_mask=None):
+        """
+        Compute losses on generated sequences for all heads.
+        
+        Args:
+            model: The language model
+            generated_sequences: Generated token sequences
+            targets: Main target sequence
+            future_targets: List of future target sequences for auxiliary heads
+            attention_mask: Optional attention mask
+        """
+        # Get model predictions
+        if attention_mask is not None:
+            outputs = model(generated_sequences, attention_mask=attention_mask)
+        else:
+            outputs = model(generated_sequences)
+            
+        if isinstance(outputs, tuple):
+            main_logits, aux_outputs = outputs
+        else:
+            main_logits = outputs
+            aux_outputs = []
+            
+        # Compute main loss, handling padding
+        main_loss = super().compute_loss(main_logits, targets)
+        
+        # Compute auxiliary losses, maintaining proper offsets
+        aux_losses = []
+        if aux_outputs and future_targets:
+            for aux_output, future_target in zip(aux_outputs, future_targets):
+                # Handle padding (-100) in future targets
+                aux_loss = super().compute_loss(aux_output, future_target)
+                aux_losses.append(aux_loss)
+                
+        return main_loss, aux_losses
+
+    def _generate_sequences(self, model, context_ids, attention_mask=None):
+        """Generate continuation sequences."""
+        current_ids = context_ids
+        current_mask = attention_mask
+        
+        generated_tokens = []
+        
+        for _ in range(self.generate_length):
+            with torch.no_grad():
+                # Forward pass
+                if current_mask is not None:
+                    outputs = model(current_ids, attention_mask=current_mask)
+                else:
+                    outputs = model(current_ids)
+                    
+                if isinstance(outputs, tuple):
+                    logits = outputs[0]
+                else:
+                    logits = outputs
+                
+                # Sample next token
+                next_token_logits = logits[:, -1, :]
+                next_tokens = self.sample_top_p(next_token_logits, top_p=0.9)
+                
+                # Update sequences
+                current_ids = torch.cat([current_ids, next_tokens], dim=1)
+                if current_mask is not None:
+                    current_mask = torch.cat([
+                        current_mask, 
+                        torch.ones_like(next_tokens, dtype=current_mask.dtype)
+                    ], dim=1)
+                    
+                generated_tokens.append(next_tokens)
+        
+        return torch.cat(generated_tokens, dim=1)
+
+    def generate(self, model, input_ids, max_length, top_p=0.9, temperature=1.0, **kwargs):
+        """Generate tokens using main head predictions."""
+        return super().generate(
+            model, input_ids, max_length, top_p=top_p, temperature=temperature, **kwargs
+        )
 class InstructionFollowingStrategy(ModelingStrategy):
     """Strategy specialized for instruction-following tasks with proper sequence length handling"""
 

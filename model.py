@@ -291,7 +291,6 @@ class TransformerBlock(nn.Module):
 
         return x
 
-
 class GPT(nn.Module):
     """GPT model with multi-latent attention and optimized gradient checkpointing."""
 
@@ -299,9 +298,7 @@ class GPT(nn.Module):
         super().__init__()
         self.config = config
 
-        # Embeddings
         self.token_embedding = nn.Embedding(config.vocab_size, config.n_embd)
-        self.position_embedding = nn.Embedding(config.block_size, config.n_embd)
 
         # Transformer blocks
         self.blocks = nn.ModuleList(
@@ -338,7 +335,6 @@ class GPT(nn.Module):
     def _init_weights(self):
         # Initialize embeddings
         nn.init.normal_(self.token_embedding.weight, mean=0.0, std=0.02)
-        nn.init.normal_(self.position_embedding.weight, mean=0.0, std=0.02)
 
         # Initialize main head
         if self.config.bias:
@@ -369,16 +365,8 @@ class GPT(nn.Module):
                 f"Sequence length {T} exceeds block size {self.config.block_size}"
             )
 
-        # Generate embeddings
-        positions = (
-            torch.arange(0, T, dtype=torch.long, device=idx.device)
-            .unsqueeze(0)
-            .expand(B, -1)
-        )
-
-        tok_emb = self.token_embedding(idx)
-        pos_emb = self.position_embedding(positions)
-        x = tok_emb + pos_emb
+        # Only use token embeddings - RoPE handles positional information
+        x = self.token_embedding(idx)
 
         # Store intermediate outputs for auxiliary heads
         intermediate_outputs = []
@@ -420,7 +408,6 @@ class GPT(nn.Module):
         if self.config.n_aux_heads > 0:
             return main_logits, aux_logits
         return main_logits
-
 
 class ExpertFFN(nn.Module):
     """Expert Feed-Forward Network with SwiGLU activation."""
