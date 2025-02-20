@@ -541,6 +541,11 @@ def get_args():
         help="Enable pre-training mode where both pathways predict next tokens",
     )
     parser.add_argument(
+        "--use_news",
+        action="store_true",
+        help="Use news db",
+    )
+    parser.add_argument(
         "--use_curriculum", action="store_true", help="Enable curriculum learning"
     )
     parser.add_argument(
@@ -770,6 +775,7 @@ if __name__ == "__main__":
         n_aux_heads=args.n_aux_heads,
         prefetch_factor=args.prefetch_factor,
         num_workers=args.num_workers,
+        use_news=args.use_news
     )
 
     optimizer, scheduler = configure_optimizer(model, args, train_loader)

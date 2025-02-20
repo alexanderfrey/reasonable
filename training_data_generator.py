@@ -7,14 +7,13 @@ from typing import List, Dict, Any
 from dataclasses import dataclass
 import argparse
 import logging
-import pandas as pd
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from queue import Queue
 import threading
 from datetime import datetime, timedelta
 from openai import OpenAI
 import pandas as pd
-
+import psycopg2
 from psycopg2.pool import ThreadedConnectionPool
 from dotenv import load_dotenv
 

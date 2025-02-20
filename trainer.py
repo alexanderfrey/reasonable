@@ -10,14 +10,14 @@ from typing import List, Dict, Optional, Union, Tuple
 from strategies import InstructionFollowingStrategy
 
 
-def safe_decode(tokenizer, tokens, max_length=100):
+def safe_decode(tokenizer, tokens, max_length=10000, pad_token_id=0):
     """Safely decode tokens with error handling"""
     try:
         # Convert to list if tensor
         if torch.is_tensor(tokens):
             tokens = tokens.tolist()
         # Filter out padding and special tokens if needed
-        tokens = [t for t in tokens if t != tokenizer.pad_token_id]
+        tokens = [t for t in tokens if t != pad_token_id]
         decoded = tokenizer.decode(tokens)
         # Truncate if needed
         return decoded[:max_length] + ("..." if len(decoded) > max_length else "")
@@ -178,6 +178,8 @@ class SingleHeadTrainer:
             # Transfer data to device - moved outside stream context for guaranteed access
             input_ids = batch["inputs"].to(device, non_blocking=True)
             targets = batch["targets"].to(device, non_blocking=True)
+            attention_mask = batch["attention_mask"]
+            instruction_mask = batch["instruction_mask"].to(device, non_blocking=True)
             future_targets = [
                 t.to(device, non_blocking=True) for t in batch["future_targets"]
             ]
@@ -187,10 +189,18 @@ class SingleHeadTrainer:
             #     print(f"\n--- Batch {batch_idx} ---")
             #     input_tokens_list = batch["inputs"][0].tolist()
             #     target_tokens_list = batch["targets"][0].tolist()
-            #     print("Input Text (decoded, first example):",
-            #         safe_decode(tokenizer, input_tokens_list))
-            #     print("Target Text (decoded, first example):",
-            #         safe_decode(tokenizer, target_tokens_list))
+            #     print(
+            #         "Input Text (decoded, first example):",
+            #         safe_decode(
+            #             tokenizer, input_tokens_list, self.strategy.pad_token_id
+            #         ),
+            #     )
+            #     print(
+            #         "Target Text (decoded, first example):",
+            #         safe_decode(
+            #             tokenizer, target_tokens_list, self.strategy.pad_token_id
+            #         ),
+            #     )
 
             # Handle generation and debugging if needed
             if gen_every_n_steps and self.global_step % gen_every_n_steps == 0:
@@ -200,18 +210,13 @@ class SingleHeadTrainer:
                     target_tokens = batch["targets"][0].cpu().tolist()
 
                     if is_instruction_mode:
-                        raw_text = tokenizer.decode(input_tokens)
-                        system, instruction, response, input_context = (
-                            self._parse_instruction_format(raw_text)
-                        )
+
                         self._log_instruction_debug(
                             model,
                             tokenizer,
                             input_tokens,
-                            instruction,
-                            response,
-                            system,
-                            input_context,
+                            attention_mask=attention_mask[0],
+                            debug_level="basic",
                         )
                     else:
                         print(
@@ -258,7 +263,7 @@ class SingleHeadTrainer:
 
                 # Forward pass and loss computation
                 with torch.cuda.amp.autocast():
-                    outputs = model(input_ids)
+                    outputs = model(idx=input_ids, attention_mask=attention_mask)
 
                     if num_aux_heads > 0:
                         main_logits, aux_outputs = outputs
@@ -267,7 +272,11 @@ class SingleHeadTrainer:
                         aux_outputs = []
 
                     main_loss, aux_losses = self.strategy.compute_all_losses(
-                        main_logits, aux_outputs, targets, future_targets
+                        main_logits,
+                        aux_outputs,
+                        targets,
+                        future_targets,
+                        instruction_mask=instruction_mask,
                     )
 
                     total_loss = main_loss
@@ -438,116 +447,323 @@ class SingleHeadTrainer:
     def _log_instruction_debug(
         self,
         model,
-        tokenizer,
+        tokenizer,  # tiktoken tokenizer
         input_tokens,
-        instruction_text,
-        response_text=None,
-        system_text=None,
-        input_context=None,
+        attention_mask=None,
+        debug_level="basic",
     ):
-        """Log debug information for instruction following mode with consistent formatting"""
+        """
+        Debug logging for instruction following mode with tiktoken tokenizer.
+        Basic mode shows parsed components and model generation, while detailed mode adds token analysis.
 
-        # First, log the complete raw input for debugging
-        raw_input = tokenizer.decode(input_tokens)
-        # print("\nRaw Input Text:")
-        # print("-" * 40)
-        # print(raw_input)
-        # print("-" * 40)
+        Args:
+            model: The model being used for generation
+            tokenizer: tiktoken tokenizer
+            input_tokens: Full sequence of input tokens
+            instruction: The parsed instruction text
+            response: The target response parsed from raw text
+            system: The parsed system prompt
+            input_context: Any additional context
+            attention_mask: Attention mask (optional)
+            debug_level: "basic" or "detailed" (default: "basic")
+        """
+        # In _log_instruction_debug, modify the input preparation:
+        if isinstance(input_tokens, list):
+            # Remove padding tokens from the end of the list
+            while input_tokens and input_tokens[-1] == self.strategy.pad_token_id:
+                input_tokens.pop()
+            input_tensor = torch.tensor(
+                [input_tokens], device=next(model.parameters()).device
+            )
+        else:
+            # If it's already a tensor, remove padding
+            padding_mask = input_tokens != self.strategy.pad_token_id
+            if not padding_mask.all():
+                last_token_pos = padding_mask.nonzero()[-1]
+                input_tokens = input_tokens[: last_token_pos + 1]
+            input_tensor = (
+                input_tokens.unsqueeze(0) if input_tokens.dim() == 1 else input_tokens
+            )
 
-        # Then log the parsed components
-        print("\nParsed Components:")
-        print("-" * 40)
+        # Debug input shape after padding removal
+        print(f"Debug: Input tensor shape after padding removal: {input_tensor.shape}")
 
-        if system_text:
-            print("System:")
-            print(system_text.strip())
-            print()
+        raw_text = tokenizer.decode(input_tokens)
+        system, instruction, response, input_context = self._parse_instruction_format(
+            raw_text
+        )
+        print("\n" + "=" * 80)
+        print(f"INSTRUCTION DEBUG LOG - {debug_level.upper()} MODE")
+        print("=" * 80)
 
-        print("Instruction:")
-        print(instruction_text.strip() if instruction_text else "")
-        print()
+        if debug_level == "basic":
+            # Show the parsed components in a clear format
+            if system:
+                print("\n📋 SYSTEM PROMPT:")
+                print("-" * 40)
+                print(system.strip())
 
-        if input_context:
-            print("Input:")
-            print(input_context.strip())
-            print()
+            print("\n💭 INSTRUCTION:")
+            print("-" * 40)
+            print(instruction.strip())
 
-        if response_text:
-            print("Response:")
-            print(response_text.strip())
-
-        # Token statistics section with better error handling and validation
-        print("\nToken Statistics:")
-        print("-" * 40)
-        try:
-            # For instruction tokens
-            instruction_token_count = 0
-            if instruction_text:
-                # Add debug printing
-                instruction_tokens = tokenizer.encode(instruction_text.strip())
-                instruction_token_count = len(instruction_tokens)
-                print(f"Instruction text being counted: '{instruction_text.strip()}'")
-
-            # For response tokens
-            response_token_count = 0
-            if response_text:
-                # Add debug printing
-                response_tokens = tokenizer.encode(response_text.strip())
-                response_token_count = len(response_tokens)
-                print(f"Response text being counted: '{response_text.strip()}'")
-
-            # For input context tokens
-            input_context_token_count = 0
             if input_context:
-                input_context_tokens = tokenizer.encode(input_context.strip())
-                input_context_token_count = len(input_context_tokens)
+                print("\n📑 CONTEXT:")
+                print("-" * 40)
+                print(input_context.strip())
 
-            # Print all token counts
-            print(f"Total tokens (without padding): {len(input_tokens)}")
-            print(f"Instruction tokens: {instruction_token_count}")
-            if input_context:
-                print(f"Input context tokens: {input_context_token_count}")
-            print(f"Response tokens: {response_token_count}")
+            if response:
+                print("\n🎯 TARGET RESPONSE:")
+                print("-" * 40)
+                print(response.strip())
 
-        except Exception as e:
-            print(f"Error calculating token statistics: {str(e)}")
-
-        # Generate and log model's response if appropriate
-        if response_text:
-            print("\nModel Generation:")
+            # Generate model response
+            print("\n🤖 MODEL GENERATION:")
             print("-" * 40)
             try:
                 with torch.no_grad():
-                    input_tensor = torch.tensor(
-                        [input_tokens], device=next(model.parameters()).device
-                    )
-                    generated = self.strategy.generate(
-                        model,
-                        input_tensor,
-                        max_length=100,
-                        temperature=0.7,
-                        top_p=0.9,
-                    )
-                    generated_tokens = generated[0].cpu().tolist()
-                    generated_text = tokenizer.decode(generated_tokens)
-
-                    # Extract just the model's response part
-                    if "[/INST]" in generated_text:
-                        generated_response = generated_text.split("[/INST]")[1].strip()
-                        generated_response = generated_response.replace(
-                            "</s>", ""
-                        ).strip()
-                        print(f"Generated response:\n{generated_response}")
+                    # Get the actual model from DDP if needed
+                    if hasattr(model, "module"):
+                        generation_model = model.module
                     else:
-                        print(f"Complete generation:\n{generated_text}")
+                        generation_model = model
 
-                    # Log special tokens for debugging
-                    print("\nSpecial tokens in generation:")
-                    print(f"Contains [/INST]: {'[/INST]' in generated_text}")
-                    print(f"Contains </s>: {'</s>' in generated_text}")
+                    # Ensure input_tokens is a tensor
+                    if isinstance(input_tokens, list):
+                        input_tensor = torch.tensor(
+                            [input_tokens], device=next(model.parameters()).device
+                        )
+                    else:
+                        input_tensor = (
+                            input_tokens.unsqueeze(0)
+                            if input_tokens.dim() == 1
+                            else input_tokens
+                        )
+
+                    # Debug input shape
+                    print(f"Debug: Input tensor shape: {input_tensor.shape}")
+                    print(
+                        f"Debug: Attention mask shape: {attention_mask.shape if attention_mask is not None else 'None'}"
+                    )
+
+                    # Use strategy's generate method with proper parameters
+                    outputs = self.strategy.generate(
+                        model=generation_model,
+                        input_ids=input_tensor,
+                        max_length=128,
+                        top_p=0.9,
+                        temperature=0.7,
+                        debug=True,
+                    )
+
+                    # Debug output shape
+                    print(
+                        f"Debug: Output shape: {outputs.shape if isinstance(outputs, torch.Tensor) else len(outputs)}"
+                    )
+
+                    # Convert outputs to list if it's a tensor
+                    if isinstance(outputs, torch.Tensor):
+                        outputs = outputs.cpu().tolist()
+
+                    # If outputs is a list of lists, take the first sequence
+                    if isinstance(outputs, list) and isinstance(outputs[0], list):
+                        outputs = outputs[0]
+
+                    # Get only the new tokens (excluding input)
+                    input_length = (
+                        len(input_tokens)
+                        if isinstance(input_tokens, list)
+                        else input_tokens.shape[-1]
+                    )
+                    new_tokens = outputs[input_length:]
+
+                    # Debug token counts
+                    print(f"Debug: Input length: {input_length}")
+                    print(f"Debug: Output length: {len(outputs)}")
+                    print(f"Debug: New tokens length: {len(new_tokens)}")
+
+                    # Debug token values
+                    print(
+                        f"Debug: Last input token: {input_tokens[-1] if isinstance(input_tokens, list) else input_tokens[0, -1].item()}"
+                    )
+                    if new_tokens:
+                        print(f"Debug: First new token: {new_tokens[0]}")
+
+                    # Decode and print the new tokens
+                    if new_tokens:
+                        generated_text = tokenizer.decode(new_tokens)
+                        print("\nGenerated text:")
+                        print("-" * 20)
+                        print(generated_text.strip())
+                    else:
+                        print("\nWarning: No new tokens generated!")
+                        print(
+                            "Debug: Check if input ends with end_token_id or pad_token_id"
+                        )
+                        print(f"Strategy pad_token_id: {self.strategy.pad_token_id}")
+                        print(f"Strategy end_token_id: {self.strategy.end_token_id}")
 
             except Exception as e:
-                print(f"Generation failed: {str(e)}")
+                print(f"Error during generation: {str(e)}")
+                import traceback
+
+                print(f"Full traceback:")
+                print(traceback.format_exc())
+
+            print("\n🧮 MODEL INPUT SUMMARY:")
+            print("-" * 40)
+            total_tokens = len(input_tokens)
+            print(f"Total tokens: {total_tokens}")
+
+            print("\n" + "=" * 80 + "\n")
+            return
+
+        # Detailed mode token analysis
+        raw_input = tokenizer.decode(input_tokens)
+        print("\n[1] RAW INPUT & COMPONENTS")
+        print("-" * 40)
+        print("Complete tokenized input:")
+        print(f"```\n{raw_input}\n```")
+
+        # Token Analysis
+        print("\n[2] TOKEN ANALYSIS")
+        print("-" * 40)
+        decoded_tokens = []
+        for t in input_tokens:
+            try:
+                decoded = tokenizer.decode([t])
+                decoded = decoded.replace("▁", "_")
+                decoded_tokens.append(decoded)
+            except Exception as e:
+                decoded_tokens.append(f"<error-decoding-{t}>")
+
+        # Show attention patterns if mask provided
+        if attention_mask is not None:
+            print("\nAttention mask shape:", attention_mask.shape)
+            print("\nToken-level visualization with attention patterns:")
+            print(
+                "Format: Each row shows which tokens the token can attend to (✓=can attend, ×=masked)"
+            )
+
+            if len(attention_mask.shape) == 2:
+                num_tokens = len(decoded_tokens)
+                chunk_size = 50
+
+                for chunk_start in range(0, num_tokens, chunk_size):
+                    chunk_end = min(chunk_start + chunk_size, num_tokens)
+
+                    print("\nTokens {}-{}:".format(chunk_start, chunk_end - 1))
+                    print(
+                        "\n     | "
+                        + "".join(f"{i:3d}" for i in range(chunk_start, chunk_end))
+                    )
+                    print("-----+" + "---" * (chunk_end - chunk_start))
+
+                    mask_values = attention_mask.cpu()
+                    for i in range(num_tokens):
+                        row_markers = mask_values[i][chunk_start:chunk_end].tolist()
+                        attention_pattern = "".join(
+                            "✓  " if m == 1 else "×  " for m in row_markers
+                        )
+                        print(
+                            f"{i:3d} | {attention_pattern} | {repr(decoded_tokens[i])}"
+                        )
+
+                    print("\n" + "-" * 80)
+            else:
+                for i, (token, mask) in enumerate(
+                    zip(decoded_tokens, attention_mask.cpu().tolist())
+                ):
+                    mask_indicator = "✓" if mask == 1 else "×"
+                    print(f"{i:3d} | {mask_indicator} | {repr(token)}")
+        else:
+            print("\nNote: No attention mask provided")
+            for i, token in enumerate(decoded_tokens):
+                print(f"{i:3d} | - | {repr(token)}")
+
+        # Special Tokens Analysis
+        print("\n[3] SPECIAL TOKENS SUMMARY")
+        print("-" * 40)
+        special_tokens = {
+            "[INST]": raw_input.count("[INST]"),
+            "[/INST]": raw_input.count("[/INST]"),
+            "<s>": raw_input.count("<s>"),
+            "</s>": raw_input.count("</s>"),
+        }
+
+        # Add EOT token if present
+        if hasattr(tokenizer, "eot_token"):
+            eot_str = tokenizer.decode([tokenizer.eot_token])
+            special_tokens[eot_str] = len(
+                [t for t in input_tokens if t == tokenizer.eot_token]
+            )
+
+        print("\nSpecial token counts:")
+        for token, count in special_tokens.items():
+            print(f"{token}: {count}")
+
+        # 4. Token Distribution Analysis
+        print("\n[4] TOKEN DISTRIBUTION ANALYSIS")
+        print("-" * 40)
+
+        # Count token frequencies
+        token_counts = {}
+        for token in input_tokens:
+            token_counts[token] = token_counts.get(token, 0) + 1
+
+        # Sort by frequency
+        sorted_tokens = sorted(token_counts.items(), key=lambda x: x[1], reverse=True)
+
+        print("\nTop 20 most frequent tokens:")
+        for token_id, count in sorted_tokens[:20]:
+            try:
+                token_text = tokenizer.decode([token_id])
+                print(f"Token {token_id}: {repr(token_text)} - {count} occurrences")
+            except Exception as e:
+                print(f"Token {token_id}: <decode-error> - {count} occurrences")
+
+        # 5. Sequence Structure Analysis
+        print("\n[5] SEQUENCE STRUCTURE ANALYSIS")
+        print("-" * 40)
+
+        # Analyze sequence length
+        print(f"\nTotal sequence length: {len(input_tokens)}")
+
+        # Find potential instruction boundaries
+        inst_starts = [i for i, t in enumerate(decoded_tokens) if "[INST]" in t]
+        inst_ends = [i for i, t in enumerate(decoded_tokens) if "[/INST]" in t]
+
+        print("\nInstruction boundaries:")
+        for start, end in zip(inst_starts, inst_ends):
+            if end > start:
+                print(
+                    f"Instruction span: tokens {start} to {end} ({end-start+1} tokens)"
+                )
+                try:
+                    inst_text = tokenizer.decode(input_tokens[start : end + 1])
+                    print(f"Content: {repr(inst_text)}")
+                except Exception as e:
+                    print(f"Content: <decode-error>")
+
+        # 6. Model Input Structure
+        print("\n[6] MODEL INPUT STRUCTURE")
+        print("-" * 40)
+
+        # Analyze input shape and device
+        if isinstance(input_tokens, torch.Tensor):
+            print(f"\nInput tensor shape: {input_tokens.shape}")
+            print(f"Input device: {input_tokens.device}")
+            print(f"Input dtype: {input_tokens.dtype}")
+        else:
+            print("\nInput is not a tensor (type: {type(input_tokens)})")
+
+        # Memory usage estimation
+        try:
+            if isinstance(input_tokens, torch.Tensor):
+                mem_bytes = input_tokens.element_size() * input_tokens.nelement()
+                print(f"Approximate memory usage: {mem_bytes/1024:.2f} KB")
+        except Exception as e:
+            print(f"Could not calculate memory usage: {str(e)}")
 
         print("\n" + "=" * 80 + "\n")
 

@@ -138,9 +138,9 @@ class MultiLatentAttention(nn.Module):
             torch.nn.functional, "scaled_dot_product_attention"
         )
 
-    def process_chunk(self, q, k, v, chunk_size):
-        B, H, L, D = q.shape
-        _, _, T, _ = k.shape
+    def process_chunk(self, q, k, v, chunk_size, mask=None):
+        B, H, Lq, D = q.shape  # Lq is n_latents
+        _, _, T, _ = k.shape  # T is sequence length
 
         out = torch.zeros_like(q)
 
@@ -150,16 +150,28 @@ class MultiLatentAttention(nn.Module):
             k_chunk = k[:, :, i:chunk_end]
             v_chunk = v[:, :, i:chunk_end]
 
+            if mask is not None:
+                # Need to adjust mask to match latent query dimension
+                # Slice mask to match chunk size and reshape for latent queries
+                mask_chunk = mask[:, :, :Lq, i:chunk_end] if mask is not None else None
+
             if self.use_flash_attention:
                 chunk_out = torch.nn.functional.scaled_dot_product_attention(
-                    q,
-                    k_chunk,
-                    v_chunk,
+                    q,  # [B, H, Lq, D]
+                    k_chunk,  # [B, H, chunk_size, D]
+                    v_chunk,  # [B, H, chunk_size, D]
+                    attn_mask=mask_chunk,
                     dropout_p=self.dropout.p if self.training else 0.0,
                     is_causal=True,
                 )
             else:
                 attn_weights = (q @ k_chunk.transpose(-2, -1)) * self.scale
+
+                if mask_chunk is not None:
+                    attn_weights = attn_weights.masked_fill(
+                        mask_chunk == 0, float("-inf")
+                    )
+
                 attn_weights = F.softmax(attn_weights, dim=-1)
                 attn_weights = self.dropout(attn_weights)
                 chunk_out = attn_weights @ v_chunk
@@ -168,7 +180,9 @@ class MultiLatentAttention(nn.Module):
 
         return out
 
-    def forward(self, x: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         B, T, C = x.size()
 
         # Initialize RoPE frequencies if needed
@@ -177,34 +191,50 @@ class MultiLatentAttention(nn.Module):
                 self.head_dim, self.max_seq_len, self.rope_theta
             ).to(x.device)
 
-        # Compute projections with memory-efficient reshaping
+        # Create causal mask
+        causal_mask = torch.triu(torch.ones(T, T, device=x.device), diagonal=1)
+
+        # Handle attention mask
+        if mask is None:
+            # If no mask provided, use only causal masking
+            mask = (~causal_mask.bool()).float()
+            # Reshape for batch and heads: [B, 1, 1, T, T]
+            mask = mask.unsqueeze(0).unsqueeze(1).unsqueeze(1)
+        else:
+            # Ensure mask has correct shape [B, 1, 1, T, T]
+            if mask.dim() == 3:  # [B, T, T]
+                mask = mask.unsqueeze(1).unsqueeze(1)
+
+            # Combine with causal mask
+            causal_mask = (
+                (~causal_mask.bool()).float().unsqueeze(0).unsqueeze(1).unsqueeze(1)
+            )
+            mask = mask * causal_mask
+
+        # Now reshape mask for latent queries
+        # Reshape from [B, 1, 1, T, T] to [B, H, Lq, T]
+        # We only need the target sequence dimension from the last axis
+        mask = mask.squeeze(2)[:, :, :, 0:T]  # [B, 1, T, T]
+        mask = mask.expand(B, self.n_head, T, T)  # [B, H, T, T]
+        # Now adjust for latent queries
+        mask = mask[:, :, : self.n_latents, :]  # [B, H, Lq, T]
         k = self.key(x).view(B, T, self.n_head, self.head_dim)
         v = self.value(x).view(B, T, self.n_head, self.head_dim)
-
-        # Apply rotary embeddings to keys
         k = apply_rotary_emb(k, self.freqs_cis[:T])
-
-        # Compute gating weights
         gates = self.gate(x).view(B, T, self.n_head, self.n_latents)
         gates = F.softmax(gates * self.scale, dim=-1)
-
-        # Prepare queries
         q = self.latent_queries.expand(B, -1, -1, -1)
 
-        # Rearrange for attention computation
-        q = q.transpose(1, 2)  # [B, H, L, D]
-        k = k.transpose(1, 2)  # [B, H, T, D]
-        v = v.transpose(1, 2)  # [B, H, T, D]
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
 
-        # Process attention in chunks
-        attn_output = self.process_chunk(q, k, v, self.chunk_size)
+        # Pass mask to process_chunk
+        attn_output = self.process_chunk(q, k, v, self.chunk_size, mask=mask)
 
-        # Apply gating
-        gates = gates.transpose(1, 2)  # [B, H, T, L]
-        # weighted_output = torch.einsum("bhls,bhtl->bhts", attn_output, gates)
+        gates = gates.transpose(1, 2)
         weighted_output = torch.einsum("bhld,bhtl->bhtd", attn_output, gates)
 
-        # Final projection
         out = weighted_output.transpose(1, 2).contiguous().view(B, T, C)
         out = self.proj(out)
         out = self.dropout(out)
@@ -291,6 +321,7 @@ class TransformerBlock(nn.Module):
 
         return x
 
+
 class GPT(nn.Module):
     """GPT model with multi-latent attention and optimized gradient checkpointing."""
 
@@ -358,7 +389,7 @@ class GPT(nn.Module):
             x = block(x, mask=mask)
         return x
 
-    def forward(self, idx, mask=None):
+    def forward(self, idx, attention_mask=None):
         B, T = idx.size()
         if T > self.config.block_size:
             raise ValueError(
@@ -383,7 +414,7 @@ class GPT(nn.Module):
                     self._forward_block_group,
                     x,
                     block_group,
-                    mask,
+                    attention_mask,
                     use_reentrant=False,
                 )
 
@@ -392,7 +423,7 @@ class GPT(nn.Module):
                     intermediate_outputs.append(x)
         else:
             for i, block in enumerate(self.blocks):
-                x = block(x, mask=mask)
+                x = block(x, mask=attention_mask)
                 if self.config.n_aux_heads > 0 and (i + 1) % aux_interval == 0:
                     intermediate_outputs.append(x)
 
@@ -408,6 +439,7 @@ class GPT(nn.Module):
         if self.config.n_aux_heads > 0:
             return main_logits, aux_logits
         return main_logits
+
 
 class ExpertFFN(nn.Module):
     """Expert Feed-Forward Network with SwiGLU activation."""

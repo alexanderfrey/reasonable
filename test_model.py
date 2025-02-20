@@ -162,15 +162,25 @@ def load_model(checkpoint_path: str, is_moe: bool = False) -> MoEGPT:
 def get_next_token_probs(
     model: GPT,
     input_ids: torch.Tensor,
-    tokenizer,  # Add tokenizer parameter
+    tokenizer,
     temperature: float = 1.0,
     top_k: Optional[int] = None,
     top_p: Optional[float] = None,
 ) -> torch.Tensor:
     """Get probability distribution over next tokens with decoded token display."""
     with torch.no_grad():
+        # Create attention mask
+        batch_size, seq_len = input_ids.size()
+        # Create causal mask
+        causal_mask = torch.triu(
+            torch.ones(seq_len, seq_len, device=input_ids.device), diagonal=1
+        )
+        attention_mask = (~causal_mask.bool()).float()
+        # Add batch dimension
+        attention_mask = attention_mask.unsqueeze(0)
+
         # Handle both cases where model returns tuple or single tensor
-        outputs = model(input_ids)
+        outputs = model(idx=input_ids, attention_mask=attention_mask)
         if isinstance(outputs, tuple):
             logits = outputs[0]  # Take main logits only, ignore auxiliary
         else:
@@ -183,9 +193,12 @@ def get_next_token_probs(
         original_probs = F.softmax(logits, dim=-1)
         top_original, top_orig_idx = torch.topk(original_probs, k=5)
         print("\nTop 5 tokens before processing:")
-        for prob, idx in zip(top_original[0], top_orig_idx[0]):
-            token_text = tokenizer.decode([idx.item()])
-            print(f"Token {idx.item()} ('{token_text}'): {prob.item():.4f}")
+        # Fix: Handle each probability and index separately
+        for i in range(5):
+            prob = top_original[0][i].item()
+            idx = top_orig_idx[0][i].item()
+            token_text = tokenizer.decode([idx])
+            print(f"Token {idx} ('{token_text}'): {prob:.4f}")
 
         # Apply temperature
         if temperature != 0:
@@ -209,14 +222,12 @@ def get_next_token_probs(
             sorted_logits, sorted_indices = torch.sort(logits, descending=True)
             cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
 
-            # Remove tokens with cumulative probability above the threshold
             sorted_indices_to_remove = cumulative_probs > top_p
             sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[
                 ..., :-1
             ].clone()
             sorted_indices_to_remove[..., 0] = 0
 
-            # Scatter sorted tensors to original indexing
             indices_to_remove = sorted_indices_to_remove.scatter(
                 -1, sorted_indices, sorted_indices_to_remove
             )
@@ -228,9 +239,12 @@ def get_next_token_probs(
         # Debug: print top tokens after processing
         top_probs, top_indices = torch.topk(probs, k=5)
         print("\nTop 5 tokens after processing:")
-        for prob, idx in zip(top_probs[0], top_indices[0]):
-            token_text = tokenizer.decode([idx.item()])
-            print(f"Token {idx.item()} ('{token_text}'): {prob.item():.4f}")
+        # Fix: Handle each probability and index separately
+        for i in range(5):
+            prob = top_probs[0][i].item()
+            idx = top_indices[0][i].item()
+            token_text = tokenizer.decode([idx])
+            print(f"Token {idx} ('{token_text}'): {prob:.4f}")
 
         return probs
 
@@ -258,6 +272,10 @@ def generate_sequence(
 
     generated_tokens = []
     for i in range(max_new_tokens):
+        # Ensure input_ids doesn't exceed model's block size
+        if input_ids.size(1) > model.config.block_size:
+            input_ids = input_ids[:, -model.config.block_size :]
+
         # Get next token probabilities
         next_token_probs = get_next_token_probs(
             model, input_ids, tokenizer, temperature, top_k, top_p

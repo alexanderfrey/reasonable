@@ -20,31 +20,6 @@ class ModelingStrategy(ABC):
         pass
 
 
-class MixedStrategy(ModelingStrategy):
-    def __init__(self, tokenizer, mask_token_id, mixing_ratio=0.5):
-        super().__init__()
-        self.next_token_strategy = NextTokenStrategy(tokenizer)
-        self.span_mask_strategy = SpanMaskingStrategy(
-            mask_token_id=mask_token_id,
-            max_span_length=5,
-            min_span_length=1,
-            masking_ratio=0.15,
-        )
-        self.mixing_ratio = mixing_ratio
-
-    def compute_loss(self, logits, targets, **kwargs):
-        next_token_loss = self.next_token_strategy.compute_loss(logits, targets)
-        span_mask_loss = self.span_mask_strategy.compute_loss(logits, targets)
-        return (
-            self.mixing_ratio * next_token_loss
-            + (1 - self.mixing_ratio) * span_mask_loss
-        )
-
-    def generate(self, model, input_ids, max_length, **kwargs):
-        # Use next-token strategy for generation
-        return self.next_token_strategy.generate(model, input_ids, max_length, **kwargs)
-
-
 class NextTokenStrategy(ModelingStrategy):
     def __init__(self, tokenizer=None):
         super().__init__()
@@ -53,142 +28,147 @@ class NextTokenStrategy(ModelingStrategy):
     def compute_loss(self, logits, targets, **kwargs):
         """
         Compute loss for next token prediction.
-        
+
         Args:
-            logits: Tensor of shape [batch_size, seq_len, vocab_size] 
+            logits: Tensor of shape [batch_size, seq_len, vocab_size]
                    containing prediction for each position
-            targets: Tensor of shape [batch_size, seq_len] 
+            targets: Tensor of shape [batch_size, seq_len]
                     containing target tokens for each position
-            
+
         Returns:
             torch.Tensor: Scalar loss value
         """
         if isinstance(logits, tuple):
             logits, _ = logits
-            
+
         # Validate input shapes
         if len(logits.shape) != 3:
             raise ValueError(
                 f"Expected logits shape [batch_size, seq_len, vocab_size], got {logits.shape}"
             )
-            
+
         if len(targets.shape) != 2:
             raise ValueError(
                 f"Expected targets shape [batch_size, seq_len], got {targets.shape}"
             )
-            
+
         batch_size, seq_len, vocab_size = logits.shape
         target_batch, target_seq = targets.shape
-        
+
         if batch_size != target_batch or seq_len != target_seq:
             raise ValueError(
                 f"Shape mismatch: logits {logits.shape} vs targets {targets.shape}"
             )
-            
+
         # Reshape logits and targets for loss computation
         # From [batch_size, seq_len, vocab_size] to [batch_size * seq_len, vocab_size]
         logits_view = logits.view(-1, vocab_size)
         # From [batch_size, seq_len] to [batch_size * seq_len]
         targets_view = targets.view(-1)
-        
+
         return F.cross_entropy(logits_view, targets_view, ignore_index=-100)
 
     def compute_all_losses(self, main_logits, aux_outputs, targets, future_targets):
         """
         Compute losses for main prediction and auxiliary heads.
-        
+
         Args:
             main_logits: Tensor of shape [batch_size, seq_len, vocab_size]
             aux_outputs: List of tensors, each [batch_size, seq_len, vocab_size]
             targets: Tensor of shape [batch_size, seq_len]
             future_targets: List of tensors, each [batch_size, seq_len]
-            
+
         Returns:
             tuple: (main_loss, list_of_aux_losses)
         """
-        # Compute main loss
+        # Your original implementation is correct
         main_loss = self.compute_loss(main_logits, targets)
         aux_losses = []
-        
-        # Process auxiliary heads if present
+
         if aux_outputs and future_targets:
             if len(aux_outputs) != len(future_targets):
                 raise ValueError(
                     f"Number of aux_outputs ({len(aux_outputs)}) must match "
                     f"number of future_targets ({len(future_targets)})"
                 )
-                
-            for idx, (aux_output, future_target) in enumerate(zip(aux_outputs, future_targets)):
-                # Validate shapes
+
+            for idx, (aux_output, future_target) in enumerate(
+                zip(aux_outputs, future_targets)
+            ):
                 if aux_output.shape != main_logits.shape:
                     raise ValueError(
                         f"Auxiliary output {idx} should have same shape as main logits, "
                         f"got {aux_output.shape} vs {main_logits.shape}"
                     )
-                
+
                 if future_target.shape != targets.shape:
                     raise ValueError(
                         f"Future target {idx} should have same shape as main targets, "
                         f"got {future_target.shape} vs {targets.shape}"
                     )
-                
+
                 aux_loss = self.compute_loss(aux_output, future_target)
                 aux_losses.append(aux_loss)
-                
+
         return main_loss, aux_losses
 
-    def generate(self, model, input_ids, max_length, top_p=0.9, temperature=1.0, **kwargs):
+    def generate(
+        self, model, input_ids, max_length, top_p=0.9, temperature=1.0, **kwargs
+    ):
         """Generate next tokens using main and auxiliary heads.
-        
+
         Note: During generation, we only use the last position's prediction.
         """
         device = next(model.parameters()).device
         tokens = input_ids.clone().to(device)
-        
+
         with torch.no_grad():
             outputs = model(tokens)
-            
+
             if isinstance(outputs, tuple):
                 main_logits, aux_outputs = outputs
             else:
                 main_logits = outputs
                 aux_outputs = []
-            
+
             # For generation, we only care about the last position
             next_token_logits = main_logits[:, -1, :]
-            
+
             if temperature != 1.0:
                 next_token_logits = next_token_logits / temperature
-                
+
             next_token = self.sample_top_p(next_token_logits, top_p)
-            
+
             # Ensure next_token has sequence dimension
             if len(next_token.shape) == 1:
                 next_token = next_token.unsqueeze(1)
-                
+
             generated_sequence = torch.cat([tokens, next_token], dim=1)
-        
+
         return generated_sequence
 
     def sample_top_p(self, logits, top_p):
         """Sample from the top-p probability distribution."""
         if len(logits.shape) != 2:
-            raise ValueError(f"Expected 2D logits tensor [batch_size, vocab_size], got shape {logits.shape}")
-            
+            raise ValueError(
+                f"Expected 2D logits tensor [batch_size, vocab_size], got shape {logits.shape}"
+            )
+
         probs = F.softmax(logits, dim=-1)
         sorted_probs, sorted_indices = torch.sort(probs, dim=-1, descending=True)
         cumsum_probs = torch.cumsum(sorted_probs, dim=-1)
-        
+
         mask = cumsum_probs <= top_p
         mask[:, 0] = True  # Always include top probability token
-        
+
         filtered_probs = torch.where(mask, sorted_probs, torch.zeros_like(sorted_probs))
         filtered_probs = filtered_probs / filtered_probs.sum(dim=-1, keepdim=True)
-        
+
         sample_indices = torch.multinomial(filtered_probs, num_samples=1)
         selected_indices = torch.gather(sorted_indices, -1, sample_indices)
-        
+
         return selected_indices
+
 
 class TeacherForcingStrategy(NextTokenStrategy):
     def __init__(self, tokenizer=None, teacher_forcing_ratio=0.4, generate_length=8):
@@ -196,11 +176,20 @@ class TeacherForcingStrategy(NextTokenStrategy):
         self.teacher_forcing_ratio = teacher_forcing_ratio
         self.generate_length = generate_length
 
-    def compute_all_losses(self, main_logits, aux_outputs, targets, future_targets, 
-                          model=None, input_ids=None, attention_mask=None, **kwargs):
+    def compute_all_losses(
+        self,
+        main_logits,
+        aux_outputs,
+        targets,
+        future_targets,
+        model=None,
+        input_ids=None,
+        attention_mask=None,
+        **kwargs,
+    ):
         """
         Compute losses with teacher forcing, respecting auxiliary head offsets.
-        
+
         Args:
             main_logits: [batch_size, seq_len, vocab_size]
             aux_outputs: List of [batch_size, seq_len, vocab_size] tensors
@@ -214,51 +203,63 @@ class TeacherForcingStrategy(NextTokenStrategy):
         main_loss, aux_losses = super().compute_all_losses(
             main_logits, aux_outputs, targets, future_targets
         )
-        
+
         # Skip teacher forcing if no model provided or during validation
         if model is None or input_ids is None or not aux_outputs:
             return main_loss, aux_losses
-            
+
         # Randomly apply teacher forcing
         if torch.rand(1).item() > self.teacher_forcing_ratio:
             return main_loss, aux_losses
-            
+
         batch_size, seq_len = input_ids.size()
         n_aux_heads = len(aux_outputs)
-        
+
         # Context window needs to account for the maximum future prediction
         context_window = seq_len - self.generate_length - n_aux_heads
-        
+
         # Use first part as context
         context_ids = input_ids[:, :context_window]
-        context_mask = attention_mask[:, :context_window] if attention_mask is not None else None
-        
+        context_mask = (
+            attention_mask[:, :context_window] if attention_mask is not None else None
+        )
+
         # Generate continuation
         generated_sequences = self._generate_sequences(model, context_ids, context_mask)
-        
+
         # Compute losses on generated sequence
         gen_main_loss, gen_aux_losses = self._compute_generation_losses(
             model,
             generated_sequences,
-            targets[:, context_window:context_window + self.generate_length],
-            [ft[:, context_window:context_window + self.generate_length] for ft in future_targets],
-            attention_mask=attention_mask[:, context_window:context_window + self.generate_length] 
-                if attention_mask is not None else None
+            targets[:, context_window : context_window + self.generate_length],
+            [
+                ft[:, context_window : context_window + self.generate_length]
+                for ft in future_targets
+            ],
+            attention_mask=(
+                attention_mask[
+                    :, context_window : context_window + self.generate_length
+                ]
+                if attention_mask is not None
+                else None
+            ),
         )
-        
+
         # Combine losses
         combined_main_loss = main_loss + 0.5 * gen_main_loss
         combined_aux_losses = [
-            aux_loss + 0.5 * gen_aux_loss 
+            aux_loss + 0.5 * gen_aux_loss
             for aux_loss, gen_aux_loss in zip(aux_losses, gen_aux_losses)
         ]
-        
+
         return combined_main_loss, combined_aux_losses
 
-    def _compute_generation_losses(self, model, generated_sequences, targets, future_targets, attention_mask=None):
+    def _compute_generation_losses(
+        self, model, generated_sequences, targets, future_targets, attention_mask=None
+    ):
         """
         Compute losses on generated sequences for all heads.
-        
+
         Args:
             model: The language model
             generated_sequences: Generated token sequences
@@ -271,16 +272,16 @@ class TeacherForcingStrategy(NextTokenStrategy):
             outputs = model(generated_sequences, attention_mask=attention_mask)
         else:
             outputs = model(generated_sequences)
-            
+
         if isinstance(outputs, tuple):
             main_logits, aux_outputs = outputs
         else:
             main_logits = outputs
             aux_outputs = []
-            
+
         # Compute main loss, handling padding
         main_loss = super().compute_loss(main_logits, targets)
-        
+
         # Compute auxiliary losses, maintaining proper offsets
         aux_losses = []
         if aux_outputs and future_targets:
@@ -288,16 +289,14 @@ class TeacherForcingStrategy(NextTokenStrategy):
                 # Handle padding (-100) in future targets
                 aux_loss = super().compute_loss(aux_output, future_target)
                 aux_losses.append(aux_loss)
-                
+
         return main_loss, aux_losses
 
     def _generate_sequences(self, model, context_ids, attention_mask=None):
         """Generate continuation sequences."""
         current_ids = context_ids
         current_mask = attention_mask
-        
-        generated_tokens = []
-        
+
         for _ in range(self.generate_length):
             with torch.no_grad():
                 # Forward pass
@@ -305,45 +304,48 @@ class TeacherForcingStrategy(NextTokenStrategy):
                     outputs = model(current_ids, attention_mask=current_mask)
                 else:
                     outputs = model(current_ids)
-                    
+
                 if isinstance(outputs, tuple):
                     logits = outputs[0]
                 else:
                     logits = outputs
-                
+
                 # Sample next token
                 next_token_logits = logits[:, -1, :]
                 next_tokens = self.sample_top_p(next_token_logits, top_p=0.9)
-                
+
                 # Update sequences
                 current_ids = torch.cat([current_ids, next_tokens], dim=1)
                 if current_mask is not None:
-                    current_mask = torch.cat([
-                        current_mask, 
-                        torch.ones_like(next_tokens, dtype=current_mask.dtype)
-                    ], dim=1)
-                    
-                generated_tokens.append(next_tokens)
-        
-        return torch.cat(generated_tokens, dim=1)
+                    current_mask = torch.cat(
+                        [
+                            current_mask,
+                            torch.ones_like(next_tokens, dtype=current_mask.dtype),
+                        ],
+                        dim=1,
+                    )
 
-    def generate(self, model, input_ids, max_length, top_p=0.9, temperature=1.0, **kwargs):
+        return current_ids[:, context_ids.size(1) :]  # Return only the generated part
+
+    def generate(
+        self, model, input_ids, max_length, top_p=0.9, temperature=1.0, **kwargs
+    ):
         """Generate tokens using main head predictions."""
         return super().generate(
             model, input_ids, max_length, top_p=top_p, temperature=temperature, **kwargs
         )
-class InstructionFollowingStrategy(ModelingStrategy):
-    """Strategy specialized for instruction-following tasks with proper sequence length handling"""
 
+
+class InstructionFollowingStrategy(ModelingStrategy):
     def __init__(
         self,
         tokenizer,
         instruction_token="[INST]",
         response_token="[/INST]",
         end_token="</s>",
-        max_length=1024,
-        pad_token_id=0,
-        format_type="alpaca",  # Can be "alpaca" or "thinking"
+        max_length=2048,
+        pad_token_id=50256,
+        format_type="alpaca",
     ):
         super().__init__()
         self.tokenizer = tokenizer
@@ -353,21 +355,111 @@ class InstructionFollowingStrategy(ModelingStrategy):
         self.max_length = max_length
         self.format_type = format_type
 
-        # Cache token IDs
-        self.instruction_token_id = self.tokenizer.encode(instruction_token)[0]
-        self.response_token_id = self.tokenizer.encode(response_token)[0]
-        self.end_token_id = self.tokenizer.encode(end_token)[0]
+        # Debug the token encoding
+        print(
+            f"Encoding instruction token '{instruction_token}': {self.tokenizer.encode(instruction_token)}"
+        )
+        print(
+            f"Encoding response token '{response_token}': {self.tokenizer.encode(response_token)}"
+        )
 
+        # Try encoding with special tokens
+        try:
+            self.instruction_token_id = tokenizer.convert_tokens_to_ids(
+                instruction_token
+            )
+            self.response_token_id = tokenizer.convert_tokens_to_ids(response_token)
+        except:
+            # Fallback to regular encoding but handle multi-token case
+            inst_ids = tokenizer.encode(instruction_token)
+            resp_ids = tokenizer.encode(response_token)
+            self.instruction_token_id = inst_ids[0] if len(inst_ids) > 0 else None
+            self.response_token_id = resp_ids[0] if len(resp_ids) > 0 else None
+
+        print(f"Final instruction token ID: {self.instruction_token_id}")
+        print(f"Final response token ID: {self.response_token_id}")
+
+        self.end_token_id = self.tokenizer.encode(end_token)[0]
         self.pad_token_id = pad_token_id
         self.device = None
+
+    def create_instruction_attention_mask(self, token_ids):
+        batch_size, seq_length = token_ids.shape
+        attention_mask = torch.zeros(
+            (batch_size, seq_length, seq_length), device=token_ids.device
+        )
+
+        # Get marker tokens
+        response_marker = self.tokenizer.encode("\n### Response:\n")
+
+        for b in range(batch_size):
+            # Instruction starts at beginning
+            inst_start = 0
+
+            # Find response section start
+            resp_start = None
+            for i in range(len(token_ids[b]) - len(response_marker) + 1):
+                if all(
+                    token_ids[b][i + j].item() == response_marker[j]
+                    for j in range(len(response_marker))
+                ):
+                    resp_start = i
+                    break
+
+            if resp_start is None:
+                continue
+
+            # Set attention patterns:
+
+            # 1. Bidirectional attention within instruction section
+            attention_mask[b, inst_start:resp_start, inst_start:resp_start] = 1
+
+            # 2. Response can attend to all instruction tokens
+            attention_mask[b, resp_start:seq_length, inst_start:resp_start] = 1
+
+            # 3. Causal attention within response section
+            resp_length = seq_length - resp_start
+            causal_mask = torch.tril(
+                torch.ones(resp_length, resp_length, device=token_ids.device)
+            )
+            attention_mask[b, resp_start:seq_length, resp_start:seq_length] = (
+                causal_mask
+            )
+
+        return attention_mask
+
+    def forward(self, model, batch, **kwargs):
+        """Enhanced forward pass with attention masking"""
+        inputs = batch["inputs"]
+        targets = batch["targets"]
+
+        # Create attention mask
+        attention_mask = self.create_instruction_attention_mask(inputs)
+
+        # Forward pass with attention mask
+        outputs = model(
+            inputs,
+            attention_mask=attention_mask,
+        )
+
+        # Compute loss with masks
+        loss = self.compute_loss(
+            outputs.logits,
+            targets,
+            attention_mask=attention_mask,
+        )
+
+        return loss, outputs
 
     def get_padding_value(self):
         """Return the padding token ID"""
         return self.pad_token_id
 
-    def format_instruction(self, instruction, response, input_context=None, thinking=None, system=None):
+    def format_instruction(
+        self, instruction, response, input_context=None, thinking=None, system=None
+    ):
         """Format instruction including thinking tags within the response section"""
-        
+
         # Helper function to convert various types to string
         def to_string(value):
             if value is None:
@@ -378,59 +470,37 @@ class InstructionFollowingStrategy(ModelingStrategy):
                 return "\n".join(f"{k}: {v}" for k, v in value.items())
             else:
                 return str(value)
-        
+
         # Convert all inputs to strings
         instruction = to_string(instruction)
         response = to_string(response)
         input_context = to_string(input_context) if input_context is not None else None
         thinking = to_string(thinking) if thinking is not None else None
         system = to_string(system) if system is not None else None
-        
+
         # Build formatted string
         formatted = f"{self.instruction_token}"
-        
+
         if system:
             formatted += f"### System:\n{system}\n\n"
-        
+
         formatted += f"### Instruction:\n{instruction}\n"
-        
+
         if input_context:
             formatted += f"\n### Input:\n{input_context}\n"
-        
+
         formatted += "\n### Response:\n"
-        
+
         # Add thinking section if provided
         if thinking:
             formatted += f"<thinking>{thinking}</thinking>\n"
-        
+
         # Add the actual response
         formatted += response
-        
+
         # Add closing tokens
         formatted += f"{self.response_token}{self.end_token}"
-        
-        return formatted
 
-    def _format_alpaca(
-        self,
-        instruction: str,
-        response: str,
-        input_context: str = None,
-        system: str = None,
-    ) -> str:
-        """Format using Alpaca style with optional system prompt"""
-        formatted = f"{self.instruction_token}"
-
-        # Add system prompt if provided
-        if system:
-            formatted += f"### System:\n{system}\n\n"
-
-        formatted += f"### Instruction:\n{instruction}\n"
-
-        if input_context:
-            formatted += f"\n### Input:\n{input_context}\n"
-
-        formatted += f"\n### Response:\n{response}{self.response_token}{self.end_token}"
         return formatted
 
     def to(self, device):
@@ -438,45 +508,53 @@ class InstructionFollowingStrategy(ModelingStrategy):
         self.device = device
         return self
 
-    def reset_state(self):
-        """Reset any internal state"""
-        self.generation_history = []
-        self.current_sequence = None
-
-    def get_state(self):
-        """Return current state for debugging"""
-        return {
-            "device": self.device,
-            "max_length": self.max_length,
-            "current_sequence": self.current_sequence,
-        }
-
     def compute_loss(self, logits, targets, instruction_mask=None, **kwargs):
-        """Compute loss with proper handling of padding tokens"""
+        # Use provided instruction mask instead of regenerating
         if instruction_mask is None:
             instruction_mask = self._create_instruction_mask_vectorized(targets)
 
-        # Create padding mask (1 for non-padding tokens, 0 for padding)
-        padding_mask = (targets != self.pad_token_id).float()
-        
-        # Compute loss
+        # Create mask for both ignored indices (-100) and pad tokens
+        ignore_mask = (targets != -100) & (targets != self.pad_token_id)
+        padding_mask = ignore_mask.float()
+
+        # Compute cross entropy loss with -100 as ignore_index
         loss = F.cross_entropy(
-            logits.view(-1, logits.size(-1)), 
-            targets.view(-1), 
+            logits.view(-1, logits.size(-1)),
+            targets.view(-1),
             reduction="none",
-            ignore_index=self.pad_token_id  # Ignore padding tokens in loss
+            ignore_index=-100,  # PyTorch's default ignore_index
         ).view_as(targets)
 
-        # Apply both instruction and padding masks
+        # Apply instruction and padding masks
         final_mask = (~instruction_mask).float() * padding_mask
         masked_loss = loss * final_mask
-        
-        # Normalize by number of non-masked tokens
+
+        # Add debug prints
+        # print(f"Logits shape: {logits.shape}")
+        # print(f"Targets shape: {targets.shape}")
+        # print(f"Unique targets: {torch.unique(targets).cpu().tolist()}")
+        # print(f"Number of non-ignored targets: {ignore_mask.sum().item()}")
+        # print(f"Final mask sum: {final_mask.sum().item()}")
+        # print(
+        #     f"Average loss per token: {(masked_loss.sum() / (final_mask.sum() + 1e-8)).item()}"
+        # )
+
+        # Normalize by number of tokens
         return masked_loss.sum() / (final_mask.sum() + 1e-8)
-    
-    
-    def compute_all_losses(self, main_logits, aux_outputs, targets, future_targets):
-        return self.compute_loss(main_logits, targets), []
+
+    def compute_all_losses(
+        self,
+        main_logits,
+        aux_outputs,
+        targets,
+        future_targets,
+        instruction_mask,
+        **kwargs,
+    ):
+        return (
+            self.compute_loss(main_logits, targets, instruction_mask=instruction_mask),
+            [],
+        )
 
     def _create_instruction_mask_vectorized(self, token_ids):
         """Create instruction mask with padding consideration"""
@@ -490,12 +568,12 @@ class InstructionFollowingStrategy(ModelingStrategy):
             batch_insts = inst_positions[0] == b
             batch_resps = resp_positions[0] == b
             batch_pads = pad_positions[0] == b
-            
+
             if batch_insts.any() and batch_resps.any():
                 start = inst_positions[1][batch_insts][0]
                 end = resp_positions[1][batch_resps][0]
-                mask[b, start:end + 1] = True
-            
+                mask[b, start : end + 1] = True
+
             # Mask out padding tokens
             if batch_pads.any():
                 pad_start = pad_positions[1][batch_pads][0]
@@ -503,64 +581,63 @@ class InstructionFollowingStrategy(ModelingStrategy):
 
         return mask
 
-    def generate(self, model, input_ids, max_length, top_p=0.9, temperature=0.7, debug=False):
-        """Generate with proper handling of special tokens and removing padding"""
+    def prepare_for_generation(self, input_ids):
+        """Prepare inputs for generation with proper masking"""
+        attention_mask = self.create_instruction_attention_mask(input_ids)
+
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+        }
+
+    def generate(
+        self, model, input_ids, max_length, top_p=0.9, temperature=0.7, debug=False
+    ):
         self.to(input_ids.device)
-        
-        # Remove padding tokens from input sequence
+
+        # Remove padding from input
         padding_mask = input_ids[0] != self.pad_token_id
         if not padding_mask.all():
-            # Find last non-padding token
             last_token_pos = padding_mask.nonzero()[-1]
-            input_ids = input_ids[:, :last_token_pos + 1]
-            if debug:
-                print(f"Removed padding. New input length: {input_ids.size(1)}")
-        
+            input_ids = input_ids[:, : last_token_pos + 1]
+
         tokens = input_ids.clone()
         response_started = False
-        
+
         with torch.no_grad():
             for step in range(max_length):
+                # Create attention mask for current sequence
+                attention_mask = self.create_instruction_attention_mask(tokens)
+
                 # Get model outputs
-                outputs = model(tokens) if not response_started else model(tokens[:, -1:])
-                logits = outputs[0] if isinstance(outputs, tuple) else outputs
+                outputs = model(tokens, attention_mask=attention_mask)
+
+                # Handle both tuple and object outputs
+                logits = outputs[0] if isinstance(outputs, tuple) else outputs.logits
                 next_token_logits = logits[:, -1, :]
 
-                # After [/INST], prevent generating instruction-related tokens
+                # Prevent generation of special tokens during response
                 if response_started:
-                    next_token_logits[:, self.instruction_token_id] = float('-inf')
-                    next_token_logits[:, self.response_token_id] = float('-inf')
-                    next_token_logits[:, self.pad_token_id] = float('-inf')
-                
+                    next_token_logits[:, self.instruction_token_id] = float("-inf")
+                    next_token_logits[:, self.response_token_id] = float("-inf")
+                    # Only stop on end token, not pad token
+                    next_token_logits[:, self.pad_token_id] = float("-inf")
+
                 # Sample next token
-                scaled_logits = next_token_logits / temperature
-                next_token = self.sample_top_p(scaled_logits, top_p)
-                
-                if debug:
-                    try:
-                        print(f"Step {step}: Generated token {next_token.item()} -> '{self.tokenizer.decode([next_token.item()])}'")
-                    except Exception as e:
-                        print(f"Step {step}: Error decoding token {next_token.item()}: {e}")
-                
-                # Check if we're starting the response
+                next_token = self.sample_top_p(next_token_logits / temperature, top_p)
+
+                # Update response_started flag
                 if not response_started and next_token.item() == self.response_token_id:
                     response_started = True
-                    if debug:
-                        print("Response generation started")
-                
+
                 # Add token to sequence
                 tokens = torch.cat([tokens, next_token], dim=1)
-                
-                # Stop if we generate end token or pad token
-                if next_token.item() in [self.end_token_id, self.pad_token_id]:
-                    if debug:
-                        print(f"Stopping generation: Generated {'end' if next_token.item() == self.end_token_id else 'pad'} token")
+
+                # Only stop on end token during response generation
+                if response_started and next_token.item() == self.end_token_id:
                     break
 
-                # Check sequence length
                 if tokens.size(1) >= self.max_length:
-                    if debug:
-                        print(f"Stopping generation: Reached maximum length {self.max_length}")
                     break
 
         return tokens

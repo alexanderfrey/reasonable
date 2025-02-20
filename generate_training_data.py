@@ -119,53 +119,92 @@ Write in a precise, analytical style that directly connects your insight to text
 
 def generate_reasoning_prompt(text: str) -> str:
     """
-    Generates a prompt that instructs an LLM to reason about a given text snippet.
+    Generates a focused prompt for training LLMs in analytical reasoning that promotes
+    natural, non-formulaic analysis while maintaining structure.
 
     Args:
-        text (str): The text snippet to analyze
+        text (str): The text to analyze.
 
     Returns:
-        str: A formatted prompt for the LLM
+        str: An optimized prompt for LLM training.
     """
-    prompt = f"""Please analyze the following text carefully and provide your reasoning:
+    prompt = f"""Instruction: Analyze the following text to identify its key arguments, evaluate its reasoning, and assess its implications.
 
+Input text:
 {text}
 
-Follow these steps in your analysis:
+Structure your analysis in three sections:
 
-1. First, identify the key concepts and main ideas presented in the text.
-   - What are the central themes?
-   - What are the core arguments or claims being made?
+Core Analysis
+- What is the central argument? Support your answer with specific evidence from the text.
+- What evidence does the text present to support its claims? Evaluate the strength of this evidence.
+- What key assumptions underlie the argument? Identify both explicit and implicit assumptions.
 
-2. Examine the logical structure:
-   - How are ideas connected?
-   - What evidence or support is provided?
-   - Are there any assumptions or implicit premises?
+Reasoning Evaluation
+- How effectively does the evidence connect to and support the main claims?
+- What gaps exist in the logic or evidence? Consider what information might be missing.
+- Are there alternative interpretations or perspectives not addressed in the text?
 
-3. Consider the context:
-   - What background knowledge is relevant?
-   - Are there any important cultural, historical, or domain-specific references?
+Impact Assessment
+- What are the practical implications of this analysis for the relevant stakeholders?
+- How might the context influence the interpretation of these arguments?
+- What limitations or uncertainties should be considered when applying these insights?
 
-4. Evaluate the reasoning:
-   - Is the logic sound and valid?
-   - Are there any potential fallacies or gaps in reasoning?
-   - How strong is the supporting evidence?
-
-5. Draw conclusions:
-   - What are the main implications?
-   - What follow-up questions arise?
-   - What additional context would be helpful?
-
-Please structure your response as a clear, step-by-step analysis. For each point, explain your reasoning and provide specific examples from the text to support your observations.
-
-Remember to:
-- Think carefully about each step before moving to the next
-- Be explicit about your reasoning process
-- Consider alternative interpretations
-- Acknowledge any uncertainties or limitations in your analysis
-- Connect your observations to form a coherent overall assessment
+Writing Guidelines:
+- Provide specific examples from the text to support each point
+- Use clear, precise language without unnecessary jargon
+- Format numbers and units consistently (e.g., $200 million, 75%)
+- Vary sentence structure to maintain engagement
+- Integrate points naturally rather than following a rigid template
+- Aim for 2-3 substantive sentences per point
 
 Begin your analysis:"""
+
+    return prompt
+
+def generate_explanatory_prompt(text: str) -> str:
+    """
+    Generates a prompt for training LLMs to explain news articles by breaking down
+    concepts and providing necessary background information.
+
+    Args:
+        text (str): The news article to explain.
+
+    Returns:
+        str: An optimized prompt for LLM training.
+    """
+    prompt = f"""Instruction: Analyze the following news article and provide a comprehensive explanation of all key concepts, terms, and context needed to fully understand it.
+
+Input text:
+{text}
+
+Structure your response in these sections:
+
+Key Terms & Concepts
+- Identify and explain all technical terms, industry-specific concepts, and potentially unfamiliar vocabulary
+- Define abbreviations and specialized terminology
+- Explain complex processes or systems mentioned
+
+Background Context
+- Provide relevant historical information needed to understand the story
+- Explain who the key organizations and individuals are
+- Describe the industry or sector context
+- Note any relevant trends or previous events
+
+Main Story Explanation
+- Break down the core news in simple terms
+- Connect it to the provided background and concepts
+- Explain why this news is significant
+
+Writing Guidelines:
+- Use clear, accessible language
+- Explain concepts as if to someone unfamiliar with the field
+- Include specific examples where helpful
+- Format numbers and data consistently
+- Link concepts to their real-world implications
+- Avoid assuming prior knowledge
+
+Begin your explanation:"""
 
     return prompt
 
@@ -268,7 +307,7 @@ async def generate_training_examples(
     directory_path: str,
     text_processor: TextProcessor,
     output_file: str,
-    sentences_per_example: int = 5,
+    sentences_per_example: int = 20,
     max_seq_length: int = 512,
     model: str = "microsoft/phi-4",
     max_retries: int = 3,
@@ -297,11 +336,12 @@ async def generate_training_examples(
         async with sem:
             for attempt in range(max_retries):
                 try:
-                    prompt = make_thinking_helper(input_text)
+                    # prompt = make_thinking_helper(input_text)
+                    prompt = generate_explanatory_prompt(input_text)
                     thought = await vllm_request(
                         prompt=prompt,
                         context=None,
-                        openai_api_base="http://100.68.45.88:8080/v1",
+                        openai_api_base="http://100.68.45.88:8090/v1",
                         model_id=model,
                     )
 
