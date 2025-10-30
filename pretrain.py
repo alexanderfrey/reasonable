@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 
 # Import the model class from model.py
 try:
-    from model import GPT
+    from model import GPT, upgrade_state_dict_for_block_norms
 except ImportError:
     print("Error: model.py not found. Please ensure it's in the same directory.")
     exit(1)
@@ -45,13 +45,17 @@ def pretokenize_corpus(
     stride,
     output_token_file,
     data_type="Training",
-    batch_lines: int = 8192,        # tune: 8k–32k lines per batch
+    batch_lines: int = 1024,  # safer default (reduce if still memory pressure)
 ):
     """
-    Fast pre-tokenization:
-    - Batch tokenizes lines with the HF *fast* tokenizer (Rust), no truncation.
-    - Appends EOS per line (document separator) to match GPT-3 style.
-    - Accumulates NumPy chunks and concatenates once at the end.
+    Memory-safe pretokenization:
+    - Tokenizes `batch_lines` lines at a time.
+    - Appends EOS per line (GPT-3-style doc separator).
+    - Streams tokens to a raw .bin file (no gigantic list of arrays).
+    - Returns (final_token_file, num_examples), where final_token_file will end with .bin
+      to indicate raw token storage.
+
+    NOTE: We keep the dataset & metadata format compatible by adding dtype info later.
     """
     print(f"Starting pre-tokenization of {data_type} data: {corpus_file}...")
     print(f"Using max_seq_len: {max_seq_len}, stride: {stride}")
@@ -61,7 +65,7 @@ def pretokenize_corpus(
     if stride > max_seq_len:
         print(f"Warning: Stride ({stride}) > max_seq_len ({max_seq_len}). Sequences will be non-overlapping.")
 
-    # decide dtype from vocab once
+    # --- choose on-disk dtype from vocab size (matches your previous logic) ---
     vocab_size = len(tokenizer)
     if vocab_size < 2**16:
         dtype = np.uint16
@@ -69,65 +73,69 @@ def pretokenize_corpus(
         dtype = np.uint32
     else:
         dtype = np.int64
+    dtype_name = np.dtype(dtype).name  # e.g., 'uint16'
 
-    # ensure output dir
-    out_dir = os.path.dirname(output_token_file)
+    # We'll write to a .bin file (raw 1D array). Keep the same base name.
+    # e.g., .../training_gpt2_tokens.bin
+    if output_token_file.endswith(".npy"):
+        final_token_file = output_token_file[:-4] + ".bin"
+    else:
+        final_token_file = output_token_file
+    tmp_bin = final_token_file + ".tmp"
+
+    out_dir = os.path.dirname(final_token_file)
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
 
-    # do not truncate; we want full tokens then we chunk later
-    trunc = False
-    add_spec = False
     eos_id = tokenizer.eos_token_id
+    add_spec = False  # don't add extra specials automatically
+    trunc = False     # no truncation here
 
-    chunks = []                # list[np.ndarray]
     token_count = 0
     line_count = 0
 
-    # streaming read with large batches
+    # Stream to a binary file by appending batches
     try:
-        with open(corpus_file, "r", encoding="utf-8") as f:
-            pbar = tqdm(desc=f"Tokenizing {data_type}", unit="line", leave=True)
+        with open(corpus_file, "r", encoding="utf-8") as f_in, open(tmp_bin, "wb") as f_out:
+            pbar = tqdm(desc=f"Tokenizing {data_type}", unit="line", leave=True, dynamic_ncols=True)
             while True:
+                # Read up to batch_lines non-empty lines
                 lines = []
-                # collect up to batch_lines
                 for _ in range(batch_lines):
-                    line = f.readline()
+                    line = f_in.readline()
                     if not line:
                         break
                     line = line.strip()
                     if line:
                         lines.append(line)
+
                 if not lines:
                     break
 
-                # batch tokenize (fast path)
+                # Fast batch tokenize
                 enc = tokenizer(
                     lines,
                     add_special_tokens=add_spec,
                     padding=False,
                     truncation=trunc,
                     return_attention_mask=False,
-                    return_length=True
+                    return_length=True,
                 )
-
                 ids_list = enc["input_ids"]  # List[List[int]]
-                # build one flat numpy array for this batch
-                # (+1 EOS per line if eos exists)
-                if eos_id is not None:
-                    flat = np.fromiter(
-                        (tok for ids in ids_list for tok in ids + [eos_id]),
-                        dtype=dtype
-                    )
-                    token_count += sum(int(l) for l in enc["length"]) + len(ids_list)
-                else:
-                    flat = np.fromiter(
-                        (tok for ids in ids_list for tok in ids),
-                        dtype=dtype
-                    )
-                    token_count += sum(int(l) for l in enc["length"])
 
-                chunks.append(flat)
+                # Build a flat array for this batch (append EOS if present)
+                if eos_id is not None:
+                    flat_iter = (tok for ids in ids_list for tok in (ids + [eos_id]))
+                    added_tokens = sum(int(L) for L in enc["length"]) + len(ids_list)
+                else:
+                    flat_iter = (tok for ids in ids_list for tok in ids)
+                    added_tokens = sum(int(L) for L in enc["length"])
+
+                # Convert generator to a NumPy array (just this batch), then write to disk
+                batch_arr = np.fromiter(flat_iter, dtype=dtype)
+                batch_arr.tofile(f_out)  # append raw bytes
+
+                token_count += int(added_tokens)
                 line_count += len(lines)
                 pbar.update(len(lines))
             pbar.close()
@@ -137,57 +145,110 @@ def pretokenize_corpus(
     except Exception as e:
         raise SystemExit(f"\nError during tokenization of {corpus_file}: {e}")
 
+    # Finalize the .bin file
+    try:
+        os.replace(tmp_bin, final_token_file)
+    except Exception as e:
+        # cleanup tmp on failure
+        try:
+            os.remove(tmp_bin)
+        except Exception:
+            pass
+        raise SystemExit(f"Failed to finalize token file '{final_token_file}': {e}")
+
     if token_count == 0:
         raise SystemExit(f"Error: No tokens found in the {data_type} corpus file.")
 
-    print(f"Finished tokenizing {line_count:,} lines → {token_count:,} tokens ({data_type}). Concatenating…")
+    print(f"Finished tokenizing {line_count:,} lines → {token_count:,} tokens ({data_type}).")
+    print(f"{data_type} token stream saved to {final_token_file}")
 
-    # single concatenate (much faster than repeated list.extend)
-    token_array = np.concatenate(chunks).astype(dtype, copy=False)
-    del chunks  # free RAM sooner
-
-    # save once
-    np.save(output_token_file, token_array)
-    print(f"{data_type} token array saved to {output_token_file} ({len(token_array):,} tokens)")
-
-    # compute num_examples using stride/max_seq_len (same as before)
-    num_tokens_in_array = int(token_array.shape[0])
-    chunk_size_for_one_example = max_seq_len + 1
-    if num_tokens_in_array < chunk_size_for_one_example:
+    # Calculate examples based on total token_count (no need to load the file)
+    chunk = max_seq_len + 1
+    if token_count < chunk:
         num_examples = 0
         print(
-            f"Warning: Total {data_type} tokens ({num_tokens_in_array}) < {chunk_size_for_one_example}; "
-            f"no full sequences."
+            f"Warning: Total {data_type} tokens ({token_count}) < {chunk}; no full sequences."
         )
     else:
-        num_examples = (num_tokens_in_array - chunk_size_for_one_example) // stride + 1
+        num_examples = (token_count - chunk) // stride + 1
 
     print(f"Calculated {num_examples:,} {data_type} examples for max_seq_len={max_seq_len} and stride={stride}")
-    return output_token_file, num_examples
+
+    # Return the actual on-disk token file (.bin) and example count.
+    # We'll store dtype/format in metadata (see patch below).
+    return final_token_file, num_examples, dtype_name
 
 
 # --- Dataset Class ---
 class PretokenizedDataset(Dataset):
-    def __init__(self, token_file_path, num_examples, max_seq_len, stride, data_type="Data"): # Added stride
+    def __init__(self, token_file_path, num_examples, max_seq_len, stride, data_type="Data"):
         self.token_file_path = token_file_path
-        self.num_examples = num_examples # This num_examples MUST be calculated using the stride
+        self.num_examples = num_examples  # MUST be calculated using the stride
         self.max_seq_len = max_seq_len
-        self.stride = stride 
+        self.stride = stride
         self.data_type = data_type
 
+        # Try loading .npy mmap first
+        self.tokens = None
+        npy_load_err = None
         try:
-            self.tokens = np.load(
-                self.token_file_path, mmap_mode="r"
-            )
+            if self.token_file_path.endswith(".npy"):
+                self.tokens = np.load(self.token_file_path, mmap_mode="r")
         except FileNotFoundError:
             print(f"Error: {self.data_type} token file not found at {self.token_file_path}")
             exit(1)
-        except ValueError as e:
-            print(f"Error loading memory-mapped file {self.token_file_path}: {e}")
-            exit(1)
+        except Exception as e:
+            npy_load_err = e  # fall back to .bin path
+
+        # Fallback: load raw .bin via np.memmap using dtype from metadata
+        if self.tokens is None:
+            # --- Find the correct metadata path reliably ---
+            meta_path = None
+            if self.token_file_path.endswith("_tokens.npy"):
+                meta_path = self.token_file_path.replace("_tokens.npy", "_metadata.json")
+            elif self.token_file_path.endswith("_tokens.bin"):
+                meta_path = self.token_file_path.replace("_tokens.bin", "_metadata.json")
+            else:
+                base, ext = os.path.splitext(self.token_file_path)
+                # last-resort heuristic: try inserting underscore before 'metadata'
+                meta_candidate = base.replace("_tokens", "_metadata") + ".json"
+                meta_path = meta_candidate
+
+            # Default dtype if metadata missing
+            dtype_name = "uint32"
+
+            # Read dtype from metadata if present
+            try:
+                with open(meta_path, "r") as f:
+                    meta = json.load(f)
+                    dtype_name = meta.get("dtype", dtype_name)
+            except Exception:
+                print(f"Warning: Could not read metadata at {meta_path}; will attempt to guess dtype from file size.")
+
+                # --- Guess dtype from file size as a robust fallback ---
+                try:
+                    fsize = os.path.getsize(self.token_file_path)
+                    for cand in ("uint16", "uint32", "int64"):
+                        if fsize % np.dtype(cand).itemsize == 0:
+                            dtype_name = cand
+                            break
+                except Exception:
+                    pass
+
+            # Finally memmap with the (meta or guessed) dtype
+            try:
+                self.tokens = np.memmap(self.token_file_path, dtype=np.dtype(dtype_name), mode="r")
+            except FileNotFoundError:
+                print(f"Error: {self.data_type} token file not found at {self.token_file_path}")
+                exit(1)
+            except Exception as e:
+                print(f"Error loading token file {self.token_file_path}: {e}")
+                if npy_load_err:
+                    print(f"(np.load error earlier: {npy_load_err})")
+                exit(1)
 
         print(
-            f"{self.data_type} Dataset initialized with {self.num_examples:,} examples using memory-mapped file: {token_file_path}"
+            f"{self.data_type} Dataset initialized with {self.num_examples:,} examples using memory-mapped file: {self.token_file_path}"
         )
         print(f"Total {self.data_type} tokens in mapped file: {len(self.tokens):,}")
 
@@ -197,31 +258,32 @@ class PretokenizedDataset(Dataset):
             print(
                 f"Error: Total {self.data_type} tokens ({len(self.tokens)}) is less than required for one sequence ({min_tokens_for_one_example})."
             )
-            if self.num_examples > 0: # This implies num_examples was miscalculated
-                 exit(1)
-            elif self.num_examples <= 0: # num_examples correctly reflects no data
-                 print(f"Warning: Number of calculated {self.data_type} examples is {self.num_examples}. Dataset is likely unusable.")
+            if self.num_examples > 0:
+                exit(1)
+            else:
+                print(f"Warning: Number of calculated {self.data_type} examples is {self.num_examples}. Dataset is likely unusable.")
 
-        # Recalculate theoretical max examples with current stride to verify num_examples (optional but good sanity check)
-        # The last possible start index `s` for a chunk of `max_seq_len + 1` tokens is when `s + max_seq_len + 1 <= len(tokens)`.
-        # So, `s_max = len(tokens) - (max_seq_len + 1)`.
-        # If `s_max < 0`, no examples are possible.
-        # Number of examples = floor(s_max / stride) + 1.
+        # Sanity check num_examples against theoretical maximum
         if len(self.tokens) >= min_tokens_for_one_example:
             theoretical_max_examples = (len(self.tokens) - (self.max_seq_len + 1)) // self.stride + 1
             if self.num_examples > theoretical_max_examples:
-                print(f"Warning: Passed num_examples ({self.num_examples}) is greater than theoretically possible ({theoretical_max_examples}) with stride {self.stride}. Clamping to theoretical max.")
+                print(
+                    f"Warning: Passed num_examples ({self.num_examples}) is greater than theoretically possible "
+                    f"({theoretical_max_examples}) with stride {self.stride}. Clamping to theoretical max."
+                )
                 self.num_examples = theoretical_max_examples
-            elif self.num_examples <= 0 and theoretical_max_examples > 0 :
-                 print(f"Error: Calculated number of {self.data_type} examples is {self.num_examples}, but {theoretical_max_examples} seem available with stride {self.stride}. Check metadata or num_examples calculation.")
-                 exit(1)
-        elif self.num_examples > 0: # Not enough tokens, but num_examples > 0
-             print(f"Error: Not enough tokens for any example, but num_examples is {self.num_examples}. Check metadata.")
-             exit(1)
-
+            elif self.num_examples <= 0 and theoretical_max_examples > 0:
+                print(
+                    f"Error: Calculated number of {self.data_type} examples is {self.num_examples}, "
+                    f"but {theoretical_max_examples} seem available with stride {self.stride}. Check metadata or num_examples calculation."
+                )
+                exit(1)
+        elif self.num_examples > 0:
+            print(f"Error: Not enough tokens for any example, but num_examples is {self.num_examples}. Check metadata.")
+            exit(1)
 
         if self.num_examples <= 0:
-             print(f"Warning: {self.data_type} dataset initialized with {self.num_examples} examples. This dataset will be empty.")
+            print(f"Warning: {self.data_type} dataset initialized with {self.num_examples} examples. This dataset will be empty.")
 
 
     def __len__(self):
@@ -462,91 +524,117 @@ def _load_or_tokenize_data(
     current_pad_token_id: int,
     current_eos_token_id: int,
 ):
-    """Loads pre-tokenized data or tokenizes if needed, with robust recompute of num_examples
+    """
+    Loads pre-tokenized data or tokenizes if needed, with robust recompute of num_examples
     for the current (max_seq_len, stride). Retokenizes only when tokenizer identity/IDs changed.
+    Compatible with both .npy and streamed .bin token files.
     """
     if not corpus_file or not os.path.exists(corpus_file):
         logger.warning(f"{data_type} corpus file not found or not specified: {corpus_file}. Skipping {data_type} data setup.")
-        return None, 0  # Return None for path, 0 examples
+        return None, 0
 
-    token_file, metadata_file = _generate_file_paths(output_dir, data_type, current_tokenizer_name)
+    # Base paths (metadata is always here; token file path may change to .bin)
+    token_file_base, metadata_file = _generate_file_paths(output_dir, data_type, current_tokenizer_name)
+
     num_examples = 0
     needs_retokenize = bool(force_retokenize)
 
-    # --- Try to use existing tokens/metadata ---
-    if os.path.exists(token_file) and os.path.exists(metadata_file) and not needs_retokenize:
+    # --- Try to reuse existing tokens/metadata ---
+    if os.path.exists(metadata_file) and not needs_retokenize:
         logger.info(f"Loading pre-tokenized {data_type} data info from {metadata_file}")
         try:
             with open(metadata_file, "r") as f:
                 metadata = json.load(f)
 
-            # Decide if we must retokenize (tokenization depends on tokenizer identity/IDs, not on seq len/stride)
-            retok_reasons = []
-            if metadata.get("tokenizer_name") != current_tokenizer_name:
-                retok_reasons.append(
-                    f"tokenizer name (saved='{metadata.get('tokenizer_name')}', current='{current_tokenizer_name}')"
-                )
-            if metadata.get("vocab_size") != current_vocab_size:
-                retok_reasons.append(
-                    f"vocab size (saved={metadata.get('vocab_size')}, current={current_vocab_size})"
-                )
-            # If EOS id changed, previously stored EOS ids would map to a different token -> must retokenize
-            if metadata.get("eos_token_id") != current_eos_token_id:
-                retok_reasons.append(
-                    f"eos_token_id (saved={metadata.get('eos_token_id')}, current={current_eos_token_id})"
-                )
+            # Use the actual token file path recorded in metadata (could be .bin)
+            meta_token_file = metadata.get("token_file", token_file_base)
+            dtype_name = metadata.get("dtype", "uint32")
 
-            # (Max seq len / stride changes do NOT require retokenization; we just recompute num_examples.)
-            if retok_reasons:
-                logger.warning(
-                    f"{data_type} token data requires retokenization due to: " + "; ".join(retok_reasons)
-                )
+            # If recorded token file is missing, we must retokenize
+            if not os.path.exists(meta_token_file):
+                logger.warning(f"Recorded token file missing: {meta_token_file}. Will retokenize.")
                 needs_retokenize = True
             else:
-                # Metadata is compatible: recompute num_examples for current (max_seq_len, stride)
-                try:
-                    tokens_mmap = np.load(token_file, mmap_mode="r")
-                    num_tokens_in_array = int(len(tokens_mmap))
-                    chunk = max_seq_len + 1
-                    if num_tokens_in_array < chunk:
-                        num_examples = 0
-                    else:
-                        num_examples = (num_tokens_in_array - chunk) // stride + 1
-                    logger.info(
-                        f"Recomputed {data_type} num_examples={num_examples} for max_seq_len={max_seq_len}, stride={stride}"
+                # Decide if we must retokenize due to tokenizer/vocab/eos changes
+                retok_reasons = []
+                if metadata.get("tokenizer_name") != current_tokenizer_name:
+                    retok_reasons.append(
+                        f"tokenizer name (saved='{metadata.get('tokenizer_name')}', current='{current_tokenizer_name}')"
                     )
-                except Exception as e:
+                if metadata.get("vocab_size") != current_vocab_size:
+                    retok_reasons.append(
+                        f"vocab size (saved={metadata.get('vocab_size')}, current={current_vocab_size})"
+                    )
+                if metadata.get("eos_token_id") != current_eos_token_id:
+                    retok_reasons.append(
+                        f"eos_token_id (saved={metadata.get('eos_token_id')}, current={current_eos_token_id})"
+                    )
+
+                if retok_reasons:
                     logger.warning(
-                        f"Failed to mmap existing {data_type} tokens for recompute: {e}. Forcing re-tokenization."
+                        f"{data_type} token data requires retokenization due to: " + "; ".join(retok_reasons)
                     )
                     needs_retokenize = True
+                else:
+                    # Recompute num_examples using file length (no loading the whole thing)
+                    try:
+                        if meta_token_file.endswith(".npy"):
+                            tokens_mmap = np.load(meta_token_file, mmap_mode="r")
+                            num_tokens_in_array = int(tokens_mmap.shape[0])
+                        else:
+                            itemsize = np.dtype(dtype_name).itemsize
+                            num_tokens_in_array = os.path.getsize(meta_token_file) // itemsize
+
+                        chunk = max_seq_len + 1
+                        num_examples = 0 if num_tokens_in_array < chunk else (num_tokens_in_array - chunk) // stride + 1
+                        logger.info(
+                            f"Recomputed {data_type} num_examples={num_examples} for max_seq_len={max_seq_len}, stride={stride}"
+                        )
+                        # Hand back the real token file to the caller (dataset)
+                        return meta_token_file, num_examples
+                    except Exception as e:
+                        logger.warning(
+                            f"Failed to inspect existing {data_type} tokens for recompute: {e}. Forcing re-tokenization."
+                        )
+                        needs_retokenize = True
 
         except (FileNotFoundError, KeyError, json.JSONDecodeError, TypeError) as e:
             logger.warning(f"Error loading/validating {data_type} metadata {metadata_file}: {e}. Forcing re-tokenization.")
             needs_retokenize = True
-            num_examples = 0  # Reset count
+            num_examples = 0
 
-    # --- Retokenize when needed or when files are missing ---
-    if not os.path.exists(token_file) or not os.path.exists(metadata_file) or needs_retokenize:
-        if needs_retokenize and os.path.exists(token_file):
-            logger.info(f"Forcing {data_type} data re-tokenization...")
-            try:
-                os.remove(token_file)
-                if os.path.exists(metadata_file):
-                    os.remove(metadata_file)
-            except OSError as e:
-                logger.warning(f"Could not remove old {data_type} token/metadata files: {e}")
-        else:
-            logger.info(
-                f"Pre-tokenized {data_type} data not found or metadata invalid for tokenizer '{current_tokenizer_name}'. Pre-tokenizing..."
-            )
+    # --- Retokenize when needed or when metadata is missing ---
+    if not os.path.exists(metadata_file) or needs_retokenize:
+        logger.info(
+            f"Preparing {data_type} tokens (retokenize={needs_retokenize}, metadata_exists={os.path.exists(metadata_file)})"
+        )
 
-        token_file, num_examples = pretokenize_corpus(
+        # Best effort: remove any old token files at the base paths
+        try:
+            if os.path.exists(token_file_base):
+                os.remove(token_file_base)
+        except OSError:
+            pass
+        try:
+            # If a .bin counterpart exists from a previous run, remove it too
+            bin_candidate = token_file_base[:-4] + ".bin" if token_file_base.endswith(".npy") else token_file_base + ".bin"
+            if os.path.exists(bin_candidate):
+                os.remove(bin_candidate)
+        except OSError:
+            pass
+        try:
+            if os.path.exists(metadata_file):
+                os.remove(metadata_file)
+        except OSError:
+            pass
+
+        # Run pretokenization (streams to .bin and returns actual path + dtype)
+        token_file, num_examples, dtype_name = pretokenize_corpus(
             corpus_file,
             tokenizer,
             max_seq_len,
             stride,
-            token_file,
+            token_file_base,   # base name; function will switch to .bin as needed
             data_type=data_type,
         )
         if num_examples == 0:
@@ -556,17 +644,20 @@ def _load_or_tokenize_data(
             if data_type == "Training":
                 exit(1)
             else:
-                return None, 0  # Skip eval
+                return None, 0
 
-        # Compute num_tokens for metadata
-        num_tokens = None
+        # Compute total number of tokens without loading the file
         try:
-            tokens_mmap = np.load(token_file, mmap_mode="r")
-            num_tokens = int(len(tokens_mmap))
+            if token_file.endswith(".npy"):
+                tokens_mmap = np.load(token_file, mmap_mode="r")
+                num_tokens = int(tokens_mmap.shape[0])
+            else:
+                num_tokens = os.path.getsize(token_file) // np.dtype(dtype_name).itemsize
         except Exception as e:
-            logger.warning(f"Could not mmap saved {data_type} tokens to capture num_tokens: {e}")
+            logger.warning(f"Could not determine {data_type} num_tokens: {e}")
+            num_tokens = None
 
-        # Save metadata
+        # Persist metadata with real token file path and dtype
         metadata = {
             "num_examples": num_examples,
             "num_tokens": num_tokens,
@@ -576,6 +667,9 @@ def _load_or_tokenize_data(
             "tokenizer_name": current_tokenizer_name,
             "pad_token_id": current_pad_token_id,
             "eos_token_id": current_eos_token_id,
+            "dtype": dtype_name,
+            "format": "bin" if token_file.endswith(".bin") else "npy",
+            "token_file": token_file,
         }
         os.makedirs(os.path.dirname(metadata_file), exist_ok=True)
         try:
@@ -585,7 +679,10 @@ def _load_or_tokenize_data(
         except IOError as e:
             logger.error(f"Failed to save {data_type} metadata to {metadata_file}: {e}")
 
-    return token_file, num_examples
+        return token_file, num_examples
+
+    # Shouldn’t get here, but in case:
+    return None, 0
 
 
 def prepare_dataloaders(args: Namespace, tokenizer: AutoTokenizer, vocab_size: int, pad_token_id: int, eos_token_id: int):
@@ -716,10 +813,21 @@ def resize_token_embeddings_(model, new_vocab_size: int, pad_idx: int | None):
             # If your head cannot be exactly tied, you can ignore this.
             pass
 
-def initialize_model(args: Namespace, vocab_size: int, pad_token_id: int, num_added_toks: int, device: torch.device):
+def initialize_model(args: Namespace, vocab_size: int, pad_token_id: int, eos_token_id: int,
+                     num_added_toks: int, device: torch.device):
     """Initializes the GPT model, handles embedding resizing and optional compilation."""
     logger.info("Initializing model...")
     
+    n_kv_head = getattr(args, "n_kv_head", None)
+    if n_kv_head is None:
+        n_kv_head = args.n_head
+    elif args.n_head % n_kv_head != 0:
+        logger.warning(
+            f"n_head ({args.n_head}) is not divisible by requested n_kv_head ({n_kv_head}); "
+            f"using n_kv_head={args.n_head} instead."
+        )
+        n_kv_head = args.n_head
+
     mla_config_dict = {
         "num_head": args.n_head,       # d_model / 64 (common head dim)
         "d_c": 64,            # KV compression dimension
@@ -745,6 +853,7 @@ def initialize_model(args: Namespace, vocab_size: int, pad_token_id: int, num_ad
         "vocab_size": vocab_size,      
         "d_model": args.d_model,
         "n_head": args.n_head,
+        "n_kv_head": n_kv_head,
         "n_layer": args.n_layer,
         "max_seq_len": args.max_seq_len,
         # "mla_config": mla_config_dict,
@@ -756,8 +865,13 @@ def initialize_model(args: Namespace, vocab_size: int, pad_token_id: int, num_ad
     
 
     model = GPT(**model_config).to(device)
+    pad_eq_eos = (pad_token_id is not None) and (eos_token_id is not None) and (pad_token_id == eos_token_id)
     with torch.no_grad():
-        if 0 <= pad_token_id < model.token_embedding.num_embeddings:
+        if (
+            pad_token_id is not None
+            and 0 <= pad_token_id < model.token_embedding.num_embeddings
+            and not pad_eq_eos
+        ):
             model.token_embedding.weight[pad_token_id].zero_()
     # If tying is expected:
     if hasattr(model, "lm_head") and isinstance(model.lm_head, nn.Linear):
@@ -812,6 +926,7 @@ def _find_latest_checkpoint(output_dir: str):
 
 def load_checkpoint(args: Namespace, model: nn.Module, optimizer: optim.Optimizer, scaler: GradScaler | None,
                     device: torch.device, use_amp: bool, current_vocab_size: int, current_pad_token_id: int,
+                    current_eos_token_id: int,
                     current_model_config: dict):
     """Loads a checkpoint if specified, handling potential mismatches."""
     start_epoch = 0
@@ -939,7 +1054,9 @@ def load_checkpoint(args: Namespace, model: nn.Module, optimizer: optim.Optimize
         except Exception as e:
             logger.error(f"Error loading checkpoint {checkpoint_path}: {e}. Starting fresh.", exc_info=True)
             start_epoch, global_step, best_eval_loss = 0, 0, float('inf')
-            model, _ = initialize_model(args, current_vocab_size, current_pad_token_id, 0, device)
+            model, _ = initialize_model(
+                args, current_vocab_size, current_pad_token_id, current_eos_token_id, 0, device
+            )
             optimizer, _, scaler = initialize_training_components(args, model, use_amp, current_pad_token_id)
     else:
         logger.info("No checkpoint specified or found. Starting training from scratch.")
@@ -991,46 +1108,6 @@ def save_checkpoint(args: Namespace, epoch: int, global_step: int, model: nn.Mod
         os.makedirs(args.output_dir, exist_ok=True) # Ensure directory exists
         torch.save(save_dict, checkpoint_path)
         logger.info(f"Checkpoint successfully saved to {checkpoint_path}")
-
-        # --- Weights & Biases Artifact Logging ---
-        # Check if W&B is enabled and a run is active
-        # if not getattr(args, 'disable_wandb', False) and wandb.run:
-        #     try:
-        #         # Use the run name or ID for a unique artifact collection per run
-        #         artifact_name_prefix = wandb.run.name if wandb.run.name else wandb.run.id
-        #         artifact_name = f"{artifact_name_prefix}-checkpoint"
-
-        #         artifact = wandb.Artifact(
-        #             name=artifact_name,
-        #             type="model",
-        #             description=(
-        #                 f"Model checkpoint at step {global_step}, epoch {epoch+1}. "
-        #                 f"Train Loss: {current_loss:.4f}. Best Eval Loss: {best_eval_loss:.4f}."
-        #             ),
-        #             metadata={
-        #                 "epoch": epoch,
-        #                 "global_step": global_step,
-        #                 "current_loss_at_save": current_loss, # Clarify this is the loss passed for saving
-        #                 "best_eval_loss": best_eval_loss,
-        #                 "is_best_eval_checkpoint": is_best,
-        #                 "is_final_checkpoint_type": is_final, # Distinguish from the slim final model
-        #                 "source_filename": checkpoint_base_name,
-        #                 # Log some key args for quick view in W&B UI
-        #                 "learning_rate": args.learning_rate,
-        #                 "batch_size": args.batch_size,
-        #                 "max_seq_len": args.max_seq_len,
-        #             }
-        #         )
-        #         artifact.add_file(checkpoint_path, name=checkpoint_base_name) # Add file with its base name
-
-        #         # Ensure unique aliases
-        #         final_aliases = list(set(current_aliases))
-
-        #         wandb.log_artifact(artifact, aliases=final_aliases)
-        #         logger.info(f"Logged checkpoint artifact to W&B: '{artifact_name}' with aliases {final_aliases}")
-
-        #     except Exception as e:
-        #         logger.error(f"Error logging checkpoint artifact to W&B: {e}", exc_info=True)
 
         # Clean old step checkpoints only for regular saves (not best, not final)
         if not is_best and not is_final and args.keep_last_n_checkpoints > 0:
@@ -1210,7 +1287,7 @@ def train(args: Namespace):
     train_dataloader, eval_dataloader = prepare_dataloaders(args, tokenizer, vocab_size, pad_token_id, eos_token_id)
 
     # --- Model ---
-    model, model_config = initialize_model(args, vocab_size, pad_token_id, num_added_toks, device)
+    model, model_config = initialize_model(args, vocab_size, pad_token_id, eos_token_id, num_added_toks, device)
 
     # --- Optimizer, Loss, Scaler ---
     optimizer, criterion, scaler = initialize_training_components(args, model, use_amp, pad_token_id)
@@ -1224,11 +1301,19 @@ def train(args: Namespace):
     # --- Checkpoint Loading ---
     # If load_checkpoint could return a wandb_run_id, you'd handle it before wandb.init or pass it to wandb.init
     start_epoch, global_step, best_eval_loss, model, optimizer, scaler = load_checkpoint(
-        args, model, optimizer, scaler, device, use_amp, vocab_size, pad_token_id, model_config
+        args, model, optimizer, scaler, device, use_amp, vocab_size, pad_token_id, eos_token_id, model_config
     )
     # If load_checkpoint returned a wandb_run_id, and W&B init happened after, you might re-init or ensure args.wandb_run_id was set prior.
     # For this example, we assume args.wandb_run_id is set externally if specific run resumption is needed.
-    
+
+    # Surface the effective model size right before training kicks off.
+    current_trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    logger.info(
+        "Starting training with %s trainable parameters (%.3fB).",
+        f"{current_trainable_params:,}",
+        current_trainable_params / 1e9,
+    )
+
     if args.compile_model and not args.debug:
         try:
             logger.info("Compiling model (post-load) ...")
@@ -1501,6 +1586,7 @@ if __name__ == "__main__":
     parser.add_argument("--max_seq_len", type=int, default=1024)
     parser.add_argument("--d_model", type=int, default=512)
     parser.add_argument("--n_head", type=int, default=8)
+    parser.add_argument("--n_kv_head", type=int, default=None, help="Number of KV heads for GQA (defaults to n_head).")
     parser.add_argument("--n_layer", type=int, default=6)
     parser.add_argument("--d_ff", type=int, default=None)
     parser.add_argument("--dropout", type=float, default=0.1)

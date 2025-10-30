@@ -1,5 +1,6 @@
 import math
-from typing import Optional, Tuple, List
+from collections import OrderedDict
+from typing import Optional, Tuple, List, Mapping
 
 import torch
 import torch.nn as nn
@@ -51,112 +52,162 @@ def apply_rotary_pos_emb(
     return xq_rot, xk_rot
 
 
+class RMSNorm(nn.Module):
+    def __init__(self, d, eps=1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(d))
+    def forward(self, x):
+        # keep LN in fp32 numerics implicitly
+        norm = x.float().pow(2).mean(dim=-1, keepdim=True).add(self.eps).rsqrt().to(x.dtype)
+        return self.weight * (x * norm)
+
+def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
+    """
+    Repeat K/V heads to match Q heads (GQA).
+    x: [B, S, Hkv, D] -> [B, S, Hq, D] where Hq = Hkv * n_rep
+    """
+    if n_rep == 1:
+        return x
+    B, S, H, D = x.shape
+    return x.unsqueeze(3).expand(B, S, H, n_rep, D).reshape(B, S, H * n_rep, D)
+
 # --- Core blocks ---
 
 class MultiHeadAttention(nn.Module):
     """
-    MHA that *always* uses FlashAttention (v1) with RoPE and optional varlen path for padding.
-    Expects:
-      - x: [B, S_q, D_model]
-      - mask: key padding mask over *full KV* (past + current), shape [B, S_kv], 1=attend, 0=pad (or None)
-      - layer_past: optional (k,v) with shapes [B, S_past, H, Dk]
-    Returns:
-      - output: [B, S_q, D_model]
-      - attn_weights: None (FA doesn't return weights)
-      - present: (k_full, v_full) if use_cache else None
+    FlashAttention(v1) + RoPE + KV caching + Sliding Window, now with GQA:
+      - Hq query heads
+      - Hkv key/value heads (Hq must be a multiple of Hkv)
+      - Cache stores K/V in Hkv heads; we repeat to Hq only for attention.
     """
 
-    def __init__(self, d_model: int, n_head: int, dropout: float = 0.1):
+    def __init__(
+        self,
+        d_model: int,
+        n_head: int,                    # Hq
+        dropout: float = 0.1,
+        max_kv_len: Optional[int] = None,
+        n_kv_head: Optional[int] = None # Hkv (defaults to Hq => MHA)
+    ):
         super().__init__()
-        assert d_model % n_head == 0
-        self.d_model = d_model
-        self.n_head = n_head
-        self.d_k = d_model // n_head
+        Hq = n_head
+        Hkv = n_kv_head if n_kv_head is not None else Hq
 
-        self.w_q = nn.Linear(d_model, d_model, bias=False)
-        self.w_k = nn.Linear(d_model, d_model, bias=False)
-        self.w_v = nn.Linear(d_model, d_model, bias=False)
+        assert d_model % Hq == 0, "d_model must be divisible by n_head (Hq)"
+        d_k = d_model // Hq
+        assert d_k % 2 == 0, "RoPE needs even head_dim"
+        assert Hq % Hkv == 0, "n_head (Hq) must be a multiple of n_kv_head (Hkv)"
+
+        self.d_model = d_model
+        self.n_head = Hq
+        self.n_kv_head = Hkv
+        self.d_k = d_k
+        self.n_rep = Hq // Hkv
+        self.max_kv_len = max_kv_len
+
+        # Projections: Q in Hq heads, K/V in Hkv heads
+        self.w_q = nn.Linear(d_model, Hq * d_k, bias=False)
+        self.w_kv = nn.Linear(d_model, 2 * Hkv * d_k, bias=False)
+
         self.fc = nn.Linear(d_model, d_model)
         self.dropout_layer = nn.Dropout(dropout)
 
     def forward(
         self,
-        x: torch.Tensor,
-        freqs_cis: torch.Tensor,                # [S_q, Dk/2] (complex) or your real-ROPE tables
-        mask: Optional[torch.Tensor] = None,    # [B, S_kv] (1=attend, 0=pad)
-        layer_past: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        x: torch.Tensor,                        # [B, S_q, D]
+        freqs_cis: torch.Tensor,                # [S_q, d_k/2] (complex)
+        mask: Optional[torch.Tensor] = None,    # [B, S_kv] (1=attend, 0=pad) over full KV (past+current)
+        layer_past: Optional[Tuple[torch.Tensor, torch.Tensor, int]] = None,  # (k_past, v_past, cache_pos)
         use_cache: bool = False,
-    ) -> Tuple[torch.Tensor, None, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
+    ) -> Tuple[torch.Tensor, None, Optional[Tuple[torch.Tensor, torch.Tensor, int]]]:
 
         B, S_q, _ = x.size()
 
-        q = self.w_q(x).view(B, S_q, self.n_head, self.d_k)
-        k = self.w_k(x).view(B, S_q, self.n_head, self.d_k)
-        v = self.w_v(x).view(B, S_q, self.n_head, self.d_k)
-
-        q, k_cur = apply_rotary_pos_emb(q, k, freqs_cis=freqs_cis)
-
+        cache_position = 0
+        k_past = v_past = None
         if layer_past is not None:
-            k_full = torch.cat((layer_past[0], k_cur), dim=1)    # [B, S_past+S_q, H, Dk]
-            v_full = torch.cat((layer_past[1], v), dim=1)        # [B, S_past+S_q, H, Dk]
+            if len(layer_past) == 3:
+                k_past, v_past, past_position = layer_past
+                if isinstance(past_position, torch.Tensor):
+                    cache_position = int(past_position.item())
+                else:
+                    cache_position = int(past_position)
+            else:
+                k_past, v_past = layer_past
+                cache_position = k_past.size(1)
+
+        # Projections
+        q = self.w_q(x).view(B, S_q, self.n_head, self.d_k)                       # [B, S_q, Hq, Dk]
+        kv = self.w_kv(x).view(B, S_q, 2, self.n_kv_head, self.d_k)               # [B, S_q, 2, Hkv, Dk]
+        k, v = kv.unbind(dim=2)                                                   # each [B, S_q, Hkv, Dk]
+
+        # RoPE on Q and K (K has fewer heads)
+        q, k_cur = apply_rotary_pos_emb(q, k, freqs_cis=freqs_cis)                # q:[B,S,Hq,D], k_cur:[B,S,Hkv,D]
+
+        # KV cache kept in Hkv heads
+        if layer_past is not None:
+            k_full = torch.cat((k_past, k_cur), dim=1)                            # [B, S_past+S_q, Hkv, D]
+            v_full = torch.cat((v_past, v),     dim=1)                            # [B, S_past+S_q, Hkv, D]
         else:
             k_full = k_cur
             v_full = v
 
-        present = (k_full, v_full) if use_cache else None
+        # Sliding window truncation
+        if use_cache and (self.max_kv_len is not None) and (k_full.size(1) > self.max_kv_len):
+            k_full = k_full[:, -self.max_kv_len:]
+            v_full = v_full[:, -self.max_kv_len:]
+            if mask is not None and mask.size(1) != k_full.size(1):
+                mask = mask[:, -k_full.size(1):]
 
-        # FlashAttention requires CUDA + fp16/bf16
-        if not (q.is_cuda and k_full.is_cuda and v_full.is_cuda):
+        next_cache_position = cache_position + S_q
+        present = (k_full, v_full, next_cache_position) if use_cache else None
+
+        # Repeat K/V heads to match Hq for attention computation
+        k_attn = repeat_kv(k_full, self.n_rep)                                    # [B, S_kv, Hq, D]
+        v_attn = repeat_kv(v_full, self.n_rep)                                    # [B, S_kv, Hq, D]
+
+        # FlashAttention requirements
+        if not (q.is_cuda and k_attn.is_cuda and v_attn.is_cuda):
             raise AssertionError("FlashAttention requires CUDA tensors. Move model and inputs to GPU.")
         allowed_dtypes = (torch.float16, torch.bfloat16)
 
         orig_dtype = q.dtype
-        q = q.contiguous()
-        k_full = k_full.contiguous()
-        v_full = v_full.contiguous()
+        if q.dtype not in allowed_dtypes:
+            q      = q.to(torch.float16)
+            k_attn = k_attn.to(torch.float16)
+            v_attn = v_attn.to(torch.float16)
 
-        # -------- No-padding (fused) path --------
+        q = q.contiguous()
+        k_attn = k_attn.contiguous()
+        v_attn = v_attn.contiguous()
+
+        # --- No-padding (fused) path ---
         if mask is None:
-            # q attends over full k_full/v_full causally; lengths must match (i.e., no cache).
-            if k_full.size(1) != S_q:
+            if k_attn.size(1) != S_q:
                 raise AssertionError(
-                    f"flash_attn_func expects q_len==kv_len; got q={S_q}, kv={k_full.size(1)}. "
+                    f"flash_attn_func expects q_len==kv_len; got q={S_q}, kv={k_attn.size(1)}. "
                     "Provide a padding mask to use varlen with cache."
                 )
-            if q.dtype not in allowed_dtypes:
-                q = q.to(torch.float16)
-                k_full = k_full.to(torch.float16)
-                v_full = v_full.to(torch.float16)
-
             context = flash_attn_func(
-                q, k_full, v_full,
+                q, k_attn, v_attn,
                 dropout_p=self.dropout_layer.p if self.training else 0.0,
                 causal=True
             )
 
-        # -------- Varlen path (with mask / cache) --------
+        # --- Varlen path (with mask / cache) ---
         else:
-            # Query mask for just the current S_q tokens at tail of KV
             if mask.size(1) == S_q:
                 q_mask = mask.bool()
             elif mask.size(1) > S_q:
                 q_mask = mask[:, -S_q:].bool()
             else:
                 q_mask = torch.ones(B, S_q, dtype=torch.bool, device=mask.device)
-
             m_bool = mask.bool()
 
-            if q.dtype not in allowed_dtypes:
-                q = q.to(torch.float16)
-                k_full = k_full.to(torch.float16)
-                v_full = v_full.to(torch.float16)
-
-            # Newer FA returns 5 values; older returns 4 → use starred unpack
-            q_unpad, q_idx, cu_q, max_q, *_ = unpad_input(q, q_mask)
-            k_unpad, _,      cu_k, max_k, *_ = unpad_input(k_full, m_bool)
-            v_unpad, *_ = unpad_input(v_full, m_bool)
-
-            # Some FA builds want int32 indices
+            q_unpad, q_idx, cu_q, max_q, *_ = unpad_input(q,      q_mask)
+            k_unpad, _,     cu_k, max_k, *_ = unpad_input(k_attn, m_bool)
+            v_unpad, *_                 = unpad_input(v_attn, m_bool)
             q_idx = q_idx.to(torch.int32)
 
             context_unpad = flash_attn_varlen_func(
@@ -165,16 +216,11 @@ class MultiHeadAttention(nn.Module):
                 dropout_p=self.dropout_layer.p if self.training else 0.0,
                 causal=True
             )
-
-            # pad_input signature differs by version:
-            # - Newer: pad_input(tensor, indices, B, S)
-            # - Older: pad_input(tensor, indices, S)
             try:
-                context = pad_input(context_unpad, q_idx, B, S_q)   # [B, S_q, H, Dk]
+                context = pad_input(context_unpad, q_idx, B, S_q)
             except TypeError:
-                context = pad_input(context_unpad, q_idx, S_q)      # [B, S_q, H, Dk]
+                context = pad_input(context_unpad, q_idx, S_q)
 
-        # Cast back to original dtype for the output projection
         if context.dtype != orig_dtype:
             context = context.to(orig_dtype)
 
@@ -204,49 +250,43 @@ class PositionwiseFeedForward(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    """ Pre-LN block with FA+RoPE """
-    def __init__(self, d_model: int, n_head: int, d_ff: int, dropout: float = 0.1):
+    def __init__(self, d_model, n_head, d_ff, dropout=0.1, max_kv_len=None, n_kv_head=None):
         super().__init__()
-        self.attn = MultiHeadAttention(d_model, n_head, dropout)
-        self.ffn = PositionwiseFeedForward(d_model, d_ff, dropout)
-        self.norm1 = nn.LayerNorm(d_model)
-        self.norm2 = nn.LayerNorm(d_model)
-        self.dropout1 = nn.Dropout(dropout)
-        self.dropout2 = nn.Dropout(dropout)
+        self.norm_attn = RMSNorm(d_model)
+        self.norm_ffn = RMSNorm(d_model)
+        self.attn = MultiHeadAttention(
+            d_model, n_head, dropout,
+            max_kv_len=max_kv_len,
+            n_kv_head=n_kv_head
+        )
+        self.ffn  = PositionwiseFeedForward(d_model, d_ff, dropout)
+        self.drop_attn = nn.Dropout(dropout)
+        self.drop_ffn  = nn.Dropout(dropout)
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        freqs_cis: torch.Tensor,
-        mask: Optional[torch.Tensor],
-        layer_past: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-        use_cache: bool = False,
-    ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
-
-        residual = x
-        x = self.norm1(x)
-        attn_out, _, present = self.attn(x, freqs_cis=freqs_cis, mask=mask, layer_past=layer_past, use_cache=use_cache)
-        x = residual + self.dropout1(attn_out)
-
-        residual = x
-        x = self.norm2(x)
-        x = residual + self.dropout2(self.ffn(x))
+    def forward(self, x, freqs_cis, mask, layer_past=None, use_cache=False):
+        h = self.norm_attn(x)
+        attn_out, _, present = self.attn(h, freqs_cis=freqs_cis, mask=mask,
+                                         layer_past=layer_past, use_cache=use_cache)
+        x = x + self.drop_attn(attn_out)
+        ffn_out = self.ffn(self.norm_ffn(x))
+        x = x + self.drop_ffn(ffn_out)
         return x, present
 
 
 class GPT(nn.Module):
-    """ GPT with FlashAttention + RoPE + KV caching (weights tied) """
     def __init__(
         self,
         vocab_size: int,
         d_model: int,
-        n_head: int,
+        n_head: int,             # Hq
         n_layer: int,
         d_ff: int,
         max_seq_len: int,
         dropout: float = 0.1,
         pad_idx: int = 0,
         rope_theta: float = 10000.0,
+        n_kv_head: Optional[int] = None,    # NEW: Hkv (defaults to Hq if None)
+        max_kv_len: Optional[int] = None,   # optionally expose sliding-window limit
     ):
         super().__init__()
         assert d_model % n_head == 0
@@ -258,18 +298,23 @@ class GPT(nn.Module):
         self.rope_theta = rope_theta
 
         self.token_embedding = nn.Embedding(vocab_size, d_model, padding_idx=pad_idx)
-        self.layers = nn.ModuleList([TransformerBlock(d_model, n_head, d_ff, dropout) for _ in range(n_layer)])
+        self.layers = nn.ModuleList([
+            TransformerBlock(
+                d_model, n_head, d_ff,
+                max_kv_len=max_kv_len,
+                dropout=dropout,
+                n_kv_head=n_kv_head
+            )
+            for _ in range(n_layer)
+        ])
         self.dropout = nn.Dropout(dropout)
-        self.final_norm = nn.LayerNorm(d_model)
+        self.final_norm = RMSNorm(d_model)
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
-
-        # weight tying
         self.lm_head.weight = self.token_embedding.weight
 
-        # Precompute a safe baseline of RoPE freqs and register as buffer
         precomp_len = max_seq_len * 2
         freqs = precompute_freqs_cis(self.d_k, precomp_len, theta=self.rope_theta)
-        self.register_buffer("precomputed_freqs_cis", freqs, persistent=False)  # non-persistent to avoid bloat
+        self.register_buffer("precomputed_freqs_cis", freqs, persistent=False)
 
         self.apply(self._init_weights)
 
@@ -299,15 +344,23 @@ class GPT(nn.Module):
         self,
         input_ids: torch.Tensor,                       # [B, S_q]
         attention_mask: Optional[torch.Tensor] = None, # [B, S_q], 1=attend, 0=pad
-        past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
+        past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor, int]]] = None,
         use_cache: bool = False,
-    ) -> Tuple[torch.Tensor, Optional[List[Tuple[torch.Tensor, torch.Tensor]]]]:
+    ) -> Tuple[torch.Tensor, Optional[List[Tuple[torch.Tensor, torch.Tensor, int]]]]:
 
         B, S_q = input_ids.size()
         device = input_ids.device
 
-        past_len = past_key_values[0][0].size(1) if (past_key_values is not None and past_key_values[0] is not None) else 0
-        start_pos = past_len
+        past_len = 0
+        start_pos = 0
+        if past_key_values is not None and past_key_values[0] is not None:
+            layer0 = past_key_values[0]
+            past_len = layer0[0].size(1)
+            if len(layer0) == 3:
+                cache_position = layer0[2]
+                start_pos = int(cache_position.item()) if isinstance(cache_position, torch.Tensor) else int(cache_position)
+            else:
+                start_pos = past_len
 
         x = self.dropout(self.token_embedding(input_ids))
 
@@ -417,3 +470,37 @@ class GPT(nn.Module):
 
         self.train()
         return sequences
+
+
+def upgrade_state_dict_for_block_norms(
+    state_dict: Mapping[str, torch.Tensor]
+) -> Mapping[str, torch.Tensor]:
+    """
+    Upgrade checkpoints trained with the old single RMSNorm per block to the new
+    dual-norm layout (attn + ffn). Copies the old weights into both new norms and
+    drops stale bias entries. Final RMSNorm weights are preserved; its old bias is discarded.
+    """
+    if any(".norm_attn.weight" in k for k in state_dict.keys()):
+        return state_dict
+
+    needs_upgrade = any(
+        k.startswith("layers.") and ".norm." in k
+        for k in state_dict.keys()
+    )
+    if not needs_upgrade:
+        return state_dict
+
+    upgraded = OrderedDict()
+    for key, value in state_dict.items():
+        if key.startswith("layers.") and ".norm." in key:
+            if key.endswith(".weight"):
+                prefix = key.replace(".norm.weight", "")
+                upgraded[f"{prefix}.norm_attn.weight"] = value.clone()
+                upgraded[f"{prefix}.norm_ffn.weight"] = value.clone()
+            # Drop old bias/extra state for the obsolete norm module
+            continue
+        if key.startswith("final_norm.") and key.endswith(".bias"):
+            # New RMSNorm has no bias.
+            continue
+        upgraded[key] = value
+    return upgraded
