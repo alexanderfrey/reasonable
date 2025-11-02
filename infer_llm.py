@@ -47,6 +47,16 @@ os.environ.setdefault("TOKENIZERS_PARALLELISM", "true")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 log = logging.getLogger("infer_llm")
 
+
+def compute_default_n_kv_head(n_head: int) -> int:
+    if n_head <= 0:
+        return n_head
+    target = max(1, n_head // 4)
+    while target > 1 and n_head % target != 0:
+        target -= 1
+    return max(1, target)
+
+
 # ---------------- LoRA wrapper (must match training) ----------------
 class LoRALinear(nn.Module):
     def __init__(self, base: nn.Linear, r: int = 8, alpha: int = 16, dropout: float = 0.0):
@@ -150,6 +160,8 @@ def load_base_or_merged(args, vocab_size: int, pad_idx: int, device: torch.devic
             raise RuntimeError("Merged full model missing 'config' field.")
         config["vocab_size"] = vocab_size
         config["pad_idx"] = pad_idx
+        if "n_kv_head" not in config or config["n_kv_head"] is None:
+            config["n_kv_head"] = compute_default_n_kv_head(config.get("n_head", args.n_head))
         model = build_model(config)
         state = ckpt.get("model_state_dict", ckpt)
         if any(k.startswith("_orig_mod.") for k in state):
@@ -174,7 +186,7 @@ def load_base_or_merged(args, vocab_size: int, pad_idx: int, device: torch.devic
         base_config = dict(
             vocab_size=vocab_size,
             d_model=args.d_model, n_head=args.n_head,
-            n_kv_head=getattr(args, "n_kv_head", args.n_head),
+            n_kv_head=args.n_kv_head,
             n_layer=args.n_layer, max_seq_len=args.max_seq_len,
             dropout=args.dropout, pad_idx=pad_idx,
             d_ff=args.d_ff or args.d_model * 4,
@@ -184,6 +196,9 @@ def load_base_or_merged(args, vocab_size: int, pad_idx: int, device: torch.devic
         base_config["pad_idx"] = pad_idx
         base_config.setdefault("max_seq_len", args.max_seq_len)
         base_config.setdefault("d_ff", base_config.get("d_model", 0) * 4)
+        if base_config.get("n_kv_head") is None:
+            n_head_cfg = base_config.get("n_head", args.n_head)
+            base_config["n_kv_head"] = compute_default_n_kv_head(n_head_cfg)
 
     model = build_model(base_config)
     if any(k.startswith("_orig_mod.") for k in base_state):
@@ -516,6 +531,17 @@ def main():
     ap.add_argument("--no_stream", action="store_true", help="Disable token-by-token streaming")
 
     args = ap.parse_args()
+
+    if args.n_kv_head is None:
+        args.n_kv_head = compute_default_n_kv_head(args.n_head)
+        log.info(f"Auto-selected n_kv_head={args.n_kv_head} (n_head={args.n_head}).")
+    elif args.n_head % args.n_kv_head != 0:
+        adjusted = compute_default_n_kv_head(args.n_head)
+        log.warning(
+            f"n_head ({args.n_head}) is not divisible by requested n_kv_head ({args.n_kv_head}); "
+            f"adjusting to {adjusted}."
+        )
+        args.n_kv_head = adjusted
 
     # Device & seeds
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

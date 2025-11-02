@@ -59,6 +59,16 @@ os.environ.setdefault("TOKENIZERS_PARALLELISM", "true")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("qlora_sft")
 
+
+def compute_default_n_kv_head(n_head: int) -> int:
+    if n_head <= 0:
+        return n_head
+    target = max(1, n_head // 4)
+    while target > 1 and n_head % target != 0:
+        target -= 1
+    return max(1, target)
+
+
 IGNORE_INDEX = -100
 
 # ===================== 4-bit Q helpers =====================
@@ -411,11 +421,24 @@ def load_tokenizer(name: str):
 # ===================== Checkpoint load/save =====================
 
 def build_model_from_args(args: Namespace, vocab_size: int, pad_idx: int) -> Tuple[nn.Module, dict]:
+    n_kv_head = getattr(args, "n_kv_head", None)
+    if n_kv_head is None:
+        n_kv_head = compute_default_n_kv_head(args.n_head)
+        setattr(args, "n_kv_head", n_kv_head)
+        logger.info(f"Auto-selected n_kv_head={n_kv_head} (n_head={args.n_head}).")
+    elif args.n_head % n_kv_head != 0:
+        adjusted = compute_default_n_kv_head(args.n_head)
+        logger.warning(
+            f"n_head ({args.n_head}) is not divisible by requested n_kv_head ({n_kv_head}); adjusting to {adjusted}."
+        )
+        n_kv_head = adjusted
+        setattr(args, "n_kv_head", n_kv_head)
+
     model_config = {
         "vocab_size": vocab_size,
         "d_model": args.d_model,
         "n_head": args.n_head,
-        "n_kv_head": getattr(args, 'n_kv_head', 8),
+        "n_kv_head": n_kv_head,
         "n_layer": args.n_layer,
         "max_seq_len": args.max_seq_len,
         "dropout": args.dropout,
@@ -687,6 +710,8 @@ if __name__ == "__main__":
     # Architecture (must match your base model)
     p.add_argument("--d_model", type=int, default=768)
     p.add_argument("--n_head", type=int, default=16)
+    p.add_argument("--n_kv_head", type=int, default=None,
+                   help="Group-query KV heads (defaults to ~n_head/4, adjusted to divide n_head)")
     p.add_argument("--n_layer", type=int, default=24)
     p.add_argument("--d_ff", type=int, default=None)
     p.add_argument("--dropout", type=float, default=0.0)

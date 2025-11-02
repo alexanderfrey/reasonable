@@ -48,6 +48,15 @@ logger = logging.getLogger("rlhf")
 
 IGNORE_INDEX = -100
 
+
+def compute_default_n_kv_head(n_head: int) -> int:
+    if n_head <= 0:
+        return n_head
+    target = max(1, n_head // 4)
+    while target > 1 and n_head % target != 0:
+        target -= 1
+    return max(1, target)
+
 # ===================== LoRA modules =====================
 class LoRALinear(nn.Module):
     def __init__(self, base: nn.Linear, r: int = 8, alpha: int = 16, dropout: float = 0.0):
@@ -410,6 +419,16 @@ def train(args):
     if device.type != "cuda":
         raise RuntimeError("CUDA expected for efficiency.")
 
+    if args.n_kv_head is None:
+        args.n_kv_head = compute_default_n_kv_head(args.n_head)
+        logger.info(f"Auto-selected n_kv_head={args.n_kv_head} (n_head={args.n_head}).")
+    elif args.n_head % args.n_kv_head != 0:
+        adjusted = compute_default_n_kv_head(args.n_head)
+        logger.warning(
+            f"n_head ({args.n_head}) is not divisible by requested n_kv_head ({args.n_kv_head}); adjusting to {adjusted}."
+        )
+        args.n_kv_head = adjusted
+
     tok = load_tokenizer(args.tokenizer_name)
     pad_id = tok.pad_token_id; vocab_size = len(tok)
 
@@ -591,7 +610,8 @@ if __name__ == "__main__":
     ap.add_argument("--d_model", type=int, default=768)
     ap.add_argument("--n_head", type=int, default=16)
     ap.add_argument("--n_layer", type=int, default=24)
-    ap.add_argument("--n_kv_head", type=int, default=8)
+    ap.add_argument("--n_kv_head", type=int, default=None,
+                    help="Group-query KV heads (defaults to ~n_head/4, adjusted to divide n_head)")
     ap.add_argument("--d_ff", type=int, default=None)
     ap.add_argument("--dropout", type=float, default=0.0)
 

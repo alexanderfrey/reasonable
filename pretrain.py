@@ -8,7 +8,7 @@ from torch.cuda.amp import GradScaler, autocast
 from transformers import AutoTokenizer
 import argparse
 from argparse import Namespace # For type hinting args
-import os, json, glob
+import os, json, glob, csv
 
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "true")
 
@@ -27,6 +27,20 @@ logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
+
+
+def compute_default_n_kv_head(n_head: int) -> int:
+    """
+    Prefer a 4:1 query-to-KV head ratio (GQA). If that ratio does not divide n_head,
+    fall back to the largest divisor ≤ target. Guarantees at least 1 head.
+    """
+    if n_head <= 0:
+        return n_head
+    target = max(1, n_head // 4)
+    while target > 1 and n_head % target != 0:
+        target -= 1
+    return max(1, target)
+
 
 # Import the model class from model.py
 try:
@@ -820,13 +834,16 @@ def initialize_model(args: Namespace, vocab_size: int, pad_token_id: int, eos_to
     
     n_kv_head = getattr(args, "n_kv_head", None)
     if n_kv_head is None:
-        n_kv_head = args.n_head
+        n_kv_head = compute_default_n_kv_head(args.n_head)
+        logger.info(f"Auto-selected n_kv_head={n_kv_head} (n_head={args.n_head}).")
     elif args.n_head % n_kv_head != 0:
         logger.warning(
             f"n_head ({args.n_head}) is not divisible by requested n_kv_head ({n_kv_head}); "
-            f"using n_kv_head={args.n_head} instead."
+            "adjusting to nearest divisor."
         )
-        n_kv_head = args.n_head
+        adjusted = compute_default_n_kv_head(args.n_head)
+        logger.warning(f"Setting n_kv_head={adjusted} for compatibility.")
+        n_kv_head = adjusted
 
     mla_config_dict = {
         "num_head": args.n_head,       # d_model / 64 (common head dim)
@@ -1177,8 +1194,31 @@ def run_debug_generation(args: Namespace, model: nn.Module, tokenizer: AutoToken
 
         generated_text = tokenizer.decode(newly_generated_ids, skip_special_tokens=True)
 
-        logger.info(f'Prompt: "{args.debug_generate_prompt}"') # Show original prompt
+        logger.info(f'Prompt: "{prompt}"') # Show original prompt
         logger.info(f"Generated Text:\n{generated_text}")
+
+        # Persist prompt/completion pair for reporting
+        try:
+            output_dir = getattr(args, "output_dir", None)
+            if output_dir:
+                os.makedirs(output_dir, exist_ok=True)
+                csv_path = os.path.join(output_dir, "debug_generations.csv")
+                append_header = not os.path.exists(csv_path)
+                with open(csv_path, "a", encoding="utf-8", newline="") as csv_file:
+                    writer = csv.writer(csv_file)
+                    if append_header:
+                        writer.writerow(["timestamp", "global_step", "prompt", "completion"])
+                    writer.writerow([
+                        time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+                        global_step,
+                        prompt,
+                        generated_text,
+                    ])
+                logger.info(f"Logged prompt/completion pair to {csv_path}")
+            else:
+                logger.warning("No output_dir provided; skipping CSV logging for debug generation.")
+        except Exception as csv_err:
+            logger.error(f"Failed to write debug generation CSV entry: {csv_err}", exc_info=True)
 
     except Exception as e:
         logger.error(f"Error during debug generation: {e}", exc_info=True)
@@ -1554,6 +1594,7 @@ def train(args: Namespace):
         model.to(device)
         model.eval()
         final_gen_args = Namespace(
+            output_dir = args.output_dir,
             debug_generate_prompt = getattr(args, 'debug_generate_prompt', "[SOS]" if bos_token_id is not None else "The"),
             debug_max_new_tokens = getattr(args, 'debug_max_new_tokens', 50),
             debug_temperature = getattr(args, 'debug_temperature', 0.7),
@@ -1586,7 +1627,8 @@ if __name__ == "__main__":
     parser.add_argument("--max_seq_len", type=int, default=1024)
     parser.add_argument("--d_model", type=int, default=512)
     parser.add_argument("--n_head", type=int, default=8)
-    parser.add_argument("--n_kv_head", type=int, default=None, help="Number of KV heads for GQA (defaults to n_head).")
+    parser.add_argument("--n_kv_head", type=int, default=None,
+                        help="Number of KV heads for GQA (defaults to ~n_head/4, adjusted to divide n_head).")
     parser.add_argument("--n_layer", type=int, default=6)
     parser.add_argument("--d_ff", type=int, default=None)
     parser.add_argument("--dropout", type=float, default=0.1)
@@ -1610,13 +1652,13 @@ if __name__ == "__main__":
     parser.add_argument("--eval_batch_size", type=int, default=None)
     parser.add_argument("--save_interval", type=int, default=1000)
     parser.add_argument("--resume_from_checkpoint", type=str, nargs="?", const="latest", default=None)
-    parser.add_argument("--keep_last_n_checkpoints", type=int, default=3)
+    parser.add_argument("--keep_last_n_checkpoints", type=int, default=2)
 
     # --- Generation Arguments ---
     parser.add_argument("--generate_example", action="store_true")
     parser.add_argument("--debug_generate_interval", type=int, default=100)
     parser.add_argument("--debug_generate_prompt", type=str, default="The meaning of life is")
-    parser.add_argument("--debug_max_new_tokens", type=int, default=30)
+    parser.add_argument("--debug_max_new_tokens", type=int, default=256)
     parser.add_argument("--debug_temperature", type=float, default=0.7)
     parser.add_argument("--debug_top_k", type=int, default=50)
 
