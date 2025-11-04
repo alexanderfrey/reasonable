@@ -379,8 +379,10 @@ class JSONLSFTDataset(Dataset):
                     else:
                         prompt_len = len(prompt_ids)
 
-                    labels = [IGNORE_INDEX] * prompt_len + ids[prompt_len:]
-                    assert len(labels) == len(ids)
+                    # Predict the *next* token at each position; last token has no target
+                    labels = [IGNORE_INDEX] * len(ids)
+                    for t in range(prompt_len, len(ids) - 1):
+                        labels[t] = ids[t + 1]
 
                     self.samples.append(Sample(ids, labels))
                     rows += 1

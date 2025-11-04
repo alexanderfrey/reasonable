@@ -30,7 +30,7 @@ python lora_finetune.py \
   --strip_think
 """
 
-import os, re, json, glob, math, logging, argparse, random
+import os, re, json, glob, math, logging, argparse, random, csv
 from argparse import Namespace
 from dataclasses import dataclass
 from typing import List, Dict, Optional, Tuple, Iterable
@@ -45,6 +45,10 @@ from transformers import AutoTokenizer
 
 import hashlib
 from tqdm import tqdm
+try:
+    import wandb
+except ImportError:
+    wandb = None
 try:
     import orjson as fastjson  # optional speedup
 except Exception:
@@ -109,6 +113,45 @@ def estimate_train_mem_bytes(trainable_params: int, dtype_bytes: int = 4, optimi
 
 def _format_prompt(prompt_template: str, user_text: str) -> str:
     return prompt_template.format(prompt=user_text)
+
+
+def _load_checkpoint_config(ckpt_path: str) -> Optional[dict]:
+    """Returns the `config` block stored in a base checkpoint, if present."""
+    try:
+        blob = torch.load(ckpt_path, map_location="cpu")
+    except Exception as e:
+        logger.warning(f"Could not read checkpoint config from {ckpt_path}: {e}")
+        return None
+    config = blob.get("config")
+    if not isinstance(config, dict):
+        logger.warning(f"No config dict found in checkpoint {ckpt_path}.")
+        return None
+    return config
+
+
+def _sync_args_with_checkpoint_config(args: Namespace, ckpt_config: dict) -> None:
+    """
+    Override architectural CLI args with the checkpoint's saved config to avoid
+    dimension mismatches (e.g., d_model, n_kv_head).
+    """
+    override_keys = [
+        "d_model",
+        "n_head",
+        "n_kv_head",
+        "n_layer",
+        "d_ff",
+        "max_seq_len",
+        "dropout",
+    ]
+    for key in override_keys:
+        if key in ckpt_config:
+            new_val = ckpt_config[key]
+            old_val = getattr(args, key, None)
+            if old_val != new_val:
+                logger.info(
+                    f"Setting args.{key}={new_val} to match checkpoint (was {old_val})."
+                )
+                setattr(args, key, new_val)
 
 @torch.no_grad()
 def _debug_generate(
@@ -673,6 +716,33 @@ def train(args: Namespace):
     if device.type != "cuda":
         raise RuntimeError("This script expects CUDA for efficiency.")
 
+    ckpt_config = _load_checkpoint_config(args.base_checkpoint)
+    if ckpt_config:
+        _sync_args_with_checkpoint_config(args, ckpt_config)
+
+    wandb_run = None
+    if getattr(args, "disable_wandb", False):
+        logger.info("Weights & Biases logging is disabled via --disable_wandb.")
+    elif wandb is None:
+        logger.warning("wandb package not installed; disabling Weights & Biases logging.")
+        args.disable_wandb = True
+    else:
+        try:
+            wandb_run = wandb.init(
+                project=args.wandb_project,
+                entity=args.wandb_entity,
+                name=args.wandb_run_name,
+                config=vars(args),
+                resume="allow",
+                id=args.wandb_run_id,
+            )
+            args.wandb_run_id = wandb_run.id
+            logger.info(f"Weights & Biases initialized. Run URL: {wandb_run.get_url()}")
+        except Exception as e:
+            logger.warning(f"Failed to initialize Weights & Biases: {e}. Disabling logging.")
+            args.disable_wandb = True
+            wandb_run = None
+
     # Tokenizer
     tok = load_tokenizer(args.tokenizer_name)
     vocab_size = len(tok)
@@ -748,8 +818,13 @@ def train(args: Namespace):
             "estimate_bytes": mem_bytes,
             "estimate_gib": mem_gib,
             "optimizer": "adamw",
-            "dtype_bytes_assumed": 4
+            "dtype_bytes_assumed": 4,
+            "wandb_run_id": getattr(args, "wandb_run_id", None),
         }, f, ensure_ascii=False, indent=2)
+    if wandb_run:
+        wandb.summary["total_params"] = counts["total_params"]
+        wandb.summary["trainable_params"] = counts["trainable_params"]
+        wandb.summary["lora_params"] = counts["lora_params"]
 
     # Datasets (cached)
     train_ds = CachedSFTDataset(train_cache, pad_id, args.max_seq_len)
@@ -838,11 +913,40 @@ def train(args: Namespace):
                     with open(debug_log_path, "a", encoding="utf-8") as f:
                         f.write(f"STEP {global_step}\nPROMPT: {args.debug_infer_prompt}\nOUTPUT:\n{dbg}\n")
                         f.write("-" * 80 + "\n")
+                    csv_path = os.path.join(args.output_dir, "debug_generations.csv")
+                    append_header = not os.path.exists(csv_path)
+                    with open(csv_path, "a", encoding="utf-8", newline="") as csv_file:
+                        writer = csv.writer(csv_file)
+                        if append_header:
+                            writer.writerow(["timestamp", "epoch", "global_step", "prompt", "completion"])
+                        writer.writerow([
+                            time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+                            epoch + 1,
+                            global_step,
+                            args.debug_infer_prompt,
+                            dbg,
+                        ])
+                    if wandb_run:
+                        wandb.log({
+                            "debug/prompt": args.debug_infer_prompt,
+                            "debug/generated_text": dbg[:1024],
+                        }, step=global_step)
 
                 # --- Eval EXACTLY once per optimizer step ---
                 if eval_dl and args.eval_interval > 0 and (global_step % args.eval_interval == 0):
                     eval_loss, eval_ppl = evaluate(model, eval_dl, criterion, device, args.use_amp, vocab_size)
                     logger.info(f"[eval] step {global_step}: loss {eval_loss:.4f} | ppl {eval_ppl:.2f}")
+                    if wandb_run:
+                        wandb.log({
+                            "eval/loss": eval_loss,
+                            "eval/perplexity": eval_ppl,
+                            "epoch": epoch + 1,
+                        }, step=global_step)
+                        best_loss = wandb.summary.get("best_eval_loss", float("inf"))
+                        if eval_loss < best_loss:
+                            wandb.summary["best_eval_loss"] = eval_loss
+                            wandb.summary["best_eval_perplexity"] = eval_ppl
+                            wandb.summary["best_eval_step"] = global_step
                     save_adapters(args, model, model_config, global_step, tag="eval")
 
             # Progress bar + running stats
@@ -858,6 +962,14 @@ def train(args: Namespace):
             # Periodic console log (avoid step 0 spam)
             if global_step > 0 and (global_step % args.log_interval == 0) and count > 0:
                 logger.info(f"step {global_step}: train loss {avg:.4f} | ppl {ppl:.2f}")
+                if wandb_run:
+                    wandb.log({
+                        "train/loss": avg,
+                        "train/perplexity": ppl,
+                        "train/learning_rate": opt.param_groups[0]["lr"],
+                        "epoch": epoch + 1,
+                        "processed_samples": global_step * args.batch_size * args.grad_accum,
+                    }, step=global_step)
                 running, count = 0.0, 0
 
         bar.close()
@@ -865,6 +977,8 @@ def train(args: Namespace):
 
     save_adapters(args, model, model_config, global_step, tag="final", merge=args.merge_and_save)
     logger.info("Training complete.")
+    if wandb_run:
+        wandb.finish()
 
 
 def save_adapters(args: Namespace, model: nn.Module, model_config: dict, step: int, tag: str,
@@ -982,6 +1096,13 @@ if __name__ == "__main__":
         default=1.1,  # >1.0 discourages repeats
         help="Repetition penalty for debug inference (CTRL/GPT-NeoX style).",
     )
+
+    # Weights & Biases
+    p.add_argument("--disable_wandb", action="store_true", help="Disable Weights & Biases logging.")
+    p.add_argument("--wandb_project", type=str, default="gpt_lora_sft", help="Weights & Biases project name.")
+    p.add_argument("--wandb_entity", type=str, default=None, help="Weights & Biases entity (team or username).")
+    p.add_argument("--wandb_run_name", type=str, default=None, help="Optional custom W&B run name.")
+    p.add_argument("--wandb_run_id", type=str, default=None, help="Resume a specific W&B run ID.")
     
     args = p.parse_args()
     

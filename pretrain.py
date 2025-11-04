@@ -1148,13 +1148,17 @@ def save_checkpoint(args: Namespace, epoch: int, global_step: int, model: nn.Mod
 
 
 def run_debug_generation(args: Namespace, model: nn.Module, tokenizer: AutoTokenizer, device: torch.device,
-                         bos_token_id: int | None, pad_token_id: int, use_amp: bool, global_step: int):
+                         bos_token_id: int | None, pad_token_id: int, use_amp: bool, global_step: int,
+                         epoch: int | None = None, step_in_epoch: int | None = None):
     """Runs a debug generation example."""
     if not (hasattr(model, 'generate') and callable(getattr(model, 'generate'))):
         logger.warning("Model does not have a 'generate' method. Skipping debug generation.")
         return
 
-    logger.info(f"\n--- Running Debug Generation @ Step {global_step} ---")
+    if epoch is not None:
+        logger.info(f"\n--- Running Debug Generation @ Epoch {epoch}, Step {global_step} ---")
+    else:
+        logger.info(f"\n--- Running Debug Generation @ Step {global_step} ---")
     start_gen_time = time.time()
     was_training = model.training
     model.eval()
@@ -1207,9 +1211,11 @@ def run_debug_generation(args: Namespace, model: nn.Module, tokenizer: AutoToken
                 with open(csv_path, "a", encoding="utf-8", newline="") as csv_file:
                     writer = csv.writer(csv_file)
                     if append_header:
-                        writer.writerow(["timestamp", "global_step", "prompt", "completion"])
+                        writer.writerow(["timestamp", "epoch", "step_in_epoch", "global_step", "prompt", "completion"])
                     writer.writerow([
                         time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+                        epoch if epoch is not None else "",
+                        step_in_epoch if step_in_epoch is not None else "",
                         global_step,
                         prompt,
                         generated_text,
@@ -1383,6 +1389,7 @@ def train(args: Namespace):
         logger.info(f"\n--- Epoch {epoch+1}/{args.epochs} ---")
         progress_bar = tqdm(enumerate(train_dataloader), total=len(train_dataloader), desc=f"Epoch {epoch+1}", leave=True, dynamic_ncols=True)
         model.train()
+        steps_in_epoch = 0
 
         for batch_idx, batch in progress_bar:
             is_final_accumulation_step = (batch_idx + 1) % gradient_accumulation_steps == 0
@@ -1424,6 +1431,7 @@ def train(args: Namespace):
 
                     optimizer.zero_grad(set_to_none=True)
                     global_step += 1
+                    steps_in_epoch += 1
 
                     # --- Logging ---
                     if args.log_interval > 0 and global_step > 0 and global_step % args.log_interval == 0:
@@ -1522,7 +1530,7 @@ def train(args: Namespace):
 
                     # --- Periodic Debug Generation ---
                     if args.debug_generate_interval > 0 and global_step % args.debug_generate_interval == 0 and global_step > 0:
-                         run_debug_generation(args, model, tokenizer, device, bos_token_id, pad_token_id, use_amp, global_step)
+                         run_debug_generation(args, model, tokenizer, device, bos_token_id, pad_token_id, use_amp, global_step, epoch + 1, steps_in_epoch)
                          model.train()
 
                 except Exception as e:
@@ -1601,7 +1609,9 @@ def train(args: Namespace):
             debug_top_k = getattr(args, 'debug_top_k', 50)
         )
         try:
-            run_debug_generation(final_gen_args, model, tokenizer, device, bos_token_id, pad_token_id, use_amp, global_step)
+            final_epoch_number = (epoch + 1) if 'epoch' in locals() else None
+            final_step_in_epoch = locals().get("steps_in_epoch", None)
+            run_debug_generation(final_gen_args, model, tokenizer, device, bos_token_id, pad_token_id, use_amp, global_step, final_epoch_number, final_step_in_epoch)
         except Exception as e:
             logger.error(f"Error during final debug generation: {e}", exc_info=True)
 
