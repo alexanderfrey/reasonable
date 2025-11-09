@@ -48,10 +48,10 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 log = logging.getLogger("infer_llm")
 
 
-def compute_default_n_kv_head(n_head: int) -> int:
+def compute_default_n_kv_head(n_head: int, kv_ratio: int = 4) -> int:
     if n_head <= 0:
         return n_head
-    target = max(1, n_head // 4)
+    target = max(1, n_head // max(1, kv_ratio))
     while target > 1 and n_head % target != 0:
         target -= 1
     return max(1, target)
@@ -161,7 +161,10 @@ def load_base_or_merged(args, vocab_size: int, pad_idx: int, device: torch.devic
         config["vocab_size"] = vocab_size
         config["pad_idx"] = pad_idx
         if "n_kv_head" not in config or config["n_kv_head"] is None:
-            config["n_kv_head"] = compute_default_n_kv_head(config.get("n_head", args.n_head))
+            kv_ratio = 4
+            if config.get("n_kv_head"):
+                kv_ratio = max(1, config.get("n_head", args.n_head) // config["n_kv_head"])
+            config["n_kv_head"] = compute_default_n_kv_head(config.get("n_head", args.n_head), kv_ratio=kv_ratio)
         model = build_model(config)
         state = ckpt.get("model_state_dict", ckpt)
         if any(k.startswith("_orig_mod.") for k in state):
@@ -197,8 +200,11 @@ def load_base_or_merged(args, vocab_size: int, pad_idx: int, device: torch.devic
         base_config.setdefault("max_seq_len", args.max_seq_len)
         base_config.setdefault("d_ff", base_config.get("d_model", 0) * 4)
         if base_config.get("n_kv_head") is None:
+            kv_ratio = 4
+            if base_config.get("n_kv_head"):
+                kv_ratio = max(1, base_config.get("n_head", args.n_head) // base_config["n_kv_head"])
             n_head_cfg = base_config.get("n_head", args.n_head)
-            base_config["n_kv_head"] = compute_default_n_kv_head(n_head_cfg)
+            base_config["n_kv_head"] = compute_default_n_kv_head(n_head_cfg, kv_ratio=kv_ratio)
 
     model = build_model(base_config)
     if any(k.startswith("_orig_mod.") for k in base_state):
@@ -488,7 +494,18 @@ def main():
     # Model sources
     ap.add_argument("--base_checkpoint", type=str, default=None, help="Path to base model .pt")
     ap.add_argument("--merged_full_model", type=str, default=None, help="Path to merged full model .pt")
-    ap.add_argument("--adapters", type=str, default=None, help="Path to LoRA adapters .pt (from SFT)")
+    ap.add_argument(
+        "--adapters",
+        type=str,
+        default=None,
+        help="Path to LoRA adapters .pt (from SFT/RLHF).",
+    )
+    ap.add_argument(
+        "--lora_adapters",
+        type=str,
+        default=None,
+        help="Alias for --adapters (useful for checkpoints produced by lora_finetune.py).",
+    )
 
     # Tokenizer / templating
     ap.add_argument("--tokenizer_name", type=str, default="gpt2")
@@ -532,6 +549,15 @@ def main():
 
     args = ap.parse_args()
 
+    if args.n_kv_head is None and args.base_checkpoint:
+        try:
+            ckpt = torch.load(args.base_checkpoint, map_location="cpu")
+            cfg = ckpt.get("config")
+            if cfg and cfg.get("n_kv_head"):
+                args.n_kv_head = cfg["n_kv_head"]
+                log.info(f"Setting n_kv_head={args.n_kv_head} from base checkpoint config.")
+        except Exception as exc:
+            log.warning(f"Could not read base checkpoint config to infer n_kv_head: {exc}")
     if args.n_kv_head is None:
         args.n_kv_head = compute_default_n_kv_head(args.n_head)
         log.info(f"Auto-selected n_kv_head={args.n_kv_head} (n_head={args.n_head}).")
@@ -561,8 +587,9 @@ def main():
     model, _cfg = load_base_or_merged(args, vocab_size, pad_idx, device)
 
     # Apply LoRA adapters if provided
-    if args.adapters:
-        load_lora_adapters(model, args.adapters, device)
+    adapter_path = args.adapters or args.lora_adapters
+    if adapter_path:
+        load_lora_adapters(model, adapter_path, device)
         log.info("LoRA adapters loaded.")
 
     # AMP setup: optionally cast weights to reduce VRAM

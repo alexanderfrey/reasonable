@@ -38,7 +38,7 @@ from typing import List, Dict, Optional, Tuple, Iterable
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, Subset
 from torch import amp
 
 from transformers import AutoTokenizer
@@ -74,10 +74,11 @@ IGNORE_INDEX = -100
 import time
 
 
-def compute_default_n_kv_head(n_head: int) -> int:
+def compute_default_n_kv_head(n_head: int, kv_ratio: int = 4) -> int:
+    """Return default KV-head count (GQA) given query heads and desired ratio."""
     if n_head <= 0:
         return n_head
-    target = max(1, n_head // 4)
+    target = max(1, n_head // max(1, kv_ratio))
     while target > 1 and n_head % target != 0:
         target -= 1
     return max(1, target)
@@ -159,11 +160,12 @@ def _debug_generate(
     tok: AutoTokenizer,
     device: torch.device,
     prompt_text: str,
-    max_new_tokens: int = 128,
+    max_new_tokens: Optional[int] = None,
     temperature: float = 0.7,
     top_p: float = 0.9,
     eos_id: Optional[int] = None,
-    repetition_penalty: float = 1.0
+    repetition_penalty: float = 1.0,
+    max_seq_len: Optional[int] = None,
 ) -> str:
     """Minimal autoregressive sampler using your model's forward (logits, _)."""
     was_training = model.training
@@ -172,7 +174,8 @@ def _debug_generate(
         input_ids = tok.encode(prompt_text, add_special_tokens=False)
         ids = torch.tensor([input_ids], dtype=torch.long, device=device)
 
-        for _ in range(max_new_tokens):
+        generated = 0
+        while True:
             logits, _ = model(ids)               # (B, T, V)
             next_logits = logits[:, -1, :]       # (B, V)
             
@@ -209,6 +212,12 @@ def _debug_generate(
 
             ids = torch.cat([ids, next_token], dim=1)
             if eos_id is not None and next_token.item() == eos_id:
+                break
+            generated += 1
+            if max_new_tokens is not None and generated >= max_new_tokens:
+                break
+            if max_seq_len is not None and ids.size(1) >= max_seq_len:
+                logger.warning("Debug generation reached max_seq_len before emitting EOS; stopping early.")
                 break
 
         out_ids = ids[0].tolist()
@@ -572,8 +581,17 @@ def load_tokenizer(name: str):
 
 def build_model_from_args(args: Namespace, vocab_size: int, pad_idx: int) -> Tuple[nn.Module, dict]:
     n_kv_head = getattr(args, 'n_kv_head', None)
+    if n_kv_head is None and ckpt_config:
+        inferred = ckpt_config.get("n_kv_head")
+        if inferred:
+            n_kv_head = inferred
+            setattr(args, 'n_kv_head', n_kv_head)
+            logger.info(f"Setting n_kv_head={n_kv_head} to match base checkpoint config.")
     if n_kv_head is None:
-        n_kv_head = compute_default_n_kv_head(args.n_head)
+        kv_ratio = 4
+        if ckpt_config and ckpt_config.get("n_kv_head"):
+            kv_ratio = max(1, ckpt_config.get("n_head", args.n_head) // ckpt_config["n_kv_head"])
+        n_kv_head = compute_default_n_kv_head(args.n_head, kv_ratio=kv_ratio)
         setattr(args, 'n_kv_head', n_kv_head)
         logger.info(f"Auto-selected n_kv_head={n_kv_head} (n_head={args.n_head}).")
     elif args.n_head % n_kv_head != 0:
@@ -748,9 +766,8 @@ def train(args: Namespace):
     vocab_size = len(tok)
     pad_id = tok.pad_token_id
 
-    # Debug inference prompt + log path
+    # Debug inference prompt text used for periodic sampling
     debug_prompt_text = _format_prompt(args.prompt_template, args.debug_infer_prompt)
-    debug_log_path = os.path.join(args.output_dir, "debug_generations.txt")
 
     # Cache dir
     cache_dir = args.dataset_cache_dir or args.output_dir
@@ -829,6 +846,16 @@ def train(args: Namespace):
     # Datasets (cached)
     train_ds = CachedSFTDataset(train_cache, pad_id, args.max_seq_len)
     eval_ds = CachedSFTDataset(eval_cache, pad_id, args.max_seq_len) if eval_cache else None
+    eval_subset_ds = eval_ds
+    if eval_ds and args.eval_max_samples and args.eval_max_samples > 0:
+        orig_eval_len = len(eval_ds)
+        if orig_eval_len > args.eval_max_samples:
+            rng = random.Random(args.shuffle_seed + 12345)
+            subset_idx = rng.sample(range(orig_eval_len), args.eval_max_samples)
+            eval_subset_ds = Subset(eval_ds, subset_idx)
+            logger.info(
+                f"Eval dataset limited to {args.eval_max_samples} random samples per interval (from {orig_eval_len})."
+            )
 
     collate = lambda batch: collate_fn(batch, pad_id, args.max_seq_len)
     train_dl = DataLoader(
@@ -836,13 +863,31 @@ def train(args: Namespace):
         pin_memory=True, drop_last=True, collate_fn=collate
     )
     eval_dl = DataLoader(
+        eval_subset_ds, batch_size=args.eval_batch_size or args.batch_size, shuffle=False,
+        num_workers=args.num_workers, pin_memory=True, drop_last=False, collate_fn=collate
+    ) if eval_subset_ds else None
+    eval_full_dl = DataLoader(
         eval_ds, batch_size=args.eval_batch_size or args.batch_size, shuffle=False,
         num_workers=args.num_workers, pin_memory=True, drop_last=False, collate_fn=collate
     ) if eval_ds else None
 
     # Optimizer / Loss / AMP
-    opt = optim.AdamW([p for p in model.parameters() if p.requires_grad],
-                      lr=args.learning_rate, weight_decay=args.weight_decay)
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    try:
+        import bitsandbytes as bnb
+        opt = bnb.optim.AdamW8bit(
+            trainable_params,
+            lr=args.learning_rate,
+            weight_decay=args.weight_decay,
+        )
+        logger.info("Using bitsandbytes AdamW8bit optimizer.")
+    except Exception as exc:
+        logger.warning(f"Falling back to torch AdamW (8-bit optimizer unavailable: {exc})")
+        opt = optim.AdamW(
+            trainable_params,
+            lr=args.learning_rate,
+            weight_decay=args.weight_decay,
+        )
     criterion = nn.CrossEntropyLoss(ignore_index=IGNORE_INDEX)
     scaler = amp.GradScaler(enabled=False)  # bf16 autocast; no scaling
 
@@ -898,21 +943,22 @@ def train(args: Namespace):
                         tok=tok,
                         device=device,
                         prompt_text=debug_prompt_text,
-                        max_new_tokens=args.debug_infer_max_new_tokens,
+                        max_new_tokens=(
+                            args.debug_infer_max_new_tokens
+                            if (args.debug_infer_max_new_tokens is not None and args.debug_infer_max_new_tokens > 0)
+                            else None
+                        ),
                         temperature=args.debug_temp,
                         top_p=args.debug_top_p,
                         eos_id=tok.eos_token_id,
                         repetition_penalty=args.debug_repetition_penalty,
+                        max_seq_len=args.max_seq_len,
                     )
                     preview = dbg.replace("\n", " ")[:200]
                     logger.info(
                         f"[debug-gen] step {global_step} | prompt='{args.debug_infer_prompt}' → "
                         f"{preview}{'...' if len(dbg) > 200 else ''}"
                     )
-                    os.makedirs(args.output_dir, exist_ok=True)
-                    with open(debug_log_path, "a", encoding="utf-8") as f:
-                        f.write(f"STEP {global_step}\nPROMPT: {args.debug_infer_prompt}\nOUTPUT:\n{dbg}\n")
-                        f.write("-" * 80 + "\n")
                     csv_path = os.path.join(args.output_dir, "debug_generations.csv")
                     append_header = not os.path.exists(csv_path)
                     with open(csv_path, "a", encoding="utf-8", newline="") as csv_file:
@@ -932,22 +978,22 @@ def train(args: Namespace):
                             "debug/generated_text": dbg[:1024],
                         }, step=global_step)
 
-                # --- Eval EXACTLY once per optimizer step ---
+                # --- Eval EXACTLY once per optimizer step (subset) ---
                 if eval_dl and args.eval_interval > 0 and (global_step % args.eval_interval == 0):
                     eval_loss, eval_ppl = evaluate(model, eval_dl, criterion, device, args.use_amp, vocab_size)
-                    logger.info(f"[eval] step {global_step}: loss {eval_loss:.4f} | ppl {eval_ppl:.2f}")
+                    logger.info(f"[eval-subset] step {global_step}: loss {eval_loss:.4f} | ppl {eval_ppl:.2f}")
                     if wandb_run:
                         wandb.log({
-                            "eval/loss": eval_loss,
-                            "eval/perplexity": eval_ppl,
+                            "eval/loss_subset": eval_loss,
+                            "eval/perplexity_subset": eval_ppl,
                             "epoch": epoch + 1,
                         }, step=global_step)
-                        best_loss = wandb.summary.get("best_eval_loss", float("inf"))
+                        best_loss = wandb.summary.get("best_eval_loss_subset", float("inf"))
                         if eval_loss < best_loss:
-                            wandb.summary["best_eval_loss"] = eval_loss
-                            wandb.summary["best_eval_perplexity"] = eval_ppl
-                            wandb.summary["best_eval_step"] = global_step
-                    save_adapters(args, model, model_config, global_step, tag="eval")
+                            wandb.summary["best_eval_loss_subset"] = eval_loss
+                            wandb.summary["best_eval_perplexity_subset"] = eval_ppl
+                            wandb.summary["best_eval_step_subset"] = global_step
+                    save_adapters(args, model, model_config, global_step, tag="eval_subset")
 
             # Progress bar + running stats
             running += loss.item(); count += 1
@@ -974,6 +1020,20 @@ def train(args: Namespace):
 
         bar.close()
         save_adapters(args, model, model_config, global_step, tag=f"epoch{epoch+1}")
+
+    if eval_full_dl:
+        final_eval_loss, final_eval_ppl = evaluate(model, eval_full_dl, criterion, device, args.use_amp, vocab_size)
+        logger.info(f"[eval-full-final] loss {final_eval_loss:.4f} | ppl {final_eval_ppl:.2f}")
+        if wandb_run:
+            wandb.log({
+                "eval/loss_full": final_eval_loss,
+                "eval/perplexity_full": final_eval_ppl,
+                "epoch": args.epochs,
+            }, step=global_step)
+            wandb.summary["final_eval_loss"] = final_eval_loss
+            wandb.summary["final_eval_perplexity"] = final_eval_ppl
+            wandb.summary["final_eval_step"] = global_step
+        save_adapters(args, model, model_config, global_step, tag="eval_full")
 
     save_adapters(args, model, model_config, global_step, tag="final", merge=args.merge_and_save)
     logger.info("Training complete.")
@@ -1029,6 +1089,8 @@ if __name__ == "__main__":
                    help="Optional eval JSONL path or glob (ignored if --training_dir is set)")
     p.add_argument("--eval_fraction", type=float, default=0.15,
                    help="Fraction for eval split when using --training_dir")
+    p.add_argument("--eval_max_samples", type=int, default=1000,
+                   help="Maximum eval samples to use per run (<=0 keeps all)")
     p.add_argument("--shuffle_seed", type=int, default=42,
                    help="Shuffle seed used when compiling data from --training_dir")
     p.add_argument("--prompt_template", type=str, default="<|user|>\n{prompt}\n<|assistant|>\n",
@@ -1084,8 +1146,8 @@ if __name__ == "__main__":
                help="Every N optimizer steps, run a quick debug generation.")
     p.add_argument("--debug_infer_prompt", type=str, default="What is love ?",
                 help="Prompt to use for periodic debug generations.")
-    p.add_argument("--debug_infer_max_new_tokens", type=int, default=512,
-                help="Max new tokens to generate during debug inference.")
+    p.add_argument("--debug_infer_max_new_tokens", type=int, default=None,
+                help="Optional cap on new tokens during debug inference (default: run until EOS or max_seq_len).")
     p.add_argument("--debug_temp", type=float, default=0.7,
                 help="Sampling temperature for debug inference (0 = greedy).")
     p.add_argument("--debug_top_p", type=float, default=0.9,

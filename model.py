@@ -5,6 +5,7 @@ from typing import Optional, Tuple, List, Mapping
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 # FlashAttention imports (required)
 from flash_attn import flash_attn_func, flash_attn_varlen_func
@@ -287,6 +288,7 @@ class GPT(nn.Module):
         rope_theta: float = 10000.0,
         n_kv_head: Optional[int] = None,    # NEW: Hkv (defaults to Hq if None)
         max_kv_len: Optional[int] = None,   # optionally expose sliding-window limit
+        use_gradient_checkpointing: bool = False,
     ):
         super().__init__()
         assert d_model % n_head == 0
@@ -311,6 +313,7 @@ class GPT(nn.Module):
         self.final_norm = RMSNorm(d_model)
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
         self.lm_head.weight = self.token_embedding.weight
+        self.use_gradient_checkpointing = use_gradient_checkpointing
 
         precomp_len = max_seq_len * 2
         freqs = precompute_freqs_cis(self.d_k, precomp_len, theta=self.rope_theta)
@@ -389,7 +392,32 @@ class GPT(nn.Module):
         h = x
         for i, layer in enumerate(self.layers):
             layer_past = past_key_values[i] if past_key_values is not None else None
-            h, present = layer(h, freqs_cis=freqs_cis, mask=kv_mask, layer_past=layer_past, use_cache=use_cache)
+            if (
+                self.use_gradient_checkpointing
+                and self.training
+                and not use_cache
+                and layer_past is None
+            ):
+                def custom_forward(hidden_states):
+                    out, _ = layer(
+                        hidden_states,
+                        freqs_cis=freqs_cis,
+                        mask=kv_mask,
+                        layer_past=None,
+                        use_cache=False,
+                    )
+                    return out
+
+                h = checkpoint(custom_forward, h)
+                present = None
+            else:
+                h, present = layer(
+                    h,
+                    freqs_cis=freqs_cis,
+                    mask=kv_mask,
+                    layer_past=layer_past,
+                    use_cache=use_cache,
+                )
             if use_cache:
                 presents.append(present)
 

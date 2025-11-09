@@ -1,3 +1,4 @@
+import inspect
 import torch
 from torch import amp
 import torch.nn as nn
@@ -28,6 +29,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+_PIN_MEMORY_DEVICE_SUPPORTED = "pin_memory_device" in inspect.signature(DataLoader.__init__).parameters
+
 
 def compute_default_n_kv_head(n_head: int) -> int:
     """
@@ -40,6 +43,23 @@ def compute_default_n_kv_head(n_head: int) -> int:
     while target > 1 and n_head % target != 0:
         target -= 1
     return max(1, target)
+
+
+def _build_optimizer(trainable_params, lr: float, weight_decay: float, *, logger_prefix: str = ""):
+    """
+    Prefer bitsandbytes AdamW8bit when available to reduce optimizer memory foot print.
+    """
+    try:
+        import bitsandbytes as bnb  # type: ignore
+
+        optimizer = bnb.optim.AdamW8bit(trainable_params, lr=lr, weight_decay=weight_decay)
+        note = f"{logger_prefix}Using bitsandbytes AdamW8bit optimizer."
+        logger.info(note.strip())
+        return optimizer
+    except Exception as exc:
+        note = f"{logger_prefix}Falling back to torch AdamW (8-bit optimizer unavailable: {exc})"
+        logger.warning(note.strip())
+        return optim.AdamW(trainable_params, lr=lr, weight_decay=weight_decay)
 
 
 # Import the model class from model.py
@@ -701,13 +721,41 @@ def _load_or_tokenize_data(
 
 def prepare_dataloaders(args: Namespace, tokenizer: AutoTokenizer, vocab_size: int, pad_token_id: int, eos_token_id: int):
     """Prepares training and optional evaluation dataloaders."""
-    stride = args.max_seq_len #// 2
+
+    def _resolve_stride(requested: int | None, fallback: int, label: str) -> int:
+        stride_val = requested if requested is not None else fallback
+        if stride_val <= 0:
+            raise SystemExit(f"{label} must be > 0 (received {stride_val}).")
+        return stride_val
+
+    train_stride = _resolve_stride(getattr(args, "train_stride", None), args.max_seq_len, "train_stride")
+    eval_stride = _resolve_stride(getattr(args, "eval_stride", None), train_stride, "eval_stride")
+
+    def _build_dataloader(dataset, *, batch_size: int, shuffle: bool, drop_last: bool, is_eval: bool):
+        loader_kwargs = {
+            "batch_size": batch_size,
+            "shuffle": shuffle,
+            "num_workers": args.num_workers,
+            "pin_memory": True,
+            "drop_last": drop_last,
+        }
+        if args.num_workers > 0:
+            loader_kwargs["persistent_workers"] = True
+            prefetch = getattr(args, "eval_prefetch_factor", None) if is_eval else getattr(args, "prefetch_factor", None)
+            if prefetch is None:
+                prefetch = getattr(args, "prefetch_factor", 4)
+            loader_kwargs["prefetch_factor"] = max(2, int(prefetch))
+        pin_device = getattr(args, "pin_memory_device", None)
+        if pin_device and torch.cuda.is_available() and _PIN_MEMORY_DEVICE_SUPPORTED:
+            loader_kwargs["pin_memory_device"] = pin_device
+        return DataLoader(dataset, **loader_kwargs)
+
     # --- Training Data ---
     train_token_file, train_num_examples = _load_or_tokenize_data(
         corpus_file=args.corpus_file,
         tokenizer=tokenizer,
         max_seq_len=args.max_seq_len,
-        stride=stride,
+        stride=train_stride,
         output_dir=args.output_dir,
         data_type="Training",
         force_retokenize=args.force_retokenize,
@@ -723,19 +771,18 @@ def prepare_dataloaders(args: Namespace, tokenizer: AutoTokenizer, vocab_size: i
     logger.info("Initializing training dataset...")
     try:
         train_dataset = PretokenizedDataset(
-            train_token_file, train_num_examples, args.max_seq_len, stride, data_type="Train"
+            train_token_file, train_num_examples, args.max_seq_len, train_stride, data_type="Train"
         )
         if len(train_dataset) == 0:
              logger.critical("Training dataset has length 0 after initialization. Exiting.")
              exit(1)
 
-        train_dataloader = DataLoader(
+        train_dataloader = _build_dataloader(
             train_dataset,
             batch_size=args.batch_size,
             shuffle=True,
-            num_workers=args.num_workers,
-            pin_memory=True,
             drop_last=True,
+            is_eval=False,
         )
         logger.info(f"Training dataloader created with {len(train_dataloader)} batches per epoch.")
     except Exception as e:
@@ -750,7 +797,7 @@ def prepare_dataloaders(args: Namespace, tokenizer: AutoTokenizer, vocab_size: i
             corpus_file=args.eval_corpus_file,
             tokenizer=tokenizer,
             max_seq_len=args.max_seq_len,
-            stride=stride,
+            stride=eval_stride,
             output_dir=args.output_dir,
             data_type="Evaluation",
             force_retokenize=args.force_retokenize,
@@ -764,16 +811,15 @@ def prepare_dataloaders(args: Namespace, tokenizer: AutoTokenizer, vocab_size: i
             logger.info("Initializing evaluation dataset...")
             try:
                 eval_dataset = PretokenizedDataset(
-                    eval_token_file, eval_num_examples, args.max_seq_len, stride, data_type="Eval"
+                    eval_token_file, eval_num_examples, args.max_seq_len, eval_stride, data_type="Eval"
                 )
                 if len(eval_dataset) > 0:
-                    eval_dataloader = DataLoader(
+                    eval_dataloader = _build_dataloader(
                         eval_dataset,
                         batch_size=(args.eval_batch_size if args.eval_batch_size else args.batch_size),
                         shuffle=False,
-                        num_workers=args.num_workers,
-                        pin_memory=True,
                         drop_last=False,
+                        is_eval=True,
                     )
                     logger.info(f"Evaluation dataloader created with {len(eval_dataloader)} batches.")
                 else:
@@ -873,13 +919,20 @@ def initialize_model(args: Namespace, vocab_size: int, pad_token_id: int, eos_to
         "n_kv_head": n_kv_head,
         "n_layer": args.n_layer,
         "max_seq_len": args.max_seq_len,
+        "max_kv_len": getattr(args, "max_kv_len", None),
         # "mla_config": mla_config_dict,
         # "moe_config": moe_config_dict,
         "dropout": args.dropout,
         "pad_idx": pad_token_id,    
-        "d_ff": args.d_ff,   
+        "d_ff": args.d_ff,
+        "use_gradient_checkpointing": getattr(args, "grad_checkpoint", False),
     }
     
+
+    if model_config["max_kv_len"]:
+        logger.info(f"Using sliding KV cache window of {model_config['max_kv_len']} tokens.")
+    if model_config["use_gradient_checkpointing"]:
+        logger.info("Gradient checkpointing enabled for Transformer blocks.")
 
     model = GPT(**model_config).to(device)
     pad_eq_eos = (pad_token_id is not None) and (eos_token_id is not None) and (pad_token_id == eos_token_id)
@@ -907,6 +960,7 @@ def initialize_model(args: Namespace, vocab_size: int, pad_token_id: int, eos_to
 
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info(f"Model initialized with {num_params:,} trainable parameters.")
+    logger.debug(f"[debug] Trainable parameter count: {num_params:,}")
 
     return model, model_config
 
@@ -914,8 +968,14 @@ def initialize_model(args: Namespace, vocab_size: int, pad_token_id: int, eos_to
 
 def initialize_training_components(args: Namespace, model: nn.Module, use_amp: bool, pad_token_id: int):
     """Initializes optimizer, loss criterion, and GradScaler."""
-    print("learning_rate:",args.learning_rate)
-    optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
+    print("learning_rate:", args.learning_rate)
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = _build_optimizer(
+        trainable_params,
+        lr=args.learning_rate,
+        weight_decay=args.weight_decay,
+        logger_prefix="[pretrain] ",
+    )
     criterion = nn.CrossEntropyLoss(ignore_index=pad_token_id)
     scaler = GradScaler() if use_amp else None
     if use_amp:
@@ -1035,13 +1095,25 @@ def load_checkpoint(args: Namespace, model: nn.Module, optimizer: optim.Optimize
                         pg['lr'] = args.learning_rate
                 except ValueError as e:
                     logger.warning(f"Could not load optimizer state (likely shape change): {e}. Re-initializing optimizer.")
-                    optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
+                    trainable_params = [p for p in model.parameters() if p.requires_grad]
+                    optimizer = _build_optimizer(
+                        trainable_params,
+                        lr=args.learning_rate,
+                        weight_decay=args.weight_decay,
+                        logger_prefix="[pretrain] ",
+                    )
             else:
                 if not same_vocab:
                     logger.info("Skipping optimizer state load due to vocab mismatch. Re-initializing optimizer.")
                 else:
                     logger.info("Optimizer state not found. Re-initializing optimizer.")
-                optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
+                trainable_params = [p for p in model.parameters() if p.requires_grad]
+                optimizer = _build_optimizer(
+                    trainable_params,
+                    lr=args.learning_rate,
+                    weight_decay=args.weight_decay,
+                    logger_prefix="[pretrain] ",
+                )
 
             # --- Load training progress ---
             global_step = checkpoint.get('global_step', 0)
@@ -1233,12 +1305,96 @@ def run_debug_generation(args: Namespace, model: nn.Module, tokenizer: AutoToken
         gen_time = time.time() - start_gen_time
         logger.info(f"--- Debug Generation Finished ({gen_time:.2f}s) ---")
 
+
+class CUDAGraphTrainStep:
+    """
+    Wraps the micro-step (forward + loss + backward) inside a CUDA graph so we can
+    replay the captured work each iteration. Only safe when GradScaler is disabled.
+    """
+
+    def __init__(self, model, criterion, device, vocab_size, gradient_accumulation_steps: int, use_amp: bool):
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA graphs require CUDA.")
+        self.model = model
+        self.criterion = criterion
+        self.device = device
+        self.vocab_size = vocab_size
+        self.grad_accum_steps = max(1, int(gradient_accumulation_steps))
+        self.use_amp = use_amp
+
+        self.graph = None
+        self.static_input = None
+        self.static_labels = None
+        self.loss_tensor = torch.zeros(1, device=device)
+        self.captured = False
+
+    def __call__(self, batch):
+        try:
+            input_ids = batch["input_ids"].to(self.device, non_blocking=True)
+            labels = batch["labels"].to(self.device, non_blocking=True)
+        except KeyError as e:
+            logger.error(f"Missing key in batch for CUDA graph replay: {e}.")
+            return None, None
+
+        if not self.captured:
+            return self._capture(input_ids, labels)
+        return self._replay(input_ids, labels)
+
+    def _ensure_static_buffers(self, input_ids: torch.Tensor, labels: torch.Tensor):
+        if self.static_input is None or self.static_input.shape != input_ids.shape:
+            self.static_input = torch.empty_like(input_ids, device=self.device)
+        if self.static_labels is None or self.static_labels.shape != labels.shape:
+            self.static_labels = torch.empty_like(labels, device=self.device)
+
+    def _capture(self, input_ids: torch.Tensor, labels: torch.Tensor):
+        self._ensure_static_buffers(input_ids, labels)
+        self.static_input.copy_(input_ids)
+        self.static_labels.copy_(labels)
+        self.loss_tensor.zero_()
+
+        torch.cuda.synchronize()
+        self.graph = torch.cuda.CUDAGraph()
+        self.model.zero_grad(set_to_none=True)
+
+        with torch.cuda.graph(self.graph):
+            try:
+                torch.compiler.cudagraph_mark_step_begin()
+            except Exception:
+                pass
+            with autocast("cuda", enabled=self.use_amp):
+                logits, _ = self.model(self.static_input)
+                loss = self.criterion(logits.view(-1, self.vocab_size), self.static_labels.view(-1))
+            loss_scaled = loss / self.grad_accum_steps
+            loss_scaled.backward()
+            self.loss_tensor.copy_(loss.detach())
+
+        self.captured = True
+        logger.info("Captured CUDA graph of the train micro-step; replay enabled.")
+        return float(self.loss_tensor.item()), None
+
+    def _replay(self, input_ids: torch.Tensor, labels: torch.Tensor):
+        if input_ids.shape != self.static_input.shape or labels.shape != self.static_labels.shape:
+            logger.error("Batch shape mismatch detected during CUDA graph replay.")
+            return None, None
+        self.static_input.copy_(input_ids)
+        self.static_labels.copy_(labels)
+        try:
+            torch.compiler.cudagraph_mark_step_begin()
+        except Exception:
+            pass
+        self.graph.replay()
+        return float(self.loss_tensor.item()), None
+
+
 def train_step(model, batch, criterion, scaler, device, use_amp, vocab_size,
-               gradient_accumulation_steps: int):
+               gradient_accumulation_steps: int, cudagraph_runner: CUDAGraphTrainStep | None = None):
     """
     Performs a single forward pass, calculates loss, scales it for accumulation,
     and performs backward pass. Does NOT step optimizer or zero grads.
     """
+    if cudagraph_runner is not None:
+        return cudagraph_runner(batch)
+
     try:
         input_ids = batch["input_ids"].to(device, non_blocking=True)
         labels = batch["labels"].to(device, non_blocking=True)
@@ -1361,12 +1517,18 @@ def train(args: Namespace):
     )
 
     if args.compile_model and not args.debug:
+        compile_kwargs = {"mode": "max-autotune", "fullgraph": True}
         try:
-            logger.info("Compiling model (post-load) ...")
-            model = torch.compile(model)
-            logger.info("Model compiled successfully.")
-        except Exception as e:
-            logger.warning(f"torch.compile failed: {e}. Continuing without compilation.")
+            logger.info("Compiling model with torch.compile (mode=max-autotune, fullgraph=True)...")
+            model = torch.compile(model, **compile_kwargs)
+            logger.info("Model compiled successfully with tuned settings.")
+        except Exception as tuned_exc:
+            logger.warning(f"torch.compile with tuned settings failed: {tuned_exc}. Retrying with defaults.")
+            try:
+                model = torch.compile(model)
+                logger.info("Model compiled successfully with default torch.compile settings.")
+            except Exception as e:
+                logger.warning(f"torch.compile failed entirely: {e}. Continuing without compilation.")
 
     # --- Gradient Accumulation Setup ---
     gradient_accumulation_steps = getattr(args, 'gradient_accumulation_steps', 32)
@@ -1377,6 +1539,19 @@ def train(args: Namespace):
     if gradient_accumulation_steps > 1:
          logger.info(f"Using gradient accumulation with {gradient_accumulation_steps} steps.")
          logger.info(f"Effective batch size: {args.batch_size * gradient_accumulation_steps}")
+
+    cudagraph_runner = None
+    if getattr(args, "use_cuda_graphs", False):
+        if scaler is not None:
+            raise RuntimeError("--use_cuda_graphs requires AMP to be disabled (GradScaler must be None).")
+        cudagraph_runner = CUDAGraphTrainStep(
+            model=model,
+            criterion=criterion,
+            device=device,
+            vocab_size=vocab_size,
+            gradient_accumulation_steps=gradient_accumulation_steps,
+            use_amp=use_amp,
+        )
 
 
     # --- Training Loop ---
@@ -1397,7 +1572,7 @@ def train(args: Namespace):
 
             step_loss_unscaled, error_info = train_step(
                 model, batch, criterion, scaler, device, use_amp, vocab_size,
-                gradient_accumulation_steps
+                gradient_accumulation_steps, cudagraph_runner=cudagraph_runner
             )
 
             if step_loss_unscaled is not None:
@@ -1632,6 +1807,16 @@ if __name__ == "__main__":
     parser.add_argument("--output_dir", type=str, default="./gpt_pretrain_output_hf")
     parser.add_argument("--tokenizer_name", type=str, default="gpt2")
     parser.add_argument("--force_retokenize", action="store_true")
+    parser.add_argument("--train_stride", type=int, default=None,
+                        help="Stride between successive training examples (defaults to max_seq_len).")
+    parser.add_argument("--eval_stride", type=int, default=None,
+                        help="Stride between evaluation examples (defaults to train stride).")
+    parser.add_argument("--prefetch_factor", type=int, default=4,
+                        help="Prefetch factor for the training DataLoader when num_workers > 0.")
+    parser.add_argument("--eval_prefetch_factor", type=int, default=None,
+                        help="Prefetch factor for the evaluation DataLoader when num_workers > 0. Defaults to training value.")
+    parser.add_argument("--pin_memory_device", type=str, default="cuda",
+                        help="Device string to pin DataLoader memory to (requires torch>=2.0).")
 
     # --- Model Architecture Arguments ---
     parser.add_argument("--max_seq_len", type=int, default=1024)
@@ -1642,6 +1827,10 @@ if __name__ == "__main__":
     parser.add_argument("--n_layer", type=int, default=6)
     parser.add_argument("--d_ff", type=int, default=None)
     parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument("--max_kv_len", type=int, default=None,
+                        help="Limit the KV cache/attention window length (enables sliding-window attention).")
+    parser.add_argument("--grad_checkpoint", action="store_true",
+                        help="Enable torch.utils.checkpoint across Transformer blocks to save activation memory.")
 
     # --- Training Arguments ---
     parser.add_argument("--epochs", type=int, default=5)
@@ -1654,6 +1843,8 @@ if __name__ == "__main__":
     parser.add_argument("--num_workers", type=int, default=2)
     parser.add_argument("--debug", action="store_true")
     parser.add_argument('--gradient_accumulation_steps', type=int, default=32, help='Number of steps to accumulate gradients before an optimizer step.')
+    parser.add_argument("--use_cuda_graphs", action="store_true",
+                        help="Capture the train micro-step with CUDA graphs for lower launch overhead (requires --use_amp disabled).")
 
 
     # --- Logging, Checkpointing, Evaluation Arguments ---
@@ -1688,6 +1879,14 @@ if __name__ == "__main__":
         print("Warning: --eval_interval > 0 but --eval_corpus_file not provided. Disabling step-based eval.")
         args.eval_interval = 0
     if args.eval_batch_size is None: args.eval_batch_size = args.batch_size
+    if args.max_kv_len is not None and args.max_kv_len <= 0:
+        raise SystemExit("--max_kv_len must be greater than 0 when provided.")
+    if args.train_stride is not None and args.train_stride <= 0:
+        raise SystemExit("--train_stride must be greater than 0 when provided.")
+    if args.eval_stride is not None and args.eval_stride <= 0:
+        raise SystemExit("--eval_stride must be greater than 0 when provided.")
+    if args.use_cuda_graphs and args.use_amp:
+        raise SystemExit("--use_cuda_graphs cannot be combined with --use_amp (GradScaler is unsupported in CUDA graphs).")
 
     # Setup basic logging (if not already configured by a larger script framework)
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
