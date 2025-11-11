@@ -1,9 +1,12 @@
 import inspect
 import torch
+import torch.distributed as dist
 from torch import amp
 import torch.nn as nn
 import torch.optim as optim
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import Dataset, DataLoader
+from torch.utils.data.distributed import DistributedSampler
 from torch.cuda.amp import GradScaler, autocast
 # Import AutoTokenizer from transformers
 from transformers import AutoTokenizer
@@ -30,6 +33,65 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 _PIN_MEMORY_DEVICE_SUPPORTED = "pin_memory_device" in inspect.signature(DataLoader.__init__).parameters
+
+
+def unwrap_model(model: nn.Module) -> nn.Module:
+    """Return the underlying model when wrapped by DistributedDataParallel."""
+    return model.module if hasattr(model, "module") else model
+
+
+def init_distributed_mode(args: Namespace) -> bool:
+    """
+    Initialize torch.distributed if --distributed is enabled.
+    Returns True when distributed training is active.
+    """
+    if not hasattr(args, "distributed"):
+        args.distributed = False
+
+    args.rank = 0
+    args.world_size = 1
+    args.is_main_process = True
+    args.local_rank = getattr(args, "local_rank", -1)
+    env_world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    if env_world_size > 1:
+        args.distributed = True
+
+    if not args.distributed:
+        if args.local_rank in (-1, None):
+            args.local_rank = 0
+        return False
+
+    if not dist.is_available():
+        raise RuntimeError("torch.distributed is unavailable but --distributed was requested.")
+
+    if "RANK" not in os.environ:
+        raise RuntimeError("--distributed expects RANK env variable (use torchrun to launch).")
+    rank = int(os.environ.get("RANK", 0))
+    world_size = env_world_size
+    local_rank_env = os.environ.get("LOCAL_RANK")
+
+    if world_size <= 1:
+        raise RuntimeError("--distributed requires WORLD_SIZE>1 (launch with torchrun).")
+
+    if local_rank_env is not None:
+        args.local_rank = int(local_rank_env)
+    elif args.local_rank in (-1, None):
+        raise RuntimeError("--distributed expects LOCAL_RANK env or --local_rank argument.")
+
+    args.rank = rank
+    args.world_size = world_size
+
+    torch.cuda.set_device(args.local_rank)
+    dist_backend = getattr(args, "dist_backend", "nccl")
+    dist.init_process_group(
+        backend=dist_backend,
+        rank=args.rank,
+        world_size=args.world_size,
+        device_id=torch.device(f"cuda:{args.local_rank}"),
+    )
+    dist.barrier()
+    args.is_main_process = args.rank == 0
+    return True
 
 
 def compute_default_n_kv_head(n_head: int) -> int:
@@ -368,17 +430,20 @@ class PretokenizedDataset(Dataset):
 
 # --- Evaluation Function ---
 @torch.no_grad()  # Ensure no gradients are computed during evaluation
-def evaluate(model, eval_dataloader, criterion, device, pad_token_id, use_amp):
+def evaluate(model, eval_dataloader, criterion, device, pad_token_id, use_amp, args: Namespace):
     """Performs evaluation on the evaluation dataset."""
     model.eval()  # Set model to evaluation mode
     total_loss = 0.0
     total_tokens = 0 # Count non-pad tokens for accurate loss calculation
 
-    eval_progress_bar = tqdm(
-        eval_dataloader, desc="Evaluating", leave=False
-    )  # Inner progress bar
+    show_progress = (not getattr(args, "distributed", False)) or getattr(args, "is_main_process", True)
+    eval_iterator = eval_dataloader
+    if show_progress:
+        eval_iterator = tqdm(
+            eval_dataloader, desc="Evaluating", leave=False
+        )  # Inner progress bar
 
-    for batch in eval_progress_bar:
+    for batch in eval_iterator:
         input_ids = batch["input_ids"].to(device, non_blocking=True)
         labels = batch["labels"].to(device, non_blocking=True)
         
@@ -426,7 +491,16 @@ def evaluate(model, eval_dataloader, criterion, device, pad_token_id, use_amp):
                 # Decide if you want to skip this batch or raise the error
                 # continue
 
+    if show_progress and hasattr(eval_iterator, "close"):
+        eval_iterator.close()
+
     model.train()  # Set model back to training mode
+
+    if getattr(args, "distributed", False) and dist.is_initialized():
+        totals = torch.tensor([total_loss, float(total_tokens)], dtype=torch.float64, device=device)
+        dist.all_reduce(totals, op=dist.ReduceOp.SUM)
+        total_loss = totals[0].item()
+        total_tokens = int(totals[1].item())
 
     if total_tokens == 0:
         print("\nWarning: No valid (non-pad) tokens processed during evaluation.")
@@ -447,9 +521,11 @@ def evaluate(model, eval_dataloader, criterion, device, pad_token_id, use_amp):
 
 def setup_environment(args: Namespace):
     """Sets up the device, AMP, and output directory."""
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    if device.type != "cuda":
+    if not torch.cuda.is_available():
         raise RuntimeError("This model requires CUDA (FlashAttention).")
+    local_rank = max(0, getattr(args, "local_rank", 0))
+    device = torch.device(f"cuda:{local_rank}")
+    torch.cuda.set_device(device)
     logger.info(f"Using device: {device}")
 
     use_amp = args.use_amp and (device.type == "cuda")
@@ -731,14 +807,21 @@ def prepare_dataloaders(args: Namespace, tokenizer: AutoTokenizer, vocab_size: i
     train_stride = _resolve_stride(getattr(args, "train_stride", None), args.max_seq_len, "train_stride")
     eval_stride = _resolve_stride(getattr(args, "eval_stride", None), train_stride, "eval_stride")
 
-    def _build_dataloader(dataset, *, batch_size: int, shuffle: bool, drop_last: bool, is_eval: bool):
+    world_size = max(1, getattr(args, "world_size", 1))
+    rank = max(0, getattr(args, "rank", 0))
+
+    def _build_dataloader(dataset, *, batch_size: int, shuffle: bool, drop_last: bool, is_eval: bool, sampler=None):
         loader_kwargs = {
             "batch_size": batch_size,
-            "shuffle": shuffle,
             "num_workers": args.num_workers,
             "pin_memory": True,
             "drop_last": drop_last,
         }
+        if sampler is not None:
+            loader_kwargs["sampler"] = sampler
+            loader_kwargs["shuffle"] = False
+        else:
+            loader_kwargs["shuffle"] = shuffle
         if args.num_workers > 0:
             loader_kwargs["persistent_workers"] = True
             prefetch = getattr(args, "eval_prefetch_factor", None) if is_eval else getattr(args, "prefetch_factor", None)
@@ -751,6 +834,7 @@ def prepare_dataloaders(args: Namespace, tokenizer: AutoTokenizer, vocab_size: i
         return DataLoader(dataset, **loader_kwargs)
 
     # --- Training Data ---
+    train_sampler = None
     train_token_file, train_num_examples = _load_or_tokenize_data(
         corpus_file=args.corpus_file,
         tokenizer=tokenizer,
@@ -777,12 +861,22 @@ def prepare_dataloaders(args: Namespace, tokenizer: AutoTokenizer, vocab_size: i
              logger.critical("Training dataset has length 0 after initialization. Exiting.")
              exit(1)
 
+        if getattr(args, "distributed", False):
+            train_sampler = DistributedSampler(
+                train_dataset,
+                num_replicas=world_size,
+                rank=rank,
+                shuffle=True,
+                drop_last=True,
+            )
+
         train_dataloader = _build_dataloader(
             train_dataset,
             batch_size=args.batch_size,
             shuffle=True,
             drop_last=True,
             is_eval=False,
+            sampler=train_sampler,
         )
         logger.info(f"Training dataloader created with {len(train_dataloader)} batches per epoch.")
     except Exception as e:
@@ -791,6 +885,7 @@ def prepare_dataloaders(args: Namespace, tokenizer: AutoTokenizer, vocab_size: i
 
     # --- Evaluation Data ---
     eval_dataloader = None
+    eval_sampler = None
     eval_num_examples = 0
     if args.eval_corpus_file:
         eval_token_file, eval_num_examples = _load_or_tokenize_data(
@@ -814,12 +909,21 @@ def prepare_dataloaders(args: Namespace, tokenizer: AutoTokenizer, vocab_size: i
                     eval_token_file, eval_num_examples, args.max_seq_len, eval_stride, data_type="Eval"
                 )
                 if len(eval_dataset) > 0:
+                    if getattr(args, "distributed", False):
+                        eval_sampler = DistributedSampler(
+                            eval_dataset,
+                            num_replicas=world_size,
+                            rank=rank,
+                            shuffle=False,
+                            drop_last=False,
+                        )
                     eval_dataloader = _build_dataloader(
                         eval_dataset,
                         batch_size=(args.eval_batch_size if args.eval_batch_size else args.batch_size),
                         shuffle=False,
                         drop_last=False,
                         is_eval=True,
+                        sampler=eval_sampler,
                     )
                     logger.info(f"Evaluation dataloader created with {len(eval_dataloader)} batches.")
                 else:
@@ -830,7 +934,7 @@ def prepare_dataloaders(args: Namespace, tokenizer: AutoTokenizer, vocab_size: i
         elif args.eval_corpus_file: # Log if file was specified but resulted in no data/examples
              logger.warning("Evaluation data could not be prepared (0 examples or file issue). Skipping evaluation.")
 
-    return train_dataloader, eval_dataloader
+    return train_dataloader, eval_dataloader, train_sampler, eval_sampler
 
 def resize_token_embeddings_(model, new_vocab_size: int, pad_idx: int | None):
     """
@@ -908,7 +1012,7 @@ def initialize_model(args: Namespace, vocab_size: int, pad_token_id: int, eos_to
         "alpha1": 0.01,         # Expert balance factor
         "alpha2": 0.01,         # Device balance factor
         "alpha3": 0.01,         # Communication balance factor
-        "D": 1,                 # Number of devices (adjust if distributed)
+        "D": max(1, getattr(args, "world_size", 1)),                 # Number of devices (matches distributed world size)
         "M": 1                  # Device limit for routing (can be N_r for D=1)
     }
     
@@ -1010,6 +1114,7 @@ def load_checkpoint(args: Namespace, model: nn.Module, optimizer: optim.Optimize
     global_step = 0
     best_eval_loss = float("inf")
     checkpoint_path = None
+    base_model = unwrap_model(model)
 
     if args.resume_from_checkpoint:
         if args.resume_from_checkpoint == "latest":
@@ -1075,10 +1180,18 @@ def load_checkpoint(args: Namespace, model: nn.Module, optimizer: optim.Optimize
                     f"Vocab mismatch: saved={saved_vocab_size}, current={current_vocab_size}. "
                     f"Resizing embeddings to current vocab before loading state_dict (strict=False)."
                 )
-                resize_token_embeddings_(model, current_vocab_size, current_pad_token_id)
+                resize_token_embeddings_(base_model, current_vocab_size, current_pad_token_id)
 
             # --- Load model weights (strict=False for tied head differences) ---
-            missing_keys, unexpected_keys = model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+            state_dict = checkpoint['model_state_dict']
+            def _strip_prefix(prefix: str, name: str) -> str:
+                return name[len(prefix):] if name.startswith(prefix) else name
+            if any(key.startswith("module.") or key.startswith("_orig_mod.") for key in state_dict.keys()):
+                state_dict = {
+                    _strip_prefix("_orig_mod.", _strip_prefix("module.", key)): value
+                    for key, value in state_dict.items()
+                }
+            missing_keys, unexpected_keys = base_model.load_state_dict(state_dict, strict=False)
             if missing_keys: logger.warning(f"Missing keys in model state_dict: {missing_keys}")
             if unexpected_keys: logger.warning(f"Unexpected keys in model state_dict: {unexpected_keys}")
             logger.info("Model state loaded.")
@@ -1159,10 +1272,11 @@ def save_checkpoint(args: Namespace, epoch: int, global_step: int, model: nn.Mod
     """
     Saves a training checkpoint and logs it to Weights & Biases as an artifact if enabled.
     """
+    model_to_save = unwrap_model(model)
     save_dict = {
         "epoch": epoch,
         "global_step": global_step,
-        "model_state_dict": model.state_dict(),
+        "model_state_dict": model_to_save.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "loss": current_loss,
         "best_eval_loss": best_eval_loss,
@@ -1223,7 +1337,8 @@ def run_debug_generation(args: Namespace, model: nn.Module, tokenizer: AutoToken
                          bos_token_id: int | None, pad_token_id: int, use_amp: bool, global_step: int,
                          epoch: int | None = None, step_in_epoch: int | None = None):
     """Runs a debug generation example."""
-    if not (hasattr(model, 'generate') and callable(getattr(model, 'generate'))):
+    base_model = unwrap_model(model)
+    if not (hasattr(base_model, 'generate') and callable(getattr(base_model, 'generate'))):
         logger.warning("Model does not have a 'generate' method. Skipping debug generation.")
         return
 
@@ -1255,7 +1370,7 @@ def run_debug_generation(args: Namespace, model: nn.Module, tokenizer: AutoToken
         }
 
         with torch.no_grad(), amp.autocast('cuda', enabled=use_amp):
-            generated_ids_tensor = model.generate(input_tensor, **gen_kwargs) # Shape: [1, TotalSeqLen]
+            generated_ids_tensor = base_model.generate(input_tensor, **gen_kwargs) # Shape: [1, TotalSeqLen]
 
         # Decode the generated part
         generated_ids = generated_ids_tensor[0]
@@ -1446,8 +1561,12 @@ def train_step(model, batch, criterion, scaler, device, use_amp, vocab_size,
 def train(args: Namespace):
     """Main function to orchestrate the training process with gradient accumulation."""
 
+    init_distributed_mode(args)
+    if args.distributed and not args.is_main_process:
+        args.disable_wandb = True
+
     # --- Weights & Biases Setup ---
-    if not getattr(args, 'disable_wandb', False): # Check if disable_wandb arg exists
+    if args.is_main_process and not getattr(args, 'disable_wandb', False): # Check if disable_wandb arg exists
         try:
             # Try to get wandb_run_id from args if resuming a specific run
             wandb_run_id = getattr(args, 'wandb_run_id', None)
@@ -1474,7 +1593,7 @@ def train(args: Namespace):
         except Exception as e:
             logger.error(f"Could not initialize Weights & Biases: {e}", exc_info=True)
             args.disable_wandb = True # Disable W&B if initialization fails
-    else:
+    elif args.is_main_process:
         logger.info("Weights & Biases logging is disabled.")
 
 
@@ -1486,7 +1605,7 @@ def train(args: Namespace):
     tokenizer, vocab_size, pad_token_id, eos_token_id, bos_token_id, num_added_toks = load_and_prepare_tokenizer(args.tokenizer_name)
 
     # --- Data ---
-    train_dataloader, eval_dataloader = prepare_dataloaders(args, tokenizer, vocab_size, pad_token_id, eos_token_id)
+    train_dataloader, eval_dataloader, train_sampler, eval_sampler = prepare_dataloaders(args, tokenizer, vocab_size, pad_token_id, eos_token_id)
 
     # --- Model ---
     model, model_config = initialize_model(args, vocab_size, pad_token_id, eos_token_id, num_added_toks, device)
@@ -1530,6 +1649,14 @@ def train(args: Namespace):
             except Exception as e:
                 logger.warning(f"torch.compile failed entirely: {e}. Continuing without compilation.")
 
+    if getattr(args, "distributed", False):
+        model = DDP(
+            model,
+            device_ids=[args.local_rank],
+            output_device=args.local_rank,
+            find_unused_parameters=False,
+        )
+
     # --- Gradient Accumulation Setup ---
     gradient_accumulation_steps = getattr(args, 'gradient_accumulation_steps', 32)
     if not isinstance(gradient_accumulation_steps, int) or gradient_accumulation_steps <= 0:
@@ -1544,6 +1671,8 @@ def train(args: Namespace):
     if getattr(args, "use_cuda_graphs", False):
         if scaler is not None:
             raise RuntimeError("--use_cuda_graphs requires AMP to be disabled (GradScaler must be None).")
+        if getattr(args, "distributed", False):
+            raise RuntimeError("--use_cuda_graphs is not supported together with --distributed.")
         cudagraph_runner = CUDAGraphTrainStep(
             model=model,
             criterion=criterion,
@@ -1561,8 +1690,15 @@ def train(args: Namespace):
     micro_steps_in_log_period = 0
 
     for epoch in range(start_epoch, args.epochs):
-        logger.info(f"\n--- Epoch {epoch+1}/{args.epochs} ---")
-        progress_bar = tqdm(enumerate(train_dataloader), total=len(train_dataloader), desc=f"Epoch {epoch+1}", leave=True, dynamic_ncols=True)
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
+        if args.is_main_process:
+            logger.info(f"\n--- Epoch {epoch+1}/{args.epochs} ---")
+        progress_iter = enumerate(train_dataloader)
+        if args.is_main_process:
+            progress_bar = tqdm(progress_iter, total=len(train_dataloader), desc=f"Epoch {epoch+1}", leave=True, dynamic_ncols=True)
+        else:
+            progress_bar = progress_iter
         model.train()
         steps_in_epoch = 0
 
@@ -1597,7 +1733,7 @@ def train(args: Namespace):
                         scale_after = scaler.get_scale()
                         if scale_before > scale_after:
                             logger.warning(f"Gradient overflow detected at step {global_step + 1}. Scale reduced from {scale_before:.1f} to {scale_after:.1f}.")
-                            if not getattr(args, 'disable_wandb', False) and wandb.run:
+                            if args.is_main_process and not getattr(args, 'disable_wandb', False) and wandb.run:
                                 wandb.log({"train/grad_overflow": 1, "train/amp_scale_old": scale_before, "train/amp_scale_new": scale_after}, step=global_step)
                     else:
                         if args.max_grad_norm > 0:
@@ -1624,10 +1760,11 @@ def train(args: Namespace):
                                 "Step": global_step, "LR": f"{optimizer.param_groups[0]['lr']:.2e}"
                             }
                             if scaler: log_postfix["Scale"] = f"{scaler.get_scale():.1f}"
-                            progress_bar.set_postfix(log_postfix)
+                            if args.is_main_process and hasattr(progress_bar, "set_postfix"):
+                                progress_bar.set_postfix(log_postfix)
 
                             # --- Weights & Biases Logging ---
-                            if not getattr(args, 'disable_wandb', False) and wandb.run:
+                            if args.is_main_process and not getattr(args, 'disable_wandb', False) and wandb.run:
                                 log_data = {
                                     "train/loss": avg_loss_log_period,
                                     "train/perplexity": perplexity,
@@ -1646,9 +1783,10 @@ def train(args: Namespace):
                             if scaler: log_postfix["Scale"] = f"{scaler.get_scale():.1f}"
                             if 'current_micro_batch_loss' in locals() and current_micro_batch_loss is not None:
                                 log_postfix["LastLoss"] = f"{current_micro_batch_loss:.4f}"
-                            progress_bar.set_postfix(log_postfix)
+                            if args.is_main_process and hasattr(progress_bar, "set_postfix"):
+                                progress_bar.set_postfix(log_postfix)
 
-                            if not getattr(args, 'disable_wandb', False) and wandb.run:
+                            if args.is_main_process and not getattr(args, 'disable_wandb', False) and wandb.run:
                                 log_data = {
                                     "train/learning_rate": optimizer.param_groups[0]['lr'],
                                     "epoch": epoch + 1,
@@ -1664,13 +1802,16 @@ def train(args: Namespace):
                     if eval_dataloader and args.eval_interval > 0 and global_step % args.eval_interval == 0 and global_step > 0:
                         start_eval_time = time.time()
                         try:
-                            eval_loss, eval_perplexity = evaluate(model, eval_dataloader, criterion, device, pad_token_id, use_amp)
+                            if eval_sampler is not None:
+                                eval_sampler.set_epoch(global_step)
+                            eval_loss, eval_perplexity = evaluate(model, eval_dataloader, criterion, device, pad_token_id, use_amp, args)
                             eval_time_taken = time.time() - start_eval_time
-                            logger.info(f"\n--- Evaluation @ Step {global_step} Finished ({eval_time_taken:.2f}s) ---")
-                            logger.info(f"  Eval Loss: {eval_loss:.4f} | Eval Perplexity: {eval_perplexity:.2f}")
+                            if args.is_main_process:
+                                logger.info(f"\n--- Evaluation @ Step {global_step} Finished ({eval_time_taken:.2f}s) ---")
+                                logger.info(f"  Eval Loss: {eval_loss:.4f} | Eval Perplexity: {eval_perplexity:.2f}")
 
                             # --- Weights & Biases Logging ---
-                            if not getattr(args, 'disable_wandb', False) and wandb.run:
+                            if args.is_main_process and not getattr(args, 'disable_wandb', False) and wandb.run:
                                 wandb.log({
                                     "eval/loss": eval_loss,
                                     "eval/perplexity": eval_perplexity,
@@ -1679,24 +1820,25 @@ def train(args: Namespace):
 
                             if eval_loss < best_eval_loss:
                                 best_eval_loss = eval_loss
-                                logger.info(f"  New best evaluation loss: {best_eval_loss:.4f}")
-                                if not getattr(args, 'disable_wandb', False) and wandb.run:
-                                    wandb.summary["best_eval_loss"] = best_eval_loss
-                                    wandb.summary["best_eval_perplexity"] = eval_perplexity
-                                    wandb.summary["best_eval_step"] = global_step
+                                if args.is_main_process:
+                                    logger.info(f"  New best evaluation loss: {best_eval_loss:.4f}")
+                                    if not getattr(args, 'disable_wandb', False) and wandb.run:
+                                        wandb.summary["best_eval_loss"] = best_eval_loss
+                                        wandb.summary["best_eval_perplexity"] = eval_perplexity
+                                        wandb.summary["best_eval_step"] = global_step
 
-                                current_wandb_run_id = wandb.run.id if not getattr(args, 'disable_wandb', False) and wandb.run else None
-                                save_loss_for_ckpt = avg_loss_log_period if micro_steps_in_log_period == 0 and 'avg_loss_log_period' in locals() else current_micro_batch_loss # Check if avg_loss_log_period was just reset
-                                if math.isnan(save_loss_for_ckpt) and 'current_micro_batch_loss' in locals(): save_loss_for_ckpt = current_micro_batch_loss # fallback
-                                save_checkpoint(args, epoch, global_step, model, optimizer, scaler,
-                                                save_loss_for_ckpt, best_eval_loss, model_config, is_best=True, wandb_run_id=current_wandb_run_id)
+                                    current_wandb_run_id = wandb.run.id if not getattr(args, 'disable_wandb', False) and wandb.run else None
+                                    save_loss_for_ckpt = avg_loss_log_period if micro_steps_in_log_period == 0 and 'avg_loss_log_period' in locals() else current_micro_batch_loss # Check if avg_loss_log_period was just reset
+                                    if math.isnan(save_loss_for_ckpt) and 'current_micro_batch_loss' in locals(): save_loss_for_ckpt = current_micro_batch_loss # fallback
+                                    save_checkpoint(args, epoch, global_step, model, optimizer, scaler,
+                                                    save_loss_for_ckpt, best_eval_loss, model_config, is_best=True, wandb_run_id=current_wandb_run_id)
                         except Exception as e:
                              logger.error(f"Error during evaluation run at step {global_step}: {e}", exc_info=True)
                         finally:
                             model.train()
 
                     # --- Checkpoint Saving (Regular Interval) ---
-                    if args.save_interval > 0 and global_step % args.save_interval == 0 and global_step > 0:
+                    if args.save_interval > 0 and global_step % args.save_interval == 0 and global_step > 0 and args.is_main_process:
                         current_wandb_run_id = wandb.run.id if not getattr(args, 'disable_wandb', False) and wandb.run else None
                         save_loss_for_ckpt = avg_loss_log_period if micro_steps_in_log_period == 0 and 'avg_loss_log_period' in locals() else current_micro_batch_loss
                         if math.isnan(save_loss_for_ckpt) and 'current_micro_batch_loss' in locals(): save_loss_for_ckpt = current_micro_batch_loss
@@ -1704,7 +1846,7 @@ def train(args: Namespace):
                                         save_loss_for_ckpt, best_eval_loss, model_config, is_best=False, wandb_run_id=current_wandb_run_id)
 
                     # --- Periodic Debug Generation ---
-                    if args.debug_generate_interval > 0 and global_step % args.debug_generate_interval == 0 and global_step > 0:
+                    if args.is_main_process and args.debug_generate_interval > 0 and global_step % args.debug_generate_interval == 0 and global_step > 0:
                          run_debug_generation(args, model, tokenizer, device, bos_token_id, pad_token_id, use_amp, global_step, epoch + 1, steps_in_epoch)
                          model.train()
 
@@ -1718,84 +1860,82 @@ def train(args: Namespace):
                      optimizer.zero_grad(set_to_none=True)
                  continue
 
-        logger.info(f"Epoch {epoch+1} completed. Global Step: {global_step}")
+        if args.is_main_process:
+            logger.info(f"Epoch {epoch+1} completed. Global Step: {global_step}")
 
     # --- Final Actions ---
-    logger.info("\nTraining finished.")
+    if args.is_main_process:
+        logger.info("\nTraining finished.")
 
     final_model_state_dict = None
-    final_eval_loss_to_save = best_eval_loss
-    best_model_path = os.path.join(args.output_dir, "model_best_eval.pt")
-    map_location = 'cpu'
+    if args.is_main_process:
+        final_eval_loss_to_save = best_eval_loss
+        best_model_path = os.path.join(args.output_dir, "model_best_eval.pt")
+        map_location = 'cpu'
 
-    if os.path.exists(best_model_path):
-        try:
-            logger.info(f"Loading best evaluation model state from {best_model_path} to save as final model.")
-            best_checkpoint = torch.load(best_model_path, map_location=map_location)
-            final_model_state_dict = best_checkpoint['model_state_dict']
-            final_eval_loss_to_save = best_checkpoint.get('eval_loss', best_eval_loss)
-            logger.info(f"(Best evaluation loss achieved: {final_eval_loss_to_save:.4f})")
-        except Exception as e:
-            logger.warning(f"Could not load best evaluation model state for final save: {e}. Saving current model state instead.")
-            model.cpu()
-            final_model_state_dict = model.state_dict()
+        if os.path.exists(best_model_path):
+            try:
+                logger.info(f"Loading best evaluation model state from {best_model_path} to save as final model.")
+                best_checkpoint = torch.load(best_model_path, map_location=map_location)
+                final_model_state_dict = best_checkpoint['model_state_dict']
+                final_eval_loss_to_save = best_checkpoint.get('eval_loss', best_eval_loss)
+                logger.info(f"(Best evaluation loss achieved: {final_eval_loss_to_save:.4f})")
+            except Exception as e:
+                logger.warning(f"Could not load best evaluation model state for final save: {e}. Saving current model state instead.")
+                model_to_save = unwrap_model(model)
+                model_to_save.cpu()
+                final_model_state_dict = model_to_save.state_dict()
+                model_to_save.to(device)
+        else:
+            logger.info("Best evaluation checkpoint not found. Saving current model state as final model.")
+            model_to_save = unwrap_model(model)
+            model_to_save.cpu()
+            final_model_state_dict = model_to_save.state_dict()
+            model_to_save.to(device)
+
+        if final_model_state_dict:
+            final_save_content = {
+                "model_state_dict": final_model_state_dict, "config": model_config,
+                "args": { "tokenizer_name": args.tokenizer_name, "d_model": args.d_model, "n_head": args.n_head, "n_layer": args.n_layer, "d_ff": args.d_ff, "max_seq_len": args.max_seq_len, },
+                "tokenizer_info": { "name": args.tokenizer_name, "vocab_size": vocab_size, "pad_token_id": pad_token_id, "eos_token_id": eos_token_id, "bos_token_id": bos_token_id, "num_added_toks": num_added_toks, },
+                "best_eval_loss": final_eval_loss_to_save, "final_global_step": global_step
+            }
+            final_model_path = os.path.join(args.output_dir, "model_final_slim.pt")
+            try:
+                 torch.save(final_save_content, final_model_path)
+                 logger.info(f"Final model state dict and config saved to {final_model_path}")
+            except Exception as e:
+                 logger.error(f"Error saving final slim model: {e}", exc_info=True)
+
+        if args.generate_example and final_model_state_dict: # ensure final_model_state_dict exists
+            logger.info("Running final example generation...")
+            model.load_state_dict(final_model_state_dict)
             model.to(device)
-    else:
-        logger.info("Best evaluation checkpoint not found. Saving current model state as final model.")
-        model.cpu()
-        final_model_state_dict = model.state_dict()
-        model.to(device)
+            model.eval()
+            final_gen_args = Namespace(
+                output_dir = args.output_dir,
+                debug_generate_prompt = getattr(args, 'debug_generate_prompt', "[SOS]" if bos_token_id is not None else "The"),
+                debug_max_new_tokens = getattr(args, 'debug_max_new_tokens', 50),
+                debug_temperature = getattr(args, 'debug_temperature', 0.7),
+                debug_top_k = getattr(args, 'debug_top_k', 50)
+            )
+            try:
+                final_epoch_number = (epoch + 1) if 'epoch' in locals() else None
+                final_step_in_epoch = locals().get("steps_in_epoch", None)
+                run_debug_generation(final_gen_args, model, tokenizer, device, bos_token_id, pad_token_id, use_amp, global_step, final_epoch_number, final_step_in_epoch)
+            except Exception as e:
+                logger.error(f"Error during final debug generation: {e}", exc_info=True)
 
-    if final_model_state_dict:
-        final_save_content = {
-            "model_state_dict": final_model_state_dict, "config": model_config,
-            "args": { "tokenizer_name": args.tokenizer_name, "d_model": args.d_model, "n_head": args.n_head, "n_layer": args.n_layer, "d_ff": args.d_ff, "max_seq_len": args.max_seq_len, },
-            "tokenizer_info": { "name": args.tokenizer_name, "vocab_size": vocab_size, "pad_token_id": pad_token_id, "eos_token_id": eos_token_id, "bos_token_id": bos_token_id, "num_added_toks": num_added_toks, },
-            "best_eval_loss": final_eval_loss_to_save, "final_global_step": global_step
-        }
-        final_model_path = os.path.join(args.output_dir, "model_final_slim.pt")
-        try:
-             torch.save(final_save_content, final_model_path)
-             logger.info(f"Final model state dict and config saved to {final_model_path}")
-             # Log final model artifact to W&B if desired
-            #  if not getattr(args, 'disable_wandb', False) and wandb.run:
-            #      final_model_artifact = wandb.Artifact(f"{wandb.run.name}-final_model", type="model", metadata=final_save_content["args"])
-            #      final_model_artifact.add_file(final_model_path)
-            #      wandb.log_artifact(final_model_artifact)
-            #      wandb.summary.update({
-            #          "final_model_path_local": final_model_path,
-            #          "final_checkpoint_best_eval_loss": final_eval_loss_to_save,
-            #          "final_checkpoint_global_step": global_step
-            #      })
-
-        except Exception as e:
-             logger.error(f"Error saving final slim model: {e}", exc_info=True)
-
-    if args.generate_example and final_model_state_dict: # ensure final_model_state_dict exists
-        logger.info("Running final example generation...")
-        model.load_state_dict(final_model_state_dict)
-        model.to(device)
-        model.eval()
-        final_gen_args = Namespace(
-            output_dir = args.output_dir,
-            debug_generate_prompt = getattr(args, 'debug_generate_prompt', "[SOS]" if bos_token_id is not None else "The"),
-            debug_max_new_tokens = getattr(args, 'debug_max_new_tokens', 50),
-            debug_temperature = getattr(args, 'debug_temperature', 0.7),
-            debug_top_k = getattr(args, 'debug_top_k', 50)
-        )
-        try:
-            final_epoch_number = (epoch + 1) if 'epoch' in locals() else None
-            final_step_in_epoch = locals().get("steps_in_epoch", None)
-            run_debug_generation(final_gen_args, model, tokenizer, device, bos_token_id, pad_token_id, use_amp, global_step, final_epoch_number, final_step_in_epoch)
-        except Exception as e:
-            logger.error(f"Error during final debug generation: {e}", exc_info=True)
-
-    logger.info("Training script finished.")
+    if args.is_main_process:
+        logger.info("Training script finished.")
 
     # --- Weights & Biases Finish ---
-    if not getattr(args, 'disable_wandb', False) and wandb.run:
+    if args.is_main_process and not getattr(args, 'disable_wandb', False) and wandb.run:
         wandb.summary["completed_epochs"] = epoch + 1 # Total epochs trained
         wandb.finish()
+
+    if args.distributed and dist.is_initialized():
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":
@@ -1845,6 +1985,12 @@ if __name__ == "__main__":
     parser.add_argument('--gradient_accumulation_steps', type=int, default=32, help='Number of steps to accumulate gradients before an optimizer step.')
     parser.add_argument("--use_cuda_graphs", action="store_true",
                         help="Capture the train micro-step with CUDA graphs for lower launch overhead (requires --use_amp disabled).")
+    parser.add_argument("--distributed", action="store_true",
+                        help="Enable multi-GPU training via torch.distributed (auto-enabled if WORLD_SIZE>1).")
+    parser.add_argument("--dist_backend", type=str, default="nccl",
+                        help="Backend to use for torch.distributed.")
+    parser.add_argument("--local_rank", type=int, default=-1,
+                        help="Local rank provided by torchrun (set automatically).")
 
 
     # --- Logging, Checkpointing, Evaluation Arguments ---
