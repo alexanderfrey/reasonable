@@ -161,10 +161,15 @@ class MultiHeadAttention(nn.Module):
         # Selection: Fused (Fast) vs Varlen (Masked)
         if mask is None:
             # Fast path: Standard FlashAttention
+            flash_causal = True
+            if layer_past is not None and S_q == 1 and k_attn.size(1) > 1:
+                # Decoding a single token against a longer KV cache: allow full attention
+                flash_causal = False
+
             context = flash_attn_func(
                 q, k_attn, v_attn,
                 dropout_p=self.dropout_layer.p if self.training else 0.0,
-                causal=True
+                causal=flash_causal
             )
         else:
             # Slow path: Varlen for padded batches
