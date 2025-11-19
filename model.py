@@ -101,6 +101,7 @@ class MultiHeadAttention(nn.Module):
         self.d_k = d_model // Hq
         self.n_rep = Hq // Hkv
         self.max_kv_len = max_kv_len
+        self.d_model = d_model
 
         self.w_q = nn.Linear(d_model, Hq * self.d_k, bias=False)
         self.w_kv = nn.Linear(d_model, 2 * Hkv * self.d_k, bias=False)
