@@ -1,4 +1,5 @@
 import inspect
+import contextlib
 import torch
 import torch.distributed as dist
 from torch import amp
@@ -1688,6 +1689,7 @@ def train(args: Namespace):
     model.train()
     total_loss_accum_for_log = 0.0
     micro_steps_in_log_period = 0
+    supports_no_sync = hasattr(model, "no_sync")
 
     for epoch in range(start_epoch, args.epochs):
         if train_sampler is not None:
@@ -1706,10 +1708,17 @@ def train(args: Namespace):
             is_final_accumulation_step = (batch_idx + 1) % gradient_accumulation_steps == 0
             is_last_batch_in_epoch = (batch_idx + 1) == len(train_dataloader)
 
-            step_loss_unscaled, error_info = train_step(
-                model, batch, criterion, scaler, device, use_amp, vocab_size,
-                gradient_accumulation_steps, cudagraph_runner=cudagraph_runner
-            )
+            do_sync = is_final_accumulation_step or is_last_batch_in_epoch
+            if supports_no_sync:
+                sync_context = contextlib.nullcontext() if do_sync else model.no_sync()
+            else:
+                sync_context = contextlib.nullcontext()
+
+            with sync_context:
+                step_loss_unscaled, error_info = train_step(
+                    model, batch, criterion, scaler, device, use_amp, vocab_size,
+                    gradient_accumulation_steps, cudagraph_runner=cudagraph_runner
+                )
 
             if step_loss_unscaled is not None:
                 total_loss_accum_for_log += step_loss_unscaled
