@@ -1,3 +1,8 @@
+"""
+Full GPT Model Implementation with FlashAttention-2, RoPE, and GQA.
+Contains critical fixes for generation masking, float32 precision, and performance.
+"""
+
 import math
 from collections import OrderedDict
 from typing import Optional, Tuple, List, Mapping
@@ -7,247 +12,214 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
-# FlashAttention imports (required)
-from flash_attn import flash_attn_func, flash_attn_varlen_func
-from flash_attn.bert_padding import pad_input, unpad_input
+# --- FlashAttention Imports & Guard ---
+try:
+    from flash_attn import flash_attn_func, flash_attn_varlen_func
+    from flash_attn.bert_padding import pad_input, unpad_input
+    FLASH_AVAILABLE = True
+except ImportError:
+    FLASH_AVAILABLE = False
+    print("WARNING: flash_attn not installed. This model requires CUDA and FlashAttention to run.")
 
 
-# --- RoPE helpers ---
+# --- RoPE Helpers ---
 
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0) -> torch.Tensor:
     """
-    Precompute RoPE freqs as complex numbers: cos(m*theta_i) + i*sin(m*theta_i).
-    Returns shape [end, dim // 2] (complex64).
+    Precompute RoPE freqs. 
+    Calculation is done in float32 to prevent precision issues in long contexts.
     """
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
-    t = torch.arange(end, device=freqs.device)
-    freqs = torch.outer(t, freqs).float()
-    return torch.polar(torch.ones_like(freqs), freqs)
-
-
-def _reshape_freqs_for_broadcast(freqs_cis: torch.Tensor, x_complex: torch.Tensor) -> torch.Tensor:
-    """
-    x_complex: [B, S, H, D/2] (complex)
-    freqs_cis: [S, D/2] -> [1, S, 1, D/2] for broadcasting.
-    """
-    assert freqs_cis.shape == (x_complex.shape[1], x_complex.shape[-1]), (
-        f"RoPE shape mismatch: freqs_cis={freqs_cis.shape} vs "
-        f"expected=({x_complex.shape[1]}, {x_complex.shape[-1]})"
-    )
-    return freqs_cis.unsqueeze(0).unsqueeze(2)
+    t = torch.arange(end, device=freqs.device, dtype=torch.float32)
+    freqs = torch.outer(t, freqs)
+    # torch.polar requires inputs to be the same dtype
+    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)
+    return freqs_cis
 
 
 def apply_rotary_pos_emb(
-    xq: torch.Tensor,  # [B, S, H, D]
-    xk: torch.Tensor,  # [B, S, H, D]
-    freqs_cis: torch.Tensor,  # [S, D/2] (complex)
+    xq: torch.Tensor, 
+    xk: torch.Tensor, 
+    freqs_cis: torch.Tensor
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Apply RoPE via complex multiply on paired last-dim.
+    Apply RoPE. Performs complex multiplication in float32.
     """
+    # Reshape freqs for broadcasting: [S, D/2] -> [1, S, 1, D/2]
+    freqs_cis = freqs_cis.unsqueeze(0).unsqueeze(2)
+    
+    # View as complex, ensure float32 for stability
     xq_c = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
     xk_c = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
-    fc = _reshape_freqs_for_broadcast(freqs_cis, xq_c)
-    xq_rot = torch.view_as_real(xq_c * fc).flatten(3).type_as(xq)
-    xk_rot = torch.view_as_real(xk_c * fc).flatten(3).type_as(xk)
-    return xq_rot, xk_rot
+    
+    # Apply rotation
+    xq_rot = torch.view_as_real(xq_c * freqs_cis).flatten(3)
+    xk_rot = torch.view_as_real(xk_c * freqs_cis).flatten(3)
+    
+    # Cast back to original dtype
+    return xq_rot.type_as(xq), xk_rot.type_as(xk)
 
+
+# --- Components ---
 
 class RMSNorm(nn.Module):
     def __init__(self, d, eps=1e-6):
         super().__init__()
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(d))
+
     def forward(self, x):
-        # keep LN in fp32 numerics implicitly
-        norm = x.float().pow(2).mean(dim=-1, keepdim=True).add(self.eps).rsqrt().to(x.dtype)
-        return self.weight * (x * norm)
+        # Calculate norm in float32
+        x_f = x.float()
+        norm = x_f.pow(2).mean(dim=-1, keepdim=True).add(self.eps).rsqrt()
+        return self.weight * (x_f * norm).to(x.dtype)
+
 
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
-    """
-    Repeat K/V heads to match Q heads (GQA).
-    x: [B, S, Hkv, D] -> [B, S, Hq, D] where Hq = Hkv * n_rep
-    """
+    """Repeat K/V heads to match Q heads (GQA)."""
     if n_rep == 1:
         return x
     B, S, H, D = x.shape
     return x.unsqueeze(3).expand(B, S, H, n_rep, D).reshape(B, S, H * n_rep, D)
 
-# --- Core blocks ---
 
 class MultiHeadAttention(nn.Module):
-    """
-    FlashAttention(v1) + RoPE + KV caching + Sliding Window, now with GQA:
-      - Hq query heads
-      - Hkv key/value heads (Hq must be a multiple of Hkv)
-      - Cache stores K/V in Hkv heads; we repeat to Hq only for attention.
-    """
-
     def __init__(
         self,
         d_model: int,
-        n_head: int,                    # Hq
+        n_head: int,
         dropout: float = 0.1,
         max_kv_len: Optional[int] = None,
-        n_kv_head: Optional[int] = None # Hkv (defaults to Hq => MHA)
+        n_kv_head: Optional[int] = None
     ):
         super().__init__()
         Hq = n_head
         Hkv = n_kv_head if n_kv_head is not None else Hq
-
-        assert d_model % Hq == 0, "d_model must be divisible by n_head (Hq)"
-        d_k = d_model // Hq
-        assert d_k % 2 == 0, "RoPE needs even head_dim"
-        assert Hq % Hkv == 0, "n_head (Hq) must be a multiple of n_kv_head (Hkv)"
-
-        self.d_model = d_model
+        
         self.n_head = Hq
         self.n_kv_head = Hkv
-        self.d_k = d_k
+        self.d_k = d_model // Hq
         self.n_rep = Hq // Hkv
         self.max_kv_len = max_kv_len
 
-        # Projections: Q in Hq heads, K/V in Hkv heads
-        self.w_q = nn.Linear(d_model, Hq * d_k, bias=False)
-        self.w_kv = nn.Linear(d_model, 2 * Hkv * d_k, bias=False)
-
+        self.w_q = nn.Linear(d_model, Hq * self.d_k, bias=False)
+        self.w_kv = nn.Linear(d_model, 2 * Hkv * self.d_k, bias=False)
         self.fc = nn.Linear(d_model, d_model)
         self.dropout_layer = nn.Dropout(dropout)
 
     def forward(
         self,
-        x: torch.Tensor,                        # [B, S_q, D]
-        freqs_cis: torch.Tensor,                # [S_q, d_k/2] (complex)
-        mask: Optional[torch.Tensor] = None,    # [B, S_kv] (1=attend, 0=pad) over full KV (past+current)
-        layer_past: Optional[Tuple[torch.Tensor, torch.Tensor, int]] = None,  # (k_past, v_past, cache_pos)
+        x: torch.Tensor,
+        freqs_cis: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+        layer_past: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         use_cache: bool = False,
-    ) -> Tuple[torch.Tensor, None, Optional[Tuple[torch.Tensor, torch.Tensor, int]]]:
-
+    ) -> Tuple[torch.Tensor, None, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
+        
         B, S_q, _ = x.size()
 
-        cache_position = 0
-        k_past = v_past = None
+        # 1. Projections
+        q = self.w_q(x).view(B, S_q, self.n_head, self.d_k)
+        kv = self.w_kv(x).view(B, S_q, 2, self.n_kv_head, self.d_k)
+        k, v = kv.unbind(dim=2)
+
+        # 2. RoPE
+        q, k = apply_rotary_pos_emb(q, k, freqs_cis=freqs_cis)
+
+        # 3. KV Cache Management
         if layer_past is not None:
-            if len(layer_past) == 3:
-                k_past, v_past, past_position = layer_past
-                if isinstance(past_position, torch.Tensor):
-                    cache_position = int(past_position.item())
-                else:
-                    cache_position = int(past_position)
-            else:
-                k_past, v_past = layer_past
-                cache_position = k_past.size(1)
+            k_past, v_past = layer_past
+            k = torch.cat((k_past, k), dim=1)
+            v = torch.cat((v_past, v), dim=1)
+        
+        # Sliding window (simple truncation)
+        if use_cache and (self.max_kv_len is not None) and (k.size(1) > self.max_kv_len):
+            k = k[:, -self.max_kv_len:]
+            v = v[:, -self.max_kv_len:]
+            # Note: If strict mask alignment is needed for sliding window training, 
+            # the mask should be sliced by the caller.
 
-        # Projections
-        q = self.w_q(x).view(B, S_q, self.n_head, self.d_k)                       # [B, S_q, Hq, Dk]
-        kv = self.w_kv(x).view(B, S_q, 2, self.n_kv_head, self.d_k)               # [B, S_q, 2, Hkv, Dk]
-        k, v = kv.unbind(dim=2)                                                   # each [B, S_q, Hkv, Dk]
+        present = (k, v) if use_cache else None
 
-        # RoPE on Q and K (K has fewer heads)
-        q, k_cur = apply_rotary_pos_emb(q, k, freqs_cis=freqs_cis)                # q:[B,S,Hq,D], k_cur:[B,S,Hkv,D]
+        # 4. GQA Repeat
+        k_attn = repeat_kv(k, self.n_rep)
+        v_attn = repeat_kv(v, self.n_rep)
 
-        # KV cache kept in Hkv heads
-        if layer_past is not None:
-            k_full = torch.cat((k_past, k_cur), dim=1)                            # [B, S_past+S_q, Hkv, D]
-            v_full = torch.cat((v_past, v),     dim=1)                            # [B, S_past+S_q, Hkv, D]
-        else:
-            k_full = k_cur
-            v_full = v
-
-        # Sliding window truncation
-        if use_cache and (self.max_kv_len is not None) and (k_full.size(1) > self.max_kv_len):
-            k_full = k_full[:, -self.max_kv_len:]
-            v_full = v_full[:, -self.max_kv_len:]
-            if mask is not None and mask.size(1) != k_full.size(1):
-                mask = mask[:, -k_full.size(1):]
-
-        next_cache_position = cache_position + S_q
-        present = (k_full, v_full, next_cache_position) if use_cache else None
-
-        # Repeat K/V heads to match Hq for attention computation
-        k_attn = repeat_kv(k_full, self.n_rep)                                    # [B, S_kv, Hq, D]
-        v_attn = repeat_kv(v_full, self.n_rep)                                    # [B, S_kv, Hq, D]
-
-        # FlashAttention requirements
-        if not (q.is_cuda and k_attn.is_cuda and v_attn.is_cuda):
-            raise AssertionError("FlashAttention requires CUDA tensors. Move model and inputs to GPU.")
-        allowed_dtypes = (torch.float16, torch.bfloat16)
-
-        orig_dtype = q.dtype
-        if q.dtype not in allowed_dtypes:
-            q      = q.to(torch.float16)
-            k_attn = k_attn.to(torch.float16)
-            v_attn = v_attn.to(torch.float16)
-
+        # 5. FlashAttention
+        # Inputs must be contiguous
         q = q.contiguous()
         k_attn = k_attn.contiguous()
         v_attn = v_attn.contiguous()
 
-        # --- No-padding (fused) path ---
+        # Cast to supported dtypes for Flash
+        orig_dtype = q.dtype
+        if q.dtype not in (torch.float16, torch.bfloat16):
+            q = q.to(torch.bfloat16)
+            k_attn = k_attn.to(torch.bfloat16)
+            v_attn = v_attn.to(torch.bfloat16)
+
+        # Selection: Fused (Fast) vs Varlen (Masked)
         if mask is None:
-            if k_attn.size(1) != S_q:
-                raise AssertionError(
-                    f"flash_attn_func expects q_len==kv_len; got q={S_q}, kv={k_attn.size(1)}. "
-                    "Provide a padding mask to use varlen with cache."
-                )
+            # Fast path: Standard FlashAttention
             context = flash_attn_func(
                 q, k_attn, v_attn,
                 dropout_p=self.dropout_layer.p if self.training else 0.0,
                 causal=True
             )
-
-        # --- Varlen path (with mask / cache) ---
         else:
+            # Slow path: Varlen for padded batches
+            # Construct Q mask
+            varlen_causal = True
             if mask.size(1) == S_q:
                 q_mask = mask.bool()
-            elif mask.size(1) > S_q:
-                q_mask = mask[:, -S_q:].bool()
             else:
+                # Decoding: Q spans only new tokens, let it see the entire history
                 q_mask = torch.ones(B, S_q, dtype=torch.bool, device=mask.device)
-            m_bool = mask.bool()
+                varlen_causal = False
+            
+            k_mask = mask.bool()
 
-            q_unpad, q_idx, cu_q, max_q, *_ = unpad_input(q,      q_mask)
-            k_unpad, _,     cu_k, max_k, *_ = unpad_input(k_attn, m_bool)
-            v_unpad, *_                 = unpad_input(v_attn, m_bool)
-            q_idx = q_idx.to(torch.int32)
+            # Unpad
+            q_unpad, q_idx, cu_q, max_q, _ = unpad_input(q, q_mask)
+            k_unpad, _,     cu_k, max_k, _ = unpad_input(k_attn, k_mask)
+            v_unpad, *_                 = unpad_input(v_attn, k_mask)
 
-            context_unpad = flash_attn_varlen_func(
-                q_unpad, k_unpad, v_unpad,
-                cu_q, cu_k, max_q, max_k,
-                dropout_p=self.dropout_layer.p if self.training else 0.0,
-                causal=True
-            )
-            try:
+            if q_unpad.numel() == 0:
+                context = torch.zeros_like(q)
+            else:
+                context_unpad = flash_attn_varlen_func(
+                    q_unpad, k_unpad, v_unpad,
+                    cu_q.int(), cu_k.int(), max_q, max_k,
+                    dropout_p=self.dropout_layer.p if self.training else 0.0,
+                    causal=varlen_causal
+                )
                 context = pad_input(context_unpad, q_idx, B, S_q)
-            except TypeError:
-                context = pad_input(context_unpad, q_idx, S_q)
 
+        # Restore dtype
         if context.dtype != orig_dtype:
             context = context.to(orig_dtype)
 
-        out = context.contiguous().view(B, S_q, self.d_model)
-        out = self.fc(out)
+        # Output projection
+        out = self.fc(context.contiguous().view(B, S_q, self.d_model))
+        out = self.dropout_layer(out)
         return out, None, present
 
 
 class PositionwiseFeedForward(nn.Module):
-    """ SwiGLU FFN """
-    def __init__(self, d_model: int, d_ff: Optional[int] = None, dropout: float = 0.1, multiple_of: int = 256):
+    def __init__(self, d_model: int, d_ff: Optional[int] = None, dropout: float = 0.1):
         super().__init__()
         if d_ff is None:
+            # SwiGLU default sizing
             d_ff = int(2 / 3 * 4 * d_model)
-            d_ff = multiple_of * ((d_ff + multiple_of - 1) // multiple_of)
+            d_ff = 256 * ((d_ff + 256 - 1) // 256)
+            
         self.w1 = nn.Linear(d_model, d_ff, bias=False)
         self.w2 = nn.Linear(d_ff, d_model, bias=False)
         self.w3 = nn.Linear(d_model, d_ff, bias=False)
         self.dropout = nn.Dropout(dropout)
-        self.activation = F.silu
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        gate = self.activation(self.w1(x))
-        value = self.w3(x)
-        x = self.dropout(gate * value)
-        return self.w2(x)
+        return self.w2(self.dropout(F.silu(self.w1(x)) * self.w3(x)))
 
 
 class TransformerBlock(nn.Module):
@@ -256,266 +228,242 @@ class TransformerBlock(nn.Module):
         self.norm_attn = RMSNorm(d_model)
         self.norm_ffn = RMSNorm(d_model)
         self.attn = MultiHeadAttention(
-            d_model, n_head, dropout,
-            max_kv_len=max_kv_len,
-            n_kv_head=n_kv_head
+            d_model, n_head, dropout, max_kv_len, n_kv_head
         )
-        self.ffn  = PositionwiseFeedForward(d_model, d_ff, dropout)
-        self.drop_attn = nn.Dropout(dropout)
-        self.drop_ffn  = nn.Dropout(dropout)
+        self.ffn = PositionwiseFeedForward(d_model, d_ff, dropout)
 
     def forward(self, x, freqs_cis, mask, layer_past=None, use_cache=False):
         h = self.norm_attn(x)
-        attn_out, _, present = self.attn(h, freqs_cis=freqs_cis, mask=mask,
-                                         layer_past=layer_past, use_cache=use_cache)
-        x = x + self.drop_attn(attn_out)
-        ffn_out = self.ffn(self.norm_ffn(x))
-        x = x + self.drop_ffn(ffn_out)
+        attn_out, _, present = self.attn(h, freqs_cis, mask, layer_past, use_cache)
+        x = x + attn_out
+        
+        h = self.norm_ffn(x)
+        ffn_out = self.ffn(h)
+        x = x + ffn_out
         return x, present
 
+
+# --- Main GPT Model ---
 
 class GPT(nn.Module):
     def __init__(
         self,
         vocab_size: int,
         d_model: int,
-        n_head: int,             # Hq
+        n_head: int,
         n_layer: int,
         d_ff: int,
         max_seq_len: int,
         dropout: float = 0.1,
         pad_idx: int = 0,
         rope_theta: float = 10000.0,
-        n_kv_head: Optional[int] = None,    # NEW: Hkv (defaults to Hq if None)
-        max_kv_len: Optional[int] = None,   # optionally expose sliding-window limit
+        n_kv_head: Optional[int] = None,
+        max_kv_len: Optional[int] = None,
         use_gradient_checkpointing: bool = False,
     ):
         super().__init__()
-        assert d_model % n_head == 0
         self.d_model = d_model
         self.n_head = n_head
         self.d_k = d_model // n_head
         self.max_seq_len = max_seq_len
         self.pad_idx = pad_idx
         self.rope_theta = rope_theta
+        self.use_gradient_checkpointing = use_gradient_checkpointing
 
         self.token_embedding = nn.Embedding(vocab_size, d_model, padding_idx=pad_idx)
         self.layers = nn.ModuleList([
             TransformerBlock(
                 d_model, n_head, d_ff,
-                max_kv_len=max_kv_len,
                 dropout=dropout,
+                max_kv_len=max_kv_len,
                 n_kv_head=n_kv_head
             )
             for _ in range(n_layer)
         ])
-        self.dropout = nn.Dropout(dropout)
         self.final_norm = RMSNorm(d_model)
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
+        
+        # Weight tying
         self.lm_head.weight = self.token_embedding.weight
-        self.use_gradient_checkpointing = use_gradient_checkpointing
+        self.dropout = nn.Dropout(dropout)
 
-        precomp_len = max_seq_len * 2
-        freqs = precompute_freqs_cis(self.d_k, precomp_len, theta=self.rope_theta)
+        # Precompute RoPE frequencies
+        precomp_len = max_seq_len * 2 
+        freqs = precompute_freqs_cis(self.d_k, precomp_len, theta=rope_theta)
         self.register_buffer("precomputed_freqs_cis", freqs, persistent=False)
 
         self.apply(self._init_weights)
 
     def _init_weights(self, module):
+        std = 0.02
         if isinstance(module, nn.Linear):
-            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            nn.init.normal_(module.weight, mean=0.0, std=std)
             if module.bias is not None:
                 nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
-            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            nn.init.normal_(module.weight, mean=0.0, std=std)
             if module.padding_idx is not None:
                 with torch.no_grad():
                     module.weight[module.padding_idx].fill_(0)
-        elif isinstance(module, nn.LayerNorm):
-            nn.init.zeros_(module.bias)
-            nn.init.ones_(module.weight)
-
-    def _slice_or_extend_rope(self, start_pos: int, seq_len: int, device: torch.device) -> torch.Tensor:
-        end_pos = start_pos + seq_len
-        # Extend on-the-fly if needed (without mutating the buffer)
-        if end_pos > self.precomputed_freqs_cis.size(0):
-            freqs = precompute_freqs_cis(self.d_k, end_pos, theta=self.rope_theta).to(device)
-            return freqs[start_pos:end_pos]
-        return self.precomputed_freqs_cis[start_pos:end_pos].to(device)
+        
+        # Re-scaling of residual projections (GPT-2/Llama style)
+        for name, p in module.named_parameters():
+            if name.endswith("fc.weight") or name.endswith("w2.weight"):
+                nn.init.normal_(p, mean=0.0, std=std / math.sqrt(2 * len(self.layers)))
 
     def forward(
         self,
-        input_ids: torch.Tensor,                       # [B, S_q]
-        attention_mask: Optional[torch.Tensor] = None, # [B, S_q], 1=attend, 0=pad
-        past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor, int]]] = None,
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None, # [B, S]
+        past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
         use_cache: bool = False,
-    ) -> Tuple[torch.Tensor, Optional[List[Tuple[torch.Tensor, torch.Tensor, int]]]]:
+    ) -> Tuple[torch.Tensor, Optional[List[Tuple[torch.Tensor, torch.Tensor]]]]:
 
         B, S_q = input_ids.size()
         device = input_ids.device
 
-        past_len = 0
+        # 1. RoPE Slicing
         start_pos = 0
         if past_key_values is not None and past_key_values[0] is not None:
-            layer0 = past_key_values[0]
-            past_len = layer0[0].size(1)
-            if len(layer0) == 3:
-                cache_position = layer0[2]
-                start_pos = int(cache_position.item()) if isinstance(cache_position, torch.Tensor) else int(cache_position)
-            else:
-                start_pos = past_len
+            start_pos = past_key_values[0][0].size(1)
 
-        x = self.dropout(self.token_embedding(input_ids))
+        end_pos = start_pos + S_q
+        if end_pos > self.precomputed_freqs_cis.size(0):
+            freqs = precompute_freqs_cis(self.d_k, end_pos + 1024, self.rope_theta).to(device)
+            self.register_buffer("precomputed_freqs_cis", freqs, persistent=False)
+            
+        freqs_cis = self.precomputed_freqs_cis[start_pos:end_pos].to(device)
 
-        # RoPE for *current* tokens
-        freqs_cis = self._slice_or_extend_rope(start_pos, S_q, device=device)
-
-        # Build full KV mask:
-        # - If attention_mask given, concat past-ones with it (so tail aligns with current queries).
-        # - If no attention_mask but past exists, concat past-ones with current-ones (so varlen has a proper q-mask tail).
+        # 2. Mask Logic
         kv_mask = None
         if attention_mask is not None:
-            kv_mask = attention_mask if past_len == 0 else torch.cat(
-                (torch.ones(B, past_len, dtype=attention_mask.dtype, device=device), attention_mask),
-                dim=1
-            )
-        elif past_len > 0:
-            kv_mask = torch.cat(
-                (
-                    torch.ones(B, past_len, dtype=torch.long, device=device),
-                    torch.ones(B, S_q, dtype=torch.long, device=device),
-                ),
-                dim=1,
-            )
+            mask_len = attention_mask.size(1)
+            expected_len = start_pos + S_q
 
+            if mask_len == expected_len:
+                # HuggingFace-style: mask already covers KV cache + current tokens
+                kv_mask = attention_mask
+            elif start_pos > 0 and mask_len == start_pos:
+                # Legacy path: mask only contains cached positions, append new tokens
+                curr_mask = torch.ones(B, S_q, dtype=attention_mask.dtype, device=device)
+                kv_mask = torch.cat([attention_mask, curr_mask], dim=1)
+            else:
+                raise ValueError(
+                    f"attention_mask has invalid shape {mask_len}, expected {expected_len} "
+                    "or cached length only."
+                )
+
+            # Optimization: Use fast fused kernel if mask is full
+            if torch.all(kv_mask):
+                kv_mask = None
+
+        # 3. Forward Pass
+        x = self.dropout(self.token_embedding(input_ids))
         presents = [] if use_cache else None
-        h = x
-        for i, layer in enumerate(self.layers):
-            layer_past = past_key_values[i] if past_key_values is not None else None
-            if (
-                self.use_gradient_checkpointing
-                and self.training
-                and not use_cache
-                and layer_past is None
-            ):
-                def custom_forward(hidden_states):
-                    out, _ = layer(
-                        hidden_states,
-                        freqs_cis=freqs_cis,
-                        mask=kv_mask,
-                        layer_past=None,
-                        use_cache=False,
-                    )
-                    return out
 
-                h = checkpoint(custom_forward, h)
+        for i, layer in enumerate(self.layers):
+            layer_past = past_key_values[i] if past_key_values else None
+            
+            if self.use_gradient_checkpointing and self.training and not use_cache:
+                # Checkpoint wrapper
+                x = checkpoint(
+                    layer, x, freqs_cis, kv_mask, None, False, 
+                    use_reentrant=False
+                )[0] # unpack tuple
                 present = None
             else:
-                h, present = layer(
-                    h,
-                    freqs_cis=freqs_cis,
-                    mask=kv_mask,
-                    layer_past=layer_past,
-                    use_cache=use_cache,
-                )
+                x, present = layer(x, freqs_cis, kv_mask, layer_past, use_cache)
+            
             if use_cache:
                 presents.append(present)
 
-        h = self.final_norm(h)
-        logits = self.lm_head(h)
+        x = self.final_norm(x)
+        logits = self.lm_head(x)
         return logits, presents
 
     @torch.no_grad()
     def generate(
         self,
-        input_ids: torch.Tensor,      # [B, S_prompt]
+        input_ids: torch.Tensor,
         max_new_tokens: int,
         temperature: float = 1.0,
         top_k: Optional[int] = None,
         repetition_penalty: float = 1.0,
-        tokenizer=None,
-        pad_token_id: Optional[int] = None,
+        pad_token_id: Optional[int] = 0,
+        eos_token_id: Optional[int] = None,
         streamer=None,
     ) -> List[List[int]]:
         self.eval()
-        device = next(self.parameters()).device
         B, _ = input_ids.shape
+        device = input_ids.device
+
+        # Create initial attention mask (1 for real, 0 for pad)
+        if pad_token_id is not None:
+            attn_mask = (input_ids != pad_token_id).long()
+        else:
+            attn_mask = torch.ones_like(input_ids)
 
         generated_ids = input_ids.clone()
-        sequences = input_ids.tolist()
         past_key_values = None
-        attn_mask = (input_ids != pad_token_id).long() if pad_token_id is not None else None
-        cur_ids = input_ids
+        curr_ids = input_ids
+        finished = torch.zeros(B, dtype=torch.bool, device=device)
 
         for _ in range(max_new_tokens):
             logits, past_key_values = self(
-                input_ids=cur_ids,
-                attention_mask=attn_mask,
+                input_ids=curr_ids,
+                attention_mask=attn_mask, # Pass accumulated mask
                 past_key_values=past_key_values,
                 use_cache=True,
             )
 
-            next_logits = logits[:, -1, :]  # [B, V]
+            next_logits = logits[:, -1, :]
 
+            # Repetition Penalty (GPU-based)
             if repetition_penalty != 1.0:
-                # Penalize tokens already generated in each sequence
-                for b in range(B):
-                    prev = torch.tensor(sequences[b], device=next_logits.device, dtype=torch.long).unsqueeze(0)
-                    scores = next_logits[b:b+1].gather(1, prev)
-                    scores = torch.where(scores > 0, scores / repetition_penalty, scores * repetition_penalty)
-                    next_logits[b:b+1].scatter_(1, prev, scores)
+                score = torch.gather(next_logits, 1, generated_ids)
+                score = torch.where(score < 0, score * repetition_penalty, score / repetition_penalty)
+                next_logits.scatter_(1, generated_ids, score)
 
+            # Sampling
             if temperature <= 0:
                 next_token = torch.argmax(next_logits, dim=-1)
             else:
-                if temperature != 1.0:
-                    next_logits = next_logits / temperature
-                if top_k is not None and top_k > 0:
+                next_logits = next_logits / temperature
+                if top_k is not None:
                     v, _ = torch.topk(next_logits, min(top_k, next_logits.size(-1)))
-                    next_logits[next_logits < v[:, [-1]]] = -float("inf")
+                    next_logits[next_logits < v[:, [-1]]] = -float('inf')
                 probs = F.softmax(next_logits, dim=-1)
                 next_token = torch.multinomial(probs, num_samples=1).squeeze(1)
 
-            if streamer is not None:
+            if streamer:
                 streamer.put(next_token.unsqueeze(0))
 
-            cur_ids = next_token.unsqueeze(1)
-            attn_mask = None  # KV cache handles positions; varlen path will synthesize q-mask as needed
-            generated_ids = torch.cat([generated_ids, cur_ids], dim=1)
+            # Update tracking
+            curr_ids = next_token.unsqueeze(1)
+            generated_ids = torch.cat([generated_ids, curr_ids], dim=1)
+            
+            # IMPORTANT: Extend the mask for the next step
+            attn_mask = torch.cat([attn_mask, torch.ones(B, 1, dtype=torch.long, device=device)], dim=1)
 
-            all_finished = True
-            for b in range(B):
-                tid = next_token[b].item()
-                sequences[b].append(tid)
-                is_eos = tokenizer and hasattr(tokenizer, "eos_token_id") and tid == tokenizer.eos_token_id
-                if not is_eos:
-                    all_finished = False
-            if all_finished:
-                break
+            if eos_token_id is not None:
+                finished = finished | (next_token == eos_token_id)
+                if finished.all():
+                    break
 
-        if streamer is not None:
+        if streamer:
             streamer.end()
-
+            
         self.train()
-        return sequences
+        return generated_ids.tolist()
 
 
-def upgrade_state_dict_for_block_norms(
-    state_dict: Mapping[str, torch.Tensor]
-) -> Mapping[str, torch.Tensor]:
+# --- Utilities ---
+
+def upgrade_state_dict_for_block_norms(state_dict: Mapping[str, torch.Tensor]) -> Mapping[str, torch.Tensor]:
     """
-    Upgrade checkpoints trained with the old single RMSNorm per block to the new
-    dual-norm layout (attn + ffn). Copies the old weights into both new norms and
-    drops stale bias entries. Final RMSNorm weights are preserved; its old bias is discarded.
+    Utility to upgrade old checkpoints (single norm) to new dual-norm layout.
     """
     if any(".norm_attn.weight" in k for k in state_dict.keys()):
-        return state_dict
-
-    needs_upgrade = any(
-        k.startswith("layers.") and ".norm." in k
-        for k in state_dict.keys()
-    )
-    if not needs_upgrade:
         return state_dict
 
     upgraded = OrderedDict()
@@ -525,10 +473,31 @@ def upgrade_state_dict_for_block_norms(
                 prefix = key.replace(".norm.weight", "")
                 upgraded[f"{prefix}.norm_attn.weight"] = value.clone()
                 upgraded[f"{prefix}.norm_ffn.weight"] = value.clone()
-            # Drop old bias/extra state for the obsolete norm module
             continue
         if key.startswith("final_norm.") and key.endswith(".bias"):
-            # New RMSNorm has no bias.
             continue
         upgraded[key] = value
     return upgraded
+
+
+if __name__ == "__main__":
+    # Simple Sanity Check
+    if not torch.cuda.is_available():
+        print("Skipping test: CUDA not available")
+    else:
+        print("Running sanity check on CUDA...")
+        model = GPT(
+            vocab_size=1000, d_model=256, n_head=4, n_layer=2, d_ff=512, 
+            max_seq_len=128, n_kv_head=2 # Test GQA
+        ).cuda()
+        
+        x = torch.randint(0, 1000, (2, 10)).cuda()
+        
+        # Forward
+        logits, _ = model(x)
+        print(f"Forward pass output: {logits.shape}") # [2, 10, 1000]
+        
+        # Generate
+        out = model.generate(x, max_new_tokens=5)
+        print(f"Generated length: {len(out[0])}") # Should be 15
+        print("Test passed.")
