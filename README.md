@@ -53,3 +53,28 @@ graph TD
     end
     
     H -.-> A
+```
+
+## 🧠 Identity Block Implementation
+
+- `identity_block.py` defines the `IdentityBlock` module. It maintains a persistent identity state (an MLP-controlled vector) and exposes `summarize_token_context` to collapse per-token hidden states into a batch summary. The block outputs a `d_model`-dimensional bias that conditions the main transformer.
+- The main SLM (`model.GPT`) now accepts `identity_dim`, `identity_hidden_dim`, and `identity_dropout`. Supplying `identity_dim` instantiates the block and automatically injects its bias into every attention head by learning dedicated Q/K projections.
+- During a forward pass the model summarizes the current batch’s token embeddings (respecting the attention mask), feeds the summary into the Identity Block, and reuses the returned “soul vector” across all layers. The bias is broadcast across sequence positions and added to Q/K before rotary embeddings are applied.
+- Training-wise, the Identity Block parameters participate in the normal language-model loss, so they receive gradient signals from the corpus. You can still run explicit “introspection” updates by calling `IdentityBlock.summarize_token_context` on a dedicated prompt, computing a target identity vector, and stepping the block with a smaller learning rate or higher EMA decay to keep the self state stable between batches.
+- Example instantiation:
+
+```python
+model = GPT(
+    vocab_size=tokenizer.vocab_size,
+    d_model=1024,
+    n_head=16,
+    n_layer=24,
+    d_ff=2730,
+    max_seq_len=4096,
+    identity_dim=512,
+    identity_hidden_dim=1024,
+    identity_dropout=0.05,
+)
+```
+
+This keeps the Knowledge Stream untouched when `identity_dim=None`, yet flips on identity-conditioned attention when the block is configured.

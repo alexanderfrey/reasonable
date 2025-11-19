@@ -12,6 +12,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
+from identity_block import IdentityBlock
+
 # --- FlashAttention Imports & Guard ---
 try:
     from flash_attn import flash_attn_func, flash_attn_varlen_func
@@ -90,7 +92,8 @@ class MultiHeadAttention(nn.Module):
         n_head: int,
         dropout: float = 0.1,
         max_kv_len: Optional[int] = None,
-        n_kv_head: Optional[int] = None
+        n_kv_head: Optional[int] = None,
+        use_identity_conditioning: bool = False,
     ):
         super().__init__()
         Hq = n_head
@@ -107,6 +110,11 @@ class MultiHeadAttention(nn.Module):
         self.w_kv = nn.Linear(d_model, 2 * Hkv * self.d_k, bias=False)
         self.fc = nn.Linear(d_model, d_model)
         self.dropout_layer = nn.Dropout(dropout)
+        self.use_identity_conditioning = use_identity_conditioning
+
+        if self.use_identity_conditioning:
+            self.identity_to_q = nn.Linear(d_model, Hq * self.d_k, bias=False)
+            self.identity_to_k = nn.Linear(d_model, Hkv * self.d_k, bias=False)
 
     def forward(
         self,
@@ -115,6 +123,7 @@ class MultiHeadAttention(nn.Module):
         mask: Optional[torch.Tensor] = None,
         layer_past: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         use_cache: bool = False,
+        identity_bias: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, None, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         
         B, S_q, _ = x.size()
@@ -123,6 +132,12 @@ class MultiHeadAttention(nn.Module):
         q = self.w_q(x).view(B, S_q, self.n_head, self.d_k)
         kv = self.w_kv(x).view(B, S_q, 2, self.n_kv_head, self.d_k)
         k, v = kv.unbind(dim=2)
+
+        if self.use_identity_conditioning and identity_bias is not None:
+            q_bias = self.identity_to_q(identity_bias).view(B, self.n_head, self.d_k).unsqueeze(1)
+            k_bias = self.identity_to_k(identity_bias).view(B, self.n_kv_head, self.d_k).unsqueeze(1)
+            q = q + q_bias.to(q.dtype)
+            k = k + k_bias.to(k.dtype)
 
         # 2. RoPE
         q, k = apply_rotary_pos_emb(q, k, freqs_cis=freqs_cis)
@@ -229,18 +244,43 @@ class PositionwiseFeedForward(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, d_model, n_head, d_ff, dropout=0.1, max_kv_len=None, n_kv_head=None):
+    def __init__(
+        self,
+        d_model,
+        n_head,
+        d_ff,
+        dropout=0.1,
+        max_kv_len=None,
+        n_kv_head=None,
+        use_identity_conditioning: bool = False,
+    ):
         super().__init__()
         self.norm_attn = RMSNorm(d_model)
         self.norm_ffn = RMSNorm(d_model)
         self.attn = MultiHeadAttention(
-            d_model, n_head, dropout, max_kv_len, n_kv_head
+            d_model, n_head, dropout, max_kv_len, n_kv_head,
+            use_identity_conditioning=use_identity_conditioning,
         )
         self.ffn = PositionwiseFeedForward(d_model, d_ff, dropout)
 
-    def forward(self, x, freqs_cis, mask, layer_past=None, use_cache=False):
+    def forward(
+        self,
+        x,
+        freqs_cis,
+        mask,
+        layer_past=None,
+        use_cache=False,
+        identity_bias: Optional[torch.Tensor] = None,
+    ):
         h = self.norm_attn(x)
-        attn_out, _, present = self.attn(h, freqs_cis, mask, layer_past, use_cache)
+        attn_out, _, present = self.attn(
+            h,
+            freqs_cis,
+            mask,
+            layer_past,
+            use_cache,
+            identity_bias=identity_bias,
+        )
         x = x + attn_out
         
         h = self.norm_ffn(x)
@@ -266,6 +306,9 @@ class GPT(nn.Module):
         n_kv_head: Optional[int] = None,
         max_kv_len: Optional[int] = None,
         use_gradient_checkpointing: bool = False,
+        identity_dim: Optional[int] = None,
+        identity_hidden_dim: Optional[int] = None,
+        identity_dropout: float = 0.1,
     ):
         super().__init__()
         self.d_model = d_model
@@ -277,12 +320,24 @@ class GPT(nn.Module):
         self.use_gradient_checkpointing = use_gradient_checkpointing
 
         self.token_embedding = nn.Embedding(vocab_size, d_model, padding_idx=pad_idx)
+        self.identity_block = None
+        self.use_identity_conditioning = identity_dim is not None
+
+        if self.use_identity_conditioning:
+            self.identity_block = IdentityBlock(
+                d_model=d_model,
+                state_dim=identity_dim,
+                hidden_dim=identity_hidden_dim,
+                dropout=identity_dropout,
+            )
+
         self.layers = nn.ModuleList([
             TransformerBlock(
                 d_model, n_head, d_ff,
                 dropout=dropout,
                 max_kv_len=max_kv_len,
-                n_kv_head=n_kv_head
+                n_kv_head=n_kv_head,
+                use_identity_conditioning=self.use_identity_conditioning,
             )
             for _ in range(n_layer)
         ])
@@ -364,7 +419,19 @@ class GPT(nn.Module):
                 kv_mask = None
 
         # 3. Forward Pass
-        x = self.dropout(self.token_embedding(input_ids))
+        token_embeddings = self.token_embedding(input_ids)
+        identity_bias = None
+        if self.identity_block is not None:
+            summary_mask = None
+            if attention_mask is not None:
+                summary_mask = attention_mask[:, -S_q:]
+            identity_context = IdentityBlock.summarize_token_context(
+                token_embeddings,
+                summary_mask,
+            )
+            identity_bias = self.identity_block(identity_context)
+
+        x = self.dropout(token_embeddings)
         presents = [] if use_cache else None
 
         for i, layer in enumerate(self.layers):
@@ -373,12 +440,19 @@ class GPT(nn.Module):
             if self.use_gradient_checkpointing and self.training and not use_cache:
                 # Checkpoint wrapper
                 x = checkpoint(
-                    layer, x, freqs_cis, kv_mask, None, False, 
+                    layer, x, freqs_cis, kv_mask, None, False, identity_bias,
                     use_reentrant=False
                 )[0] # unpack tuple
                 present = None
             else:
-                x, present = layer(x, freqs_cis, kv_mask, layer_past, use_cache)
+                x, present = layer(
+                    x,
+                    freqs_cis,
+                    kv_mask,
+                    layer_past,
+                    use_cache,
+                    identity_bias=identity_bias,
+                )
             
             if use_cache:
                 presents.append(present)
