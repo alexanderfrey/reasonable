@@ -4,6 +4,7 @@ import torch.distributed as dist
 from torch import amp
 import torch.nn as nn
 import torch.optim as optim
+import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.data.distributed import DistributedSampler
@@ -127,6 +128,7 @@ def _build_optimizer(trainable_params, lr: float, weight_decay: float, *, logger
 # Import the model class from model.py
 try:
     from model import GPT, upgrade_state_dict_for_block_norms
+    from identity_block import IdentityBlock
 except ImportError:
     print("Error: model.py not found. Please ensure it's in the same directory.")
     exit(1)
@@ -1030,6 +1032,9 @@ def initialize_model(args: Namespace, vocab_size: int, pad_token_id: int, eos_to
         "pad_idx": pad_token_id,    
         "d_ff": args.d_ff,
         "use_gradient_checkpointing": getattr(args, "grad_checkpoint", False),
+        "identity_dim": getattr(args, "identity_dim", None),
+        "identity_hidden_dim": getattr(args, "identity_hidden_dim", None),
+        "identity_dropout": getattr(args, "identity_dropout", 0.1),
     }
     
 
@@ -1085,6 +1090,116 @@ def initialize_training_components(args: Namespace, model: nn.Module, use_amp: b
     if use_amp:
         logger.info("Using Automatic Mixed Precision (AMP) with GradScaler.")
     return optimizer, criterion, scaler
+
+
+def build_identity_optimizer(args: Namespace, model: nn.Module) -> Optional[optim.Optimizer]:
+    """
+    Create a slower optimizer dedicated to the Identity Block so introspection
+    updates do not disturb the main optimizer state.
+    """
+    base_model = unwrap_model(model)
+    identity_block = getattr(base_model, "identity_block", None)
+    if identity_block is None:
+        return None
+
+    identity_params = [p for p in identity_block.parameters() if p.requires_grad]
+    if not identity_params:
+        return None
+
+    lr = getattr(args, "identity_lr", None)
+    if lr is None:
+        lr = args.learning_rate * 0.1
+
+    logger.info(
+        "Initializing identity optimizer with %d parameters at lr=%.2e",
+        sum(p.numel() for p in identity_params),
+        lr,
+    )
+    return optim.AdamW(identity_params, lr=lr, weight_decay=0.0)
+
+
+def run_identity_introspection(
+    args: Namespace,
+    model: nn.Module,
+    tokenizer,
+    device: torch.device,
+    identity_optimizer: Optional[optim.Optimizer],
+    pad_token_id: Optional[int],
+    eos_token_id: Optional[int],
+) -> Optional[dict]:
+    """
+    Runs the introspection prompt + generation loop and nudges the Identity Block
+    toward the generated summary using an auxiliary loss.
+    """
+    if identity_optimizer is None:
+        return None
+
+    prompt = getattr(args, "identity_prompt", "")
+    if not prompt or getattr(args, "identity_update_interval", 0) <= 0:
+        return None
+
+    base_model = unwrap_model(model)
+    identity_block = getattr(base_model, "identity_block", None)
+    if identity_block is None:
+        return None
+
+    max_new_tokens = max(0, getattr(args, "identity_max_new_tokens", 0))
+    if max_new_tokens <= 0:
+        return None
+
+    encoded = tokenizer(prompt, return_tensors="pt")
+    prompt_ids = encoded["input_ids"].to(device)
+    prompt_ids = prompt_ids[:, -base_model.max_seq_len :]
+
+    pad_id = pad_token_id
+    if pad_id is None:
+        pad_id = tokenizer.pad_token_id
+    if pad_id is None:
+        pad_id = 0
+
+    eos_id = eos_token_id if eos_token_id is not None else tokenizer.eos_token_id
+
+    top_k = getattr(args, "identity_top_k", 50)
+    if top_k is not None and top_k <= 0:
+        top_k = None
+
+    try:
+        generated = base_model.generate(
+            input_ids=prompt_ids,
+            max_new_tokens=max_new_tokens,
+            temperature=getattr(args, "identity_temperature", 0.7),
+            top_k=top_k,
+            pad_token_id=pad_id,
+            eos_token_id=eos_id,
+        )
+    except Exception as e:
+        logger.error(f"Identity introspection generation failed: {e}")
+        return None
+
+    if not generated:
+        return None
+
+    generated_tensor = torch.tensor(generated[0], device=device).unsqueeze(0)
+    attn_mask = torch.ones_like(generated_tensor, device=device)
+
+    with torch.no_grad():
+        token_embeddings = base_model.token_embedding(generated_tensor)
+        context = IdentityBlock.summarize_token_context(token_embeddings, attn_mask)
+
+    context = context.detach()
+
+    identity_optimizer.zero_grad(set_to_none=True)
+    predicted = identity_block(context)
+    reconstruction_loss = F.mse_loss(predicted, context)
+    scaled_loss = reconstruction_loss * getattr(args, "identity_loss_scale", 1.0)
+    scaled_loss.backward()
+    identity_optimizer.step()
+    identity_optimizer.zero_grad(set_to_none=True)
+
+    return {
+        "loss": float(reconstruction_loss.item()),
+        "text": tokenizer.decode(generated[0]),
+    }
 
 def _find_latest_checkpoint(output_dir: str):
     """Finds the latest checkpoint file based on modification time."""
@@ -1624,6 +1739,7 @@ def train(args: Namespace):
     start_epoch, global_step, best_eval_loss, model, optimizer, scaler = load_checkpoint(
         args, model, optimizer, scaler, device, use_amp, vocab_size, pad_token_id, eos_token_id, model_config
     )
+    identity_optimizer = build_identity_optimizer(args, model)
     # If load_checkpoint returned a wandb_run_id, and W&B init happened after, you might re-init or ensure args.wandb_run_id was set prior.
     # For this example, we assume args.wandb_run_id is set externally if specific run resumption is needed.
 
@@ -1748,6 +1864,41 @@ def train(args: Namespace):
                     optimizer.zero_grad(set_to_none=True)
                     global_step += 1
                     steps_in_epoch += 1
+
+                    identity_log = None
+                    if (
+                        identity_optimizer is not None
+                        and getattr(args, "identity_update_interval", 0) > 0
+                        and global_step % args.identity_update_interval == 0
+                    ):
+                        identity_log = run_identity_introspection(
+                            args,
+                            model,
+                            tokenizer,
+                            device,
+                            identity_optimizer,
+                            pad_token_id,
+                            eos_token_id,
+                        )
+                        if identity_log:
+                            if args.is_main_process:
+                                msg = (
+                                    f"Identity introspection ({global_step}): "
+                                    f"loss={identity_log['loss']:.4f} | text='{identity_log['text'][:120]}'"
+                                )
+                                logger.info(msg)
+                            if (
+                                args.is_main_process
+                                and not getattr(args, "disable_wandb", False)
+                                and wandb.run
+                            ):
+                                wandb.log(
+                                    {
+                                        "identity/loss": identity_log["loss"],
+                                        "identity/text": identity_log["text"],
+                                    },
+                                    step=global_step,
+                                )
 
                     # --- Logging ---
                     if args.log_interval > 0 and global_step > 0 and global_step % args.log_interval == 0:
@@ -1976,6 +2127,12 @@ if __name__ == "__main__":
                         help="Limit the KV cache/attention window length (enables sliding-window attention).")
     parser.add_argument("--grad_checkpoint", action="store_true",
                         help="Enable torch.utils.checkpoint across Transformer blocks to save activation memory.")
+    parser.add_argument("--identity_dim", type=int, default=None,
+                        help="Enable the Identity Block by providing its latent state dimension (None disables it).")
+    parser.add_argument("--identity_hidden_dim", type=int, default=None,
+                        help="Hidden size of the Identity Block controller MLP (defaults to 2x state dim).")
+    parser.add_argument("--identity_dropout", type=float, default=0.1,
+                        help="Dropout probability inside the Identity Block controller.")
 
     # --- Training Arguments ---
     parser.add_argument("--epochs", type=int, default=5)
@@ -1997,6 +2154,22 @@ if __name__ == "__main__":
     parser.add_argument("--local_rank", type=int, default=-1,
                         help="Local rank provided by torchrun (set automatically).")
 
+    # --- Identity Loop Arguments ---
+    parser.add_argument("--identity_update_interval", type=int, default=0,
+                        help="Run an introspection update every N optimizer steps (0 disables the loop).")
+    parser.add_argument("--identity_prompt", type=str,
+                        default="Who am I? Where do I want to go?",
+                        help="Prompt used to trigger the introspection generation pass.")
+    parser.add_argument("--identity_max_new_tokens", type=int, default=64,
+                        help="Number of tokens to sample during introspection generation.")
+    parser.add_argument("--identity_temperature", type=float, default=0.7,
+                        help="Sampling temperature for introspection generation.")
+    parser.add_argument("--identity_top_k", type=int, default=50,
+                        help="Top-k sampling filter for introspection generation (<=0 disables filtering).")
+    parser.add_argument("--identity_lr", type=float, default=None,
+                        help="Learning rate for the Identity Block optimizer (defaults to 0.1x main LR).")
+    parser.add_argument("--identity_loss_scale", type=float, default=1.0,
+                        help="Multiplier applied to the introspection reconstruction loss.")
 
     # --- Logging, Checkpointing, Evaluation Arguments ---
     parser.add_argument("--log_interval", type=int, default=100)

@@ -78,3 +78,21 @@ model = GPT(
 ```
 
 This keeps the Knowledge Stream untouched when `identity_dim=None`, yet flips on identity-conditioned attention when the block is configured.
+
+### Training the Identity Block
+
+- `pretrain.py` exposes `--identity_dim`, `--identity_hidden_dim`, and `--identity_dropout` to instantiate the block, plus an introspection loop driven by `--identity_update_interval`. When the interval is > 0 the trainer pauses every N optimizer steps, prompts the model with `--identity_prompt`, samples `--identity_max_new_tokens` tokens, and summarizes that text with `IdentityBlock.summarize_token_context`.
+- The summary becomes a reconstruction target: a dedicated optimizer (LR = `--identity_lr` or 0.1× the main LR) nudges the Identity Block so that `identity_block(summary)` matches the sampled context, weighted by `--identity_loss_scale`. This provides deliberate “Who am I?” updates in addition to the standard LM gradients the block receives during corpus batches.
+- CLI example:
+
+```bash
+python pretrain.py \
+  --corpus_file data/train.txt \
+  --tokenizer_name gpt2 \
+  --identity_dim 512 \
+  --identity_update_interval 200 \
+  --identity_prompt "Who am I? Where do I want to go?" \
+  --identity_max_new_tokens 80
+```
+
+The introspection loss and generated self-description are logged each time, so you can watch the “self” vector drift in wandb or the console.
