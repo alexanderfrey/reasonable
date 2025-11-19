@@ -119,10 +119,14 @@ def load_lora_adapters(model: nn.Module, adapters_path: str, device: torch.devic
         sd = ckpt["adapters_state_dict"]
         model.to(device)
         missing, unexpected = model.load_state_dict(sd, strict=False)
-        if missing:
-            log.warning(f"[LoRA load] Missing keys: {missing[:10]}{'...' if len(missing)>10 else ''}")
-        if unexpected:
-            log.warning(f"[LoRA load] Unexpected keys: {unexpected[:10]}{'...' if len(unexpected)>10 else ''}")
+        # Base checkpoint params aren't included in the adapters file, so ignore
+        # those entries and only warn if actual LoRA tensors are absent.
+        missing_lora = [k for k in missing if ".lora_" in k]
+        unexpected_lora = [k for k in unexpected if ".lora_" in k]
+        if missing_lora:
+            log.warning(f"[LoRA load] Missing keys: {missing_lora[:10]}{'...' if len(missing_lora)>10 else ''}")
+        if unexpected_lora:
+            log.warning(f"[LoRA load] Unexpected keys: {unexpected_lora[:10]}{'...' if len(unexpected_lora)>10 else ''}")
         for p in model.parameters():
             p.requires_grad = False
     else:
@@ -613,8 +617,13 @@ def main():
         # stream flag from CLI
         do_stream = stream and (not args.no_stream)
 
-        if do_stream:
-            print("", end="", flush=True)
+        streamed_any = False
+        def _stream_cb(chunk: str):
+            nonlocal streamed_any
+            if chunk:
+                streamed_any = True
+                print(chunk, end="", flush=True)
+        stream_cb = _stream_cb if do_stream else None
 
         generated = debug_style_generate(
             model=model,
@@ -629,15 +638,16 @@ def main():
             use_amp=amp_enabled,
             amp_dtype_str=args.amp_dtype,
             stream=do_stream,
+            on_token=stream_cb,
             suppress_eos_steps=3,  # <- helps avoid immediate EOS; tune or set 0
         )
 
         # If we streamed tokens, ensure newline and also print final (in case buffer was empty)
         if do_stream:
-            if not generated:
-                # nothing streamed? print the final text at once
+            if not streamed_any and generated:
+                # streaming path requested but nothing was emitted (e.g., immediate EOS)
                 print(generated, end="")
-            print()  # newline
+            print()
 
         else:
             # non-stream mode: print the whole thing

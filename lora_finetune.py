@@ -38,7 +38,10 @@ from typing import List, Dict, Optional, Tuple, Iterable
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import Dataset, DataLoader, Subset
+from torch.utils.data.distributed import DistributedSampler
 from torch import amp
 
 from transformers import AutoTokenizer
@@ -72,6 +75,68 @@ logger = logging.getLogger("lora_sft")
 IGNORE_INDEX = -100
 
 import time
+
+
+def unwrap_model(model: nn.Module) -> nn.Module:
+    """Return the underlying model when wrapped by DistributedDataParallel."""
+    return model.module if hasattr(model, "module") else model
+
+
+def init_distributed_mode(args: Namespace) -> None:
+    """Initialize torch.distributed (auto-enabled when torchrun sets WORLD_SIZE)."""
+    if not hasattr(args, "distributed"):
+        args.distributed = False
+
+    args.rank = 0
+    args.world_size = 1
+    args.is_main_process = True
+    args.local_rank = getattr(args, "local_rank", -1)
+
+    env_world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    if env_world_size > 1:
+        args.distributed = True
+
+    if not args.distributed:
+        if args.local_rank in (-1, None):
+            args.local_rank = 0
+        return
+
+    if not dist.is_available():
+        raise RuntimeError("torch.distributed is unavailable but distributed training was requested.")
+
+    if "RANK" not in os.environ:
+        raise RuntimeError("Distributed mode expects RANK env variable. Launch with torchrun.")
+
+    rank = int(os.environ.get("RANK", 0))
+    world_size = env_world_size
+    local_rank_env = os.environ.get("LOCAL_RANK")
+
+    if world_size <= 1:
+        raise RuntimeError("Distributed mode expects WORLD_SIZE>1. Launch with torchrun.")
+
+    if local_rank_env is not None:
+        args.local_rank = int(local_rank_env)
+    elif args.local_rank in (-1, None):
+        raise RuntimeError("Distributed mode expects LOCAL_RANK env or --local_rank argument.")
+
+    args.rank = rank
+    args.world_size = world_size
+
+    torch.cuda.set_device(args.local_rank)
+    dist_backend = getattr(args, "dist_backend", "nccl")
+    dist.init_process_group(
+        backend=dist_backend,
+        rank=args.rank,
+        world_size=args.world_size,
+        device_id=torch.device(f"cuda:{args.local_rank}"),
+    )
+    dist.barrier()
+    args.is_main_process = args.rank == 0
+
+
+def barrier_if_distributed(args: Namespace) -> None:
+    if getattr(args, "distributed", False) and dist.is_initialized():
+        dist.barrier()
 
 
 def compute_default_n_kv_head(n_head: int, kv_ratio: int = 4) -> int:
@@ -702,7 +767,9 @@ def _write_jsonl(path: str, rows: List[dict]) -> None:
 # ===================== Train / Eval =====================
 
 def evaluate(model: nn.Module, dl: DataLoader, criterion, device, use_amp: bool, vocab_size: int) -> Tuple[float, float]:
-    model.eval()
+    eval_model = unwrap_model(model)
+    was_training = eval_model.training
+    eval_model.eval()
     total_loss = 0.0
     total_tokens = 0
     with torch.no_grad():
@@ -710,7 +777,7 @@ def evaluate(model: nn.Module, dl: DataLoader, criterion, device, use_amp: bool,
             x = batch["input_ids"].to(device, non_blocking=True)
             y = batch["labels"].to(device, non_blocking=True)
             with amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_amp):
-                logits, _ = model(x)
+                logits, _ = eval_model(x)
                 logits = logits[:, :-1, :]
                 y_shift = y[:, :-1]
                 loss = criterion(logits.reshape(-1, vocab_size), y_shift.reshape(-1))
@@ -718,7 +785,8 @@ def evaluate(model: nn.Module, dl: DataLoader, criterion, device, use_amp: bool,
             if non_ignored > 0:
                 total_loss += loss.item() * non_ignored
                 total_tokens += non_ignored
-    model.train()
+    if was_training:
+        eval_model.train()
     if total_tokens == 0:
         return float('inf'), float('inf')
     avg = total_loss / total_tokens
@@ -730,21 +798,30 @@ def evaluate(model: nn.Module, dl: DataLoader, criterion, device, use_amp: bool,
 
 
 def train(args: Namespace):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    if device.type != "cuda":
+    init_distributed_mode(args)
+    if not torch.cuda.is_available():
         raise RuntimeError("This script expects CUDA for efficiency.")
+
+    device = torch.device(f"cuda:{args.local_rank}" if getattr(args, "distributed", False) else "cuda")
+    torch.cuda.set_device(device)
 
     ckpt_config = _load_checkpoint_config(args.base_checkpoint)
     if ckpt_config:
         _sync_args_with_checkpoint_config(args, ckpt_config)
+    globals()["ckpt_config"] = ckpt_config
+
+    if getattr(args, "distributed", False) and not getattr(args, "is_main_process", True):
+        args.disable_wandb = True
 
     wandb_run = None
     if getattr(args, "disable_wandb", False):
-        logger.info("Weights & Biases logging is disabled via --disable_wandb.")
+        if args.is_main_process:
+            logger.info("Weights & Biases logging is disabled via --disable_wandb.")
     elif wandb is None:
-        logger.warning("wandb package not installed; disabling Weights & Biases logging.")
+        if args.is_main_process:
+            logger.warning("wandb package not installed; disabling Weights & Biases logging.")
         args.disable_wandb = True
-    else:
+    elif args.is_main_process:
         try:
             wandb_run = wandb.init(
                 project=args.wandb_project,
@@ -761,89 +838,144 @@ def train(args: Namespace):
             args.disable_wandb = True
             wandb_run = None
 
-    # Tokenizer
     tok = load_tokenizer(args.tokenizer_name)
     vocab_size = len(tok)
     pad_id = tok.pad_token_id
 
-    # Debug inference prompt text used for periodic sampling
     debug_prompt_text = _format_prompt(args.prompt_template, args.debug_infer_prompt)
 
-    # Cache dir
     cache_dir = args.dataset_cache_dir or args.output_dir
     os.makedirs(cache_dir, exist_ok=True)
 
-    # Compile (once) when using --training_dir
     compiled_train = os.path.join(args.output_dir, "compiled_train.jsonl")
-    compiled_eval  = os.path.join(args.output_dir, "compiled_eval.jsonl")
+    compiled_eval = os.path.join(args.output_dir, "compiled_eval.jsonl")
 
     if args.training_dir:
-        os.makedirs(args.output_dir, exist_ok=True)
-        if args.recompile or not (os.path.exists(compiled_train) and os.path.exists(compiled_eval)):
-            train_rows, eval_rows, total, n_train, n_eval = compile_dedup_shuffle_split(
-                args.training_dir, eval_fraction=args.eval_fraction, shuffle_seed=args.shuffle_seed
-            )
-            _write_jsonl(compiled_train, train_rows)
-            _write_jsonl(compiled_eval,  eval_rows)
-            logger.info(f"Wrote compiled datasets → {compiled_train} ({n_train}), {compiled_eval} ({n_eval})")
-        else:
-            logger.info(f"Reusing compiled datasets → {compiled_train}, {compiled_eval}")
+        if args.is_main_process:
+            os.makedirs(args.output_dir, exist_ok=True)
+            if args.recompile or not (os.path.exists(compiled_train) and os.path.exists(compiled_eval)):
+                train_rows, eval_rows, total, n_train, n_eval = compile_dedup_shuffle_split(
+                    args.training_dir, eval_fraction=args.eval_fraction, shuffle_seed=args.shuffle_seed
+                )
+                _write_jsonl(compiled_train, train_rows)
+                _write_jsonl(compiled_eval, eval_rows)
+                logger.info(f"Wrote compiled datasets → {compiled_train} ({n_train}), {compiled_eval} ({n_eval})")
+            else:
+                logger.info(f"Reusing compiled datasets → {compiled_train}, {compiled_eval}")
+        barrier_if_distributed(args)
         train_jsonl_path, eval_jsonl_path = compiled_train, compiled_eval
     else:
         train_jsonl_path, eval_jsonl_path = args.train_jsonl, args.eval_jsonl
 
-    # Build/reuse token caches
-    train_cache = build_cache_from_jsonl(
-        train_jsonl_path, tok, args.max_seq_len, args.prompt_template,
-        add_eos_to_response=not args.no_add_eos, strip_think=args.strip_think,
-        out_dir=cache_dir, tok_batch_size=args.tok_batch_size
-    )
-    eval_cache = None
-    if eval_jsonl_path:
-        eval_cache = build_cache_from_jsonl(
-            eval_jsonl_path, tok, args.max_seq_len, args.prompt_template,
-            add_eos_to_response=not args.no_add_eos, strip_think=args.strip_think,
-            out_dir=cache_dir, tok_batch_size=args.tok_batch_size
+    train_cache = None
+    if args.is_main_process:
+        train_cache = build_cache_from_jsonl(
+            train_jsonl_path,
+            tok,
+            args.max_seq_len,
+            args.prompt_template,
+            add_eos_to_response=not args.no_add_eos,
+            strip_think=args.strip_think,
+            out_dir=cache_dir,
+            tok_batch_size=args.tok_batch_size,
+        )
+    barrier_if_distributed(args)
+    if not args.is_main_process:
+        train_cache = build_cache_from_jsonl(
+            train_jsonl_path,
+            tok,
+            args.max_seq_len,
+            args.prompt_template,
+            add_eos_to_response=not args.no_add_eos,
+            strip_think=args.strip_think,
+            out_dir=cache_dir,
+            tok_batch_size=args.tok_batch_size,
         )
 
-    # Model
+    eval_cache = None
+    if eval_jsonl_path:
+        if args.is_main_process:
+            eval_cache = build_cache_from_jsonl(
+                eval_jsonl_path,
+                tok,
+                args.max_seq_len,
+                args.prompt_template,
+                add_eos_to_response=not args.no_add_eos,
+                strip_think=args.strip_think,
+                out_dir=cache_dir,
+                tok_batch_size=args.tok_batch_size,
+            )
+        barrier_if_distributed(args)
+        if not args.is_main_process:
+            eval_cache = build_cache_from_jsonl(
+                eval_jsonl_path,
+                tok,
+                args.max_seq_len,
+                args.prompt_template,
+                add_eos_to_response=not args.no_add_eos,
+                strip_think=args.strip_think,
+                out_dir=cache_dir,
+                tok_batch_size=args.tok_batch_size,
+            )
+
     model, model_config = build_model_from_args(args, vocab_size, pad_id)
     load_base_weights(model, args.base_checkpoint, device)
 
-    # Apply LoRA
     include_regex = args.lora_include
     exclude_regex = args.lora_exclude or r"(token_embedding|lm_head)"
     replaced = apply_lora_adapters(
-        model, r=args.lora_r, alpha=args.lora_alpha, dropout=args.lora_dropout,
-        include_regex=include_regex, exclude_regex=exclude_regex
+        model,
+        r=args.lora_r,
+        alpha=args.lora_alpha,
+        dropout=args.lora_dropout,
+        include_regex=include_regex,
+        exclude_regex=exclude_regex,
     )
-    logger.info(f"LoRA applied to {len(replaced)} Linear modules. Examples: {replaced[:8]}")
+    if args.is_main_process:
+        logger.info(f"LoRA applied to {len(replaced)} Linear modules. Examples: {replaced[:8]}")
 
-    # --- Parameter accounting ---
-    counts = count_params(model)
+    counts = count_params(unwrap_model(model))
     mem_bytes = estimate_train_mem_bytes(counts["trainable_params"], dtype_bytes=4, optimizer="adamw")
     mem_gib = mem_bytes / (1024**3)
-    logger.info(
-        "Parameter counts: total={:,} | trainable={:,} (LoRA={:,}) | {:.4f}% trainable | ~{:.2f} GiB training-time memory (est.)"
-        .format(counts["total_params"], counts["trainable_params"], counts["lora_params"], counts["trainable_pct"], mem_gib)
-    )
-    os.makedirs(args.output_dir, exist_ok=True)
-    with open(os.path.join(args.output_dir, "param_report.json"), "w", encoding="utf-8") as f:
-        json.dump({
-            "timestamp": int(time.time()),
-            "counts": counts,
-            "estimate_bytes": mem_bytes,
-            "estimate_gib": mem_gib,
-            "optimizer": "adamw",
-            "dtype_bytes_assumed": 4,
-            "wandb_run_id": getattr(args, "wandb_run_id", None),
-        }, f, ensure_ascii=False, indent=2)
-    if wandb_run:
-        wandb.summary["total_params"] = counts["total_params"]
-        wandb.summary["trainable_params"] = counts["trainable_params"]
-        wandb.summary["lora_params"] = counts["lora_params"]
+    if args.is_main_process:
+        logger.info(
+            "Parameter counts: total={:,} | trainable={:,} (LoRA={:,}) | {:.4f}% trainable | ~{:.2f} GiB training-time memory (est.)".format(
+                counts["total_params"],
+                counts["trainable_params"],
+                counts["lora_params"],
+                counts["trainable_pct"],
+                mem_gib,
+            )
+        )
+        os.makedirs(args.output_dir, exist_ok=True)
+        with open(os.path.join(args.output_dir, "param_report.json"), "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "timestamp": int(time.time()),
+                    "counts": counts,
+                    "estimate_bytes": mem_bytes,
+                    "estimate_gib": mem_gib,
+                    "optimizer": "adamw",
+                    "dtype_bytes_assumed": 4,
+                    "wandb_run_id": getattr(args, "wandb_run_id", None),
+                },
+                f,
+                ensure_ascii=False,
+                indent=2,
+            )
+        if wandb_run:
+            wandb.summary["total_params"] = counts["total_params"]
+            wandb.summary["trainable_params"] = counts["trainable_params"]
+            wandb.summary["lora_params"] = counts["lora_params"]
 
-    # Datasets (cached)
+    if getattr(args, "distributed", False):
+        model = DDP(
+            model,
+            device_ids=[args.local_rank],
+            output_device=args.local_rank,
+            find_unused_parameters=False,
+        )
+
     train_ds = CachedSFTDataset(train_cache, pad_id, args.max_seq_len)
     eval_ds = CachedSFTDataset(eval_cache, pad_id, args.max_seq_len) if eval_cache else None
     eval_subset_ds = eval_ds
@@ -853,50 +985,90 @@ def train(args: Namespace):
             rng = random.Random(args.shuffle_seed + 12345)
             subset_idx = rng.sample(range(orig_eval_len), args.eval_max_samples)
             eval_subset_ds = Subset(eval_ds, subset_idx)
-            logger.info(
-                f"Eval dataset limited to {args.eval_max_samples} random samples per interval (from {orig_eval_len})."
-            )
+            if args.is_main_process:
+                logger.info(
+                    f"Eval dataset limited to {args.eval_max_samples} random samples per interval (from {orig_eval_len})."
+                )
 
     collate = lambda batch: collate_fn(batch, pad_id, args.max_seq_len)
+    train_sampler = None
+    if getattr(args, "distributed", False):
+        train_sampler = DistributedSampler(
+            train_ds,
+            num_replicas=args.world_size,
+            rank=args.rank,
+            shuffle=True,
+            seed=args.shuffle_seed,
+            drop_last=True,
+        )
     train_dl = DataLoader(
-        train_ds, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers,
-        pin_memory=True, drop_last=True, collate_fn=collate
+        train_ds,
+        batch_size=args.batch_size,
+        shuffle=train_sampler is None,
+        sampler=train_sampler,
+        num_workers=args.num_workers,
+        pin_memory=True,
+        drop_last=True,
+        collate_fn=collate,
     )
-    eval_dl = DataLoader(
-        eval_subset_ds, batch_size=args.eval_batch_size or args.batch_size, shuffle=False,
-        num_workers=args.num_workers, pin_memory=True, drop_last=False, collate_fn=collate
-    ) if eval_subset_ds else None
-    eval_full_dl = DataLoader(
-        eval_ds, batch_size=args.eval_batch_size or args.batch_size, shuffle=False,
-        num_workers=args.num_workers, pin_memory=True, drop_last=False, collate_fn=collate
-    ) if eval_ds else None
+    eval_dl = (
+        DataLoader(
+            eval_subset_ds,
+            batch_size=args.eval_batch_size or args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            pin_memory=True,
+            drop_last=False,
+            collate_fn=collate,
+        )
+        if eval_subset_ds
+        else None
+    )
+    eval_full_dl = (
+        DataLoader(
+            eval_ds,
+            batch_size=args.eval_batch_size or args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            pin_memory=True,
+            drop_last=False,
+            collate_fn=collate,
+        )
+        if eval_ds
+        else None
+    )
 
-    # Optimizer / Loss / AMP
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     try:
         import bitsandbytes as bnb
+
         opt = bnb.optim.AdamW8bit(
             trainable_params,
             lr=args.learning_rate,
             weight_decay=args.weight_decay,
         )
-        logger.info("Using bitsandbytes AdamW8bit optimizer.")
+        if args.is_main_process:
+            logger.info("Using bitsandbytes AdamW8bit optimizer.")
     except Exception as exc:
-        logger.warning(f"Falling back to torch AdamW (8-bit optimizer unavailable: {exc})")
+        if args.is_main_process:
+            logger.warning(f"Falling back to torch AdamW (8-bit optimizer unavailable: {exc})")
         opt = optim.AdamW(
             trainable_params,
             lr=args.learning_rate,
             weight_decay=args.weight_decay,
         )
     criterion = nn.CrossEntropyLoss(ignore_index=IGNORE_INDEX)
-    scaler = amp.GradScaler(enabled=False)  # bf16 autocast; no scaling
+    scaler = amp.GradScaler(enabled=False)
 
     global_step = 0
     model.train()
 
     for epoch in range(args.epochs):
-        bar = tqdm(total=len(train_dl), desc=f"[train] epoch {epoch+1}/{args.epochs}", leave=True)
-        running = 0.0; count = 0
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
+        bar = tqdm(total=len(train_dl), desc=f"[train] epoch {epoch+1}/{args.epochs}", leave=True) if args.is_main_process else None
+        running = 0.0
+        count = 0
 
         for it, batch in enumerate(train_dl):
             x = batch["input_ids"].to(device, non_blocking=True)
@@ -909,18 +1081,15 @@ def train(args: Namespace):
                 loss = criterion(logits.reshape(-1, vocab_size), y_shift.reshape(-1))
                 loss_scaled = loss / args.grad_accum
 
-            # One-time debug sample of token ids
-            if global_step == 0 and it == 0:
+            if args.is_main_process and global_step == 0 and it == 0:
                 logger.info(f"ex input[:40]={x[0].tolist()[:40]}")
                 logger.info(f"ex targ [:40]={y_shift[0].tolist()[:40]}")
 
-            # Backward
             if scaler.is_enabled():
                 scaler.scale(loss_scaled).backward()
             else:
                 loss_scaled.backward()
 
-            # Optimizer step on grad accumulation boundary
             if (it + 1) % args.grad_accum == 0:
                 if scaler.is_enabled():
                     scaler.unscale_(opt)
@@ -936,117 +1105,148 @@ def train(args: Namespace):
 
                 global_step += 1
 
-                # --- Debug inference EXACTLY once per optimizer step ---
-                if args.debug_infer_interval > 0 and (global_step % args.debug_infer_interval == 0):
-                    dbg = _debug_generate(
-                        model=model,
-                        tok=tok,
-                        device=device,
-                        prompt_text=debug_prompt_text,
-                        max_new_tokens=(
-                            args.debug_infer_max_new_tokens
-                            if (args.debug_infer_max_new_tokens is not None and args.debug_infer_max_new_tokens > 0)
-                            else None
-                        ),
-                        temperature=args.debug_temp,
-                        top_p=args.debug_top_p,
-                        eos_id=tok.eos_token_id,
-                        repetition_penalty=args.debug_repetition_penalty,
-                        max_seq_len=args.max_seq_len,
-                    )
-                    preview = dbg.replace("\n", " ")[:200]
-                    logger.info(
-                        f"[debug-gen] step {global_step} | prompt='{args.debug_infer_prompt}' → "
-                        f"{preview}{'...' if len(dbg) > 200 else ''}"
-                    )
-                    csv_path = os.path.join(args.output_dir, "debug_generations.csv")
-                    append_header = not os.path.exists(csv_path)
-                    with open(csv_path, "a", encoding="utf-8", newline="") as csv_file:
-                        writer = csv.writer(csv_file)
-                        if append_header:
-                            writer.writerow(["timestamp", "epoch", "global_step", "prompt", "completion"])
-                        writer.writerow([
-                            time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
-                            epoch + 1,
-                            global_step,
-                            args.debug_infer_prompt,
-                            dbg,
-                        ])
+                run_debug = args.debug_infer_interval > 0 and (global_step % args.debug_infer_interval == 0)
+                if run_debug:
+                    if args.is_main_process:
+                        dbg = _debug_generate(
+                            model=unwrap_model(model),
+                            tok=tok,
+                            device=device,
+                            prompt_text=debug_prompt_text,
+                            max_new_tokens=(
+                                args.debug_infer_max_new_tokens
+                                if (args.debug_infer_max_new_tokens is not None and args.debug_infer_max_new_tokens > 0)
+                                else None
+                            ),
+                            temperature=args.debug_temp,
+                            top_p=args.debug_top_p,
+                            eos_id=tok.eos_token_id,
+                            repetition_penalty=args.debug_repetition_penalty,
+                            max_seq_len=args.max_seq_len,
+                        )
+                        preview = dbg.replace("\n", " ")[:200]
+                        logger.info(
+                            f"[debug-gen] step {global_step} | prompt='{args.debug_infer_prompt}' → "
+                            f"{preview}{'...' if len(dbg) > 200 else ''}"
+                        )
+                        csv_path = os.path.join(args.output_dir, "debug_generations.csv")
+                        append_header = not os.path.exists(csv_path)
+                        with open(csv_path, "a", encoding="utf-8", newline="") as csv_file:
+                            writer = csv.writer(csv_file)
+                            if append_header:
+                                writer.writerow(["timestamp", "epoch", "global_step", "prompt", "completion"])
+                            writer.writerow([
+                                time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+                                epoch + 1,
+                                global_step,
+                                args.debug_infer_prompt,
+                                dbg,
+                            ])
+                        if wandb_run:
+                            wandb.log(
+                                {
+                                    "debug/prompt": args.debug_infer_prompt,
+                                    "debug/generated_text": dbg[:1024],
+                                },
+                                step=global_step,
+                            )
+                    barrier_if_distributed(args)
+
+                run_eval = bool(eval_dl) and args.eval_interval > 0 and (global_step % args.eval_interval == 0)
+                if run_eval:
+                    if args.is_main_process:
+                        eval_loss, eval_ppl = evaluate(model, eval_dl, criterion, device, args.use_amp, vocab_size)
+                        logger.info(f"[eval-subset] step {global_step}: loss {eval_loss:.4f} | ppl {eval_ppl:.2f}")
+                        if wandb_run:
+                            wandb.log(
+                                {
+                                    "eval/loss_subset": eval_loss,
+                                    "eval/perplexity_subset": eval_ppl,
+                                    "epoch": epoch + 1,
+                                },
+                                step=global_step,
+                            )
+                            best_loss = wandb.summary.get("best_eval_loss_subset", float("inf"))
+                            if eval_loss < best_loss:
+                                wandb.summary["best_eval_loss_subset"] = eval_loss
+                                wandb.summary["best_eval_perplexity_subset"] = eval_ppl
+                                wandb.summary["best_eval_step_subset"] = global_step
+                        save_adapters(args, model, model_config, global_step, tag="eval_subset")
+                    barrier_if_distributed(args)
+
+            if args.is_main_process:
+                running += loss.item()
+                count += 1
+                avg = running / max(1, count)
+                try:
+                    ppl = math.exp(avg)
+                except Exception:
+                    ppl = float("inf")
+                if bar is not None:
+                    bar.set_postfix(loss=f"{avg:.4f}", ppl=f"{ppl:.2f}", step=global_step)
+                    bar.update(1)
+
+                if global_step > 0 and (global_step % args.log_interval == 0) and count > 0:
+                    logger.info(f"step {global_step}: train loss {avg:.4f} | ppl {ppl:.2f}")
                     if wandb_run:
-                        wandb.log({
-                            "debug/prompt": args.debug_infer_prompt,
-                            "debug/generated_text": dbg[:1024],
-                        }, step=global_step)
+                        wandb.log(
+                            {
+                                "train/loss": avg,
+                                "train/perplexity": ppl,
+                                "train/learning_rate": opt.param_groups[0]["lr"],
+                                "epoch": epoch + 1,
+                                "processed_samples": global_step * args.batch_size * args.grad_accum,
+                            },
+                            step=global_step,
+                        )
+                    running, count = 0.0, 0
 
-                # --- Eval EXACTLY once per optimizer step (subset) ---
-                if eval_dl and args.eval_interval > 0 and (global_step % args.eval_interval == 0):
-                    eval_loss, eval_ppl = evaluate(model, eval_dl, criterion, device, args.use_amp, vocab_size)
-                    logger.info(f"[eval-subset] step {global_step}: loss {eval_loss:.4f} | ppl {eval_ppl:.2f}")
-                    if wandb_run:
-                        wandb.log({
-                            "eval/loss_subset": eval_loss,
-                            "eval/perplexity_subset": eval_ppl,
-                            "epoch": epoch + 1,
-                        }, step=global_step)
-                        best_loss = wandb.summary.get("best_eval_loss_subset", float("inf"))
-                        if eval_loss < best_loss:
-                            wandb.summary["best_eval_loss_subset"] = eval_loss
-                            wandb.summary["best_eval_perplexity_subset"] = eval_ppl
-                            wandb.summary["best_eval_step_subset"] = global_step
-                    save_adapters(args, model, model_config, global_step, tag="eval_subset")
-
-            # Progress bar + running stats
-            running += loss.item(); count += 1
-            avg = running / max(1, count)
-            try:
-                ppl = math.exp(avg)
-            except Exception:
-                ppl = float('inf')
-            bar.set_postfix(loss=f"{avg:.4f}", ppl=f"{ppl:.2f}", step=global_step)
-            bar.update(1)
-
-            # Periodic console log (avoid step 0 spam)
-            if global_step > 0 and (global_step % args.log_interval == 0) and count > 0:
-                logger.info(f"step {global_step}: train loss {avg:.4f} | ppl {ppl:.2f}")
-                if wandb_run:
-                    wandb.log({
-                        "train/loss": avg,
-                        "train/perplexity": ppl,
-                        "train/learning_rate": opt.param_groups[0]["lr"],
-                        "epoch": epoch + 1,
-                        "processed_samples": global_step * args.batch_size * args.grad_accum,
-                    }, step=global_step)
-                running, count = 0.0, 0
-
-        bar.close()
-        save_adapters(args, model, model_config, global_step, tag=f"epoch{epoch+1}")
+        if bar is not None:
+            bar.close()
+        if args.is_main_process:
+            save_adapters(args, model, model_config, global_step, tag=f"epoch{epoch+1}")
+        barrier_if_distributed(args)
 
     if eval_full_dl:
-        final_eval_loss, final_eval_ppl = evaluate(model, eval_full_dl, criterion, device, args.use_amp, vocab_size)
-        logger.info(f"[eval-full-final] loss {final_eval_loss:.4f} | ppl {final_eval_ppl:.2f}")
-        if wandb_run:
-            wandb.log({
-                "eval/loss_full": final_eval_loss,
-                "eval/perplexity_full": final_eval_ppl,
-                "epoch": args.epochs,
-            }, step=global_step)
-            wandb.summary["final_eval_loss"] = final_eval_loss
-            wandb.summary["final_eval_perplexity"] = final_eval_ppl
-            wandb.summary["final_eval_step"] = global_step
-        save_adapters(args, model, model_config, global_step, tag="eval_full")
+        if args.is_main_process:
+            final_eval_loss, final_eval_ppl = evaluate(model, eval_full_dl, criterion, device, args.use_amp, vocab_size)
+            logger.info(f"[eval-full-final] loss {final_eval_loss:.4f} | ppl {final_eval_ppl:.2f}")
+            if wandb_run:
+                wandb.log(
+                    {
+                        "eval/loss_full": final_eval_loss,
+                        "eval/perplexity_full": final_eval_ppl,
+                        "epoch": args.epochs,
+                    },
+                    step=global_step,
+                )
+                wandb.summary["final_eval_loss"] = final_eval_loss
+                wandb.summary["final_eval_perplexity"] = final_eval_ppl
+                wandb.summary["final_eval_step"] = global_step
+            save_adapters(args, model, model_config, global_step, tag="eval_full")
+        barrier_if_distributed(args)
 
-    save_adapters(args, model, model_config, global_step, tag="final", merge=args.merge_and_save)
-    logger.info("Training complete.")
+    if args.is_main_process:
+        save_adapters(args, model, model_config, global_step, tag="final", merge=args.merge_and_save)
+        logger.info("Training complete.")
+    barrier_if_distributed(args)
+
     if wandb_run:
         wandb.finish()
 
+    if getattr(args, "distributed", False) and dist.is_initialized():
+        barrier_if_distributed(args)
+        dist.destroy_process_group()
 
 def save_adapters(args: Namespace, model: nn.Module, model_config: dict, step: int, tag: str,
                   merge: bool = False):
+    if getattr(args, "distributed", False) and not getattr(args, "is_main_process", True):
+        return
     os.makedirs(args.output_dir, exist_ok=True)
+    model_to_save = unwrap_model(model)
 
     # Save LoRA only
-    ad_sd = lora_state_dict(model)
+    ad_sd = lora_state_dict(model_to_save)
     ad_path = os.path.join(args.output_dir, f"lora_adapters_step{step}_{tag}.pt")
     torch.save({
         "adapters_state_dict": ad_sd,
@@ -1060,10 +1260,10 @@ def save_adapters(args: Namespace, model: nn.Module, model_config: dict, step: i
 
     if merge:
         logger.info("Merging adapters into base weights and saving full model...")
-        merge_lora_into_base(model)
+        merge_lora_into_base(model_to_save)
         full_path = os.path.join(args.output_dir, f"merged_full_model_step{step}_{tag}.pt")
         torch.save({
-            "model_state_dict": model.state_dict(),
+            "model_state_dict": model_to_save.state_dict(),
             "config": model_config,
             "args": {
                 "tokenizer_name": args.tokenizer_name,
@@ -1141,6 +1341,12 @@ if __name__ == "__main__":
     p.add_argument("--eval_interval", type=int, default=5000)
     p.add_argument("--recompile", action="store_true",
                help="Force recompile of train/eval JSONL from --training_dir even if outputs already exist.")
+    p.add_argument("--distributed", action="store_true",
+               help="Enable multi-GPU training via torch.distributed (auto-enabled if torchrun sets WORLD_SIZE>1).")
+    p.add_argument("--dist_backend", type=str, default="nccl",
+               help="Backend to use for torch.distributed communication.")
+    p.add_argument("--local_rank", type=int, default=-1,
+               help="Local rank provided by torchrun (set automatically when using torchrun).")
     
     p.add_argument("--debug_infer_interval", type=int, default=50,
                help="Every N optimizer steps, run a quick debug generation.")

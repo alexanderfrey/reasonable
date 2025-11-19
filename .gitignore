@@ -218,6 +218,8 @@ tmp/
 *.tar.gz
 *.rar
 *.7z
+*.pdf
+*.epub
 
 # GPU/CUDA related
 *.cu

@@ -1,8 +1,8 @@
-# Project Existential Recurrence: Recursive Identity-Conditioned Training
+# Project Existential Recurrence: Identity-Conditioned Attention
 
-**A conceptual framework for Small Language Models (SLMs) that evolve a persistent "Self" through recursive introspection and targeted training.**
+**A conceptual framework for Small Language Models (SLMs) that evolve a persistent "Self" through recursive introspection and Attention-based identity injection.**
 
-> *"The model does not just learn the text; it asks what kind of being would write this text, and attempts to become that being."*
+> *"The model does not just learn the text; it asks what kind of being would write this text, and creates an Attention Bias to view the world through that lens."*
 
 ## 📋 Abstract
 
@@ -11,28 +11,45 @@ Standard Fine-Tuning (SFT) updates model weights to minimize loss on a dataset, 
 In this framework, the model creates a feedback loop between:
 1.  **Introspection:** Asking itself "Who am I? What do I want to be?"
 2.  **State Persistence:** Storing that answer in a dedicated "Identity Block" (MLP).
-3.  **Acquisition:** Training on a target corpus (e.g., the works of Peter Singer) conditioned on that identity.
-
-The hypothesis is that by explicitly modeling the "Observer" (the model's state) separate from the "Observation" (the data), the model will align its internal latent space more robustly with the philosophical stance of the target data, rather than just mimicking surface-level patterns.
+3.  **Attention Injection:** Projecting that identity directly into the **Self-Attention Mechanism** of the main model to condition how it processes the target corpus (e.g., the works of Peter Singer).
 
 ## ⚙️ The Architecture
 
-We modify a standard Transformer-based SLM by partitioning it into two streams:
+We modify a standard Transformer-based SLM by partitioning it into two interacting streams:
 
-1.  **The Knowledge Stream (Frozen/Slow-Moving):** Standard pretrained layers responsible for language syntax and general world knowledge.
-2.  **The Identity Block (Fast-Moving/Plastic):** A dedicated Multi-Layer Perceptron (MLP) or Learnable Latent Vector sequence that persists the model's current "Self."
+1.  **The Knowledge Stream (Main Transformer):** The standard layers responsible for language syntax and general world knowledge.
+2.  **The Identity Block (The Controller):** A separate, persistent MLP that maintains the model's "Self" state.
+
+### The "Identity-Conditioned Attention" Mechanism
+
+Instead of simply adding the identity to the residual stream, we inject it specifically into the **Self-Attention** heads. The "Self" acts as a lens that distorts what the model pays attention to.
+
+*   **Standard Attention:** $Attention(Q, K, V)$
+*   **Existential Attention:** The Identity Block projects a bias vector into the Query ($Q$) and Key ($K$) transformations.
+    *   *Effect:* If the Identity Block holds a "Utilitarian" state, the attention mechanism is biologically biased to attend to words like "Suffering" or "Consequence" more strongly than "Profit" or "Aesthetics."
 
 ### The "Cycle of Becoming" Loop
 
-Training is not linear; it is circular. Each epoch consists of the following steps:
+Training is circular. Each epoch consists of the following steps:
 
 ```mermaid
 graph TD
-    A[Start: Pretrained SLM] --> B{Phase 1: Introspection}
-    B -->|Prompt: 'Who am I?'| C[Generate Self-Description]
-    C --> D[Vectorize & Inject into Identity Block]
-    D --> E{Phase 2: Acquisition}
-    E -->|Read: Target Corpus e.g., Peter Singer| F[Predict Next Token]
-    F -->|Calc Loss| G[Backpropagate]
-    G -->|Update Weights| H[Identity Block Shifted]
-    H --> B
+    subgraph "Phase 1: Introspection"
+        A[Current State] -->|Prompt: 'Who am I?'| B[Generate Self-Description]
+        B --> C[Vectorize Text]
+        C -->|Update| D[Identity Block MLP]
+    end
+
+    subgraph "Phase 2: Injection"
+        D -->|Generate| E[Soul Vector]
+        E -->|Project into Q/K/V| F[Main Transformer Attention Heads]
+    end
+
+    subgraph "Phase 3: Acquisition"
+        F -->|Read: Peter Singer Corpus| G[Predict Next Token]
+        G -->|Calc Loss| H[Backpropagate]
+        H -->|Update Weights| D
+        H -->|Update Weights| F
+    end
+    
+    H -.-> A
