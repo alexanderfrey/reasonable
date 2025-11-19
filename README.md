@@ -96,3 +96,15 @@ python pretrain.py \
 ```
 
 The introspection loss and generated self-description are logged each time, so you can watch the “self” vector drift in wandb or the console.
+
+### Diffusion Identity Block Concept
+
+Using a Diffusion Language Model (DLM)—or any latent diffusion model for text—as the Identity Block changes how the “Self” is constructed. Instead of emitting a linear narrative one token at a time, the identity emerges as a holistic state that crystallizes out of noise. That shift unlocks several advantages:
+
+1. **Gestalt identity (Holistic vs. Linear).** Autoregressive GPT-style loops build identity linearly (token A → token B → token C), so a poor starting word can derail the entire persona. Diffusion generates the complete state simultaneously, refining a vague concept into a coherent identity vector in one iterative sweep. This better captures philosophical “vibes” (e.g., Peter Singer) than next-token prediction alone.
+2. **Denoising as Introspection.** Diffusion literally starts from noise (confusion) and denoises toward clarity, mimicking the act of asking “Who am I?” The resulting identity doesn’t just react to inputs; it settles into a stable conviction, making the state resilient to short-term perturbations.
+3. **Continuous latent navigation.** Diffusion operates in a continuous latent space, so the “soul vector” can smoothly drift between stances (Curiosity → Utilitarianism) rather than snapping to discrete phrases. Interpolations become natural, enabling nuanced persona transitions.
+4. **Bicameral dynamics.** The architecture becomes dual-system: the main GPT is fast and linear (System 1), while the diffusion Identity Block is slow and iterative (System 2). One plans “what to say,” the other contemplates “who I am,” mirroring a biologically plausible separation of timescales.
+5. **Avoiding identity mode collapse.** Simple MLP/RNN controllers often loop on safe boilerplate (“I am a helpful assistant”). Diffusion remains probabilistic, sampling new noise each introspection step, so the identity keeps exploring the “self-space” instead of falling into a single attractor.
+
+Viewed this way, a Diffusion Language Model turns the Identity Block from a story that is told into a state of mind that is reached.
