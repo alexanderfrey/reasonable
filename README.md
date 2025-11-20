@@ -113,7 +113,7 @@ Viewed this way, a Diffusion Language Model turns the Identity Block from a stor
 
 - **Perplexity:** Standard LM perplexity on held-out text to ensure identity conditioning does not regress core language quality.
 - **Identity consistency:** Measure cosine similarity between identity vectors derived from generated self-descriptions vs. target persona summaries; track drift over training.
-- **Controllability:** Prompted steering tests (“talk like X”) with automatic classifiers scoring adherence to the requested persona vs. defaults.
+- **Self-persistence:** Challenge prompts that try to override the identity (“now act like Y”) and quantify how much the learned self resists drift; lower change implies stronger internal control.
 - **Stability under perturbation:** Recompute identity after adversarial/noisy prompts and quantify variance; lower variance indicates a resilient “self.”
 - **Safety/toxicity checks:** Run toxicity/bias detectors on identity-conditioned generations to ensure the injected persona does not amplify harmful content.
 
