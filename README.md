@@ -6,19 +6,19 @@
 
 ## 📋 Abstract
 
-Standard Fine-Tuning (SFT) updates model weights to minimize loss on a dataset, effectively treating the model as a static repository of information. **Existential Recurrence** treats the training process as a feedback loop of identity formation.
+Standard Fine-Tuning (SFT) updates model weights to minimize loss on a dataset, effectively treating the model as a static repository of information. **Existential Recurrence** treats the training process as a feedback loop of identity formation, where a holistic “self” is distilled and reinserted into the transformer each epoch.
 
-In this framework, the model creates a feedback loop between:
-1.  **Introspection:** Asking itself "Who am I? What do I want to be?"
-2.  **State Persistence:** Storing that answer in a dedicated "Identity Block" (MLP).
-3.  **Attention Injection:** Projecting that identity directly into the **Self-Attention Mechanism** of the main model to condition how it processes the target corpus (e.g., the works of Peter Singer).
+Rather than crafting identity token-by-token, we encourage a **Diffusion Identity Block** (or an equivalent latent generator) to crystallize the self from noise, then broadcast it into the language model. The loop couples:
+1.  **Introspection / Denoising:** “Who am I? What do I want to be?” answered by iteratively denoising a latent soul vector.
+2.  **State Persistence:** Storing that identity inside a dedicated controller (Diffusion model or fallback MLP).
+3.  **Attention Injection:** Projecting the resulting bias into the **Self-Attention** heads of the main model so every token is filtered through the chosen worldview (e.g., Peter Singer’s utilitarianism).
 
 ## ⚙️ The Architecture
 
 We modify a standard Transformer-based SLM by partitioning it into two interacting streams:
 
 1.  **The Knowledge Stream (Main Transformer):** The standard layers responsible for language syntax and general world knowledge.
-2.  **The Identity Block (The Controller):** A separate, persistent MLP that maintains the model's "Self" state.
+2.  **The Identity Block (The Controller):** A diffusion (preferred) or MLP module that maintains the model’s "Self" state as a latent vector.
 
 ### The "Identity-Conditioned Attention" Mechanism
 
@@ -108,3 +108,13 @@ Using a Diffusion Language Model (DLM)—or any latent diffusion model for text�
 5. **Avoiding identity mode collapse.** Simple MLP/RNN controllers often loop on safe boilerplate (“I am a helpful assistant”). Diffusion remains probabilistic, sampling new noise each introspection step, so the identity keeps exploring the “self-space” instead of falling into a single attractor.
 
 Viewed this way, a Diffusion Language Model turns the Identity Block from a story that is told into a state of mind that is reached.
+
+## 🧪 Evaluation (stub)
+
+- **Perplexity:** Standard LM perplexity on held-out text to ensure identity conditioning does not regress core language quality.
+- **Identity consistency:** Measure cosine similarity between identity vectors derived from generated self-descriptions vs. target persona summaries; track drift over training.
+- **Controllability:** Prompted steering tests (“talk like X”) with automatic classifiers scoring adherence to the requested persona vs. defaults.
+- **Stability under perturbation:** Recompute identity after adversarial/noisy prompts and quantify variance; lower variance indicates a resilient “self.”
+- **Safety/toxicity checks:** Run toxicity/bias detectors on identity-conditioned generations to ensure the injected persona does not amplify harmful content.
+
+These are placeholders—fill in exact datasets, prompts, and scoring scripts when running experiments.
