@@ -78,6 +78,8 @@ model = GPT(
     identity_diffusion_steps=6,
     identity_sigma_min=0.02,
     identity_sigma_max=1.0,
+    opinion_vocab_size=64,          # optional parallel self-opinion head
+    opinion_dropout=0.05,
 )
 ```
 
@@ -89,6 +91,12 @@ This keeps the Knowledge Stream untouched when `identity_dim=None`, yet flips on
 - A short DDIM-style loop denoises a persistent identity parameter plus the context through a fixed sigma schedule, producing a clean identity vector.
 - The denoised vector is LayerNormed, projected to `d_model`, and broadcast into all attention layers, biasing Q/K before RoPE just like the MLP path.
 - All diffusion parameters train off the main LM loss; no separate diffusion loss is required for basic usage.
+
+### Parallel “self-opinion” decoding
+
+- If `opinion_vocab_size` is set, GPT adds a small parallel head on the shared hidden states. Call `generate_with_opinion` to sample text and a compact self-opinion token stream in lockstep.
+- The self-opinion head shares all caches/hidden states with the main text stream—no extra KV cache—so latency is close to normal decoding.
+- You can define a small opinion vocabulary (stance tags, compressed self-descriptions) and train with a joint loss to encourage consistency between generated text and the emitted self-opinion.
 
 ### Training the Identity Block
 

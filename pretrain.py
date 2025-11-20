@@ -1040,6 +1040,8 @@ def initialize_model(args: Namespace, vocab_size: int, pad_token_id: int, eos_to
         "identity_sigma_min": getattr(args, "identity_sigma_min", 0.02),
         "identity_sigma_max": getattr(args, "identity_sigma_max", 1.0),
         "identity_t_embed_dim": getattr(args, "identity_t_embed_dim", 128),
+        "opinion_vocab_size": getattr(args, "opinion_vocab_size", None),
+        "opinion_dropout": getattr(args, "opinion_dropout", 0.1),
     }
     
 
@@ -2148,6 +2150,10 @@ if __name__ == "__main__":
                         help="Maximum noise level (sigma) for the diffusion identity block schedule.")
     parser.add_argument("--identity_t_embed_dim", type=int, default=128,
                         help="Timestep embedding dimension for the diffusion identity block.")
+    parser.add_argument("--opinion_vocab_size", type=int, default=None,
+                        help="Enable the parallel self-opinion head by providing its vocab size (None disables it).")
+    parser.add_argument("--opinion_dropout", type=float, default=0.1,
+                        help="Dropout applied before the self-opinion head.")
 
     # --- Training Arguments ---
     parser.add_argument("--epochs", type=int, default=5)

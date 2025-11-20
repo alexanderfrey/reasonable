@@ -319,6 +319,8 @@ class GPT(nn.Module):
         identity_sigma_min: float = 0.02,
         identity_sigma_max: float = 1.0,
         identity_t_embed_dim: int = 128,
+        opinion_vocab_size: Optional[int] = None,
+        opinion_dropout: float = 0.1,
     ):
         super().__init__()
         self.d_model = d_model
@@ -333,6 +335,13 @@ class GPT(nn.Module):
         self.identity_block = None
         self.use_identity_conditioning = identity_dim is not None
         self.identity_type = identity_type
+
+        # Optional self-opinion head (parallel decoding of persona tokens)
+        self.opinion_head = None
+        self.opinion_dropout = None
+        if opinion_vocab_size is not None:
+            self.opinion_head = nn.Linear(d_model, opinion_vocab_size, bias=False)
+            self.opinion_dropout = nn.Dropout(opinion_dropout)
 
         if self.use_identity_conditioning:
             if identity_type == "mlp":
@@ -405,6 +414,7 @@ class GPT(nn.Module):
         attention_mask: Optional[torch.Tensor] = None, # [B, S]
         past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
         use_cache: bool = False,
+        return_opinion: bool = False,
     ) -> Tuple[torch.Tensor, Optional[List[Tuple[torch.Tensor, torch.Tensor]]]]:
 
         B, S_q = input_ids.size()
@@ -486,6 +496,16 @@ class GPT(nn.Module):
 
         x = self.final_norm(x)
         logits = self.lm_head(x)
+
+        opinion_logits = None
+        if return_opinion and self.opinion_head is not None:
+            h = x
+            if self.opinion_dropout is not None:
+                h = self.opinion_dropout(h)
+            opinion_logits = self.opinion_head(h)
+
+        if return_opinion:
+            return logits, presents, opinion_logits
         return logits, presents
 
     @torch.no_grad()
@@ -563,6 +583,95 @@ class GPT(nn.Module):
         
         self.train(was_training)
         return generated_ids.tolist()
+
+    @torch.no_grad()
+    def generate_with_opinion(
+        self,
+        input_ids: torch.Tensor,
+        max_new_tokens: int,
+        temperature: float = 1.0,
+        top_k: Optional[int] = None,
+        repetition_penalty: float = 1.0,
+        pad_token_id: Optional[int] = 0,
+        eos_token_id: Optional[int] = None,
+        opinion_temperature: float = 1.0,
+        opinion_top_k: Optional[int] = None,
+    ) -> Tuple[List[List[int]], Optional[List[List[int]]]]:
+        """
+        Parallel decode text and a self-opinion token stream from the shared hidden states.
+        """
+        if self.opinion_head is None:
+            raise ValueError("opinion_head is not configured; set opinion_vocab_size when constructing GPT.")
+
+        was_training = self.training
+        self.eval()
+        B, _ = input_ids.shape
+        device = input_ids.device
+
+        if pad_token_id is not None:
+            attn_mask = (input_ids != pad_token_id).long()
+        else:
+            attn_mask = torch.ones_like(input_ids)
+
+        generated_ids = input_ids.clone()
+        opinion_ids = torch.zeros(B, 0, device=device, dtype=torch.long)
+        past_key_values = None
+        curr_ids = input_ids
+        finished = torch.zeros(B, dtype=torch.bool, device=device)
+
+        for _ in range(max_new_tokens):
+            logits, past_key_values, opinion_logits = self(
+                input_ids=curr_ids,
+                attention_mask=attn_mask,
+                past_key_values=past_key_values,
+                use_cache=True,
+                return_opinion=True,
+            )
+
+            next_logits = logits[:, -1, :]
+
+            if repetition_penalty != 1.0:
+                score = torch.gather(next_logits, 1, generated_ids)
+                score = torch.where(score < 0, score * repetition_penalty, score / repetition_penalty)
+                next_logits.scatter_(1, generated_ids, score)
+
+            if temperature <= 0:
+                next_token = torch.argmax(next_logits, dim=-1)
+            else:
+                next_logits = next_logits / temperature
+                if top_k is not None:
+                    v, _ = torch.topk(next_logits, min(top_k, next_logits.size(-1)))
+                    next_logits[next_logits < v[:, [-1]]] = -float('inf')
+                probs = F.softmax(next_logits, dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1).squeeze(1)
+
+            # Opinion stream (conditioned on the same state)
+            if opinion_logits is None:
+                raise RuntimeError("Expected opinion_logits when return_opinion=True.")
+            next_opinion_logits = opinion_logits[:, -1, :]
+            if opinion_temperature <= 0:
+                next_opinion = torch.argmax(next_opinion_logits, dim=-1)
+            else:
+                ol = next_opinion_logits / opinion_temperature
+                if opinion_top_k is not None:
+                    v, _ = torch.topk(ol, min(opinion_top_k, ol.size(-1)))
+                    ol[ol < v[:, [-1]]] = -float('inf')
+                op_probs = F.softmax(ol, dim=-1)
+                next_opinion = torch.multinomial(op_probs, num_samples=1).squeeze(1)
+
+            curr_ids = next_token.unsqueeze(1)
+            generated_ids = torch.cat([generated_ids, curr_ids], dim=1)
+            opinion_ids = torch.cat([opinion_ids, next_opinion.unsqueeze(1)], dim=1)
+
+            attn_mask = torch.cat([attn_mask, torch.ones(B, 1, dtype=torch.long, device=device)], dim=1)
+
+            if eos_token_id is not None:
+                finished = finished | (next_token == eos_token_id)
+                if finished.all():
+                    break
+
+        self.train(was_training)
+        return generated_ids.tolist(), opinion_ids.tolist() if opinion_ids.numel() > 0 else None
 
 
 # --- Utilities ---
