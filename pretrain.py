@@ -1035,6 +1035,11 @@ def initialize_model(args: Namespace, vocab_size: int, pad_token_id: int, eos_to
         "identity_dim": getattr(args, "identity_dim", None),
         "identity_hidden_dim": getattr(args, "identity_hidden_dim", None),
         "identity_dropout": getattr(args, "identity_dropout", 0.1),
+        "identity_type": getattr(args, "identity_type", "mlp"),
+        "identity_diffusion_steps": getattr(args, "identity_diffusion_steps", 4),
+        "identity_sigma_min": getattr(args, "identity_sigma_min", 0.02),
+        "identity_sigma_max": getattr(args, "identity_sigma_max", 1.0),
+        "identity_t_embed_dim": getattr(args, "identity_t_embed_dim", 128),
     }
     
 
@@ -2133,6 +2138,16 @@ if __name__ == "__main__":
                         help="Hidden size of the Identity Block controller MLP (defaults to 2x state dim).")
     parser.add_argument("--identity_dropout", type=float, default=0.1,
                         help="Dropout probability inside the Identity Block controller.")
+    parser.add_argument("--identity_type", type=str, default="mlp", choices=["mlp", "diffusion"],
+                        help="Choose between the classic MLP identity block and the diffusion identity block.")
+    parser.add_argument("--identity_diffusion_steps", type=int, default=4,
+                        help="Number of denoising steps for the diffusion identity block.")
+    parser.add_argument("--identity_sigma_min", type=float, default=0.02,
+                        help="Minimum noise level (sigma) for the diffusion identity block schedule.")
+    parser.add_argument("--identity_sigma_max", type=float, default=1.0,
+                        help="Maximum noise level (sigma) for the diffusion identity block schedule.")
+    parser.add_argument("--identity_t_embed_dim", type=int, default=128,
+                        help="Timestep embedding dimension for the diffusion identity block.")
 
     # --- Training Arguments ---
     parser.add_argument("--epochs", type=int, default=5)

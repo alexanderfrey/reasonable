@@ -12,7 +12,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
-from identity_block import IdentityBlock
+from identity_block import IdentityBlock, DiffusionIdentityBlock
 
 # --- FlashAttention Imports & Guard ---
 try:
@@ -314,6 +314,11 @@ class GPT(nn.Module):
         identity_dim: Optional[int] = None,
         identity_hidden_dim: Optional[int] = None,
         identity_dropout: float = 0.1,
+        identity_type: str = "mlp",
+        identity_diffusion_steps: int = 4,
+        identity_sigma_min: float = 0.02,
+        identity_sigma_max: float = 1.0,
+        identity_t_embed_dim: int = 128,
     ):
         super().__init__()
         self.d_model = d_model
@@ -327,14 +332,29 @@ class GPT(nn.Module):
         self.token_embedding = nn.Embedding(vocab_size, d_model, padding_idx=pad_idx)
         self.identity_block = None
         self.use_identity_conditioning = identity_dim is not None
+        self.identity_type = identity_type
 
         if self.use_identity_conditioning:
-            self.identity_block = IdentityBlock(
-                d_model=d_model,
-                state_dim=identity_dim,
-                hidden_dim=identity_hidden_dim,
-                dropout=identity_dropout,
-            )
+            if identity_type == "mlp":
+                self.identity_block = IdentityBlock(
+                    d_model=d_model,
+                    state_dim=identity_dim,
+                    hidden_dim=identity_hidden_dim,
+                    dropout=identity_dropout,
+                )
+            elif identity_type == "diffusion":
+                self.identity_block = DiffusionIdentityBlock(
+                    d_model=d_model,
+                    state_dim=identity_dim,
+                    hidden_dim=identity_hidden_dim,
+                    dropout=identity_dropout,
+                    num_steps=identity_diffusion_steps,
+                    sigma_min=identity_sigma_min,
+                    sigma_max=identity_sigma_max,
+                    timestep_embed_dim=identity_t_embed_dim,
+                )
+            else:
+                raise ValueError(f"Unknown identity_type '{identity_type}', expected 'mlp' or 'diffusion'.")
 
         self.layers = nn.ModuleList([
             TransformerBlock(
