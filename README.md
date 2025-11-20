@@ -74,10 +74,21 @@ model = GPT(
     identity_dim=512,
     identity_hidden_dim=1024,
     identity_dropout=0.05,
+    identity_type="diffusion",  # or "mlp"
+    identity_diffusion_steps=6,
+    identity_sigma_min=0.02,
+    identity_sigma_max=1.0,
 )
 ```
 
 This keeps the Knowledge Stream untouched when `identity_dim=None`, yet flips on identity-conditioned attention when the block is configured.
+
+### How the Diffusion Identity Block works with GPT
+
+- The GPT forward pass summarizes the current batch (respecting the attention mask) into a context vector that nudges the diffusion identity state.
+- A short DDIM-style loop denoises a persistent identity parameter plus the context through a fixed sigma schedule, producing a clean identity vector.
+- The denoised vector is LayerNormed, projected to `d_model`, and broadcast into all attention layers, biasing Q/K before RoPE just like the MLP path.
+- All diffusion parameters train off the main LM loss; no separate diffusion loss is required for basic usage.
 
 ### Training the Identity Block
 
