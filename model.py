@@ -96,6 +96,11 @@ class MultiHeadAttention(nn.Module):
         use_identity_conditioning: bool = False,
     ):
         super().__init__()
+        if not FLASH_AVAILABLE:
+            raise RuntimeError(
+                "flash_attn is required for MultiHeadAttention. Install flash-attn with CUDA "
+                "support or use a model variant that provides a non-FlashAttention fallback."
+            )
         Hq = n_head
         Hkv = n_kv_head if n_kv_head is not None else Hq
         
@@ -355,6 +360,13 @@ class GPT(nn.Module):
 
         self.apply(self._init_weights)
 
+        # Single-pass rescale of residual projections (GPT-2/Llama style)
+        rescale_std = 0.02 / math.sqrt(2 * len(self.layers))
+        with torch.no_grad():
+            for name, p in self.named_parameters():
+                if name.endswith("fc.weight") or name.endswith("w2.weight"):
+                    nn.init.normal_(p, mean=0.0, std=rescale_std)
+
     def _init_weights(self, module):
         std = 0.02
         if isinstance(module, nn.Linear):
@@ -366,11 +378,6 @@ class GPT(nn.Module):
             if module.padding_idx is not None:
                 with torch.no_grad():
                     module.weight[module.padding_idx].fill_(0)
-        
-        # Re-scaling of residual projections (GPT-2/Llama style)
-        for name, p in module.named_parameters():
-            if name.endswith("fc.weight") or name.endswith("w2.weight"):
-                nn.init.normal_(p, mean=0.0, std=std / math.sqrt(2 * len(self.layers)))
 
     def forward(
         self,
@@ -473,6 +480,7 @@ class GPT(nn.Module):
         eos_token_id: Optional[int] = None,
         streamer=None,
     ) -> List[List[int]]:
+        was_training = self.training
         self.eval()
         B, _ = input_ids.shape
         device = input_ids.device
@@ -532,8 +540,8 @@ class GPT(nn.Module):
 
         if streamer:
             streamer.end()
-            
-        self.train()
+        
+        self.train(was_training)
         return generated_ids.tolist()
 
 
