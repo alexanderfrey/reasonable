@@ -1334,8 +1334,8 @@ def save_checkpoint(args: Namespace, epoch: int, global_step: int, model: nn.Mod
 
 
 def run_debug_generation(args: Namespace, model: nn.Module, tokenizer: AutoTokenizer, device: torch.device,
-                         bos_token_id: int | None, pad_token_id: int, use_amp: bool, global_step: int,
-                         epoch: int | None = None, step_in_epoch: int | None = None):
+                         bos_token_id: int | None, pad_token_id: int, eos_token_id: int | None, use_amp: bool,
+                         global_step: int, epoch: int | None = None, step_in_epoch: int | None = None):
     """Runs a debug generation example."""
     base_model = unwrap_model(model)
     if not (hasattr(base_model, 'generate') and callable(getattr(base_model, 'generate'))):
@@ -1354,18 +1354,27 @@ def run_debug_generation(args: Namespace, model: nn.Module, tokenizer: AutoToken
         prompt = args.debug_generate_prompt
         # GPT-3 style: no BOS; and be explicit about no special tokens
         input_ids_list = tokenizer.encode(prompt, add_special_tokens=False)
-        
+
         if not input_ids_list:
-             logger.warning("Debug prompt encoded to an empty sequence. Skipping generation.")
-             return
+            logger.warning("Debug prompt encoded to an empty sequence. Skipping generation.")
+            return
 
         input_tensor = torch.tensor([input_ids_list], dtype=torch.long).to(device)
+
+        top_p = args.debug_top_p if 0 < args.debug_top_p <= 1.0 else None
+        top_k = args.debug_top_k if args.debug_top_k > 0 else None
+        # Prefer nucleus over top-k when both are set
+        if top_p is not None:
+            top_k = None
 
         gen_kwargs = {
             "max_new_tokens": args.debug_max_new_tokens,
             "temperature": args.debug_temperature,
-            "top_k": args.debug_top_k if args.debug_top_k > 0 else None,
+            "top_k": top_k,
+            "top_p": top_p,
             "pad_token_id": pad_token_id,
+            "repetition_penalty": args.debug_repetition_penalty if args.debug_repetition_penalty > 0 else 1.0,
+            "eos_token_id": eos_token_id,
             # Assuming model.generate handles sampling logic based on temp/top_k
         }
 
@@ -1838,7 +1847,7 @@ def train(args: Namespace):
                                     save_checkpoint(args, epoch, global_step, model, optimizer, scaler,
                                                     save_loss_for_ckpt, best_eval_loss, model_config, is_best=True, wandb_run_id=current_wandb_run_id)
                         except Exception as e:
-                             logger.error(f"Error during evaluation run at step {global_step}: {e}", exc_info=True)
+                            logger.error(f"Error during evaluation run at step {global_step}: {e}", exc_info=True)
                         finally:
                             model.train()
 
@@ -1852,18 +1861,18 @@ def train(args: Namespace):
 
                     # --- Periodic Debug Generation ---
                     if args.is_main_process and args.debug_generate_interval > 0 and global_step % args.debug_generate_interval == 0 and global_step > 0:
-                         run_debug_generation(args, model, tokenizer, device, bos_token_id, pad_token_id, use_amp, global_step, epoch + 1, steps_in_epoch)
-                         model.train()
+                        run_debug_generation(args, model, tokenizer, device, bos_token_id, pad_token_id, eos_token_id, use_amp, global_step, epoch + 1, steps_in_epoch)
+                        model.train()
 
                 except Exception as e:
                     logger.error(f"Error during optimizer step/logging/eval/saving at micro-batch {batch_idx+1}, global step {global_step}: {e}", exc_info=True)
                     optimizer.zero_grad(set_to_none=True)
 
             elif step_loss_unscaled is None:
-                 if error_info is not None:
-                     logger.warning(f"Zeroing gradients after failed step {batch_idx+1} due to error.")
-                     optimizer.zero_grad(set_to_none=True)
-                 continue
+                if error_info is not None:
+                    logger.warning(f"Zeroing gradients after failed step {batch_idx+1} due to error.")
+                    optimizer.zero_grad(set_to_none=True)
+                continue
 
         if args.is_main_process:
             logger.info(f"Epoch {epoch+1} completed. Global Step: {global_step}")
@@ -1922,12 +1931,14 @@ def train(args: Namespace):
                 debug_generate_prompt = getattr(args, 'debug_generate_prompt', "[SOS]" if bos_token_id is not None else "The"),
                 debug_max_new_tokens = getattr(args, 'debug_max_new_tokens', 50),
                 debug_temperature = getattr(args, 'debug_temperature', 0.7),
-                debug_top_k = getattr(args, 'debug_top_k', 50)
+                debug_top_k = getattr(args, 'debug_top_k', 50),
+                debug_top_p = getattr(args, 'debug_top_p', 0.9),
+                debug_repetition_penalty = getattr(args, 'debug_repetition_penalty', 1.1),
             )
             try:
                 final_epoch_number = (epoch + 1) if 'epoch' in locals() else None
                 final_step_in_epoch = locals().get("steps_in_epoch", None)
-                run_debug_generation(final_gen_args, model, tokenizer, device, bos_token_id, pad_token_id, use_amp, global_step, final_epoch_number, final_step_in_epoch)
+                run_debug_generation(final_gen_args, model, tokenizer, device, bos_token_id, pad_token_id, eos_token_id, use_amp, global_step, final_epoch_number, final_step_in_epoch)
             except Exception as e:
                 logger.error(f"Error during final debug generation: {e}", exc_info=True)
 
@@ -2013,6 +2024,10 @@ if __name__ == "__main__":
     parser.add_argument("--debug_max_new_tokens", type=int, default=256)
     parser.add_argument("--debug_temperature", type=float, default=0.7)
     parser.add_argument("--debug_top_k", type=int, default=50)
+    parser.add_argument("--debug_top_p", type=float, default=0.9,
+                        help="Nucleus sampling probability for debug generations (set <=0 to disable).")
+    parser.add_argument("--debug_repetition_penalty", type=float, default=1.1,
+                        help="Repetition penalty applied during debug generations (set <=0 to disable).")
 
     # --- Weights & Biases Arguments ---
     parser.add_argument('--wandb_project', type=str, default="gpt_pretrain_hf", help="Weights & Biases project name.")

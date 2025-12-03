@@ -394,6 +394,7 @@ class GPT(nn.Module):
         max_new_tokens: int,
         temperature: float = 1.0,
         top_k: Optional[int] = None,
+        top_p: Optional[float] = None,
         repetition_penalty: float = 1.0,
         pad_token_id: Optional[int] = 0,
         eos_token_id: Optional[int] = None,
@@ -438,6 +439,17 @@ class GPT(nn.Module):
                 if top_k is not None:
                     v, _ = torch.topk(next_logits, min(top_k, next_logits.size(-1)))
                     next_logits[next_logits < v[:, [-1]]] = -float('inf')
+                elif top_p is not None and 0.0 < top_p < 1.0:
+                    # Nucleus sampling: keep smallest set whose cumulative prob >= top_p
+                    sorted_logits, sorted_indices = torch.sort(next_logits, descending=True)
+                    sorted_probs = F.softmax(sorted_logits, dim=-1)
+                    cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+                    cutoff_mask = cumulative_probs > top_p
+                    # Shift mask right to always keep at least one token
+                    cutoff_mask[..., 1:] = cutoff_mask[..., :-1].clone()
+                    cutoff_mask[..., 0] = False
+                    sorted_logits = torch.where(cutoff_mask, torch.full_like(sorted_logits, -float("inf")), sorted_logits)
+                    next_logits = torch.empty_like(next_logits).scatter(1, sorted_indices, sorted_logits)
                 probs = F.softmax(next_logits, dim=-1)
                 next_token = torch.multinomial(probs, num_samples=1).squeeze(1)
 
