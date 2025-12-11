@@ -279,18 +279,38 @@ def pretokenize_corpus(
 
     token_count = 0
     line_count = 0
+    bytes_read = 0
+
+    # Get file size for progress estimation
+    try:
+        file_size = os.path.getsize(corpus_file)
+    except OSError:
+        file_size = 0
 
     # Stream to a binary file by appending batches
+    import time
+    start_time = time.time()
     try:
         with open(corpus_file, "r", encoding="utf-8") as f_in, open(tmp_bin, "wb") as f_out:
-            pbar = tqdm(desc=f"Tokenizing {data_type}", unit="line", leave=True, dynamic_ncols=True)
+            # Use file size for progress bar if available
+            pbar = tqdm(
+                total=file_size if file_size > 0 else None,
+                desc=f"Tokenizing {data_type}",
+                unit="B",
+                unit_scale=True,
+                unit_divisor=1024,
+                leave=True,
+                dynamic_ncols=True,
+            )
             while True:
                 # Read up to batch_lines non-empty lines
                 lines = []
+                batch_bytes = 0
                 for _ in range(batch_lines):
                     line = f_in.readline()
                     if not line:
                         break
+                    batch_bytes += len(line.encode('utf-8'))
                     line = line.strip()
                     if line:
                         lines.append(line)
@@ -323,7 +343,17 @@ def pretokenize_corpus(
 
                 token_count += int(added_tokens)
                 line_count += len(lines)
-                pbar.update(len(lines))
+                bytes_read += batch_bytes
+                pbar.update(batch_bytes)
+
+                # Update postfix with detailed stats
+                elapsed = time.time() - start_time
+                tok_per_sec = token_count / elapsed if elapsed > 0 else 0
+                pbar.set_postfix({
+                    'lines': f'{line_count:,}',
+                    'tokens': f'{token_count:,}',
+                    'tok/s': f'{tok_per_sec:,.0f}',
+                }, refresh=False)
 
                 # Aggressive memory cleanup to prevent OOM on large corpora
                 del lines, enc, ids_list, batch_arr
