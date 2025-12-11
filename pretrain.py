@@ -1165,7 +1165,7 @@ def initialize_model(args: Namespace, vocab_size: int, pad_token_id: int, eos_to
     }
     
     model_config = {
-        "vocab_size": vocab_size,      
+        "vocab_size": vocab_size,
         "d_model": args.d_model,
         "n_head": args.n_head,
         "n_kv_head": n_kv_head,
@@ -1175,7 +1175,8 @@ def initialize_model(args: Namespace, vocab_size: int, pad_token_id: int, eos_to
         # "mla_config": mla_config_dict,
         # "moe_config": moe_config_dict,
         "dropout": args.dropout,
-        "pad_idx": pad_token_id,    
+        "rope_theta": getattr(args, "rope_theta", 500000.0),
+        "pad_idx": pad_token_id,
         "d_ff": args.d_ff,
         "use_gradient_checkpointing": getattr(args, "grad_checkpoint", False),
     }
@@ -2170,6 +2171,8 @@ if __name__ == "__main__":
     parser.add_argument("--n_head", type=int, default=8)
     parser.add_argument("--n_kv_head", type=int, default=None,
                         help="Number of KV heads for GQA (defaults to ~n_head/4, adjusted to divide n_head).")
+    parser.add_argument("--rope_theta", type=float, default=500000.0,
+                        help="RoPE base frequency. 500k (default) for long context, 10k for original.")
     parser.add_argument("--n_layer", type=int, default=6)
     parser.add_argument("--d_ff", type=int, default=None)
     parser.add_argument("--dropout", type=float, default=0.1)

@@ -164,7 +164,7 @@ class TransformerBlock(nn.Module):
 # --- Main GPT Model ---
 
 class GPTConfig:
-    def __init__(self, vocab_size, d_model, n_head, n_layer, max_seq_len, n_kv_head=None, dropout=0.0):
+    def __init__(self, vocab_size, d_model, n_head, n_layer, max_seq_len, n_kv_head=None, dropout=0.0, rope_theta=500000.0):
         self.vocab_size = vocab_size
         self.d_model = d_model
         self.n_head = n_head
@@ -172,14 +172,27 @@ class GPTConfig:
         self.max_seq_len = max_seq_len
         self.n_kv_head = n_kv_head
         self.dropout = dropout  # Dropout rate for attention and residual connections
+        self.rope_theta = rope_theta  # RoPE base frequency (500k for long context, 10k original)
         # SwiGLU sizing
         self.d_ff = int(2 * (4 * d_model) / 3)
         self.d_ff = 256 * ((self.d_ff + 256 - 1) // 256) # Multiple of 256
 
 
 class GPT(nn.Module):
-    def __init__(self, config: GPTConfig):
+    def __init__(self, config: GPTConfig = None, **kwargs):
         super().__init__()
+        # Support both GPTConfig object and kwargs for flexibility
+        if config is None:
+            config = GPTConfig(
+                vocab_size=kwargs['vocab_size'],
+                d_model=kwargs['d_model'],
+                n_head=kwargs['n_head'],
+                n_layer=kwargs['n_layer'],
+                max_seq_len=kwargs['max_seq_len'],
+                n_kv_head=kwargs.get('n_kv_head'),
+                dropout=kwargs.get('dropout', 0.0),
+                rope_theta=kwargs.get('rope_theta', 500000.0),
+            )
         self.config = config
 
         self.token_embedding = nn.Embedding(config.vocab_size, config.d_model)
@@ -224,7 +237,8 @@ class GPT(nn.Module):
     def _init_rope(self):
         # Precompute cos/sin for the maximum sequence length
         # Using float32 for high precision calculation
-        theta = 10000.0
+        # Larger theta (500k) enables better long-context modeling
+        theta = getattr(self.config, 'rope_theta', 500000.0)
         inv_freq = 1.0 / (theta ** (torch.arange(0, self.head_dim, 2).float() / self.head_dim))
         t = torch.arange(self.config.max_seq_len, dtype=torch.float32)
         freqs = torch.outer(t, inv_freq)
