@@ -579,7 +579,10 @@ def evaluate(model, eval_dataloader, criterion, device, pad_token_id, use_amp, u
             eval_dataloader, desc="Evaluating", leave=False
         )  # Inner progress bar
 
-    for batch in eval_iterator:
+    max_eval_batches = getattr(args, 'max_eval_batches', None)
+    for batch_idx, batch in enumerate(eval_iterator):
+        if max_eval_batches is not None and batch_idx >= max_eval_batches:
+            break
         input_ids = batch["input_ids"].to(device, non_blocking=True)
         labels = batch["labels"].to(device, non_blocking=True)
 
@@ -1528,7 +1531,7 @@ def save_checkpoint(args: Namespace, epoch: int, global_step: int, model: nn.Mod
 
 
 def run_debug_generation(args: Namespace, model: nn.Module, tokenizer: AutoTokenizer, device: torch.device,
-                         bos_token_id: int | None, pad_token_id: int, eos_token_id: int | None, use_amp: bool,
+                         bos_token_id: int | None, pad_token_id: int, eos_token_id: int | None, use_amp: bool, use_bf16: bool,
                          global_step: int, epoch: int | None = None, step_in_epoch: int | None = None):
     """Runs a debug generation example."""
     base_model = unwrap_model(model)
@@ -1555,24 +1558,17 @@ def run_debug_generation(args: Namespace, model: nn.Module, tokenizer: AutoToken
 
         input_tensor = torch.tensor([input_ids_list], dtype=torch.long).to(device)
 
-        top_p = args.debug_top_p if 0 < args.debug_top_p <= 1.0 else None
-        top_k = args.debug_top_k if args.debug_top_k > 0 else None
-        # Prefer nucleus over top-k when both are set
-        if top_p is not None:
-            top_k = None
-
         gen_kwargs = {
             "max_new_tokens": args.debug_max_new_tokens,
             "temperature": args.debug_temperature,
-            "top_k": top_k,
-            "top_p": top_p,
-            "pad_token_id": pad_token_id,
+            "top_k": args.debug_top_k if args.debug_top_k > 0 else None,
             "repetition_penalty": args.debug_repetition_penalty if args.debug_repetition_penalty > 0 else 1.0,
-            "eos_token_id": eos_token_id,
             # Assuming model.generate handles sampling logic based on temp/top_k
         }
 
-        with torch.no_grad(), amp.autocast('cuda', enabled=use_amp):
+        amp_enabled = use_amp or use_bf16
+        amp_dtype = torch.bfloat16 if use_bf16 else torch.float16
+        with torch.no_grad(), amp.autocast('cuda', enabled=amp_enabled, dtype=amp_dtype):
             generated_ids_tensor = base_model.generate(input_tensor, **gen_kwargs) # Shape: [1, TotalSeqLen]
 
         # Decode the generated part
@@ -1850,9 +1846,10 @@ def train(args: Namespace):
     )
 
     if args.compile_model and not args.debug:
-        compile_kwargs = {"mode": "max-autotune", "fullgraph": True}
+        # Avoid fullgraph=True because flash-attn rotary can introduce data-dependent branches
+        compile_kwargs = {"mode": "max-autotune", "fullgraph": False}
         try:
-            logger.info("Compiling model with torch.compile (mode=max-autotune, fullgraph=True)...")
+            logger.info("Compiling model with torch.compile (mode=max-autotune, fullgraph=False)...")
             model = torch.compile(model, **compile_kwargs)
             logger.info("Model compiled successfully with tuned settings.")
         except Exception as tuned_exc:
@@ -2092,7 +2089,7 @@ def train(args: Namespace):
 
                     # --- Periodic Debug Generation ---
                     if args.is_main_process and args.debug_generate_interval > 0 and global_step % args.debug_generate_interval == 0 and global_step > 0:
-                        run_debug_generation(args, model, tokenizer, device, bos_token_id, pad_token_id, eos_token_id, use_amp, global_step, epoch + 1, steps_in_epoch)
+                        run_debug_generation(args, model, tokenizer, device, bos_token_id, pad_token_id, eos_token_id, use_amp, use_bf16, global_step, epoch + 1, steps_in_epoch)
                         model.train()
 
                 except Exception as e:
@@ -2169,7 +2166,7 @@ def train(args: Namespace):
             try:
                 final_epoch_number = (epoch + 1) if 'epoch' in locals() else None
                 final_step_in_epoch = locals().get("steps_in_epoch", None)
-                run_debug_generation(final_gen_args, model, tokenizer, device, bos_token_id, pad_token_id, eos_token_id, use_amp, global_step, final_epoch_number, final_step_in_epoch)
+                run_debug_generation(final_gen_args, model, tokenizer, device, bos_token_id, pad_token_id, eos_token_id, use_amp, use_bf16, global_step, final_epoch_number, final_step_in_epoch)
             except Exception as e:
                 logger.error(f"Error during final debug generation: {e}", exc_info=True)
 
@@ -2259,13 +2256,14 @@ if __name__ == "__main__":
     parser.add_argument("--log_interval", type=int, default=100)
     parser.add_argument("--eval_interval", type=int, default=1000)
     parser.add_argument("--eval_batch_size", type=int, default=None)
+    parser.add_argument("--max_eval_batches", type=int, default=None, help="Cap evaluation to first N batches (for debugging)")
     parser.add_argument("--save_interval", type=int, default=1000)
     parser.add_argument("--resume_from_checkpoint", type=str, nargs="?", const="latest", default=None)
     parser.add_argument("--keep_last_n_checkpoints", type=int, default=2)
 
     # --- Generation Arguments ---
     parser.add_argument("--generate_example", action="store_true")
-    parser.add_argument("--debug_generate_interval", type=int, default=100)
+    parser.add_argument("--debug_generate_interval", type=int, default=5)
     parser.add_argument("--debug_generate_prompt", type=str, default="The meaning of life is")
     parser.add_argument("--debug_max_new_tokens", type=int, default=256)
     parser.add_argument("--debug_temperature", type=float, default=0.7)

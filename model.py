@@ -4,10 +4,13 @@ Features: FlashAttention-2, Static KV Cache, Fused RoPE, Fused MLP, GQA.
 """
 
 import math
+import logging
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Tuple, List
+
+logger = logging.getLogger(__name__)
 
 # --- SOTA Imports ---
 try:
@@ -88,8 +91,30 @@ class OptimizedAttention(nn.Module):
         # 2. Split Q, K, V
         q, k, v = qkv.split([self.n_head, self.n_kv_head, self.n_kv_head], dim=2)
 
+        # Ensure flash-attn sees a supported dtype
+        target_dtype = q.dtype
+        if target_dtype not in (torch.float16, torch.bfloat16):
+            if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+                target_dtype = torch.bfloat16
+            else:
+                target_dtype = torch.float16
+        if q.dtype != target_dtype:
+            q = q.to(dtype=target_dtype)
+            k = k.to(dtype=target_dtype)
+            v = v.to(dtype=target_dtype)
+
         # 3. Fused RoPE
         # flash_attn rotary expects inputs as [B, S, H, D]
+        # Guard against any mismatch between cached rotary dim and head_dim
+        rotary_dim = cos.shape[-1] * 2  # flash-attn treats cache dim as half
+        head_dim = q.shape[-1]
+        if rotary_dim > head_dim:
+            trim = head_dim // 2
+            cos = cos[..., :trim]
+            sin = sin[..., :trim]
+        if cos.dtype != target_dtype:
+            cos = cos.to(dtype=target_dtype)
+            sin = sin.to(dtype=target_dtype)
         q = apply_rotary_emb(q, cos, sin, interleaved=False)
         k = apply_rotary_emb(k, cos, sin, interleaved=False)
 
@@ -132,7 +157,8 @@ class OptimizedAttention(nn.Module):
             causal=is_causal,
             window_size=(-1, -1)  # Full context
         )
-
+        # flash_attn returns [B, S, H, D]; merge heads for the output projection
+        output = output.reshape(B, S, self.n_head * self.head_dim)
         return self.o_proj(output)
 
 
@@ -242,15 +268,22 @@ class GPT(nn.Module):
         inv_freq = 1.0 / (theta ** (torch.arange(0, self.head_dim, 2).float() / self.head_dim))
         t = torch.arange(self.config.max_seq_len, dtype=torch.float32)
         freqs = torch.outer(t, inv_freq)
-        
-        # Concatenate to match head_dim
-        emb = torch.cat((freqs, freqs), dim=-1)
-        
-        # Register as buffer to save in state_dict
-        self.register_buffer("cos_cached", emb.cos().to(dtype=torch.bfloat16), persistent=False)
-        self.register_buffer("sin_cached", emb.sin().to(dtype=torch.bfloat16), persistent=False)
+        # flash-attn rotary expects cos/sin shape [S, head_dim/2]; it multiplies by 2 internally
+        self.register_buffer("cos_cached", freqs.cos().to(dtype=torch.bfloat16), persistent=False)
+        self.register_buffer("sin_cached", freqs.sin().to(dtype=torch.bfloat16), persistent=False)
 
-    def setup_caches(self, batch_size, dtype=torch.bfloat16):
+    def _cache_dtype(self, prefer: Optional[torch.dtype] = None) -> torch.dtype:
+        """
+        flash-attn kernels only support fp16/bf16. Pick a supported dtype,
+        preferring the requested one when valid.
+        """
+        if prefer in (torch.float16, torch.bfloat16):
+            return prefer
+        if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+            return torch.bfloat16
+        return torch.float16
+
+    def setup_caches(self, batch_size, dtype: Optional[torch.dtype] = None):
         """
         Allocates the Static KV Cache in VRAM.
         Shape: [n_layer, 2, B, Max_Len, n_kv, head_dim]
@@ -259,6 +292,7 @@ class GPT(nn.Module):
         # or grouped. Here we group them by layer.
         
         # Dimensions: [2(k,v), B, Max_Seq, n_kv_head, head_dim]
+        cache_dtype = self._cache_dtype(dtype or self.token_embedding.weight.dtype)
         cache_shape = (
             2, 
             batch_size, 
@@ -271,8 +305,8 @@ class GPT(nn.Module):
         self.kv_caches = []
         for _ in range(self.config.n_layer):
             # Pre-allocate zeroed tensor
-            k_cache = torch.zeros(cache_shape[1:], dtype=dtype, device=device)
-            v_cache = torch.zeros(cache_shape[1:], dtype=dtype, device=device)
+            k_cache = torch.zeros(cache_shape[1:], dtype=cache_dtype, device=device)
+            v_cache = torch.zeros(cache_shape[1:], dtype=cache_dtype, device=device)
             self.kv_caches.append((k_cache, v_cache))
 
     def forward(
@@ -288,22 +322,38 @@ class GPT(nn.Module):
             input_pos = torch.arange(input_ids.size(1), device=input_ids.device)
 
         # 1. Fetch RoPE for these positions
-        # shape: [S, Head_Dim] -> Reshaped for broadcast
-        cos = self.cos_cached[input_pos].unsqueeze(0) # [1, S, D]
-        sin = self.sin_cached[input_pos].unsqueeze(0)
+        # flash_attn rotary expects [S, D]; broadcast happens inside the kernel
+        cos = self.cos_cached[input_pos]  # [S, D]
+        sin = self.sin_cached[input_pos]
 
         # 2. Embeddings
         x = self.token_embedding(input_ids)
 
+        use_cache = bool(self.kv_caches) and len(self.kv_caches) == len(self.layers)
+        if use_cache:
+            cache_batch = self.kv_caches[0][0].shape[0]
+            cache_device = self.kv_caches[0][0].device
+            if cache_batch != input_ids.size(0) or cache_device != input_ids.device:
+                logger.debug(
+                    "Resetting KV cache due to batch/device mismatch (cache_batch=%s, batch=%s, cache_device=%s, input_device=%s).",
+                    cache_batch,
+                    input_ids.size(0),
+                    cache_device,
+                    input_ids.device,
+                )
+                self.kv_caches = None
+                use_cache = False
+
         # 3. Transformer Layers
         for i, layer in enumerate(self.layers):
             # Retrieve layer-specific cache tuple (K, V)
-            layer_cache = self.kv_caches[i] if self.kv_caches else None
+            layer_cache = self.kv_caches[i] if use_cache else None
             x = layer(x, cos, sin, kv_cache=layer_cache, input_pos=input_pos)
 
         x = self.final_norm(x)
         logits = self.lm_head(x)
-        return logits
+        # Keep API compatible with callers expecting (logits, kv_cache_out)
+        return logits, None
 
     @torch.no_grad()
     def generate(
@@ -311,7 +361,8 @@ class GPT(nn.Module):
         input_ids: torch.Tensor, 
         max_new_tokens: int, 
         temperature: float = 1.0, 
-        top_k: Optional[int] = None
+        top_k: Optional[int] = None,
+        repetition_penalty: float = 1.0,
     ):
         """
         Optimized generation loop with Static Cache and Prefill/Decode separation.
@@ -322,37 +373,49 @@ class GPT(nn.Module):
 
         # 1. Setup Static Cache
         # Crucial: Reset/Allocate cache for this batch size
-        self.setup_caches(batch_size=B, dtype=self.token_embedding.weight.dtype)
+        cache_dtype = self._cache_dtype(self.token_embedding.weight.dtype)
+        self.setup_caches(batch_size=B, dtype=cache_dtype)
 
-        # 2. Prefill Phase (Process entire prompt at once)
-        # We tell the model to write to positions 0...S-1
-        input_pos = torch.arange(0, S, device=device)
-        logits = self(input_ids, input_pos=input_pos)
-        
-        # Select last token to start generation
-        next_token_logits = logits[:, -1, :]
-        next_token = self._sample_token(next_token_logits, temperature, top_k)
-        generated_ids = [next_token]
-
-        # 3. Decode Phase (Token by Token)
-        # Compile Hint: The loop body is static shape!
-        cur_pos = S
-        
-        for _ in range(max_new_tokens):
-            # Input is just the last generated token [B, 1]
-            # input_pos is just the current scalar position [B] or [1]
-            pos_tensor = torch.tensor([cur_pos], device=device) # Scalar tensor
+        try:
+            # 2. Prefill Phase (Process entire prompt at once)
+            # We tell the model to write to positions 0...S-1
+            input_pos = torch.arange(0, S, device=device)
+            logits, _ = self(input_ids, input_pos=input_pos)
             
-            # Forward pass writes to cache[cur_pos] and attends to 0...cur_pos
-            logits = self(next_token, input_pos=pos_tensor)
-            
+            # Select last token to start generation
             next_token_logits = logits[:, -1, :]
+            if repetition_penalty and repetition_penalty != 1.0:
+                # Apply repetition penalty using the existing prompt tokens
+                next_token_logits = self._apply_repetition_penalty(next_token_logits, input_ids, repetition_penalty)
             next_token = self._sample_token(next_token_logits, temperature, top_k)
-            
-            generated_ids.append(next_token)
-            cur_pos += 1
+            generated_ids = [next_token]
 
-        return torch.cat([input_ids] + generated_ids, dim=1)
+            # 3. Decode Phase (Token by Token)
+            # Compile Hint: The loop body is static shape!
+            cur_pos = S
+            
+            for _ in range(max_new_tokens):
+                # Input is just the last generated token [B, 1]
+                # input_pos is just the current scalar position [B] or [1]
+                pos_tensor = torch.tensor([cur_pos], device=device) # Scalar tensor
+                
+                # Forward pass writes to cache[cur_pos] and attends to 0...cur_pos
+                logits, _ = self(next_token, input_pos=pos_tensor)
+                
+                next_token_logits = logits[:, -1, :]
+                if repetition_penalty and repetition_penalty != 1.0:
+                    # Build full history = prompt + generated so far
+                    history = torch.cat([input_ids] + generated_ids, dim=1)
+                    next_token_logits = self._apply_repetition_penalty(next_token_logits, history, repetition_penalty)
+                next_token = self._sample_token(next_token_logits, temperature, top_k)
+                
+                generated_ids.append(next_token)
+                cur_pos += 1
+
+            return torch.cat([input_ids] + generated_ids, dim=1)
+        finally:
+            # Prevent stale caches from leaking into training passes with different batch sizes
+            self.kv_caches = None
 
     def _sample_token(self, logits, temperature, top_k):
         if temperature > 0:
@@ -366,3 +429,18 @@ class GPT(nn.Module):
             next_token = torch.argmax(logits, dim=-1, keepdim=True)
         return next_token
 
+    def _apply_repetition_penalty(self, logits: torch.Tensor, history: torch.Tensor, penalty: float) -> torch.Tensor:
+        """
+        Applies repetition penalty to logits based on tokens in `history`.
+        Supports batch processing; expects logits/history batch sizes to match.
+        """
+        if penalty == 1.0:
+            return logits
+        adjusted = logits.clone()
+        B = logits.size(0)
+        for b in range(B):
+            used = torch.unique(history[b])
+            vals = adjusted[b, used]
+            penalized = torch.where(vals < 0, vals * penalty, vals / penalty)
+            adjusted[b, used] = penalized
+        return adjusted
