@@ -107,26 +107,115 @@ def compute_default_n_kv_head(n_head: int) -> int:
     return max(1, target)
 
 
-def _build_optimizer(trainable_params, lr: float, weight_decay: float, *, logger_prefix: str = ""):
+def _build_optimizer(model_or_params, lr: float, weight_decay: float, *, logger_prefix: str = ""):
     """
-    Prefer bitsandbytes AdamW8bit when available to reduce optimizer memory foot print.
+    Build optimizer with proper parameter groups (no weight decay on embeddings/biases/norms).
+    Prefer bitsandbytes AdamW8bit when available to reduce optimizer memory footprint.
+    Falls back to fused torch AdamW for performance.
     """
+    # Handle both model and raw parameter list inputs
+    if isinstance(model_or_params, nn.Module):
+        # Create parameter groups: decay vs no-decay
+        decay_params = []
+        no_decay_params = []
+        for name, param in model_or_params.named_parameters():
+            if not param.requires_grad:
+                continue
+            # No weight decay for: embeddings, biases, LayerNorm/RMSNorm weights
+            if param.ndim == 1 or "embedding" in name.lower() or "bias" in name:
+                no_decay_params.append(param)
+            else:
+                decay_params.append(param)
+
+        param_groups = [
+            {"params": decay_params, "weight_decay": weight_decay},
+            {"params": no_decay_params, "weight_decay": 0.0},
+        ]
+        logger.info(f"{logger_prefix}Param groups: {len(decay_params)} with decay, {len(no_decay_params)} without decay")
+    else:
+        # Legacy: raw parameter list
+        param_groups = [{"params": list(model_or_params), "weight_decay": weight_decay}]
+
     try:
         import bitsandbytes as bnb  # type: ignore
-
-        optimizer = bnb.optim.AdamW8bit(trainable_params, lr=lr, weight_decay=weight_decay)
-        note = f"{logger_prefix}Using bitsandbytes AdamW8bit optimizer."
-        logger.info(note.strip())
+        optimizer = bnb.optim.AdamW8bit(param_groups, lr=lr)
+        logger.info(f"{logger_prefix}Using bitsandbytes AdamW8bit optimizer.")
         return optimizer
     except Exception as exc:
-        note = f"{logger_prefix}Falling back to torch AdamW (8-bit optimizer unavailable: {exc})"
-        logger.warning(note.strip())
-        return optim.AdamW(trainable_params, lr=lr, weight_decay=weight_decay)
+        logger.info(f"{logger_prefix}8-bit optimizer unavailable ({exc}), trying fused AdamW...")
+
+    # Try fused AdamW (requires CUDA, ~10-20% faster)
+    try:
+        optimizer = optim.AdamW(param_groups, lr=lr, fused=True)
+        logger.info(f"{logger_prefix}Using fused torch AdamW optimizer.")
+        return optimizer
+    except Exception as exc:
+        logger.warning(f"{logger_prefix}Fused AdamW unavailable ({exc}), using standard AdamW.")
+        return optim.AdamW(param_groups, lr=lr)
+
+
+def _build_lr_scheduler(
+    args: Namespace,
+    optimizer: optim.Optimizer,
+    num_training_steps: int,
+    *,
+    start_step: int = 0,
+):
+    """
+    Construct a per-step LR scheduler (optional).
+    Supported schedulers:
+      - none: disable scheduling
+      - cosine: linear warmup -> cosine decay to lr_min_ratio * base_lr
+      - linear: linear warmup -> linear decay to lr_min_ratio * base_lr
+    """
+    scheduler_name = getattr(args, "lr_scheduler", "none") or "none"
+    scheduler_name = scheduler_name.lower()
+    if scheduler_name == "none":
+        return None
+
+    if num_training_steps <= 0:
+        logger.warning("Cannot build LR scheduler: num_training_steps is <= 0.")
+        return None
+
+    warmup_steps = max(0, int(getattr(args, "lr_warmup_steps", 0)))
+    warmup_steps = min(warmup_steps, num_training_steps)
+    min_ratio = getattr(args, "lr_min_ratio", 0.0)
+    min_ratio = min(max(min_ratio, 0.0), 1.0)
+
+    def cosine_lambda(step: int):
+        if warmup_steps > 0 and step < warmup_steps:
+            return float(step) / float(max(1, warmup_steps))
+        progress = (step - warmup_steps) / float(max(1, num_training_steps - warmup_steps))
+        progress = min(max(progress, 0.0), 1.0)
+        cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return min_ratio + (1.0 - min_ratio) * cosine_decay
+
+    def linear_lambda(step: int):
+        if warmup_steps > 0 and step < warmup_steps:
+            return float(step) / float(max(1, warmup_steps))
+        progress = (step - warmup_steps) / float(max(1, num_training_steps - warmup_steps))
+        progress = min(max(progress, 0.0), 1.0)
+        return max(min_ratio, 1.0 - (1.0 - min_ratio) * progress)
+
+    if scheduler_name == "cosine":
+        lr_lambda = cosine_lambda
+    elif scheduler_name == "linear":
+        lr_lambda = linear_lambda
+    else:
+        raise ValueError(f"Unsupported lr_scheduler '{scheduler_name}'.")
+
+    scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda, last_epoch=start_step - 1)
+    logger.info(
+        f"[pretrain] Using {scheduler_name} LR scheduler "
+        f"(total_steps={num_training_steps}, warmup_steps={warmup_steps}, "
+        f"min_lr={args.learning_rate * max(min_ratio, 0.0):.2e})."
+    )
+    return scheduler
 
 
 # Import the model class from model.py
 try:
-    from model import GPT, upgrade_state_dict_for_block_norms
+    from model import GPT
 except ImportError:
     print("Error: model.py not found. Please ensure it's in the same directory.")
     exit(1)
@@ -430,11 +519,22 @@ class PretokenizedDataset(Dataset):
 
 # --- Evaluation Function ---
 @torch.no_grad()  # Ensure no gradients are computed during evaluation
-def evaluate(model, eval_dataloader, criterion, device, pad_token_id, use_amp, args: Namespace):
+def evaluate(model, eval_dataloader, criterion, device, pad_token_id, use_amp, use_bf16, args: Namespace):
     """Performs evaluation on the evaluation dataset."""
     model.eval()  # Set model to evaluation mode
     total_loss = 0.0
     total_tokens = 0 # Count non-pad tokens for accurate loss calculation
+
+    # Determine autocast dtype
+    if use_bf16:
+        amp_dtype = torch.bfloat16
+        amp_enabled = True
+    elif use_amp:
+        amp_dtype = torch.float16
+        amp_enabled = True
+    else:
+        amp_dtype = torch.float32
+        amp_enabled = False
 
     show_progress = (not getattr(args, "distributed", False)) or getattr(args, "is_main_process", True)
     eval_iterator = eval_dataloader
@@ -446,15 +546,14 @@ def evaluate(model, eval_dataloader, criterion, device, pad_token_id, use_amp, a
     for batch in eval_iterator:
         input_ids = batch["input_ids"].to(device, non_blocking=True)
         labels = batch["labels"].to(device, non_blocking=True)
-        
+
         try:
             torch.compiler.cudagraph_mark_step_begin()
         except Exception:
             pass
 
-
         from torch.amp import autocast
-        with autocast("cuda", enabled=use_amp):
+        with autocast("cuda", enabled=amp_enabled, dtype=amp_dtype):
             try:
                 logits, _ = model(input_ids)
                 # Important: Calculate loss correctly, ignoring padding index
@@ -520,7 +619,7 @@ def evaluate(model, eval_dataloader, criterion, device, pad_token_id, use_amp, a
 
 
 def setup_environment(args: Namespace):
-    """Sets up the device, AMP, and output directory."""
+    """Sets up the device, AMP/BF16, and output directory."""
     if not torch.cuda.is_available():
         raise RuntimeError("This model requires CUDA (FlashAttention).")
     local_rank = max(0, getattr(args, "local_rank", 0))
@@ -528,14 +627,31 @@ def setup_environment(args: Namespace):
     torch.cuda.set_device(device)
     logger.info(f"Using device: {device}")
 
-    use_amp = args.use_amp and (device.type == "cuda")
-    if args.use_amp and not use_amp:
-        logger.warning("AMP requested (--use_amp) but CUDA not available. Disabling AMP.")
+    # Determine mixed precision mode
+    use_bf16 = getattr(args, "use_bf16", False)
+    use_amp = getattr(args, "use_amp", False)
+
+    # bf16 takes precedence over fp16 AMP
+    if use_bf16:
+        if not torch.cuda.is_bf16_supported():
+            logger.warning("BFloat16 requested but not supported on this GPU. Falling back to FP16 AMP.")
+            use_bf16 = False
+            use_amp = True
+        else:
+            use_amp = False  # Don't use fp16 scaler with bf16
+            logger.info("Using BFloat16 mixed precision (no GradScaler needed).")
+
+    if use_amp and not use_bf16:
+        logger.info("Using FP16 mixed precision with GradScaler.")
+
+    # Store on args for later access
+    args.use_bf16 = use_bf16
+    args.use_amp = use_amp
 
     os.makedirs(args.output_dir, exist_ok=True)
     logger.info(f"Output directory: {args.output_dir}")
 
-    return device, use_amp
+    return device, use_amp, use_bf16
 
 def load_and_prepare_tokenizer(tokenizer_name: str):
     """
@@ -633,6 +749,8 @@ def _load_or_tokenize_data(
     current_tokenizer_name: str,
     current_pad_token_id: int,
     current_eos_token_id: int,
+    rank: int = 0,
+    distributed: bool = False,
 ):
     """
     Loads pre-tokenized data or tokenizes if needed, with robust recompute of num_examples
@@ -715,6 +833,26 @@ def _load_or_tokenize_data(
 
     # --- Retokenize when needed or when metadata is missing ---
     if not os.path.exists(metadata_file) or needs_retokenize:
+        # In distributed mode, only rank 0 performs tokenization to avoid OOM
+        # from multiple processes tokenizing large corpora simultaneously
+        if distributed and rank != 0:
+            logger.info(f"Rank {rank} waiting for rank 0 to complete {data_type} tokenization...")
+            dist.barrier()
+            # After barrier, rank 0 has finished tokenization - reload metadata
+            logger.info(f"Rank {rank} loading tokenized {data_type} data created by rank 0")
+            try:
+                with open(metadata_file, "r") as f:
+                    metadata = json.load(f)
+                token_file = metadata.get("token_file", token_file_base)
+                num_examples = metadata.get("num_examples", 0)
+                return token_file, num_examples
+            except Exception as e:
+                logger.error(f"Rank {rank} failed to load {data_type} metadata after barrier: {e}")
+                if data_type == "Training":
+                    exit(1)
+                return None, 0
+
+        # Rank 0 (or non-distributed) performs tokenization
         logger.info(
             f"Preparing {data_type} tokens (retokenize={needs_retokenize}, metadata_exists={os.path.exists(metadata_file)})"
         )
@@ -789,6 +927,11 @@ def _load_or_tokenize_data(
         except IOError as e:
             logger.error(f"Failed to save {data_type} metadata to {metadata_file}: {e}")
 
+        # In distributed mode, signal other ranks that tokenization is complete
+        if distributed:
+            logger.info(f"Rank 0 finished {data_type} tokenization, signaling other ranks...")
+            dist.barrier()
+
         return token_file, num_examples
 
     # Shouldn’t get here, but in case:
@@ -835,6 +978,7 @@ def prepare_dataloaders(args: Namespace, tokenizer: AutoTokenizer, vocab_size: i
 
     # --- Training Data ---
     train_sampler = None
+    distributed = getattr(args, "distributed", False)
     train_token_file, train_num_examples = _load_or_tokenize_data(
         corpus_file=args.corpus_file,
         tokenizer=tokenizer,
@@ -845,8 +989,10 @@ def prepare_dataloaders(args: Namespace, tokenizer: AutoTokenizer, vocab_size: i
         force_retokenize=args.force_retokenize,
         current_vocab_size=vocab_size,
         current_tokenizer_name=args.tokenizer_name,
-        current_pad_token_id = pad_token_id,
-        current_eos_token_id = eos_token_id,
+        current_pad_token_id=pad_token_id,
+        current_eos_token_id=eos_token_id,
+        rank=rank,
+        distributed=distributed,
     )
     if not train_token_file or train_num_examples == 0:
          logger.critical("Failed to prepare training data. Exiting.")
@@ -898,8 +1044,10 @@ def prepare_dataloaders(args: Namespace, tokenizer: AutoTokenizer, vocab_size: i
             force_retokenize=args.force_retokenize,
             current_vocab_size=vocab_size,
             current_tokenizer_name=args.tokenizer_name,
-            current_pad_token_id = pad_token_id,
-            current_eos_token_id = eos_token_id,
+            current_pad_token_id=pad_token_id,
+            current_eos_token_id=eos_token_id,
+            rank=rank,
+            distributed=distributed,
         )
 
         if eval_token_file and eval_num_examples > 0:
@@ -1070,20 +1218,22 @@ def initialize_model(args: Namespace, vocab_size: int, pad_token_id: int, eos_to
 
 
 
-def initialize_training_components(args: Namespace, model: nn.Module, use_amp: bool, pad_token_id: int):
+def initialize_training_components(args: Namespace, model: nn.Module, use_amp: bool, use_bf16: bool, pad_token_id: int):
     """Initializes optimizer, loss criterion, and GradScaler."""
     print("learning_rate:", args.learning_rate)
-    trainable_params = [p for p in model.parameters() if p.requires_grad]
     optimizer = _build_optimizer(
-        trainable_params,
+        model,
         lr=args.learning_rate,
         weight_decay=args.weight_decay,
         logger_prefix="[pretrain] ",
     )
     criterion = nn.CrossEntropyLoss(ignore_index=pad_token_id)
-    scaler = GradScaler() if use_amp else None
-    if use_amp:
-        logger.info("Using Automatic Mixed Precision (AMP) with GradScaler.")
+    # GradScaler only needed for FP16 AMP, not for BF16
+    scaler = GradScaler() if (use_amp and not use_bf16) else None
+    if use_amp and not use_bf16:
+        logger.info("Using FP16 Mixed Precision with GradScaler.")
+    elif use_bf16:
+        logger.info("Using BFloat16 Mixed Precision (no GradScaler).")
     return optimizer, criterion, scaler
 
 def _find_latest_checkpoint(output_dir: str):
@@ -1106,13 +1256,14 @@ def _find_latest_checkpoint(output_dir: str):
 
 
 def load_checkpoint(args: Namespace, model: nn.Module, optimizer: optim.Optimizer, scaler: GradScaler | None,
-                    device: torch.device, use_amp: bool, current_vocab_size: int, current_pad_token_id: int,
+                    device: torch.device, use_amp: bool, use_bf16: bool, current_vocab_size: int, current_pad_token_id: int,
                     current_eos_token_id: int,
                     current_model_config: dict):
     """Loads a checkpoint if specified, handling potential mismatches."""
     start_epoch = 0
     global_step = 0
     best_eval_loss = float("inf")
+    scheduler_state_dict = None
     checkpoint_path = None
     base_model = unwrap_model(model)
 
@@ -1208,9 +1359,8 @@ def load_checkpoint(args: Namespace, model: nn.Module, optimizer: optim.Optimize
                         pg['lr'] = args.learning_rate
                 except ValueError as e:
                     logger.warning(f"Could not load optimizer state (likely shape change): {e}. Re-initializing optimizer.")
-                    trainable_params = [p for p in model.parameters() if p.requires_grad]
                     optimizer = _build_optimizer(
-                        trainable_params,
+                        model,
                         lr=args.learning_rate,
                         weight_decay=args.weight_decay,
                         logger_prefix="[pretrain] ",
@@ -1220,9 +1370,8 @@ def load_checkpoint(args: Namespace, model: nn.Module, optimizer: optim.Optimize
                     logger.info("Skipping optimizer state load due to vocab mismatch. Re-initializing optimizer.")
                 else:
                     logger.info("Optimizer state not found. Re-initializing optimizer.")
-                trainable_params = [p for p in model.parameters() if p.requires_grad]
                 optimizer = _build_optimizer(
-                    trainable_params,
+                    model,
                     lr=args.learning_rate,
                     weight_decay=args.weight_decay,
                     logger_prefix="[pretrain] ",
@@ -1232,6 +1381,7 @@ def load_checkpoint(args: Namespace, model: nn.Module, optimizer: optim.Optimize
             global_step = checkpoint.get('global_step', 0)
             start_epoch = checkpoint.get('epoch', -1) + 1
             best_eval_loss = checkpoint.get('best_eval_loss', float('inf'))
+            scheduler_state_dict = checkpoint.get('scheduler_state_dict', None)
 
             # --- GradScaler ---
             if use_amp and scaler:
@@ -1252,22 +1402,23 @@ def load_checkpoint(args: Namespace, model: nn.Module, optimizer: optim.Optimize
 
         except FileNotFoundError:
             logger.error(f"Checkpoint file {checkpoint_path} disappeared unexpectedly. Starting fresh.")
-            start_epoch, global_step, best_eval_loss = 0, 0, float('inf')
+            start_epoch, global_step, best_eval_loss, scheduler_state_dict = 0, 0, float('inf'), None
         except Exception as e:
             logger.error(f"Error loading checkpoint {checkpoint_path}: {e}. Starting fresh.", exc_info=True)
-            start_epoch, global_step, best_eval_loss = 0, 0, float('inf')
+            start_epoch, global_step, best_eval_loss, scheduler_state_dict = 0, 0, float('inf'), None
             model, _ = initialize_model(
                 args, current_vocab_size, current_pad_token_id, current_eos_token_id, 0, device
             )
-            optimizer, _, scaler = initialize_training_components(args, model, use_amp, current_pad_token_id)
+            optimizer, _, scaler = initialize_training_components(args, model, use_amp, use_bf16, current_pad_token_id)
     else:
         logger.info("No checkpoint specified or found. Starting training from scratch.")
 
-    return start_epoch, global_step, best_eval_loss, model, optimizer, scaler
+    return start_epoch, global_step, best_eval_loss, model, optimizer, scaler, scheduler_state_dict
 
 def save_checkpoint(args: Namespace, epoch: int, global_step: int, model: nn.Module, optimizer: optim.Optimizer,
                       scaler: Optional[GradScaler], current_loss: float, best_eval_loss: float, model_config: dict,
                       wandb_run_id: Optional[str] = None, # W&B run ID for traceability
+                      scheduler: Optional[optim.lr_scheduler._LRScheduler] = None,
                       is_best: bool = False, is_final: bool = False):
     """
     Saves a training checkpoint and logs it to Weights & Biases as an artifact if enabled.
@@ -1284,6 +1435,8 @@ def save_checkpoint(args: Namespace, epoch: int, global_step: int, model: nn.Mod
         "config": model_config,
         "wandb_run_id": wandb_run_id, # Store W&B run ID for resuming W&B run
     }
+    if scheduler is not None:
+        save_dict["scheduler_state_dict"] = scheduler.state_dict()
     if scaler is not None: # Ensure scaler is not None before accessing state_dict
         save_dict["scaler_state_dict"] = scaler.state_dict()
 
@@ -1510,7 +1663,7 @@ class CUDAGraphTrainStep:
         return float(self.loss_tensor.item()), None
 
 
-def train_step(model, batch, criterion, scaler, device, use_amp, vocab_size,
+def train_step(model, batch, criterion, scaler, device, use_amp, use_bf16, vocab_size,
                gradient_accumulation_steps: int, cudagraph_runner: CUDAGraphTrainStep | None = None):
     """
     Performs a single forward pass, calculates loss, scales it for accumulation,
@@ -1541,8 +1694,19 @@ def train_step(model, batch, criterion, scaler, device, use_amp, vocab_size,
 
     try:
         from torch.amp import autocast
-        with autocast("cuda", enabled=use_amp):
-            logits, _ = model(input_ids) 
+        # Determine autocast dtype: bf16 > fp16 > disabled
+        if use_bf16:
+            amp_dtype = torch.bfloat16
+            amp_enabled = True
+        elif use_amp:
+            amp_dtype = torch.float16
+            amp_enabled = True
+        else:
+            amp_dtype = torch.float32
+            amp_enabled = False
+
+        with autocast("cuda", enabled=amp_enabled, dtype=amp_dtype):
+            logits, _ = model(input_ids)
             # Calculate raw loss (unscaled)
             loss = criterion(logits.view(-1, vocab_size), labels.view(-1))
 
@@ -1607,7 +1771,7 @@ def train(args: Namespace):
 
 
     # --- Setup ---
-    device, use_amp = setup_environment(args)
+    device, use_amp, use_bf16 = setup_environment(args)
     # logger = logging.getLogger(__name__) # Already defined globally or passed
 
     # --- Tokenizer ---
@@ -1620,7 +1784,7 @@ def train(args: Namespace):
     model, model_config = initialize_model(args, vocab_size, pad_token_id, eos_token_id, num_added_toks, device)
 
     # --- Optimizer, Loss, Scaler ---
-    optimizer, criterion, scaler = initialize_training_components(args, model, use_amp, pad_token_id)
+    optimizer, criterion, scaler = initialize_training_components(args, model, use_amp, use_bf16, pad_token_id)
 
     # --- Weights & Biases Watch Model (after model and criterion init) ---
     # if not getattr(args, 'disable_wandb', False) and wandb.run:
@@ -1630,8 +1794,8 @@ def train(args: Namespace):
 
     # --- Checkpoint Loading ---
     # If load_checkpoint could return a wandb_run_id, you'd handle it before wandb.init or pass it to wandb.init
-    start_epoch, global_step, best_eval_loss, model, optimizer, scaler = load_checkpoint(
-        args, model, optimizer, scaler, device, use_amp, vocab_size, pad_token_id, eos_token_id, model_config
+    start_epoch, global_step, best_eval_loss, model, optimizer, scaler, scheduler_state_dict = load_checkpoint(
+        args, model, optimizer, scaler, device, use_amp, use_bf16, vocab_size, pad_token_id, eos_token_id, model_config
     )
     # If load_checkpoint returned a wandb_run_id, and W&B init happened after, you might re-init or ensure args.wandb_run_id was set prior.
     # For this example, we assume args.wandb_run_id is set externally if specific run resumption is needed.
@@ -1675,6 +1839,21 @@ def train(args: Namespace):
     if gradient_accumulation_steps > 1:
          logger.info(f"Using gradient accumulation with {gradient_accumulation_steps} steps.")
          logger.info(f"Effective batch size: {args.batch_size * gradient_accumulation_steps}")
+
+    steps_per_epoch = max(1, math.ceil(len(train_dataloader) / gradient_accumulation_steps))
+    total_training_steps = args.epochs * steps_per_epoch
+
+    scheduler = None
+    scheduler_name = (getattr(args, "lr_scheduler", "none") or "none").lower()
+    if scheduler_name != "none":
+        scheduler = _build_lr_scheduler(args, optimizer, total_training_steps, start_step=global_step)
+        if scheduler_state_dict is not None:
+            try:
+                scheduler.load_state_dict(scheduler_state_dict)
+                logger.info("LR scheduler state loaded.")
+            except Exception as e:
+                logger.warning(f"Could not load LR scheduler state: {e}. Re-initializing scheduler.")
+                scheduler = _build_lr_scheduler(args, optimizer, total_training_steps, start_step=global_step)
 
     cudagraph_runner = None
     if getattr(args, "use_cuda_graphs", False):
@@ -1721,7 +1900,7 @@ def train(args: Namespace):
                 model.require_backward_grad_sync = do_sync
 
             step_loss_unscaled, error_info = train_step(
-                model, batch, criterion, scaler, device, use_amp, vocab_size,
+                model, batch, criterion, scaler, device, use_amp, use_bf16, vocab_size,
                 gradient_accumulation_steps, cudagraph_runner=cudagraph_runner
             )
 
@@ -1742,10 +1921,15 @@ def train(args: Namespace):
                         if args.max_grad_norm > 0:
                             torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
                         scale_before = scaler.get_scale()
+
+                    optimizer_step_skipped = False
+                    if scaler:
                         scaler.step(optimizer)
                         scaler.update()
                         scale_after = scaler.get_scale()
-                        if scale_before > scale_after:
+                        # If scale decreased, optimizer step was skipped due to inf/nan grads
+                        optimizer_step_skipped = (scale_before > scale_after)
+                        if optimizer_step_skipped:
                             logger.warning(f"Gradient overflow detected at step {global_step + 1}. Scale reduced from {scale_before:.1f} to {scale_after:.1f}.")
                             if args.is_main_process and not getattr(args, 'disable_wandb', False) and wandb.run:
                                 wandb.log({"train/grad_overflow": 1, "train/amp_scale_old": scale_before, "train/amp_scale_new": scale_after}, step=global_step)
@@ -1753,6 +1937,10 @@ def train(args: Namespace):
                         if args.max_grad_norm > 0:
                             torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
                         optimizer.step()
+
+                    # Only step scheduler if optimizer actually stepped
+                    if scheduler and not optimizer_step_skipped:
+                        scheduler.step()
 
                     optimizer.zero_grad(set_to_none=True)
                     global_step += 1
@@ -1818,7 +2006,7 @@ def train(args: Namespace):
                         try:
                             if eval_sampler is not None:
                                 eval_sampler.set_epoch(global_step)
-                            eval_loss, eval_perplexity = evaluate(model, eval_dataloader, criterion, device, pad_token_id, use_amp, args)
+                            eval_loss, eval_perplexity = evaluate(model, eval_dataloader, criterion, device, pad_token_id, use_amp, use_bf16, args)
                             eval_time_taken = time.time() - start_eval_time
                             if args.is_main_process:
                                 logger.info(f"\n--- Evaluation @ Step {global_step} Finished ({eval_time_taken:.2f}s) ---")
@@ -1845,7 +2033,8 @@ def train(args: Namespace):
                                     save_loss_for_ckpt = avg_loss_log_period if micro_steps_in_log_period == 0 and 'avg_loss_log_period' in locals() else current_micro_batch_loss # Check if avg_loss_log_period was just reset
                                     if math.isnan(save_loss_for_ckpt) and 'current_micro_batch_loss' in locals(): save_loss_for_ckpt = current_micro_batch_loss # fallback
                                     save_checkpoint(args, epoch, global_step, model, optimizer, scaler,
-                                                    save_loss_for_ckpt, best_eval_loss, model_config, is_best=True, wandb_run_id=current_wandb_run_id)
+                                                    save_loss_for_ckpt, best_eval_loss, model_config, wandb_run_id=current_wandb_run_id,
+                                                    scheduler=scheduler, is_best=True)
                         except Exception as e:
                             logger.error(f"Error during evaluation run at step {global_step}: {e}", exc_info=True)
                         finally:
@@ -1857,7 +2046,8 @@ def train(args: Namespace):
                         save_loss_for_ckpt = avg_loss_log_period if micro_steps_in_log_period == 0 and 'avg_loss_log_period' in locals() else current_micro_batch_loss
                         if math.isnan(save_loss_for_ckpt) and 'current_micro_batch_loss' in locals(): save_loss_for_ckpt = current_micro_batch_loss
                         save_checkpoint(args, epoch, global_step, model, optimizer, scaler,
-                                        save_loss_for_ckpt, best_eval_loss, model_config, is_best=False, wandb_run_id=current_wandb_run_id)
+                                        save_loss_for_ckpt, best_eval_loss, model_config, wandb_run_id=current_wandb_run_id,
+                                        scheduler=scheduler, is_best=False)
 
                     # --- Periodic Debug Generation ---
                     if args.is_main_process and args.debug_generate_interval > 0 and global_step % args.debug_generate_interval == 0 and global_step > 0:
@@ -1992,9 +2182,19 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--batch_size", type=int, default=16, help="Micro-batch size per device.")
     parser.add_argument("--learning_rate", type=float, default=1e-4)
+    parser.add_argument("--lr_scheduler", type=str, default="none",
+                        choices=["none", "cosine", "linear"],
+                        help="Learning rate schedule applied per optimizer step.")
+    parser.add_argument("--lr_warmup_steps", type=int, default=0,
+                        help="Number of warmup steps before decaying the learning rate.")
+    parser.add_argument("--lr_min_ratio", type=float, default=0.1,
+                        help="Minimum LR as a fraction of the base LR for cosine/linear decay.")
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
-    parser.add_argument("--use_amp", action="store_true")
+    parser.add_argument("--use_amp", action="store_true",
+                        help="Use FP16 mixed precision with GradScaler.")
+    parser.add_argument("--use_bf16", action="store_true",
+                        help="Use BFloat16 mixed precision (more stable, no scaler needed). Preferred over --use_amp.")
     parser.add_argument("--compile_model", action="store_true")
     parser.add_argument("--num_workers", type=int, default=2)
     parser.add_argument("--debug", action="store_true")

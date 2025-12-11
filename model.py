@@ -49,7 +49,7 @@ class OptimizedMLP(nn.Module):
 
 class OptimizedAttention(nn.Module):
     """
-    Drop-in replacement for MultiHeadAttention, but requires the 
+    Drop-in replacement for MultiHeadAttention, but requires the
     parent GPT model to handle 'input_pos' and 'kv_cache'.
     """
     def __init__(self, config):
@@ -58,7 +58,8 @@ class OptimizedAttention(nn.Module):
         self.n_head = config.n_head
         self.n_kv_head = config.n_kv_head if config.n_kv_head is not None else config.n_head
         self.head_dim = self.d_model // self.n_head
-        
+        self.dropout = getattr(config, 'dropout', 0.0)
+
         # Check GQA constraints
         assert self.n_head % self.n_kv_head == 0
         self.n_rep = self.n_head // self.n_kv_head
@@ -120,17 +121,18 @@ class OptimizedAttention(nn.Module):
 
         # 5. Flash Attention 2
         # Automatically handles GQA (if n_kv < n_head) and broadcasting
-        
-        # Dropout is usually 0 during inference
-        is_causal = (S > 1) # Causal masking required during prefill, not single-token decode
-        
+
+        is_causal = (S > 1)  # Causal masking required during prefill, not single-token decode
+        # Only apply dropout during training
+        attn_dropout = self.dropout if self.training else 0.0
+
         output = flash_attn_func(
-            q, k, v, 
-            dropout_p=0.0, 
+            q, k, v,
+            dropout_p=attn_dropout,
             causal=is_causal,
-            window_size=(-1, -1) # Full context
+            window_size=(-1, -1)  # Full context
         )
-        
+
         return self.o_proj(output)
 
 
@@ -141,31 +143,35 @@ class TransformerBlock(nn.Module):
         self.attn = OptimizedAttention(config)
         self.norm_ffn = OptimizedRMSNorm(config.d_model)
         self.ffn = OptimizedMLP(config.d_model, config.d_ff)
+        # Residual dropout (applied after attention and FFN)
+        dropout = getattr(config, 'dropout', 0.0)
+        self.resid_dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
 
     def forward(self, x, cos, sin, kv_cache=None, input_pos=None):
         # Attention Block
         h = self.norm_attn(x)
         attn_out = self.attn(h, cos, sin, kv_cache, input_pos)
-        x = x + attn_out
-        
+        x = x + self.resid_dropout(attn_out)
+
         # MLP Block
         h = self.norm_ffn(x)
         ffn_out = self.ffn(h)
-        x = x + ffn_out
-        
+        x = x + self.resid_dropout(ffn_out)
+
         return x
 
 
 # --- Main GPT Model ---
 
 class GPTConfig:
-    def __init__(self, vocab_size, d_model, n_head, n_layer, max_seq_len, n_kv_head=None):
+    def __init__(self, vocab_size, d_model, n_head, n_layer, max_seq_len, n_kv_head=None, dropout=0.0):
         self.vocab_size = vocab_size
         self.d_model = d_model
         self.n_head = n_head
         self.n_layer = n_layer
         self.max_seq_len = max_seq_len
         self.n_kv_head = n_kv_head
+        self.dropout = dropout  # Dropout rate for attention and residual connections
         # SwiGLU sizing
         self.d_ff = int(2 * (4 * d_model) / 3)
         self.d_ff = 256 * ((self.d_ff + 256 - 1) // 256) # Multiple of 256
@@ -175,20 +181,45 @@ class GPT(nn.Module):
     def __init__(self, config: GPTConfig):
         super().__init__()
         self.config = config
-        
+
         self.token_embedding = nn.Embedding(config.vocab_size, config.d_model)
         self.layers = nn.ModuleList([TransformerBlock(config) for _ in range(config.n_layer)])
         self.final_norm = OptimizedRMSNorm(config.d_model)
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
-        
+
         # Weight tying
         self.lm_head.weight = self.token_embedding.weight
-        
+
         # Initialize RoPE Cache (Cos/Sin)
         self.head_dim = config.d_model // config.n_head
         self._init_rope()
-        
+
         self.kv_caches = None # Placeholder
+
+        # Apply SOTA weight initialization
+        self._init_weights()
+
+    def _init_weights(self):
+        """
+        GPT-2/GPT-3 style weight initialization:
+        - Normal(0, 0.02) for most weights
+        - Scaled Normal for residual projections: 0.02 / sqrt(2 * n_layer)
+        - Embeddings: Normal(0, 0.02)
+        """
+        init_std = 0.02
+        residual_std = init_std / math.sqrt(2 * self.config.n_layer)
+
+        for name, module in self.named_modules():
+            if isinstance(module, nn.Linear):
+                # Scale down output projections (o_proj, down_proj) for residual stability
+                if "o_proj" in name or "down_proj" in name:
+                    nn.init.normal_(module.weight, mean=0.0, std=residual_std)
+                else:
+                    nn.init.normal_(module.weight, mean=0.0, std=init_std)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.Embedding):
+                nn.init.normal_(module.weight, mean=0.0, std=init_std)
 
     def _init_rope(self):
         # Precompute cos/sin for the maximum sequence length
