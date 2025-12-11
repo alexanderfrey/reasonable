@@ -2192,7 +2192,8 @@ if __name__ == "__main__":
     parser.add_argument("--corpus_file", type=str, required=True)
     parser.add_argument("--eval_corpus_file", type=str, default=None)
     parser.add_argument("--output_dir", type=str, default="./gpt_pretrain_output_hf")
-    parser.add_argument("--tokenizer_name", type=str, default="gpt2")
+    parser.add_argument("--tokenizer_name", type=str, default="mistralai/Mistral-7B-v0.1",
+                        help="HuggingFace tokenizer. Recommended: mistralai/Mistral-7B-v0.1 (32k vocab) or meta-llama/Meta-Llama-3-8B (128k vocab, requires license).")
     parser.add_argument("--force_retokenize", action="store_true")
     parser.add_argument("--tokenize_batch_lines", type=int, default=64,
                         help="Number of lines to tokenize at once. Reduce if OOM during tokenization (default: 64).")
