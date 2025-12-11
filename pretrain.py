@@ -230,7 +230,7 @@ def pretokenize_corpus(
     stride,
     output_token_file,
     data_type="Training",
-    batch_lines: int = 1024,  # safer default (reduce if still memory pressure)
+    batch_lines: int = 64,  # reduced from 1024 to prevent OOM on long documents
 ):
     """
     Memory-safe pretokenization:
@@ -242,6 +242,7 @@ def pretokenize_corpus(
 
     NOTE: We keep the dataset & metadata format compatible by adding dtype info later.
     """
+    import gc
     print(f"Starting pre-tokenization of {data_type} data: {corpus_file}...")
     print(f"Using max_seq_len: {max_seq_len}, stride: {stride}")
 
@@ -323,6 +324,11 @@ def pretokenize_corpus(
                 token_count += int(added_tokens)
                 line_count += len(lines)
                 pbar.update(len(lines))
+
+                # Aggressive memory cleanup to prevent OOM on large corpora
+                del lines, enc, ids_list, batch_arr
+                if line_count % 10000 == 0:
+                    gc.collect()
             pbar.close()
 
     except FileNotFoundError:
@@ -751,6 +757,7 @@ def _load_or_tokenize_data(
     current_eos_token_id: int,
     rank: int = 0,
     distributed: bool = False,
+    batch_lines: int = 64,
 ):
     """
     Loads pre-tokenized data or tokenizes if needed, with robust recompute of num_examples
@@ -884,6 +891,7 @@ def _load_or_tokenize_data(
             stride,
             token_file_base,   # base name; function will switch to .bin as needed
             data_type=data_type,
+            batch_lines=batch_lines,
         )
         if num_examples == 0:
             logger.error(
@@ -993,6 +1001,7 @@ def prepare_dataloaders(args: Namespace, tokenizer: AutoTokenizer, vocab_size: i
         current_eos_token_id=eos_token_id,
         rank=rank,
         distributed=distributed,
+        batch_lines=getattr(args, "tokenize_batch_lines", 64),
     )
     if not train_token_file or train_num_examples == 0:
          logger.critical("Failed to prepare training data. Exiting.")
@@ -1048,6 +1057,7 @@ def prepare_dataloaders(args: Namespace, tokenizer: AutoTokenizer, vocab_size: i
             current_eos_token_id=eos_token_id,
             rank=rank,
             distributed=distributed,
+            batch_lines=getattr(args, "tokenize_batch_lines", 64),
         )
 
         if eval_token_file and eval_num_examples > 0:
@@ -2154,6 +2164,8 @@ if __name__ == "__main__":
     parser.add_argument("--output_dir", type=str, default="./gpt_pretrain_output_hf")
     parser.add_argument("--tokenizer_name", type=str, default="gpt2")
     parser.add_argument("--force_retokenize", action="store_true")
+    parser.add_argument("--tokenize_batch_lines", type=int, default=64,
+                        help="Number of lines to tokenize at once. Reduce if OOM during tokenization (default: 64).")
     parser.add_argument("--train_stride", type=int, default=None,
                         help="Stride between successive training examples (defaults to max_seq_len).")
     parser.add_argument("--eval_stride", type=int, default=None,
