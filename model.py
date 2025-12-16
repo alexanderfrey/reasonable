@@ -160,6 +160,9 @@ class OptimizedAttention(nn.Module):
         )
         # flash_attn returns [B, S, H, D]; merge heads for the output projection
         output = output.reshape(B, S, self.n_head * self.head_dim)
+        # Cast to weight dtype for compatibility with gradient checkpointing (which may
+        # recompute outside autocast context)
+        output = output.to(self.o_proj.weight.dtype)
         return self.o_proj(output)
 
 

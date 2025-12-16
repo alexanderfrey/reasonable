@@ -1299,6 +1299,26 @@ def _find_latest_checkpoint(output_dir: str):
     return latest_checkpoint
 
 
+def _infer_d_ff_from_checkpoint(checkpoint_path: str) -> int | None:
+    """
+    Infer d_ff from checkpoint weights (not metadata, which may be incorrect).
+    Returns the d_ff value or None if it cannot be determined.
+    """
+    try:
+        # Load only the state dict keys and shapes, not full weights
+        checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+        state_dict = checkpoint.get('model_state_dict', {})
+
+        # Look for the first FFN gate_up_proj weight: shape is [2*d_ff, d_model]
+        for key, tensor in state_dict.items():
+            if 'ffn.gate_up_proj.weight' in key:
+                d_ff = tensor.shape[0] // 2
+                return d_ff
+        return None
+    except Exception:
+        return None
+
+
 def load_checkpoint(args: Namespace, model: nn.Module, optimizer: optim.Optimizer, scaler: GradScaler | None,
                     device: torch.device, use_amp: bool, use_bf16: bool, current_vocab_size: int, current_pad_token_id: int,
                     current_eos_token_id: int,
@@ -1746,6 +1766,7 @@ def train_step(model, batch, criterion, scaler, device, use_amp, use_bf16, vocab
             logits, _ = model(input_ids)
             # Calculate raw loss (unscaled)
             loss = criterion(logits.view(-1, vocab_size), labels.view(-1))
+            del logits  # Free 4GB+ before backward pass
 
         if torch.isnan(loss) or torch.isinf(loss):
             logger.warning("NaN/Inf loss detected during forward. Skipping backward for this batch.")
@@ -2282,6 +2303,17 @@ if __name__ == "__main__":
 
 
     args = parser.parse_args()
+
+    # Infer d_ff from checkpoint if resuming and d_ff not explicitly set
+    if args.d_ff is None and args.resume_from_checkpoint:
+        checkpoint_path = args.resume_from_checkpoint
+        if checkpoint_path == "latest":
+            checkpoint_path = _find_latest_checkpoint(args.output_dir)
+        if checkpoint_path and os.path.isfile(checkpoint_path):
+            inferred_d_ff = _infer_d_ff_from_checkpoint(checkpoint_path)
+            if inferred_d_ff is not None:
+                args.d_ff = inferred_d_ff
+                print(f"Inferred d_ff={inferred_d_ff} from checkpoint weights")
 
     if args.d_ff is None: args.d_ff = args.d_model * 4
     assert args.d_model % args.n_head == 0, f"d_model ({args.d_model}) must be divisible by n_head ({args.n_head})"
