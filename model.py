@@ -191,7 +191,7 @@ class TransformerBlock(nn.Module):
 # --- Main GPT Model ---
 
 class GPTConfig:
-    def __init__(self, vocab_size, d_model, n_head, n_layer, max_seq_len, n_kv_head=None, dropout=0.0, rope_theta=500000.0, use_gradient_checkpointing=False):
+    def __init__(self, vocab_size, d_model, n_head, n_layer, max_seq_len, n_kv_head=None, dropout=0.0, rope_theta=500000.0, use_gradient_checkpointing=False, d_ff=None):
         self.vocab_size = vocab_size
         self.d_model = d_model
         self.n_head = n_head
@@ -201,9 +201,12 @@ class GPTConfig:
         self.dropout = dropout  # Dropout rate for attention and residual connections
         self.rope_theta = rope_theta  # RoPE base frequency (500k for long context, 10k original)
         self.use_gradient_checkpointing = use_gradient_checkpointing
-        # SwiGLU sizing
-        self.d_ff = int(2 * (4 * d_model) / 3)
-        self.d_ff = 256 * ((self.d_ff + 256 - 1) // 256) # Multiple of 256
+        # SwiGLU sizing: use provided d_ff or compute optimal value
+        if d_ff is not None:
+            self.d_ff = d_ff
+        else:
+            self.d_ff = int(2 * (4 * d_model) / 3)
+            self.d_ff = 256 * ((self.d_ff + 256 - 1) // 256)  # Multiple of 256
 
 
 class GPT(nn.Module):
@@ -221,6 +224,7 @@ class GPT(nn.Module):
                 dropout=kwargs.get('dropout', 0.0),
                 rope_theta=kwargs.get('rope_theta', 500000.0),
                 use_gradient_checkpointing=kwargs.get('use_gradient_checkpointing', False),
+                d_ff=kwargs.get('d_ff'),
             )
         self.config = config
 
