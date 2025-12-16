@@ -2275,7 +2275,7 @@ if __name__ == "__main__":
 
     # --- Logging, Checkpointing, Evaluation Arguments ---
     parser.add_argument("--log_interval", type=int, default=100)
-    parser.add_argument("--eval_interval", type=int, default=1000)
+    parser.add_argument("--eval_interval", type=int, default=2000)
     parser.add_argument("--eval_batch_size", type=int, default=None)
     parser.add_argument("--max_eval_batches", type=int, default=None, help="Cap evaluation to first N batches (for debugging)")
     parser.add_argument("--save_interval", type=int, default=1000)
@@ -2284,9 +2284,9 @@ if __name__ == "__main__":
 
     # --- Generation Arguments ---
     parser.add_argument("--generate_example", action="store_true")
-    parser.add_argument("--debug_generate_interval", type=int, default=5)
+    parser.add_argument("--debug_generate_interval", type=int, default=100)
     parser.add_argument("--debug_generate_prompt", type=str, default="The meaning of life is")
-    parser.add_argument("--debug_max_new_tokens", type=int, default=256)
+    parser.add_argument("--debug_max_new_tokens", type=int, default=128)
     parser.add_argument("--debug_temperature", type=float, default=0.7)
     parser.add_argument("--debug_top_k", type=int, default=50)
     parser.add_argument("--debug_top_p", type=float, default=0.9,
