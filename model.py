@@ -8,6 +8,7 @@ import logging
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as gradient_checkpoint
 from typing import Optional, Tuple, List
 
 logger = logging.getLogger(__name__)
@@ -190,7 +191,7 @@ class TransformerBlock(nn.Module):
 # --- Main GPT Model ---
 
 class GPTConfig:
-    def __init__(self, vocab_size, d_model, n_head, n_layer, max_seq_len, n_kv_head=None, dropout=0.0, rope_theta=500000.0):
+    def __init__(self, vocab_size, d_model, n_head, n_layer, max_seq_len, n_kv_head=None, dropout=0.0, rope_theta=500000.0, use_gradient_checkpointing=False):
         self.vocab_size = vocab_size
         self.d_model = d_model
         self.n_head = n_head
@@ -199,6 +200,7 @@ class GPTConfig:
         self.n_kv_head = n_kv_head
         self.dropout = dropout  # Dropout rate for attention and residual connections
         self.rope_theta = rope_theta  # RoPE base frequency (500k for long context, 10k original)
+        self.use_gradient_checkpointing = use_gradient_checkpointing
         # SwiGLU sizing
         self.d_ff = int(2 * (4 * d_model) / 3)
         self.d_ff = 256 * ((self.d_ff + 256 - 1) // 256) # Multiple of 256
@@ -218,6 +220,7 @@ class GPT(nn.Module):
                 n_kv_head=kwargs.get('n_kv_head'),
                 dropout=kwargs.get('dropout', 0.0),
                 rope_theta=kwargs.get('rope_theta', 500000.0),
+                use_gradient_checkpointing=kwargs.get('use_gradient_checkpointing', False),
             )
         self.config = config
 
@@ -345,10 +348,14 @@ class GPT(nn.Module):
                 use_cache = False
 
         # 3. Transformer Layers
+        use_checkpointing = self.config.use_gradient_checkpointing and self.training and not use_cache
         for i, layer in enumerate(self.layers):
             # Retrieve layer-specific cache tuple (K, V)
             layer_cache = self.kv_caches[i] if use_cache else None
-            x = layer(x, cos, sin, kv_cache=layer_cache, input_pos=input_pos)
+            if use_checkpointing:
+                x = gradient_checkpoint(layer, x, cos, sin, layer_cache, input_pos, use_reentrant=False)
+            else:
+                x = layer(x, cos, sin, kv_cache=layer_cache, input_pos=input_pos)
 
         x = self.final_norm(x)
         logits = self.lm_head(x)
