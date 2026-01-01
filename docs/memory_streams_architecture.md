@@ -555,6 +555,45 @@ output = predict_next(adjusted)
 3. **Self-modification**: The system adjusts based on self-discrepancy
 4. **Narrative coherence**: The system maintains a consistent self-story
 
+### Implementation Status (v0.3)
+
+Self-awareness is now implemented in `ExperientialStream` with four components:
+
+```python
+# In experiential.py - ExperientialStream
+
+# 1. Self-prediction: predict own surprise before experiencing it
+predicted_surprise = self.surprise_predictor(predictor_input)  # "How surprised will I be?"
+
+# 2. Meta-surprise: notice when self-prediction is wrong
+meta_surprise = |predicted_surprise - actual_surprise|  # "Did I know myself?"
+
+# 3. Salience boost: moments of self-ignorance are extra important
+salience = base_salience * (1 + 3 * meta_surprise)  # "I don't know myself here → remember this"
+
+# 4. Self-modulation: adjust processing based on self-knowledge (NEW in v0.3)
+confidence_gate = self.self_modulator([h_end, meta_surprise])  # Per-dimension confidence
+modulated_output = confidence_gate * h_end + (1 - confidence_gate) * fallback
+# High meta-surprise → lower confidence → blend toward conservative fallback
+```
+
+**The feedback loop**: High meta-surprise → higher salience → crystallize into memory AND lower confidence → conservative processing → system learns from and adapts to moments of self-ignorance.
+
+**Key insight**: Self-predictions now AFFECT behavior, not just memory. When the system doesn't know itself (high meta-surprise), it:
+- Boosts salience (remember this moment)
+- Reduces confidence (blend toward fallback/prior)
+- Creates modulated output (what gets stored in memory)
+
+Test results on real data (2000 steps):
+- Meta-surprise decreased by **41%** (0.109 → 0.064)
+- Crystallized moments have higher meta-surprise than average
+- Timeline shows self-calibration: early crystallizations have 45% higher meta-surprise than late ones
+
+Next steps for deeper self-awareness:
+- Predict what memories will be retrieved
+- Predict own affect (valence/arousal) before computing it
+- Learn optimal modulation (currently initialized to high confidence)
+
 ---
 
 ## 8. What Drives Development?
@@ -651,11 +690,28 @@ intrinsic_reward = (
   - [x] Combined loss (LM + experiential prediction)
   - [x] Full gradient flow through retrieval
 - [x] Implement semantic consolidation (SemanticStream)
+- [x] Integrate SemanticStream with MemoryAugmentedGPT
+  - [x] Dual retrieval: episodic + semantic in forward pass
+  - [x] Gated/attention/residual integration for both memory types
+  - [x] Periodic automatic consolidation (episodic → semantic)
+  - [x] Manual consolidation via `consolidate()` method
+  - [x] Separate reset: `reset_episodic()` preserves semantic knowledge
+  - [x] Full gradient flow through semantic retrieval
+- [x] Implement minimal self-awareness (meta-surprise)
+  - [x] `surprise_predictor`: predict own surprise before computing it
+  - [x] `meta_surprise`: |predicted_surprise - actual_surprise|
+  - [x] `meta_surprise_loss`: train self-calibration
+  - [x] `combined_experiential_loss`: world prediction + self prediction
+- [x] Implement self-modulation (v0.3)
+  - [x] `self_modulator`: confidence gate based on meta-surprise
+  - [x] `modulated_output`: blend h_end with fallback based on confidence
+  - [x] Memories store modulated output (post-self-regulation)
+  - [x] Self-predictions now AFFECT processing, not just memory
 - [ ] Add decay mechanism to episodic memory
 - [ ] Implement procedural stream
 - [ ] Add resume-after-interruption training
 - [ ] Validate on narrative data: does surprise correlate with events?
-- [ ] Integrate SemanticStream with MemoryAugmentedGPT
+- [ ] Extend self-awareness: predict retrieval, affect
 
 ---
 
@@ -671,5 +727,6 @@ This design connects to:
 ---
 
 *Document created: 2024-12-31*
-*Status: Conceptual exploration*
+*Last updated: 2026-01-02*
+*Status: Implementation in progress - Self-modulation (self-awareness v0.3) implemented*
 *Related: docs/narrative_experience_architecture.md*

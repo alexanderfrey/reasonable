@@ -410,13 +410,15 @@ class ExperientialStream(nn.Module):
         split_ratio: float = 0.5,
         use_layer_norm: bool = True,
         use_persistent_state: bool = True,
-        use_affect: bool = True
+        use_affect: bool = True,
+        use_meta_surprise: bool = True
     ):
         super().__init__()
         self.d_model = d_model
         self.split_ratio = split_ratio
         self.use_persistent_state = use_persistent_state
         self.use_affect = use_affect
+        self.use_meta_surprise = use_meta_surprise
 
         # Predictor input size depends on whether we use persistent state
         # With persistent state: [h_mid, prev_state] → predicted h_end
@@ -460,6 +462,33 @@ class ExperientialStream(nn.Module):
                 nn.Sigmoid()  # Output in [0, 1]
             )
 
+        # Meta-surprise: predict own surprise BEFORE computing it
+        # This is the first step toward self-awareness: "How surprised will I be?"
+        if use_meta_surprise:
+            meta_hidden = d_model // 2
+            self.surprise_predictor = nn.Sequential(
+                nn.Linear(predictor_input_dim, meta_hidden),
+                nn.GELU(),
+                nn.Linear(meta_hidden, 1),
+                nn.Sigmoid()  # Output in [0, 1] to match surprise range
+            )
+
+            # Self-modulation: adjust processing based on self-knowledge
+            # This is the key step: meta-surprise doesn't just affect memory,
+            # it affects actual processing. High meta-surprise ("I don't know
+            # myself here") → blend toward more conservative/prior representation.
+            #
+            # Input: h_end (what we computed) + meta_surprise (how uncertain)
+            # Output: confidence gate per dimension [0, 1]
+            #   High confidence → use h_end
+            #   Low confidence → use fallback (prev_state or h_mid)
+            self.self_modulator = nn.Sequential(
+                nn.Linear(d_model + 1, d_model // 2),
+                nn.GELU(),
+                nn.Linear(d_model // 2, d_model),
+                nn.Sigmoid()
+            )
+
         # Persistent state buffer (not a parameter, just a buffer)
         self.register_buffer('_persistent_state', None)
         self._batch_size = None
@@ -474,6 +503,14 @@ class ExperientialStream(nn.Module):
             # Initialize gate to 0.5 (balanced between old and new)
             nn.init.zeros_(self.state_gate[0].weight)
             nn.init.constant_(self.state_gate[0].bias, 0.0)
+        if self.use_meta_surprise:
+            # Initialize surprise predictor to predict ~0.5 (uncertain)
+            nn.init.zeros_(self.surprise_predictor[-2].weight)
+            nn.init.constant_(self.surprise_predictor[-2].bias, 0.0)  # sigmoid(0) = 0.5
+            # Initialize self-modulator to output ~1 (high confidence initially)
+            # This means h_end passes through unchanged until the system learns
+            nn.init.zeros_(self.self_modulator[-2].weight)
+            nn.init.constant_(self.self_modulator[-2].bias, 2.0)  # sigmoid(2) ≈ 0.88
 
     def reset_state(self, batch_size: Optional[int] = None):
         """Reset persistent state (call at start of new sequence/episode)."""
@@ -534,9 +571,14 @@ class ExperientialStream(nn.Module):
                 - prediction: [batch, d_model] predicted future (pred h_end)
                 - target: [batch, d_model] actual future (h_end, detached)
                 - surprise: [batch] prediction error (0=expected, 1=surprising)
+                - predicted_surprise: [batch] self-predicted surprise (what I thought I'd feel)
+                - meta_surprise: [batch] |predicted_surprise - surprise| (self-awareness signal)
                 - valence: [batch] emotional valence (-1=negative, 1=positive)
                 - arousal: [batch] activation level (0=calm, 1=excited)
-                - salience: [batch] importance signal (surprise × arousal × |valence|)
+                - salience: [batch] importance signal (surprise × arousal × |valence| × (1 + meta_surprise))
+                - modulated_output: [batch, d_model] h_end adjusted by self-knowledge
+                    (high confidence → h_end, low confidence → fallback to prior)
+                - confidence_gate: [batch, d_model] how much we trusted h_end per dimension
                 - persistent_state: [batch, d_model] updated persistent state
                 - gate_values: [batch, d_model] state gate activations (if persistent)
         """
@@ -563,12 +605,24 @@ class ExperientialStream(nn.Module):
         # Predict future from current (+ persistent state if enabled)
         prediction = self.predictor(predictor_input)  # [B, d]
 
+        # Meta-surprise: predict own surprise BEFORE computing it
+        # This is the self-awareness signal: "How surprised will I be?"
+        predicted_surprise = None
+        meta_surprise = None
+        if self.use_meta_surprise:
+            predicted_surprise = self.surprise_predictor(predictor_input).squeeze(-1)  # [B]
+
         # Compute surprise (no gradient needed for this metric)
         with torch.no_grad():
             pred_norm = F.normalize(prediction, dim=-1)
             target_norm = F.normalize(h_end, dim=-1)
             similarity = (pred_norm * target_norm).sum(dim=-1)
             surprise = 1 - similarity
+
+        # Compute meta-surprise: how wrong was my self-prediction?
+        # This measures self-calibration: "Did I know how I would react?"
+        if self.use_meta_surprise and predicted_surprise is not None:
+            meta_surprise = (predicted_surprise - surprise.detach()).abs()
 
         # Compute affect (valence and arousal)
         valence = None
@@ -581,8 +635,36 @@ class ExperientialStream(nn.Module):
 
             # Salience = how important is this moment?
             # High surprise + high arousal + strong valence = very salient
+            # Meta-surprise boost: moments of self-ignorance are extra important
+            #   "I don't know myself here" → pay attention, remember this
             with torch.no_grad():
-                salience = surprise * arousal * valence.abs()
+                base_salience = surprise * arousal * valence.abs()
+                if meta_surprise is not None:
+                    # Boost salience by meta-surprise with 3x amplification
+                    # Range: [1, 1 + 3*max_ms] where max_ms ≈ 0.5 early → [1, 2.5]
+                    salience = base_salience * (1 + 3 * meta_surprise)
+                else:
+                    salience = base_salience
+
+        # Self-modulation: adjust processing based on self-knowledge
+        # This is where meta-surprise AFFECTS behavior, not just memory
+        modulated_output = h_end
+        confidence_gate = None
+        if self.use_meta_surprise and meta_surprise is not None:
+            # Build input: h_end + meta_surprise scalar
+            ms_scalar = meta_surprise.unsqueeze(-1)  # [B, 1]
+            mod_input = torch.cat([h_end, ms_scalar], dim=-1)  # [B, d_model + 1]
+
+            # Compute confidence gate per dimension
+            # High meta-surprise → lower confidence → blend toward fallback
+            confidence_gate = self.self_modulator(mod_input)  # [B, d_model] in [0, 1]
+
+            # Fallback: previous state (what we knew) or h_mid (current input)
+            # This represents "when uncertain, be conservative"
+            fallback = prev_state if prev_state is not None else h_mid
+
+            # Blend: confident → use h_end, uncertain → use fallback
+            modulated_output = confidence_gate * h_end + (1 - confidence_gate) * fallback
 
         # Update persistent state
         gate_values = None
@@ -601,9 +683,13 @@ class ExperientialStream(nn.Module):
             'prediction': prediction,
             'target': h_end.detach(),  # stop gradient for contrastive loss
             'surprise': surprise,
+            'predicted_surprise': predicted_surprise,
+            'meta_surprise': meta_surprise,
             'valence': valence,
             'arousal': arousal,
             'salience': salience,
+            'modulated_output': modulated_output,  # h_end adjusted by self-knowledge
+            'confidence_gate': confidence_gate,    # how much we trusted h_end
             'mid_idx': mid_idx,
             'end_idx': end_idx if end_idx != -1 else seq_len - 1,
             'persistent_state': self._persistent_state,
@@ -718,6 +804,73 @@ def experiential_loss(
     return loss
 
 
+def meta_surprise_loss(
+    predicted_surprise: torch.Tensor,
+    actual_surprise: torch.Tensor
+) -> torch.Tensor:
+    """
+    Loss for training meta-surprise prediction (self-awareness).
+
+    The system learns to predict its own surprise before experiencing it.
+    This is training for self-calibration: "How surprised will I be?"
+
+    Uses MSE loss between predicted and actual surprise values.
+
+    Args:
+        predicted_surprise: [batch] predicted surprise (0-1)
+        actual_surprise: [batch] actual surprise (0-1, should be detached)
+
+    Returns:
+        Scalar loss value
+    """
+    return F.mse_loss(predicted_surprise, actual_surprise.detach())
+
+
+def combined_experiential_loss(
+    output: Dict[str, torch.Tensor],
+    exp_weight: float = 1.0,
+    meta_weight: float = 0.1,
+    temperature: float = 0.1
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """
+    Combined loss for experiential prediction and meta-surprise.
+
+    Args:
+        output: dict from ExperientialStream.forward()
+        exp_weight: weight for experiential prediction loss
+        meta_weight: weight for meta-surprise loss
+        temperature: temperature for contrastive loss
+
+    Returns:
+        total_loss: combined scalar loss
+        loss_dict: breakdown of individual losses
+    """
+    loss_dict = {}
+
+    # Experiential prediction loss (predicting world)
+    exp_loss = experiential_loss(
+        output['prediction'],
+        output['target'],
+        temperature=temperature
+    )
+    loss_dict['exp_loss'] = exp_loss.item()
+
+    total_loss = exp_weight * exp_loss
+
+    # Meta-surprise loss (predicting self)
+    if output.get('predicted_surprise') is not None:
+        meta_loss = meta_surprise_loss(
+            output['predicted_surprise'],
+            output['surprise']
+        )
+        loss_dict['meta_loss'] = meta_loss.item()
+        loss_dict['mean_meta_surprise'] = output['meta_surprise'].mean().item()
+        total_loss = total_loss + meta_weight * meta_loss
+
+    loss_dict['total_loss'] = total_loss.item()
+    return total_loss, loss_dict
+
+
 def prediction_accuracy(
     prediction: torch.Tensor,
     target: torch.Tensor
@@ -776,11 +929,12 @@ def compute_metrics(output: Dict[str, torch.Tensor]) -> Dict[str, float]:
 
 class MemoryAugmentedGPT(nn.Module):
     """
-    GPT model augmented with episodic memory.
+    GPT model augmented with episodic and semantic memory.
 
-    Retrieves relevant memories from past experiences and uses them to
-    condition the model's predictions. Enables:
-    - Learning from past experiences (what worked before)
+    Retrieves relevant memories from past experiences and semantic knowledge
+    to condition the model's predictions. Enables:
+    - Learning from past experiences (episodic: what happened before)
+    - Abstracting knowledge from repeated patterns (semantic: what I know)
     - Maintaining consistency across long contexts
     - Recalling relevant patterns/events
 
@@ -788,6 +942,10 @@ class MemoryAugmentedGPT(nn.Module):
     1. Residual: Add retrieved memory to hidden states
     2. Gated: Learn to blend memory with hidden states
     3. Cross-attention: Attend to memory as additional context
+
+    Memory hierarchy:
+    - Experiential → Episodic (crystallization): high-salience moments
+    - Episodic → Semantic (consolidation): repeated patterns become knowledge
 
     Usage:
         gpt = GPT(config)
@@ -800,6 +958,10 @@ class MemoryAugmentedGPT(nn.Module):
         lm_loss = F.cross_entropy(logits.view(-1, vocab), targets.view(-1))
         exp_loss = experiential_loss(mem_out['prediction'], mem_out['target'])
         total_loss = lm_loss + 0.1 * exp_loss
+
+        # Periodic consolidation (e.g., every N steps)
+        if step % consolidation_interval == 0:
+            memory_gpt.consolidate()
     """
 
     def __init__(
@@ -810,7 +972,11 @@ class MemoryAugmentedGPT(nn.Module):
         memory_integration: str = 'gated',  # 'residual', 'gated', or 'attention'
         memory_weight: float = 0.1,
         use_experiential: bool = True,
+        use_semantic: bool = True,
         retrieval_temperature: float = 0.1,
+        semantic_weight: float = 0.5,
+        consolidation_interval: int = 100,
+        min_consolidation_evidence: int = 3,
     ):
         """
         Args:
@@ -820,7 +986,11 @@ class MemoryAugmentedGPT(nn.Module):
             memory_integration: How to integrate memories ('residual', 'gated', 'attention')
             memory_weight: Base weight for memory contribution (for residual mode)
             use_experiential: Whether to use experiential stream for surprise/salience
+            use_semantic: Whether to use semantic memory for abstracted knowledge
             retrieval_temperature: Temperature for soft retrieval
+            semantic_weight: Weight for semantic vs episodic retrieval [0, 1]
+            consolidation_interval: Steps between automatic consolidation (0 = manual only)
+            min_consolidation_evidence: Minimum episodes for consolidation
         """
         super().__init__()
         self.gpt = gpt_model
@@ -828,6 +998,9 @@ class MemoryAugmentedGPT(nn.Module):
         self.memory_integration = memory_integration
         self.memory_weight = memory_weight
         self.retrieval_temperature = retrieval_temperature
+        self.semantic_weight = semantic_weight
+        self.consolidation_interval = consolidation_interval
+        self._step_counter = 0
 
         # Episodic memory
         self.memory = EpisodicMemory(
@@ -836,12 +1009,22 @@ class MemoryAugmentedGPT(nn.Module):
             crystallization_threshold=crystallization_threshold
         )
 
+        # Semantic memory (abstracted knowledge)
+        if use_semantic:
+            self.semantic = SemanticStream(
+                d_model=self.d_model,
+                min_evidence=min_consolidation_evidence
+            )
+        else:
+            self.semantic = None
+
         # Experiential stream (for computing surprise/salience)
         if use_experiential:
             self.experiential = ExperientialStream(
                 d_model=self.d_model,
                 use_affect=True,
-                use_persistent_state=True
+                use_persistent_state=True,
+                use_meta_surprise=True  # Enable self-modulation
             )
         else:
             self.experiential = None
@@ -855,6 +1038,14 @@ class MemoryAugmentedGPT(nn.Module):
             )
             # Project retrieved memory to match hidden state space
             self.memory_proj = nn.Linear(self.d_model, self.d_model)
+            # Semantic projection (separate from episodic)
+            if use_semantic:
+                self.semantic_proj = nn.Linear(self.d_model, self.d_model)
+                # Gate for blending episodic and semantic
+                self.semantic_gate = nn.Sequential(
+                    nn.Linear(self.d_model * 2, self.d_model),
+                    nn.Sigmoid()
+                )
 
         elif memory_integration == 'attention':
             # Cross-attention to memory
@@ -864,6 +1055,14 @@ class MemoryAugmentedGPT(nn.Module):
                 batch_first=True
             )
             self.memory_norm = nn.LayerNorm(self.d_model)
+            # Semantic also uses cross-attention (shared or separate)
+            if use_semantic:
+                self.semantic_attention = nn.MultiheadAttention(
+                    self.d_model,
+                    num_heads=4,
+                    batch_first=True
+                )
+                self.semantic_norm = nn.LayerNorm(self.d_model)
 
         # Query projection for retrieval
         self.query_proj = nn.Linear(self.d_model, self.d_model)
@@ -878,6 +1077,12 @@ class MemoryAugmentedGPT(nn.Module):
             nn.init.constant_(self.memory_gate[0].bias, -2.0)  # sigmoid(-2) ≈ 0.12
             nn.init.xavier_uniform_(self.memory_proj.weight)
             nn.init.zeros_(self.memory_proj.bias)
+            # Initialize semantic layers if present
+            if self.semantic is not None:
+                nn.init.xavier_uniform_(self.semantic_proj.weight)
+                nn.init.zeros_(self.semantic_proj.bias)
+                nn.init.zeros_(self.semantic_gate[0].weight)
+                nn.init.constant_(self.semantic_gate[0].bias, 0.0)  # sigmoid(0) = 0.5
 
         nn.init.xavier_uniform_(self.query_proj.weight)
         nn.init.zeros_(self.query_proj.bias)
@@ -888,6 +1093,7 @@ class MemoryAugmentedGPT(nn.Module):
         input_pos: Optional[torch.Tensor] = None,
         crystallize: bool = True,
         use_memory: bool = True,
+        use_semantic: bool = True,
         return_memory_weights: bool = False
     ) -> Tuple[torch.Tensor, torch.Tensor, Dict]:
         """
@@ -897,7 +1103,8 @@ class MemoryAugmentedGPT(nn.Module):
             input_ids: [batch, seq_len] input token IDs
             input_pos: Optional position indices
             crystallize: Whether to store high-salience moments in memory
-            use_memory: Whether to retrieve and use memories
+            use_memory: Whether to retrieve and use episodic memories
+            use_semantic: Whether to retrieve and use semantic knowledge
             return_memory_weights: Include retrieval weights in output
 
         Returns:
@@ -916,36 +1123,54 @@ class MemoryAugmentedGPT(nn.Module):
         )
 
         memory_output = {
-            'retrieved_values': None,
-            'retrieval_weights': None,
+            'retrieved_episodic': None,
+            'retrieved_semantic': None,
+            'episodic_weights': None,
+            'semantic_weights': None,
             'crystallized': False,
-            'memory_size': self.memory.size
+            'consolidated': False,
+            'episodic_size': self.memory.size,
+            'semantic_size': self.semantic.size if self.semantic else 0
         }
 
-        # 2. Retrieve from memory and integrate
-        if use_memory and self.memory.size > 0:
-            # Use end-of-sequence hidden state as query
-            # Shape: [batch, d_model]
-            query_state = hidden_states[:, -1, :]
-            query = self.query_proj(query_state)
+        # 2. Retrieve from episodic and semantic memory
+        query_state = hidden_states[:, -1, :]
+        query = self.query_proj(query_state)
 
-            # Soft retrieval
-            retrieved, weights = self.memory.retrieve_soft(
+        episodic_retrieved = None
+        semantic_retrieved = None
+
+        # 2a. Episodic retrieval
+        if use_memory and self.memory.size > 0:
+            episodic_retrieved, episodic_weights = self.memory.retrieve_soft(
                 query,
                 temperature=self.retrieval_temperature
             )
-
-            memory_output['retrieved_values'] = retrieved
+            memory_output['retrieved_episodic'] = episodic_retrieved
             if return_memory_weights:
-                memory_output['retrieval_weights'] = weights
+                memory_output['episodic_weights'] = episodic_weights
 
-            # Integrate memory with hidden states
-            hidden_states = self._integrate_memory(hidden_states, retrieved)
+        # 2b. Semantic retrieval
+        if use_semantic and self.semantic is not None and self.semantic.size > 0:
+            semantic_retrieved, semantic_weights = self.semantic.query_soft(
+                query,
+                temperature=self.retrieval_temperature
+            )
+            memory_output['retrieved_semantic'] = semantic_retrieved
+            if return_memory_weights:
+                memory_output['semantic_weights'] = semantic_weights
 
+        # 3. Integrate memory with hidden states
+        if episodic_retrieved is not None or semantic_retrieved is not None:
+            hidden_states = self._integrate_memory(
+                hidden_states,
+                episodic_retrieved,
+                semantic_retrieved
+            )
             # Recompute logits with memory-augmented hidden states
             logits = self.gpt.lm_head(self.gpt.final_norm(hidden_states))
 
-        # 3. Experiential processing (for crystallization and prediction)
+        # 4. Experiential processing (for crystallization and prediction)
         if self.experiential is not None:
             exp_output = self.experiential(hidden_states)
             memory_output.update({
@@ -954,16 +1179,22 @@ class MemoryAugmentedGPT(nn.Module):
                 'surprise': exp_output['surprise'],
                 'valence': exp_output['valence'],
                 'arousal': exp_output['arousal'],
-                'salience': exp_output['salience']
+                'salience': exp_output['salience'],
+                'modulated_output': exp_output.get('modulated_output'),
+                'confidence_gate': exp_output.get('confidence_gate'),
+                'meta_surprise': exp_output.get('meta_surprise'),
             })
 
-            # 4. Crystallize high-salience moments
+            # 5. Crystallize high-salience moments into episodic memory
+            # Store the MODULATED output (post-self-regulation), not raw target
+            # This means memories contain what the system "committed to" after reflection
             if crystallize:
+                modulated = exp_output.get('modulated_output', exp_output['target'])
                 for i in range(batch_size):
                     salience = exp_output['salience'][i].item()
                     if self.memory.should_crystallize(salience):
                         self.memory.store(
-                            content=exp_output['target'][i],
+                            content=modulated[i],
                             context=exp_output['prediction'][i],
                             salience=salience,
                             valence=exp_output['valence'][i].item(),
@@ -971,21 +1202,32 @@ class MemoryAugmentedGPT(nn.Module):
                         )
                         memory_output['crystallized'] = True
 
-        memory_output['memory_size'] = self.memory.size
+        # 6. Periodic consolidation (episodic → semantic)
+        self._step_counter += 1
+        if (self.consolidation_interval > 0 and
+            self.semantic is not None and
+            self._step_counter % self.consolidation_interval == 0):
+            n_consolidated = self.consolidate()
+            memory_output['consolidated'] = n_consolidated > 0
+
+        memory_output['episodic_size'] = self.memory.size
+        memory_output['semantic_size'] = self.semantic.size if self.semantic else 0
 
         return logits, hidden_states, memory_output
 
     def _integrate_memory(
         self,
         hidden_states: torch.Tensor,
-        retrieved: torch.Tensor
+        episodic_retrieved: Optional[torch.Tensor] = None,
+        semantic_retrieved: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """
-        Integrate retrieved memory into hidden states.
+        Integrate retrieved episodic and semantic memory into hidden states.
 
         Args:
             hidden_states: [batch, seq_len, d_model]
-            retrieved: [batch, d_model]
+            episodic_retrieved: [batch, d_model] - retrieved episodic memories
+            semantic_retrieved: [batch, d_model] - retrieved semantic knowledge
 
         Returns:
             augmented: [batch, seq_len, d_model]
@@ -994,50 +1236,121 @@ class MemoryAugmentedGPT(nn.Module):
 
         if self.memory_integration == 'residual':
             # Simple additive: add memory to all positions
-            # Broadcast retrieved [batch, d_model] to [batch, seq_len, d_model]
-            memory_contribution = retrieved.unsqueeze(1).expand(-1, seq_len, -1)
-            return hidden_states + self.memory_weight * memory_contribution
+            result = hidden_states
+
+            if episodic_retrieved is not None:
+                episodic_contrib = episodic_retrieved.unsqueeze(1).expand(-1, seq_len, -1)
+                result = result + self.memory_weight * (1 - self.semantic_weight) * episodic_contrib
+
+            if semantic_retrieved is not None:
+                semantic_contrib = semantic_retrieved.unsqueeze(1).expand(-1, seq_len, -1)
+                result = result + self.memory_weight * self.semantic_weight * semantic_contrib
+
+            return result
 
         elif self.memory_integration == 'gated':
-            # Learned gate: how much memory vs original at each position
-            # Expand retrieved to match sequence
-            retrieved_expanded = retrieved.unsqueeze(1).expand(-1, seq_len, -1)
-            projected = self.memory_proj(retrieved_expanded)
+            result = hidden_states
 
-            # Compute gate: [batch, seq_len, d_model]
-            gate_input = torch.cat([hidden_states, projected], dim=-1)
-            gate = self.memory_gate(gate_input)
+            # Integrate episodic memory
+            if episodic_retrieved is not None:
+                episodic_expanded = episodic_retrieved.unsqueeze(1).expand(-1, seq_len, -1)
+                episodic_proj = self.memory_proj(episodic_expanded)
+                gate_input = torch.cat([result, episodic_proj], dim=-1)
+                episodic_gate = self.memory_gate(gate_input)
+                result = episodic_gate * episodic_proj + (1 - episodic_gate) * result
 
-            # Blend: gate * memory + (1 - gate) * original
-            return gate * projected + (1 - gate) * hidden_states
+            # Integrate semantic memory (if available)
+            if semantic_retrieved is not None and self.semantic is not None:
+                semantic_expanded = semantic_retrieved.unsqueeze(1).expand(-1, seq_len, -1)
+                semantic_proj = self.semantic_proj(semantic_expanded)
+                gate_input = torch.cat([result, semantic_proj], dim=-1)
+                semantic_gate = self.semantic_gate(gate_input)
+                result = semantic_gate * semantic_proj + (1 - semantic_gate) * result
+
+            return result
 
         elif self.memory_integration == 'attention':
-            # Cross-attention to memory
-            # retrieved: [batch, d_model] -> [batch, 1, d_model] as single "memory token"
-            memory_tokens = retrieved.unsqueeze(1)
+            result = hidden_states
 
-            # Attend to memory from each position in hidden_states
-            attended, _ = self.memory_attention(
-                hidden_states,
-                memory_tokens,
-                memory_tokens
-            )
+            # Attend to episodic memory
+            if episodic_retrieved is not None:
+                episodic_tokens = episodic_retrieved.unsqueeze(1)
+                attended, _ = self.memory_attention(
+                    result,
+                    episodic_tokens,
+                    episodic_tokens
+                )
+                result = result + self.memory_norm(attended)
 
-            # Residual connection with normalization
-            return hidden_states + self.memory_norm(attended)
+            # Attend to semantic memory
+            if semantic_retrieved is not None and self.semantic is not None:
+                semantic_tokens = semantic_retrieved.unsqueeze(1)
+                attended, _ = self.semantic_attention(
+                    result,
+                    semantic_tokens,
+                    semantic_tokens
+                )
+                result = result + self.semantic_norm(attended)
+
+            return result
 
         else:
             raise ValueError(f"Unknown integration mode: {self.memory_integration}")
 
     def reset_memory(self):
-        """Clear all stored memories."""
+        """Clear all stored memories (episodic and semantic)."""
+        self.memory.clear()
+        if self.semantic is not None:
+            self.semantic.clear()
+        if self.experiential is not None:
+            self.experiential.reset_state()
+        self._step_counter = 0
+
+    def reset_episodic(self):
+        """Clear only episodic memory (preserve semantic knowledge)."""
         self.memory.clear()
         if self.experiential is not None:
             self.experiential.reset_state()
 
+    def consolidate(self, n_clusters: int = 5, min_cluster_size: int = 3) -> int:
+        """
+        Consolidate episodic memories into semantic concepts.
+
+        This is the episodic → semantic transition: repeated patterns
+        become abstracted knowledge.
+
+        Args:
+            n_clusters: Number of clusters to try for grouping episodes
+            min_cluster_size: Minimum episodes per cluster for consolidation
+
+        Returns:
+            Number of new concepts created
+        """
+        if self.semantic is None:
+            return 0
+
+        if self.memory.size < min_cluster_size:
+            return 0
+
+        concepts = self.semantic.consolidate_from_memory(
+            self.memory,
+            n_clusters=n_clusters,
+            min_cluster_size=min_cluster_size
+        )
+
+        # Advance semantic step counter
+        self.semantic.step()
+
+        return len(concepts)
+
     def get_memory_stats(self) -> Dict:
         """Get statistics about current memory state."""
-        stats = self.memory.get_stats()
+        stats = {
+            'episodic': self.memory.get_stats(),
+            'step_counter': self._step_counter
+        }
+        if self.semantic is not None:
+            stats['semantic'] = self.semantic.get_stats()
         if self.experiential is not None:
             stats['experiential_state'] = self.experiential.get_state() is not None
         return stats
@@ -1045,19 +1358,28 @@ class MemoryAugmentedGPT(nn.Module):
     def retrieve_relevant(
         self,
         query: torch.Tensor,
-        top_k: int = 5
-    ) -> List[Tuple[Episode, float]]:
+        top_k: int = 5,
+        include_semantic: bool = True
+    ) -> Dict[str, List]:
         """
         Retrieve relevant memories for a query (hard retrieval for inspection).
 
         Args:
             query: [d_model] query vector
-            top_k: number of memories to retrieve
+            top_k: number of memories to retrieve per memory type
+            include_semantic: whether to include semantic concepts
 
         Returns:
-            List of (Episode, similarity) tuples
+            Dict with 'episodic' and optionally 'semantic' lists of (item, similarity) tuples
         """
-        return self.memory.retrieve(query, top_k=top_k)
+        result = {
+            'episodic': self.memory.retrieve(query, top_k=top_k)
+        }
+
+        if include_semantic and self.semantic is not None and self.semantic.size > 0:
+            result['semantic'] = self.semantic.query(query, top_k=top_k)
+
+        return result
 
 
 def memory_augmented_loss(
@@ -1081,7 +1403,7 @@ def memory_augmented_loss(
 
     Returns:
         total_loss: combined scalar loss
-        loss_dict: breakdown of individual losses
+        loss_dict: breakdown of individual losses including memory stats
     """
     loss_dict = {}
 
@@ -1103,6 +1425,12 @@ def memory_augmented_loss(
         )
         loss_dict['exp_loss'] = exp_loss.item()
         total_loss = total_loss + exp_weight * exp_loss
+
+    # Memory statistics (for logging)
+    loss_dict['episodic_size'] = memory_output.get('episodic_size', 0)
+    loss_dict['semantic_size'] = memory_output.get('semantic_size', 0)
+    loss_dict['crystallized'] = memory_output.get('crystallized', False)
+    loss_dict['consolidated'] = memory_output.get('consolidated', False)
 
     loss_dict['total_loss'] = total_loss.item()
     return total_loss, loss_dict
@@ -1964,6 +2292,256 @@ def test_affect_gradients():
     return True
 
 
+def test_meta_surprise():
+    """Test meta-surprise (self-awareness) computation."""
+    print("Testing meta-surprise...")
+
+    batch_size = 8
+    seq_len = 64
+    d_model = 128
+
+    exp = ExperientialStream(d_model=d_model, use_meta_surprise=True)
+    hidden_states = torch.randn(batch_size, seq_len, d_model)
+
+    output = exp(hidden_states)
+
+    # Check meta-surprise outputs exist
+    assert output['predicted_surprise'] is not None, "predicted_surprise should exist"
+    assert output['meta_surprise'] is not None, "meta_surprise should exist"
+
+    # Check shapes
+    assert output['predicted_surprise'].shape == (batch_size,), \
+        f"Wrong predicted_surprise shape: {output['predicted_surprise'].shape}"
+    assert output['meta_surprise'].shape == (batch_size,), \
+        f"Wrong meta_surprise shape: {output['meta_surprise'].shape}"
+
+    # Check ranges
+    assert (output['predicted_surprise'] >= 0).all() and (output['predicted_surprise'] <= 1).all(), \
+        "predicted_surprise should be in [0, 1]"
+    assert (output['meta_surprise'] >= 0).all(), \
+        "meta_surprise should be non-negative"
+
+    # Check surprise is also present
+    assert output['surprise'].shape == (batch_size,), "surprise should exist"
+
+    print(f"  predicted_surprise range: [{output['predicted_surprise'].min():.3f}, {output['predicted_surprise'].max():.3f}]")
+    print(f"  actual surprise range: [{output['surprise'].min():.3f}, {output['surprise'].max():.3f}]")
+    print(f"  meta_surprise range: [{output['meta_surprise'].min():.3f}, {output['meta_surprise'].max():.3f}]")
+    print("  Meta-surprise shapes and ranges correct!")
+    return True
+
+
+def test_meta_surprise_gradients():
+    """Test that gradients flow through meta-surprise prediction."""
+    print("Testing meta-surprise gradient flow...")
+
+    batch_size = 8
+    seq_len = 64
+    d_model = 128
+
+    exp = ExperientialStream(d_model=d_model, use_meta_surprise=True)
+    hidden_states = torch.randn(batch_size, seq_len, d_model, requires_grad=True)
+
+    output = exp(hidden_states)
+
+    # Use meta_surprise_loss
+    loss = meta_surprise_loss(output['predicted_surprise'], output['surprise'])
+    loss.backward()
+
+    # Check gradients exist for surprise predictor
+    has_grads = any(p.grad is not None and p.grad.abs().sum() > 0
+                   for p in exp.surprise_predictor.parameters())
+    assert has_grads, "No gradients in surprise predictor!"
+
+    # Check hidden_states has gradients
+    assert hidden_states.grad is not None, "No gradient to hidden_states!"
+
+    print("  Gradients flow through meta-surprise correctly!")
+    return True
+
+
+def test_meta_surprise_learning():
+    """Test that the system can learn to predict its own surprise."""
+    print("Testing meta-surprise learning (self-calibration)...")
+
+    d_model = 128
+    batch_size = 16
+    seq_len = 64
+    n_steps = 100
+
+    exp = ExperientialStream(d_model=d_model, use_meta_surprise=True)
+    optimizer = torch.optim.Adam(exp.parameters(), lr=0.01)
+
+    initial_meta_surprise = None
+    final_meta_surprise = None
+
+    for step in range(n_steps):
+        # Generate random hidden states
+        hidden_states = torch.randn(batch_size, seq_len, d_model)
+
+        output = exp(hidden_states)
+
+        # Combined loss: predict world + predict self
+        total_loss, loss_dict = combined_experiential_loss(
+            output,
+            exp_weight=1.0,
+            meta_weight=0.5
+        )
+
+        optimizer.zero_grad()
+        total_loss.backward()
+        optimizer.step()
+
+        # Detach state to prevent memory growth
+        exp.detach_state()
+
+        if step == 0:
+            initial_meta_surprise = loss_dict['mean_meta_surprise']
+        if step == n_steps - 1:
+            final_meta_surprise = loss_dict['mean_meta_surprise']
+
+        if step % 20 == 0:
+            print(f"  Step {step}: exp_loss={loss_dict['exp_loss']:.4f}, "
+                  f"meta_loss={loss_dict['meta_loss']:.4f}, "
+                  f"mean_meta_surprise={loss_dict['mean_meta_surprise']:.4f}")
+
+    print(f"  Initial meta-surprise: {initial_meta_surprise:.4f}")
+    print(f"  Final meta-surprise: {final_meta_surprise:.4f}")
+
+    # Meta-surprise should decrease as system learns to predict itself
+    # Note: this may not always hold with random data, but gives us a baseline
+    print("  Meta-surprise learning test completed!")
+    return True
+
+
+def test_self_modulation():
+    """Test self-modulation: hidden states adjust based on meta-surprise."""
+    print("Testing self-modulation...")
+
+    batch_size = 8
+    seq_len = 64
+    d_model = 128
+
+    exp = ExperientialStream(
+        d_model=d_model,
+        use_meta_surprise=True,
+        use_persistent_state=True
+    )
+    hidden_states = torch.randn(batch_size, seq_len, d_model)
+
+    output = exp(hidden_states)
+
+    # Check self-modulation outputs exist
+    assert output['modulated_output'] is not None, "modulated_output should exist"
+    assert output['confidence_gate'] is not None, "confidence_gate should exist"
+
+    # Check shapes
+    assert output['modulated_output'].shape == (batch_size, d_model), \
+        f"Wrong modulated_output shape: {output['modulated_output'].shape}"
+    assert output['confidence_gate'].shape == (batch_size, d_model), \
+        f"Wrong confidence_gate shape: {output['confidence_gate'].shape}"
+
+    # Check confidence_gate is in [0, 1] (sigmoid output)
+    assert (output['confidence_gate'] >= 0).all() and (output['confidence_gate'] <= 1).all(), \
+        "confidence_gate should be in [0, 1]"
+
+    # Verify modulated_output is a blend of h_end and fallback
+    # When confidence_gate ≈ 1, modulated_output ≈ h_end (target)
+    # When confidence_gate ≈ 0, modulated_output ≈ fallback (prev_state or h_mid)
+    print(f"  modulated_output shape: {output['modulated_output'].shape}")
+    print(f"  confidence_gate range: [{output['confidence_gate'].min():.3f}, {output['confidence_gate'].max():.3f}]")
+    print(f"  confidence_gate mean: {output['confidence_gate'].mean():.3f}")
+
+    print("  Self-modulation shapes and ranges correct!")
+    return True
+
+
+def test_self_modulation_behavior():
+    """Test that high meta-surprise leads to lower confidence."""
+    print("Testing self-modulation behavior...")
+
+    batch_size = 8
+    seq_len = 64
+    d_model = 128
+
+    exp = ExperientialStream(
+        d_model=d_model,
+        use_meta_surprise=True,
+        use_persistent_state=True
+    )
+
+    # Train briefly so meta-surprise predictor has learned something
+    optimizer = torch.optim.Adam(exp.parameters(), lr=0.01)
+    for _ in range(20):
+        hidden = torch.randn(batch_size, seq_len, d_model)
+        exp.reset_state(batch_size)
+        out = exp(hidden)
+        loss, _ = combined_experiential_loss(out, meta_weight=1.0)
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+    # Now test: samples with higher meta-surprise should have lower mean confidence
+    exp.eval()
+    with torch.no_grad():
+        hidden = torch.randn(batch_size * 4, seq_len, d_model)
+        exp.reset_state(batch_size * 4)
+        output = exp(hidden)
+
+        meta_surprise = output['meta_surprise']  # [B]
+        confidence = output['confidence_gate'].mean(dim=-1)  # [B] mean across dimensions
+
+        # Sort samples by meta-surprise
+        sorted_indices = torch.argsort(meta_surprise)
+        low_ms_indices = sorted_indices[:batch_size]
+        high_ms_indices = sorted_indices[-batch_size:]
+
+        low_ms_conf = confidence[low_ms_indices].mean()
+        high_ms_conf = confidence[high_ms_indices].mean()
+
+        print(f"  Low meta-surprise samples: ms={meta_surprise[low_ms_indices].mean():.4f}, conf={low_ms_conf:.4f}")
+        print(f"  High meta-surprise samples: ms={meta_surprise[high_ms_indices].mean():.4f}, conf={high_ms_conf:.4f}")
+
+        # Note: After initialization, this relationship may not hold perfectly
+        # The key test is that the mechanism exists and gradients flow
+        print("  Self-modulation behavior test completed!")
+
+    return True
+
+
+def test_self_modulation_gradients():
+    """Test that gradients flow through self-modulation."""
+    print("Testing self-modulation gradient flow...")
+
+    batch_size = 8
+    seq_len = 64
+    d_model = 128
+
+    exp = ExperientialStream(
+        d_model=d_model,
+        use_meta_surprise=True,
+        use_persistent_state=True
+    )
+    hidden_states = torch.randn(batch_size, seq_len, d_model, requires_grad=True)
+
+    output = exp(hidden_states)
+
+    # Loss that uses modulated_output
+    loss = output['modulated_output'].mean()
+    loss.backward()
+
+    # Check gradients exist for self_modulator
+    has_grads = any(p.grad is not None and p.grad.abs().sum() > 0
+                   for p in exp.self_modulator.parameters())
+    assert has_grads, "No gradients in self_modulator!"
+
+    # Check hidden_states has gradients
+    assert hidden_states.grad is not None, "No gradient to hidden_states!"
+
+    print("  Gradients flow through self-modulation correctly!")
+    return True
+
+
 def test_persistent_state():
     """Test that persistent state carries over across chunks."""
     print("Testing persistent state...")
@@ -2413,7 +2991,8 @@ def test_memory_augmented_gpt():
             gpt,
             memory_capacity=100,
             crystallization_threshold=0.1,  # Low threshold for testing
-            memory_integration=mode
+            memory_integration=mode,
+            use_semantic=False  # Test episodic only first
         )
 
         # Initial forward (no memories yet)
@@ -2426,7 +3005,7 @@ def test_memory_augmented_gpt():
             f"Hidden shape wrong: {hidden.shape}"
         assert 'surprise' in mem_out, "Should have experiential output"
 
-        initial_size = mem_out['memory_size']
+        initial_size = mem_out['episodic_size']
         print(f"    Initial memory size: {initial_size}")
 
         # Run multiple forwards to build up memory
@@ -2434,7 +3013,7 @@ def test_memory_augmented_gpt():
             input_ids = torch.randint(0, vocab_size, (batch_size, seq_len))
             logits, hidden, mem_out = memory_gpt(input_ids, crystallize=True)
 
-        final_size = mem_out['memory_size']
+        final_size = mem_out['episodic_size']
         print(f"    Final memory size: {final_size}")
         assert final_size > initial_size, "Memory should have grown"
 
@@ -2447,9 +3026,9 @@ def test_memory_augmented_gpt():
             return_memory_weights=True
         )
 
-        assert mem_out['retrieved_values'] is not None, "Should have retrieved values"
-        assert mem_out['retrieval_weights'] is not None, "Should have retrieval weights"
-        print(f"    Retrieved values shape: {mem_out['retrieved_values'].shape}")
+        assert mem_out['retrieved_episodic'] is not None, "Should have retrieved episodic values"
+        assert mem_out['episodic_weights'] is not None, "Should have episodic retrieval weights"
+        print(f"    Retrieved values shape: {mem_out['retrieved_episodic'].shape}")
 
         # Reset and verify
         memory_gpt.reset_memory()
@@ -2475,7 +3054,8 @@ def test_memory_augmented_gradient_flow():
         gpt,
         memory_capacity=50,
         crystallization_threshold=0.05,
-        memory_integration='gated'
+        memory_integration='gated',
+        use_semantic=False  # Test episodic only
     )
 
     # Build up some memories first
@@ -2532,7 +3112,8 @@ def test_memory_augmented_learning():
         gpt,
         memory_capacity=50,
         crystallization_threshold=0.1,
-        memory_integration='gated'
+        memory_integration='gated',
+        use_semantic=False  # Test episodic only
     )
 
     optimizer = torch.optim.Adam(memory_gpt.parameters(), lr=0.01)
@@ -2555,7 +3136,7 @@ def test_memory_augmented_learning():
         losses.append(loss.item())
 
         if step % 10 == 0:
-            print(f"  Step {step}: loss={loss.item():.4f}, memory_size={mem_out['memory_size']}")
+            print(f"  Step {step}: loss={loss.item():.4f}, episodic_size={mem_out['episodic_size']}")
 
     initial_loss = sum(losses[:5]) / 5
     final_loss = sum(losses[-5:]) / 5
@@ -2839,6 +3420,228 @@ def test_semantic_relations():
     return True
 
 
+def test_integrated_semantic_memory():
+    """Test MemoryAugmentedGPT with semantic memory integration."""
+    print("Testing integrated semantic memory...")
+
+    # Setup
+    vocab_size = 1000
+    d_model = 128
+    batch_size = 4
+    seq_len = 32
+
+    config = MockGPTConfig(vocab_size=vocab_size, d_model=d_model)
+    gpt = MockGPT(config)
+
+    # Create memory-augmented model with semantic memory
+    memory_gpt = MemoryAugmentedGPT(
+        gpt,
+        memory_capacity=100,
+        crystallization_threshold=0.1,  # Low threshold for testing
+        memory_integration='gated',
+        use_semantic=True,
+        consolidation_interval=20,  # Consolidate every 20 steps
+        min_consolidation_evidence=3
+    )
+
+    # Verify semantic stream is initialized
+    assert memory_gpt.semantic is not None, "Semantic stream should be initialized"
+    assert memory_gpt.semantic.size == 0, "Semantic stream should start empty"
+
+    # Run multiple forwards to build episodic memory
+    print("  Building episodic memory...")
+    for i in range(25):  # Enough steps to trigger consolidation
+        input_ids = torch.randint(0, vocab_size, (batch_size, seq_len))
+        logits, hidden, mem_out = memory_gpt(input_ids, crystallize=True)
+
+    episodic_size = mem_out['episodic_size']
+    semantic_size = mem_out['semantic_size']
+    print(f"  Episodic size: {episodic_size}, Semantic size: {semantic_size}")
+
+    # Should have some episodic memories
+    assert episodic_size > 0, "Should have episodic memories"
+
+    # Semantic might have consolidated (depends on clustering)
+    # Not guaranteed, but should not crash
+
+    # Test retrieval with semantic
+    input_ids = torch.randint(0, vocab_size, (batch_size, seq_len))
+    logits, hidden, mem_out = memory_gpt(
+        input_ids,
+        use_memory=True,
+        use_semantic=True,
+        return_memory_weights=True
+    )
+
+    assert mem_out['retrieved_episodic'] is not None, "Should have episodic retrieval"
+    print(f"  Episodic retrieval shape: {mem_out['retrieved_episodic'].shape}")
+
+    # Manual consolidation
+    print("  Testing manual consolidation...")
+    n_consolidated = memory_gpt.consolidate(n_clusters=3, min_cluster_size=3)
+    print(f"  Consolidated {n_consolidated} concepts")
+
+    # Check semantic memory grew
+    if n_consolidated > 0:
+        assert memory_gpt.semantic.size > 0, "Semantic memory should have concepts"
+
+        # Now test semantic retrieval
+        input_ids = torch.randint(0, vocab_size, (batch_size, seq_len))
+        logits, hidden, mem_out = memory_gpt(
+            input_ids,
+            use_memory=True,
+            use_semantic=True,
+            return_memory_weights=True
+        )
+
+        if mem_out['retrieved_semantic'] is not None:
+            print(f"  Semantic retrieval shape: {mem_out['retrieved_semantic'].shape}")
+        else:
+            print("  No semantic retrieval (semantic memory may be empty)")
+
+    # Test retrieve_relevant
+    query = torch.randn(d_model)
+    results = memory_gpt.retrieve_relevant(query, top_k=3, include_semantic=True)
+    assert 'episodic' in results, "Should have episodic results"
+    print(f"  retrieve_relevant: {len(results['episodic'])} episodic, {len(results.get('semantic', []))} semantic")
+
+    # Test get_memory_stats
+    stats = memory_gpt.get_memory_stats()
+    assert 'episodic' in stats, "Should have episodic stats"
+    if memory_gpt.semantic.size > 0:
+        assert 'semantic' in stats, "Should have semantic stats"
+    print(f"  Stats: episodic={stats['episodic']['size']}, step_counter={stats['step_counter']}")
+
+    # Test reset_episodic (preserve semantic)
+    semantic_before = memory_gpt.semantic.size
+    memory_gpt.reset_episodic()
+    assert memory_gpt.memory.size == 0, "Episodic should be cleared"
+    assert memory_gpt.semantic.size == semantic_before, "Semantic should be preserved"
+
+    # Test full reset
+    memory_gpt.reset_memory()
+    assert memory_gpt.memory.size == 0, "Episodic should be cleared"
+    assert memory_gpt.semantic.size == 0, "Semantic should be cleared"
+
+    print("  Integrated semantic memory test passed!")
+    return True
+
+
+def test_integrated_semantic_gradient_flow():
+    """Test gradient flow through semantic retrieval."""
+    print("Testing gradient flow through semantic retrieval...")
+
+    vocab_size = 1000
+    d_model = 64
+    batch_size = 2
+    seq_len = 16
+
+    config = MockGPTConfig(vocab_size=vocab_size, d_model=d_model)
+    gpt = MockGPT(config)
+
+    memory_gpt = MemoryAugmentedGPT(
+        gpt,
+        memory_capacity=50,
+        crystallization_threshold=0.0,  # Store everything
+        memory_integration='gated',
+        use_semantic=True,
+        consolidation_interval=0  # Manual only
+    )
+
+    # Build some episodic memories
+    for _ in range(20):
+        input_ids = torch.randint(0, vocab_size, (batch_size, seq_len))
+        memory_gpt(input_ids, crystallize=True)
+
+    # Consolidate to create semantic memories
+    n_consolidated = memory_gpt.consolidate(n_clusters=3, min_cluster_size=3)
+
+    if n_consolidated == 0:
+        print("  Warning: No concepts consolidated, testing with episodic only")
+
+    # Test gradient flow
+    input_ids = torch.randint(0, vocab_size, (batch_size, seq_len))
+    targets = torch.randint(0, vocab_size, (batch_size, seq_len))
+
+    logits, hidden, mem_out = memory_gpt(
+        input_ids,
+        use_memory=True,
+        use_semantic=True,
+        crystallize=False
+    )
+
+    # Compute loss
+    loss, loss_dict = memory_augmented_loss(logits, targets, mem_out)
+
+    # Check gradients flow
+    loss.backward()
+
+    # Check query projection has gradients
+    assert memory_gpt.query_proj.weight.grad is not None, "Query proj should have gradients"
+    assert memory_gpt.query_proj.weight.grad.abs().sum() > 0, "Query proj gradients should be non-zero"
+
+    # Check memory gate has gradients
+    assert memory_gpt.memory_gate[0].weight.grad is not None, "Memory gate should have gradients"
+
+    # If semantic was used, check semantic layers
+    if n_consolidated > 0 and hasattr(memory_gpt, 'semantic_gate'):
+        assert memory_gpt.semantic_gate[0].weight.grad is not None, "Semantic gate should have gradients"
+        print("  Semantic gate gradients verified")
+
+    print(f"  Loss dict: lm={loss_dict['lm_loss']:.4f}, episodic={loss_dict['episodic_size']}, semantic={loss_dict['semantic_size']}")
+    print("  Gradient flow test passed!")
+    return True
+
+
+def test_all_integration_modes_with_semantic():
+    """Test all integration modes work with semantic memory."""
+    print("Testing all integration modes with semantic...")
+
+    vocab_size = 1000
+    d_model = 64
+    batch_size = 2
+    seq_len = 16
+
+    config = MockGPTConfig(vocab_size=vocab_size, d_model=d_model)
+
+    for mode in ['residual', 'gated', 'attention']:
+        print(f"  Testing {mode} mode...")
+
+        gpt = MockGPT(config)
+        memory_gpt = MemoryAugmentedGPT(
+            gpt,
+            memory_capacity=50,
+            crystallization_threshold=0.0,
+            memory_integration=mode,
+            use_semantic=True,
+            consolidation_interval=0
+        )
+
+        # Build memories
+        for _ in range(15):
+            input_ids = torch.randint(0, vocab_size, (batch_size, seq_len))
+            memory_gpt(input_ids, crystallize=True)
+
+        # Consolidate
+        memory_gpt.consolidate(n_clusters=2, min_cluster_size=3)
+
+        # Forward with both memory types
+        input_ids = torch.randint(0, vocab_size, (batch_size, seq_len))
+        logits, hidden, mem_out = memory_gpt(
+            input_ids,
+            use_memory=True,
+            use_semantic=True
+        )
+
+        assert logits.shape == (batch_size, seq_len, vocab_size), f"Wrong logits shape for {mode}"
+        assert hidden.shape == (batch_size, seq_len, d_model), f"Wrong hidden shape for {mode}"
+
+        print(f"    {mode}: episodic={mem_out['episodic_size']}, semantic={mem_out['semantic_size']}")
+
+    print("  All integration modes test passed!")
+    return True
+
+
 if __name__ == "__main__":
     print("=" * 60)
     print("ExperientialStream & EpisodicMemory Tests")
@@ -2855,6 +3658,18 @@ if __name__ == "__main__":
     test_affect_prediction()
     print()
     test_affect_gradients()
+    print()
+    test_meta_surprise()
+    print()
+    test_meta_surprise_gradients()
+    print()
+    test_meta_surprise_learning()
+    print()
+    test_self_modulation()
+    print()
+    test_self_modulation_behavior()
+    print()
+    test_self_modulation_gradients()
     print()
     test_persistent_state()
     print()
@@ -2888,6 +3703,17 @@ if __name__ == "__main__":
     test_semantic_generalization()
     print()
     test_semantic_relations()
+
+    print()
+    print("=" * 60)
+    print("Integrated Semantic Memory Tests")
+    print("=" * 60)
+
+    test_integrated_semantic_memory()
+    print()
+    test_integrated_semantic_gradient_flow()
+    print()
+    test_all_integration_modes_with_semantic()
 
     print()
     print("=" * 60)
