@@ -69,12 +69,14 @@ class ExperientialStream(nn.Module):
         predictor_hidden_mult: int = 2,
         split_ratio: float = 0.5,
         use_layer_norm: bool = True,
-        use_persistent_state: bool = True
+        use_persistent_state: bool = True,
+        use_affect: bool = True
     ):
         super().__init__()
         self.d_model = d_model
         self.split_ratio = split_ratio
         self.use_persistent_state = use_persistent_state
+        self.use_affect = use_affect
 
         # Predictor input size depends on whether we use persistent state
         # With persistent state: [h_mid, prev_state] → predicted h_end
@@ -97,6 +99,25 @@ class ExperientialStream(nn.Module):
             self.state_gate = nn.Sequential(
                 nn.Linear(d_model * 2, d_model),
                 nn.Sigmoid()
+            )
+
+        # Affect prediction heads (valence and arousal)
+        # These predict the emotional quality of the current state
+        if use_affect:
+            affect_hidden = d_model // 2
+            # Valence: positive/negative (-1 to 1)
+            self.valence_head = nn.Sequential(
+                nn.Linear(d_model, affect_hidden),
+                nn.GELU(),
+                nn.Linear(affect_hidden, 1),
+                nn.Tanh()  # Output in [-1, 1]
+            )
+            # Arousal: activation level (0 to 1)
+            self.arousal_head = nn.Sequential(
+                nn.Linear(d_model, affect_hidden),
+                nn.GELU(),
+                nn.Linear(affect_hidden, 1),
+                nn.Sigmoid()  # Output in [0, 1]
             )
 
         # Persistent state buffer (not a parameter, just a buffer)
@@ -172,7 +193,10 @@ class ExperientialStream(nn.Module):
                 - state: [batch, d_model] current state (h_mid)
                 - prediction: [batch, d_model] predicted future (pred h_end)
                 - target: [batch, d_model] actual future (h_end, detached)
-                - surprise: [batch] prediction error
+                - surprise: [batch] prediction error (0=expected, 1=surprising)
+                - valence: [batch] emotional valence (-1=negative, 1=positive)
+                - arousal: [batch] activation level (0=calm, 1=excited)
+                - salience: [batch] importance signal (surprise × arousal × |valence|)
                 - persistent_state: [batch, d_model] updated persistent state
                 - gate_values: [batch, d_model] state gate activations (if persistent)
         """
@@ -206,6 +230,20 @@ class ExperientialStream(nn.Module):
             similarity = (pred_norm * target_norm).sum(dim=-1)
             surprise = 1 - similarity
 
+        # Compute affect (valence and arousal)
+        valence = None
+        arousal = None
+        salience = None
+        if self.use_affect:
+            # Predict affect from the end state (what we actually experienced)
+            valence = self.valence_head(h_end).squeeze(-1)  # [B]
+            arousal = self.arousal_head(h_end).squeeze(-1)  # [B]
+
+            # Salience = how important is this moment?
+            # High surprise + high arousal + strong valence = very salient
+            with torch.no_grad():
+                salience = surprise * arousal * valence.abs()
+
         # Update persistent state
         gate_values = None
         if self.use_persistent_state and update_state:
@@ -223,6 +261,9 @@ class ExperientialStream(nn.Module):
             'prediction': prediction,
             'target': h_end.detach(),  # stop gradient for contrastive loss
             'surprise': surprise,
+            'valence': valence,
+            'arousal': arousal,
+            'salience': salience,
             'mid_idx': mid_idx,
             'end_idx': end_idx if end_idx != -1 else seq_len - 1,
             'persistent_state': self._persistent_state,
@@ -512,6 +553,83 @@ def test_learning():
     return True
 
 
+def test_affect_prediction():
+    """Test that affect prediction produces valid outputs."""
+    print("Testing affect prediction...")
+
+    batch_size = 4
+    seq_len = 64
+    d_model = 128
+
+    # Test with affect enabled (default)
+    exp = ExperientialStream(d_model=d_model, use_affect=True)
+    hidden_states = torch.randn(batch_size, seq_len, d_model)
+
+    output = exp(hidden_states)
+
+    # Check affect outputs exist and have correct shape
+    assert output['valence'] is not None, "Valence should exist"
+    assert output['arousal'] is not None, "Arousal should exist"
+    assert output['salience'] is not None, "Salience should exist"
+
+    assert output['valence'].shape == (batch_size,), f"Valence shape wrong: {output['valence'].shape}"
+    assert output['arousal'].shape == (batch_size,), f"Arousal shape wrong: {output['arousal'].shape}"
+    assert output['salience'].shape == (batch_size,), f"Salience shape wrong: {output['salience'].shape}"
+
+    # Check value ranges
+    assert (output['valence'] >= -1).all() and (output['valence'] <= 1).all(), \
+        f"Valence out of range [-1, 1]: {output['valence']}"
+    assert (output['arousal'] >= 0).all() and (output['arousal'] <= 1).all(), \
+        f"Arousal out of range [0, 1]: {output['arousal']}"
+    assert (output['salience'] >= 0).all(), f"Salience should be non-negative: {output['salience']}"
+
+    print(f"  Valence range: [{output['valence'].min():.3f}, {output['valence'].max():.3f}]")
+    print(f"  Arousal range: [{output['arousal'].min():.3f}, {output['arousal'].max():.3f}]")
+    print(f"  Salience range: [{output['salience'].min():.3f}, {output['salience'].max():.3f}]")
+
+    # Test with affect disabled
+    exp_no_affect = ExperientialStream(d_model=d_model, use_affect=False)
+    output_no_affect = exp_no_affect(hidden_states)
+
+    assert output_no_affect['valence'] is None, "Valence should be None when affect disabled"
+    assert output_no_affect['arousal'] is None, "Arousal should be None when affect disabled"
+    assert output_no_affect['salience'] is None, "Salience should be None when affect disabled"
+
+    print("  Affect prediction shapes and ranges correct!")
+    return True
+
+
+def test_affect_gradients():
+    """Test that gradients flow through affect heads."""
+    print("Testing affect gradient flow...")
+
+    batch_size = 8
+    seq_len = 64
+    d_model = 128
+
+    exp = ExperientialStream(d_model=d_model, use_affect=True)
+    hidden_states = torch.randn(batch_size, seq_len, d_model, requires_grad=True)
+
+    output = exp(hidden_states)
+
+    # Create a simple loss using affect outputs
+    # (In practice, we'd have a target for valence/arousal)
+    affect_loss = output['valence'].mean() + output['arousal'].mean()
+    affect_loss.backward()
+
+    # Check gradients exist for affect heads
+    has_valence_grads = any(p.grad is not None and p.grad.abs().sum() > 0
+                           for p in exp.valence_head.parameters())
+    has_arousal_grads = any(p.grad is not None and p.grad.abs().sum() > 0
+                           for p in exp.arousal_head.parameters())
+
+    assert has_valence_grads, "No gradients in valence head!"
+    assert has_arousal_grads, "No gradients in arousal head!"
+
+    print("  Gradients flow through affect heads correctly!")
+    return True
+
+
 def test_persistent_state():
     """Test that persistent state carries over across chunks."""
     print("Testing persistent state...")
@@ -648,6 +766,10 @@ if __name__ == "__main__":
     test_gradient_flow()
     print()
     test_learning()
+    print()
+    test_affect_prediction()
+    print()
+    test_affect_gradients()
     print()
     test_persistent_state()
     print()
