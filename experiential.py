@@ -772,6 +772,342 @@ def compute_metrics(output: Dict[str, torch.Tensor]) -> Dict[str, float]:
     }
 
 
+# --- Memory-Augmented Generation ---
+
+class MemoryAugmentedGPT(nn.Module):
+    """
+    GPT model augmented with episodic memory.
+
+    Retrieves relevant memories from past experiences and uses them to
+    condition the model's predictions. Enables:
+    - Learning from past experiences (what worked before)
+    - Maintaining consistency across long contexts
+    - Recalling relevant patterns/events
+
+    Integration options:
+    1. Residual: Add retrieved memory to hidden states
+    2. Gated: Learn to blend memory with hidden states
+    3. Cross-attention: Attend to memory as additional context
+
+    Usage:
+        gpt = GPT(config)
+        memory_gpt = MemoryAugmentedGPT(gpt, memory_capacity=1000)
+
+        # Training: forward returns (logits, hidden_states, memory_output)
+        logits, hidden, mem_out = memory_gpt(input_ids, crystallize=True)
+
+        # The model learns to use retrieved memories
+        lm_loss = F.cross_entropy(logits.view(-1, vocab), targets.view(-1))
+        exp_loss = experiential_loss(mem_out['prediction'], mem_out['target'])
+        total_loss = lm_loss + 0.1 * exp_loss
+    """
+
+    def __init__(
+        self,
+        gpt_model: nn.Module,
+        memory_capacity: int = 1000,
+        crystallization_threshold: float = 0.3,
+        memory_integration: str = 'gated',  # 'residual', 'gated', or 'attention'
+        memory_weight: float = 0.1,
+        use_experiential: bool = True,
+        retrieval_temperature: float = 0.1,
+    ):
+        """
+        Args:
+            gpt_model: Pre-existing GPT model to wrap
+            memory_capacity: Maximum episodes to store
+            crystallization_threshold: Salience threshold for storing memories
+            memory_integration: How to integrate memories ('residual', 'gated', 'attention')
+            memory_weight: Base weight for memory contribution (for residual mode)
+            use_experiential: Whether to use experiential stream for surprise/salience
+            retrieval_temperature: Temperature for soft retrieval
+        """
+        super().__init__()
+        self.gpt = gpt_model
+        self.d_model = gpt_model.config.d_model
+        self.memory_integration = memory_integration
+        self.memory_weight = memory_weight
+        self.retrieval_temperature = retrieval_temperature
+
+        # Episodic memory
+        self.memory = EpisodicMemory(
+            d_model=self.d_model,
+            capacity=memory_capacity,
+            crystallization_threshold=crystallization_threshold
+        )
+
+        # Experiential stream (for computing surprise/salience)
+        if use_experiential:
+            self.experiential = ExperientialStream(
+                d_model=self.d_model,
+                use_affect=True,
+                use_persistent_state=True
+            )
+        else:
+            self.experiential = None
+
+        # Memory integration components
+        if memory_integration == 'gated':
+            # Learned gate: how much to use memory vs original hidden state
+            self.memory_gate = nn.Sequential(
+                nn.Linear(self.d_model * 2, self.d_model),
+                nn.Sigmoid()
+            )
+            # Project retrieved memory to match hidden state space
+            self.memory_proj = nn.Linear(self.d_model, self.d_model)
+
+        elif memory_integration == 'attention':
+            # Cross-attention to memory
+            self.memory_attention = nn.MultiheadAttention(
+                self.d_model,
+                num_heads=4,
+                batch_first=True
+            )
+            self.memory_norm = nn.LayerNorm(self.d_model)
+
+        # Query projection for retrieval
+        self.query_proj = nn.Linear(self.d_model, self.d_model)
+
+        self._init_weights()
+
+    def _init_weights(self):
+        """Initialize memory integration weights."""
+        if self.memory_integration == 'gated':
+            # Initialize gate to pass through original hidden states initially
+            nn.init.zeros_(self.memory_gate[0].weight)
+            nn.init.constant_(self.memory_gate[0].bias, -2.0)  # sigmoid(-2) ≈ 0.12
+            nn.init.xavier_uniform_(self.memory_proj.weight)
+            nn.init.zeros_(self.memory_proj.bias)
+
+        nn.init.xavier_uniform_(self.query_proj.weight)
+        nn.init.zeros_(self.query_proj.bias)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        input_pos: Optional[torch.Tensor] = None,
+        crystallize: bool = True,
+        use_memory: bool = True,
+        return_memory_weights: bool = False
+    ) -> Tuple[torch.Tensor, torch.Tensor, Dict]:
+        """
+        Forward pass with memory retrieval and optional crystallization.
+
+        Args:
+            input_ids: [batch, seq_len] input token IDs
+            input_pos: Optional position indices
+            crystallize: Whether to store high-salience moments in memory
+            use_memory: Whether to retrieve and use memories
+            return_memory_weights: Include retrieval weights in output
+
+        Returns:
+            logits: [batch, seq_len, vocab_size] output logits
+            hidden_states: [batch, seq_len, d_model] final hidden states
+            memory_output: dict with experiential/memory info
+        """
+        batch_size, seq_len = input_ids.shape
+        device = input_ids.device
+
+        # 1. Get hidden states from GPT
+        logits, hidden_states = self.gpt(
+            input_ids,
+            input_pos=input_pos,
+            return_hidden_states=True
+        )
+
+        memory_output = {
+            'retrieved_values': None,
+            'retrieval_weights': None,
+            'crystallized': False,
+            'memory_size': self.memory.size
+        }
+
+        # 2. Retrieve from memory and integrate
+        if use_memory and self.memory.size > 0:
+            # Use end-of-sequence hidden state as query
+            # Shape: [batch, d_model]
+            query_state = hidden_states[:, -1, :]
+            query = self.query_proj(query_state)
+
+            # Soft retrieval
+            retrieved, weights = self.memory.retrieve_soft(
+                query,
+                temperature=self.retrieval_temperature
+            )
+
+            memory_output['retrieved_values'] = retrieved
+            if return_memory_weights:
+                memory_output['retrieval_weights'] = weights
+
+            # Integrate memory with hidden states
+            hidden_states = self._integrate_memory(hidden_states, retrieved)
+
+            # Recompute logits with memory-augmented hidden states
+            logits = self.gpt.lm_head(self.gpt.final_norm(hidden_states))
+
+        # 3. Experiential processing (for crystallization and prediction)
+        if self.experiential is not None:
+            exp_output = self.experiential(hidden_states)
+            memory_output.update({
+                'prediction': exp_output['prediction'],
+                'target': exp_output['target'],
+                'surprise': exp_output['surprise'],
+                'valence': exp_output['valence'],
+                'arousal': exp_output['arousal'],
+                'salience': exp_output['salience']
+            })
+
+            # 4. Crystallize high-salience moments
+            if crystallize:
+                for i in range(batch_size):
+                    salience = exp_output['salience'][i].item()
+                    if self.memory.should_crystallize(salience):
+                        self.memory.store(
+                            content=exp_output['target'][i],
+                            context=exp_output['prediction'][i],
+                            salience=salience,
+                            valence=exp_output['valence'][i].item(),
+                            arousal=exp_output['arousal'][i].item()
+                        )
+                        memory_output['crystallized'] = True
+
+        memory_output['memory_size'] = self.memory.size
+
+        return logits, hidden_states, memory_output
+
+    def _integrate_memory(
+        self,
+        hidden_states: torch.Tensor,
+        retrieved: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Integrate retrieved memory into hidden states.
+
+        Args:
+            hidden_states: [batch, seq_len, d_model]
+            retrieved: [batch, d_model]
+
+        Returns:
+            augmented: [batch, seq_len, d_model]
+        """
+        batch_size, seq_len, d_model = hidden_states.shape
+
+        if self.memory_integration == 'residual':
+            # Simple additive: add memory to all positions
+            # Broadcast retrieved [batch, d_model] to [batch, seq_len, d_model]
+            memory_contribution = retrieved.unsqueeze(1).expand(-1, seq_len, -1)
+            return hidden_states + self.memory_weight * memory_contribution
+
+        elif self.memory_integration == 'gated':
+            # Learned gate: how much memory vs original at each position
+            # Expand retrieved to match sequence
+            retrieved_expanded = retrieved.unsqueeze(1).expand(-1, seq_len, -1)
+            projected = self.memory_proj(retrieved_expanded)
+
+            # Compute gate: [batch, seq_len, d_model]
+            gate_input = torch.cat([hidden_states, projected], dim=-1)
+            gate = self.memory_gate(gate_input)
+
+            # Blend: gate * memory + (1 - gate) * original
+            return gate * projected + (1 - gate) * hidden_states
+
+        elif self.memory_integration == 'attention':
+            # Cross-attention to memory
+            # retrieved: [batch, d_model] -> [batch, 1, d_model] as single "memory token"
+            memory_tokens = retrieved.unsqueeze(1)
+
+            # Attend to memory from each position in hidden_states
+            attended, _ = self.memory_attention(
+                hidden_states,
+                memory_tokens,
+                memory_tokens
+            )
+
+            # Residual connection with normalization
+            return hidden_states + self.memory_norm(attended)
+
+        else:
+            raise ValueError(f"Unknown integration mode: {self.memory_integration}")
+
+    def reset_memory(self):
+        """Clear all stored memories."""
+        self.memory.clear()
+        if self.experiential is not None:
+            self.experiential.reset_state()
+
+    def get_memory_stats(self) -> Dict:
+        """Get statistics about current memory state."""
+        stats = self.memory.get_stats()
+        if self.experiential is not None:
+            stats['experiential_state'] = self.experiential.get_state() is not None
+        return stats
+
+    def retrieve_relevant(
+        self,
+        query: torch.Tensor,
+        top_k: int = 5
+    ) -> List[Tuple[Episode, float]]:
+        """
+        Retrieve relevant memories for a query (hard retrieval for inspection).
+
+        Args:
+            query: [d_model] query vector
+            top_k: number of memories to retrieve
+
+        Returns:
+            List of (Episode, similarity) tuples
+        """
+        return self.memory.retrieve(query, top_k=top_k)
+
+
+def memory_augmented_loss(
+    lm_logits: torch.Tensor,
+    targets: torch.Tensor,
+    memory_output: Dict,
+    lm_weight: float = 1.0,
+    exp_weight: float = 0.1,
+    retrieval_weight: float = 0.0
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """
+    Combined loss for memory-augmented generation.
+
+    Args:
+        lm_logits: [batch, seq_len, vocab] model output logits
+        targets: [batch, seq_len] target token IDs
+        memory_output: output dict from MemoryAugmentedGPT.forward()
+        lm_weight: weight for language modeling loss
+        exp_weight: weight for experiential prediction loss
+        retrieval_weight: weight for retrieval contrastive loss (if applicable)
+
+    Returns:
+        total_loss: combined scalar loss
+        loss_dict: breakdown of individual losses
+    """
+    loss_dict = {}
+
+    # Language modeling loss
+    lm_loss = F.cross_entropy(
+        lm_logits.view(-1, lm_logits.size(-1)),
+        targets.view(-1),
+        ignore_index=-100  # Skip padding
+    )
+    loss_dict['lm_loss'] = lm_loss.item()
+
+    total_loss = lm_weight * lm_loss
+
+    # Experiential prediction loss
+    if 'prediction' in memory_output and memory_output['prediction'] is not None:
+        exp_loss = experiential_loss(
+            memory_output['prediction'],
+            memory_output['target']
+        )
+        loss_dict['exp_loss'] = exp_loss.item()
+        total_loss = total_loss + exp_weight * exp_loss
+
+    loss_dict['total_loss'] = total_loss.item()
+    return total_loss, loss_dict
+
+
 # --- Testing utilities ---
 
 def test_shapes():
@@ -1358,6 +1694,223 @@ def test_retrieve_soft_learning():
     return True
 
 
+# Mock GPT for testing MemoryAugmentedGPT
+class MockGPTConfig:
+    """Minimal config for testing."""
+    def __init__(self, vocab_size=1000, d_model=128, n_layer=2):
+        self.vocab_size = vocab_size
+        self.d_model = d_model
+        self.n_layer = n_layer
+
+
+class MockGPT(nn.Module):
+    """Minimal GPT-like model for testing memory augmentation."""
+
+    def __init__(self, config: MockGPTConfig):
+        super().__init__()
+        self.config = config
+        self.token_embedding = nn.Embedding(config.vocab_size, config.d_model)
+        self.layers = nn.ModuleList([
+            nn.Linear(config.d_model, config.d_model)
+            for _ in range(config.n_layer)
+        ])
+        self.final_norm = nn.LayerNorm(config.d_model)
+        self.lm_head = nn.Linear(config.d_model, config.vocab_size)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        input_pos=None,
+        return_hidden_states: bool = False
+    ):
+        x = self.token_embedding(input_ids)
+        for layer in self.layers:
+            x = F.gelu(layer(x))
+        hidden_states = self.final_norm(x)
+        logits = self.lm_head(hidden_states)
+
+        if return_hidden_states:
+            return logits, hidden_states
+        return logits, None
+
+
+def test_memory_augmented_gpt():
+    """Test MemoryAugmentedGPT wrapper."""
+    print("Testing MemoryAugmentedGPT...")
+
+    # Setup
+    vocab_size = 1000
+    d_model = 128
+    batch_size = 4
+    seq_len = 32
+
+    config = MockGPTConfig(vocab_size=vocab_size, d_model=d_model)
+    gpt = MockGPT(config)
+
+    # Test all three integration modes
+    for mode in ['residual', 'gated', 'attention']:
+        print(f"  Testing {mode} integration...")
+
+        memory_gpt = MemoryAugmentedGPT(
+            gpt,
+            memory_capacity=100,
+            crystallization_threshold=0.1,  # Low threshold for testing
+            memory_integration=mode
+        )
+
+        # Initial forward (no memories yet)
+        input_ids = torch.randint(0, vocab_size, (batch_size, seq_len))
+        logits, hidden, mem_out = memory_gpt(input_ids, crystallize=True)
+
+        assert logits.shape == (batch_size, seq_len, vocab_size), \
+            f"Logits shape wrong: {logits.shape}"
+        assert hidden.shape == (batch_size, seq_len, d_model), \
+            f"Hidden shape wrong: {hidden.shape}"
+        assert 'surprise' in mem_out, "Should have experiential output"
+
+        initial_size = mem_out['memory_size']
+        print(f"    Initial memory size: {initial_size}")
+
+        # Run multiple forwards to build up memory
+        for _ in range(10):
+            input_ids = torch.randint(0, vocab_size, (batch_size, seq_len))
+            logits, hidden, mem_out = memory_gpt(input_ids, crystallize=True)
+
+        final_size = mem_out['memory_size']
+        print(f"    Final memory size: {final_size}")
+        assert final_size > initial_size, "Memory should have grown"
+
+        # Test with memory retrieval
+        input_ids = torch.randint(0, vocab_size, (batch_size, seq_len))
+        logits_mem, hidden_mem, mem_out = memory_gpt(
+            input_ids,
+            crystallize=False,
+            use_memory=True,
+            return_memory_weights=True
+        )
+
+        assert mem_out['retrieved_values'] is not None, "Should have retrieved values"
+        assert mem_out['retrieval_weights'] is not None, "Should have retrieval weights"
+        print(f"    Retrieved values shape: {mem_out['retrieved_values'].shape}")
+
+        # Reset and verify
+        memory_gpt.reset_memory()
+        assert memory_gpt.memory.size == 0, "Memory should be cleared"
+        print(f"    {mode} integration works!")
+
+    print("  MemoryAugmentedGPT test passed!")
+    return True
+
+
+def test_memory_augmented_gradient_flow():
+    """Test that gradients flow through memory-augmented model."""
+    print("Testing memory-augmented gradient flow...")
+
+    vocab_size = 500
+    d_model = 64
+    batch_size = 4
+    seq_len = 16
+
+    config = MockGPTConfig(vocab_size=vocab_size, d_model=d_model)
+    gpt = MockGPT(config)
+    memory_gpt = MemoryAugmentedGPT(
+        gpt,
+        memory_capacity=50,
+        crystallization_threshold=0.05,
+        memory_integration='gated'
+    )
+
+    # Build up some memories first
+    for _ in range(5):
+        input_ids = torch.randint(0, vocab_size, (batch_size, seq_len))
+        memory_gpt(input_ids, crystallize=True)
+
+    # Now test gradient flow
+    input_ids = torch.randint(0, vocab_size, (batch_size, seq_len))
+    targets = torch.randint(0, vocab_size, (batch_size, seq_len))
+
+    logits, hidden, mem_out = memory_gpt(input_ids, use_memory=True)
+
+    # Compute loss
+    loss, loss_dict = memory_augmented_loss(
+        logits, targets, mem_out,
+        lm_weight=1.0, exp_weight=0.1
+    )
+
+    # Backward pass
+    loss.backward()
+
+    # Check gradients exist
+    has_gpt_grads = any(
+        p.grad is not None and p.grad.abs().sum() > 0
+        for p in gpt.parameters()
+    )
+    assert has_gpt_grads, "GPT should have gradients"
+
+    has_memory_grads = any(
+        p.grad is not None and p.grad.abs().sum() > 0
+        for p in memory_gpt.memory_gate.parameters()
+    )
+    assert has_memory_grads, "Memory gate should have gradients"
+
+    print(f"  Loss breakdown: {loss_dict}")
+    print("  Gradient flow test passed!")
+    return True
+
+
+def test_memory_augmented_learning():
+    """Test that memory-augmented model can learn."""
+    print("Testing memory-augmented learning...")
+
+    vocab_size = 200
+    d_model = 64
+    batch_size = 8
+    seq_len = 16
+    n_steps = 30
+
+    config = MockGPTConfig(vocab_size=vocab_size, d_model=d_model)
+    gpt = MockGPT(config)
+    memory_gpt = MemoryAugmentedGPT(
+        gpt,
+        memory_capacity=50,
+        crystallization_threshold=0.1,
+        memory_integration='gated'
+    )
+
+    optimizer = torch.optim.Adam(memory_gpt.parameters(), lr=0.01)
+
+    losses = []
+    for step in range(n_steps):
+        # Generate data where next token depends on pattern
+        input_ids = torch.randint(0, vocab_size, (batch_size, seq_len))
+        targets = input_ids.roll(-1, dims=1)  # Simple next-token prediction
+        targets[:, -1] = 0  # Pad last position
+
+        logits, hidden, mem_out = memory_gpt(input_ids, crystallize=True, use_memory=True)
+
+        loss, _ = memory_augmented_loss(logits, targets, mem_out)
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        losses.append(loss.item())
+
+        if step % 10 == 0:
+            print(f"  Step {step}: loss={loss.item():.4f}, memory_size={mem_out['memory_size']}")
+
+    initial_loss = sum(losses[:5]) / 5
+    final_loss = sum(losses[-5:]) / 5
+    print(f"  Initial loss: {initial_loss:.4f}")
+    print(f"  Final loss: {final_loss:.4f}")
+
+    # Loss should decrease (model is learning)
+    assert final_loss < initial_loss, "Loss should decrease with training"
+
+    print("  Memory-augmented learning test passed!")
+    return True
+
+
 if __name__ == "__main__":
     print("=" * 60)
     print("ExperientialStream & EpisodicMemory Tests")
@@ -1386,6 +1939,12 @@ if __name__ == "__main__":
     test_retrieve_soft()
     print()
     test_retrieve_soft_learning()
+    print()
+    test_memory_augmented_gpt()
+    print()
+    test_memory_augmented_gradient_flow()
+    print()
+    test_memory_augmented_learning()
 
     print()
     print("=" * 60)
