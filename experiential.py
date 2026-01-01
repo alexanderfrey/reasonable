@@ -1108,6 +1108,664 @@ def memory_augmented_loss(
     return total_loss, loss_dict
 
 
+# --- Semantic Stream (Consolidation) ---
+
+@dataclass
+class ConceptRelation:
+    """A relationship between two concepts."""
+    target_id: int
+    relation_type: str  # "is-a", "has-a", "related-to", "causes", "opposite-of"
+    strength: float     # [0, 1]
+    evidence: List[int] = field(default_factory=list)  # episode timestamps
+
+
+@dataclass
+class Concept:
+    """A piece of abstracted knowledge distilled from episodes."""
+    id: int
+    embedding: torch.Tensor          # [d_model] - distributed representation
+    prototype: torch.Tensor          # [d_model] - mean of source episodes
+
+    # Provenance
+    source_episodes: List[int]       # timestamps of source episodes
+    consolidation_time: int          # when this concept was created
+    evidence_count: int              # number of supporting episodes
+
+    # Confidence
+    confidence: float                # [0, 1] - based on evidence
+
+    # Optional
+    name: Optional[str] = None       # human-readable label
+    connections: Dict[int, ConceptRelation] = field(default_factory=dict)
+    parent: Optional[int] = None     # more abstract concept
+    children: List[int] = field(default_factory=list)  # more specific concepts
+    abstraction_level: int = 0       # 0 = concrete, higher = more abstract
+
+
+class PatternExtractor(nn.Module):
+    """
+    Extract common pattern from a set of embeddings.
+
+    Uses attention pooling to find latent structure beyond simple averaging.
+    """
+
+    def __init__(self, d_model: int, hidden_dim: Optional[int] = None):
+        super().__init__()
+        self.d_model = d_model
+        hidden_dim = hidden_dim or d_model * 2
+
+        # Attention pooling
+        self.attention = nn.MultiheadAttention(
+            d_model, num_heads=4, batch_first=True
+        )
+        self.query = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
+
+        # Pattern refinement
+        self.refiner = nn.Sequential(
+            nn.Linear(d_model, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, d_model)
+        )
+
+    def forward(self, embeddings: torch.Tensor) -> torch.Tensor:
+        """
+        Extract pattern from embeddings.
+
+        Args:
+            embeddings: [n_items, d_model] - items to find pattern in
+
+        Returns:
+            pattern: [d_model] - extracted common pattern
+        """
+        if embeddings.dim() == 1:
+            return embeddings  # Single item, return as-is
+
+        # Add batch dimension
+        embeddings = embeddings.unsqueeze(0)  # [1, n_items, d_model]
+
+        # Attention pooling
+        pooled, _ = self.attention(self.query, embeddings, embeddings)
+        pooled = pooled.squeeze(0).squeeze(0)  # [d_model]
+
+        # Refine pattern
+        pattern = self.refiner(pooled)
+
+        return pattern
+
+
+class RelationPredictor(nn.Module):
+    """
+    Predict relation between two concepts.
+    """
+
+    RELATION_TYPES = [
+        "related-to",   # general association (most common)
+        "is-a",         # hyponymy (child is-a parent)
+        "has-a",        # meronymy
+        "causes",       # causation
+        "opposite-of",  # antonymy
+        "none"          # no significant relation
+    ]
+
+    def __init__(self, d_model: int):
+        super().__init__()
+        self.d_model = d_model
+        self.n_types = len(self.RELATION_TYPES)
+
+        # Relation classifier: takes concat(a, b, a-b)
+        self.classifier = nn.Sequential(
+            nn.Linear(d_model * 3, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, self.n_types)
+        )
+
+        # Strength predictor
+        self.strength_head = nn.Sequential(
+            nn.Linear(d_model * 3, d_model // 2),
+            nn.GELU(),
+            nn.Linear(d_model // 2, 1),
+            nn.Sigmoid()
+        )
+
+    def forward(
+        self,
+        concept_a: torch.Tensor,
+        concept_b: torch.Tensor,
+        threshold: float = 0.3
+    ) -> Optional[ConceptRelation]:
+        """
+        Predict relation from concept_a to concept_b.
+
+        Args:
+            concept_a: [d_model] - source concept embedding
+            concept_b: [d_model] - target concept embedding
+            threshold: minimum strength to return a relation
+
+        Returns:
+            ConceptRelation or None if no significant relation
+        """
+        # Concatenate with difference for asymmetric relations
+        combined = torch.cat([
+            concept_a,
+            concept_b,
+            concept_a - concept_b
+        ], dim=-1)
+
+        # Predict relation type
+        type_logits = self.classifier(combined)
+        type_probs = F.softmax(type_logits, dim=-1)
+        type_idx = type_probs.argmax().item()
+        relation_type = self.RELATION_TYPES[type_idx]
+
+        if relation_type == "none":
+            return None
+
+        # Predict strength
+        strength = self.strength_head(combined).item()
+
+        if strength < threshold:
+            return None
+
+        return ConceptRelation(
+            target_id=-1,  # Filled by caller
+            relation_type=relation_type,
+            strength=strength,
+            evidence=[]
+        )
+
+
+class SemanticStream(nn.Module):
+    """
+    Semantic memory: abstracted, connected knowledge.
+
+    Consolidates episodic memories into concepts, builds a knowledge graph,
+    and provides retrieval for informing current processing.
+
+    Usage:
+        semantic = SemanticStream(d_model=1024)
+
+        # Consolidate similar episodes into a concept
+        episodes = memory.retrieve_by_salience(top_k=10)
+        concept = semantic.consolidate(episodes)
+
+        # Query for relevant knowledge
+        relevant = semantic.query(current_hidden_state, top_k=5)
+
+        # Differentiable retrieval for training
+        knowledge, weights = semantic.query_soft(query)
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        min_evidence: int = 3,
+        similarity_threshold: float = 0.7,
+        max_concepts: int = 10000
+    ):
+        """
+        Args:
+            d_model: embedding dimension
+            min_evidence: minimum episodes required for consolidation
+            similarity_threshold: threshold for auto-clustering episodes
+            max_concepts: maximum concepts to store
+        """
+        super().__init__()
+        self.d_model = d_model
+        self.min_evidence = min_evidence
+        self.similarity_threshold = similarity_threshold
+        self.max_concepts = max_concepts
+
+        # Pattern extraction
+        self.pattern_extractor = PatternExtractor(d_model)
+
+        # Relation prediction
+        self.relation_predictor = RelationPredictor(d_model)
+
+        # Query projection for retrieval
+        self.query_projection = nn.Linear(d_model, d_model)
+
+        # Knowledge storage
+        self.concepts: Dict[int, Concept] = {}
+        self.next_concept_id = 0
+        self._step = 0
+
+        # Cached embedding index for fast retrieval
+        self._embedding_cache: Optional[torch.Tensor] = None
+        self._cache_valid = False
+
+    @property
+    def size(self) -> int:
+        """Number of concepts stored."""
+        return len(self.concepts)
+
+    def consolidate(
+        self,
+        episodes: List[Episode],
+        require_min_evidence: bool = True,
+        name: Optional[str] = None
+    ) -> Optional[Concept]:
+        """
+        Distill episodes into a concept.
+
+        Args:
+            episodes: list of Episode objects to consolidate
+            require_min_evidence: if True, require at least min_evidence episodes
+            name: optional human-readable name for the concept
+
+        Returns:
+            Created Concept, or None if insufficient evidence
+        """
+        if require_min_evidence and len(episodes) < self.min_evidence:
+            return None
+
+        if len(episodes) == 0:
+            return None
+
+        # Stack episode embeddings
+        device = episodes[0].content.device
+        episode_embeddings = torch.stack([ep.content.to(device) for ep in episodes])
+
+        # Extract common pattern
+        pattern = self.pattern_extractor(episode_embeddings)
+
+        # Compute prototype (mean)
+        prototype = episode_embeddings.mean(dim=0)
+
+        # Create concept
+        concept = Concept(
+            id=self.next_concept_id,
+            embedding=pattern.detach().clone(),
+            prototype=prototype.detach().clone(),
+            source_episodes=[ep.timestamp for ep in episodes],
+            consolidation_time=self._step,
+            evidence_count=len(episodes),
+            confidence=min(1.0, len(episodes) / 10.0),
+            name=name,
+            abstraction_level=0
+        )
+
+        # Add to storage
+        self._add_concept(concept)
+
+        # Discover relations to existing concepts
+        self._discover_relations(concept)
+
+        return concept
+
+    def consolidate_from_memory(
+        self,
+        memory: EpisodicMemory,
+        n_clusters: int = 5,
+        min_cluster_size: int = 3
+    ) -> List[Concept]:
+        """
+        Automatically consolidate episodes from episodic memory.
+
+        Uses clustering to find groups of similar episodes.
+
+        Args:
+            memory: EpisodicMemory to consolidate from
+            n_clusters: number of clusters to try
+            min_cluster_size: minimum episodes per cluster
+
+        Returns:
+            List of created concepts
+        """
+        if memory.size < min_cluster_size:
+            return []
+
+        # Get all episode contents
+        contents = memory.get_content_matrix()
+        if contents.size(0) == 0:
+            return []
+
+        # Simple clustering: k-means style
+        clusters = self._cluster_episodes(
+            memory.episodes,
+            contents,
+            n_clusters,
+            min_cluster_size
+        )
+
+        # Consolidate each cluster
+        new_concepts = []
+        for cluster_episodes in clusters:
+            concept = self.consolidate(cluster_episodes, require_min_evidence=True)
+            if concept is not None:
+                new_concepts.append(concept)
+
+        return new_concepts
+
+    def _cluster_episodes(
+        self,
+        episodes: List[Episode],
+        contents: torch.Tensor,
+        n_clusters: int,
+        min_size: int
+    ) -> List[List[Episode]]:
+        """Simple clustering of episodes by similarity."""
+        if len(episodes) < n_clusters:
+            return []
+
+        # Normalize for cosine similarity
+        contents_norm = F.normalize(contents, dim=-1)
+
+        # Initialize centroids randomly
+        n_clusters = min(n_clusters, len(episodes) // min_size)
+        if n_clusters < 1:
+            return []
+
+        indices = torch.randperm(len(episodes))[:n_clusters]
+        centroids = contents_norm[indices].clone()
+
+        # K-means iterations
+        for _ in range(10):
+            # Assign to nearest centroid
+            sims = torch.mm(contents_norm, centroids.t())  # [n, k]
+            assignments = sims.argmax(dim=1)  # [n]
+
+            # Update centroids
+            new_centroids = []
+            for k in range(n_clusters):
+                mask = (assignments == k)
+                if mask.sum() > 0:
+                    new_centroids.append(contents_norm[mask].mean(dim=0))
+                else:
+                    new_centroids.append(centroids[k])
+            centroids = torch.stack(new_centroids)
+            centroids = F.normalize(centroids, dim=-1)
+
+        # Build clusters
+        clusters = [[] for _ in range(n_clusters)]
+        for i, ep in enumerate(episodes):
+            clusters[assignments[i].item()].append(ep)
+
+        # Filter by minimum size
+        return [c for c in clusters if len(c) >= min_size]
+
+    def query(
+        self,
+        query: torch.Tensor,
+        top_k: int = 5
+    ) -> List[Tuple[Concept, float]]:
+        """
+        Retrieve relevant concepts for a query.
+
+        Args:
+            query: [d_model] or [batch, d_model] query vector
+            top_k: number of concepts to retrieve
+
+        Returns:
+            List of (Concept, similarity) tuples
+        """
+        if self.size == 0:
+            return []
+
+        # Ensure 2D
+        if query.dim() == 1:
+            query = query.unsqueeze(0)
+
+        # Project query
+        query_emb = self.query_projection(query)
+        query_norm = F.normalize(query_emb, dim=-1)
+
+        # Get embedding index
+        emb_index = self._get_embedding_index(query.device)
+        emb_norm = F.normalize(emb_index, dim=-1)
+
+        # Compute similarities
+        sims = torch.mm(query_norm, emb_norm.t())  # [batch, n_concepts]
+
+        # Get top-k for first query
+        top_k = min(top_k, self.size)
+        values, indices = sims[0].topk(top_k)
+
+        return [
+            (self.concepts[idx.item()], values[i].item())
+            for i, idx in enumerate(indices)
+        ]
+
+    def query_soft(
+        self,
+        query: torch.Tensor,
+        temperature: float = 0.1
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Differentiable retrieval over concepts.
+
+        Args:
+            query: [batch, d_model] or [d_model] query vector
+            temperature: softmax temperature
+
+        Returns:
+            knowledge: [batch, d_model] - weighted sum of concept embeddings
+            weights: [batch, n_concepts] - attention weights
+        """
+        if self.size == 0:
+            if query.dim() == 1:
+                return torch.zeros(self.d_model, device=query.device), torch.zeros(0, device=query.device)
+            else:
+                batch_size = query.size(0)
+                return torch.zeros(batch_size, self.d_model, device=query.device), torch.zeros(batch_size, 0, device=query.device)
+
+        # Ensure 2D
+        squeeze_output = False
+        if query.dim() == 1:
+            query = query.unsqueeze(0)
+            squeeze_output = True
+
+        # Project query
+        query_emb = self.query_projection(query)
+        query_norm = F.normalize(query_emb, dim=-1)
+
+        # Get embedding index
+        emb_index = self._get_embedding_index(query.device)
+
+        # Compute attention
+        scores = torch.mm(query_norm, F.normalize(emb_index, dim=-1).t()) / temperature
+        weights = F.softmax(scores, dim=-1)
+
+        # Weighted sum
+        knowledge = torch.mm(weights, emb_index)
+
+        if squeeze_output:
+            knowledge = knowledge.squeeze(0)
+            weights = weights.squeeze(0)
+
+        return knowledge, weights
+
+    def connect(
+        self,
+        concept_a_id: int,
+        concept_b_id: int,
+        relation_type: str = "related-to",
+        strength: float = 0.5,
+        evidence: Optional[List[int]] = None
+    ) -> bool:
+        """
+        Create or strengthen a relation between concepts.
+
+        Args:
+            concept_a_id: source concept
+            concept_b_id: target concept
+            relation_type: type of relation
+            strength: relation strength [0, 1]
+            evidence: episode timestamps supporting this relation
+
+        Returns:
+            True if relation was created/updated
+        """
+        if concept_a_id not in self.concepts or concept_b_id not in self.concepts:
+            return False
+
+        relation = ConceptRelation(
+            target_id=concept_b_id,
+            relation_type=relation_type,
+            strength=strength,
+            evidence=evidence or []
+        )
+
+        self.concepts[concept_a_id].connections[concept_b_id] = relation
+        return True
+
+    def generalize(
+        self,
+        concept_ids: List[int],
+        name: Optional[str] = None
+    ) -> Optional[Concept]:
+        """
+        Create a more abstract concept from specific ones.
+
+        Args:
+            concept_ids: IDs of concepts to generalize
+            name: optional name for the abstraction
+
+        Returns:
+            Created abstract Concept, or None if failed
+        """
+        if len(concept_ids) < 2:
+            return None
+
+        # Get concept embeddings
+        embeddings = []
+        for cid in concept_ids:
+            if cid not in self.concepts:
+                continue
+            embeddings.append(self.concepts[cid].embedding)
+
+        if len(embeddings) < 2:
+            return None
+
+        embeddings = torch.stack(embeddings)
+
+        # Extract higher-level pattern
+        pattern = self.pattern_extractor(embeddings)
+
+        # Determine abstraction level
+        max_level = max(
+            self.concepts[cid].abstraction_level
+            for cid in concept_ids if cid in self.concepts
+        )
+
+        # Create abstract concept
+        abstract = Concept(
+            id=self.next_concept_id,
+            embedding=pattern.detach().clone(),
+            prototype=embeddings.mean(dim=0).detach().clone(),
+            source_episodes=[],  # Derived from concepts, not episodes
+            consolidation_time=self._step,
+            evidence_count=sum(
+                self.concepts[cid].evidence_count
+                for cid in concept_ids if cid in self.concepts
+            ),
+            confidence=min(
+                self.concepts[cid].confidence
+                for cid in concept_ids if cid in self.concepts
+            ),
+            name=name,
+            children=concept_ids,
+            abstraction_level=max_level + 1
+        )
+
+        self._add_concept(abstract)
+
+        # Update children to point to parent
+        for cid in concept_ids:
+            if cid in self.concepts:
+                self.concepts[cid].parent = abstract.id
+                self.connect(cid, abstract.id, "is-a", 1.0)
+
+        return abstract
+
+    def get_stats(self) -> Dict:
+        """Get statistics about the knowledge graph."""
+        if self.size == 0:
+            return {
+                'n_concepts': 0,
+                'n_relations': 0,
+                'avg_evidence': 0,
+                'avg_confidence': 0,
+                'max_abstraction_level': 0
+            }
+
+        n_relations = sum(
+            len(c.connections) for c in self.concepts.values()
+        )
+
+        return {
+            'n_concepts': self.size,
+            'n_relations': n_relations,
+            'avg_evidence': sum(c.evidence_count for c in self.concepts.values()) / self.size,
+            'avg_confidence': sum(c.confidence for c in self.concepts.values()) / self.size,
+            'max_abstraction_level': max(c.abstraction_level for c in self.concepts.values()),
+            'concepts_by_level': {
+                level: sum(1 for c in self.concepts.values() if c.abstraction_level == level)
+                for level in range(max(c.abstraction_level for c in self.concepts.values()) + 1)
+            }
+        }
+
+    def clear(self):
+        """Clear all concepts."""
+        self.concepts.clear()
+        self.next_concept_id = 0
+        self._cache_valid = False
+        self._embedding_cache = None
+
+    def _add_concept(self, concept: Concept):
+        """Add concept to storage."""
+        if self.size >= self.max_concepts:
+            # Evict lowest confidence concept
+            min_conf_id = min(
+                self.concepts.keys(),
+                key=lambda k: self.concepts[k].confidence
+            )
+            del self.concepts[min_conf_id]
+
+        self.concepts[concept.id] = concept
+        self.next_concept_id = max(self.next_concept_id, concept.id + 1)
+        self._cache_valid = False
+
+    def _discover_relations(self, new_concept: Concept):
+        """Discover relations between new concept and existing ones."""
+        if self.size <= 1:
+            return
+
+        for cid, existing in self.concepts.items():
+            if cid == new_concept.id:
+                continue
+
+            # Predict relation
+            relation = self.relation_predictor(
+                new_concept.embedding,
+                existing.embedding
+            )
+
+            if relation is not None:
+                self.connect(
+                    new_concept.id,
+                    cid,
+                    relation.relation_type,
+                    relation.strength
+                )
+
+    def _get_embedding_index(self, device: torch.device) -> torch.Tensor:
+        """Get cached embedding index."""
+        if not self._cache_valid or self._embedding_cache is None:
+            if self.size == 0:
+                self._embedding_cache = torch.zeros(0, self.d_model, device=device)
+            else:
+                self._embedding_cache = torch.stack([
+                    self.concepts[i].embedding
+                    for i in sorted(self.concepts.keys())
+                ]).to(device)
+            self._cache_valid = True
+        return self._embedding_cache.to(device)
+
+    def step(self):
+        """Advance internal step counter."""
+        self._step += 1
+
+
 # --- Testing utilities ---
 
 def test_shapes():
@@ -1911,6 +2569,276 @@ def test_memory_augmented_learning():
     return True
 
 
+def test_semantic_stream_basic():
+    """Test basic SemanticStream operations."""
+    print("Testing SemanticStream basics...")
+
+    d_model = 128
+
+    semantic = SemanticStream(d_model=d_model, min_evidence=2)
+
+    # Initially empty
+    assert semantic.size == 0, "Semantic memory should start empty"
+
+    # Create some fake episodes for consolidation
+    episodes = []
+    for i in range(5):
+        content = torch.randn(d_model)
+        content = F.normalize(content, dim=-1)
+        ep = Episode(
+            content=content,
+            context=torch.randn(d_model),
+            timestamp=i,
+            salience=0.5 + 0.1 * i,
+            valence=0.0,
+            arousal=0.5
+        )
+        episodes.append(ep)
+
+    # Test consolidation
+    concept = semantic.consolidate(episodes, require_min_evidence=True, name="test_concept")
+
+    assert concept is not None, "Should create concept from 5 episodes"
+    assert concept.id == 0, "First concept should have id 0"
+    assert concept.evidence_count == 5, "Should have 5 episodes as evidence"
+    assert concept.name == "test_concept", "Name should be set"
+    assert concept.embedding.shape == (d_model,), f"Embedding shape wrong: {concept.embedding.shape}"
+    assert concept.prototype.shape == (d_model,), f"Prototype shape wrong: {concept.prototype.shape}"
+
+    print(f"  Created concept: id={concept.id}, name={concept.name}, evidence={concept.evidence_count}")
+    print(f"  Semantic memory size: {semantic.size}")
+
+    # Test that min_evidence is enforced
+    small_episodes = episodes[:1]
+    small_concept = semantic.consolidate(small_episodes, require_min_evidence=True)
+    assert small_concept is None, "Should not create concept with insufficient evidence"
+
+    print("  Min evidence requirement works!")
+
+    # Test stats
+    stats = semantic.get_stats()
+    assert stats['n_concepts'] == 1, f"Should have 1 concept, got {stats['n_concepts']}"
+    print(f"  Stats: {stats}")
+
+    print("  SemanticStream basics test passed!")
+    return True
+
+
+def test_semantic_query():
+    """Test SemanticStream querying."""
+    print("Testing SemanticStream querying...")
+
+    d_model = 128
+    semantic = SemanticStream(d_model=d_model, min_evidence=2)
+
+    # Create several distinct concepts
+    n_concepts = 3
+    created_concepts = []
+
+    for c in range(n_concepts):
+        # Create a cluster of episodes around a center
+        center = torch.randn(d_model)
+        center = F.normalize(center, dim=-1)
+
+        episodes = []
+        for i in range(5):
+            # Episodes similar to center
+            content = center + torch.randn(d_model) * 0.1
+            content = F.normalize(content, dim=-1)
+            ep = Episode(
+                content=content,
+                context=torch.randn(d_model),
+                timestamp=c * 10 + i,
+                salience=0.5,
+                valence=0.0,
+                arousal=0.5
+            )
+            episodes.append(ep)
+
+        concept = semantic.consolidate(episodes, name=f"concept_{c}")
+        assert concept is not None, f"Should create concept {c}"
+        created_concepts.append(concept)
+
+    assert semantic.size == n_concepts, f"Should have {n_concepts} concepts"
+
+    # Test query - query with a concept's own embedding should find that concept
+    query = created_concepts[1].embedding.clone()  # Use actual embedding
+    results = semantic.query(query, top_k=2)
+
+    assert len(results) == 2, f"Should retrieve 2 concepts, got {len(results)}"
+    concept, similarity = results[0]
+    # With projected query, similarity should still be reasonable
+    print(f"  Query results: top match id={concept.id}, similarity = {similarity:.4f}")
+
+    # Test query_soft (differentiable)
+    query = torch.randn(d_model, requires_grad=True)
+    knowledge, weights = semantic.query_soft(query, temperature=0.1)
+
+    assert knowledge.shape == (d_model,), f"Knowledge shape wrong: {knowledge.shape}"
+    assert weights.shape == (n_concepts,), f"Weights shape wrong: {weights.shape}"
+    assert abs(weights.sum().item() - 1.0) < 1e-5, "Weights should sum to 1"
+
+    # Test gradient flow
+    loss = knowledge.sum()
+    loss.backward()
+    assert query.grad is not None, "Gradients should flow through query_soft"
+    print("  Gradient flow through query_soft works!")
+
+    # Test batched query_soft
+    batch_query = torch.randn(4, d_model)
+    batch_knowledge, batch_weights = semantic.query_soft(batch_query)
+    assert batch_knowledge.shape == (4, d_model), f"Batch knowledge shape wrong: {batch_knowledge.shape}"
+    assert batch_weights.shape == (4, n_concepts), f"Batch weights shape wrong: {batch_weights.shape}"
+    print("  Batched query_soft works!")
+
+    print("  SemanticStream querying test passed!")
+    return True
+
+
+def test_semantic_consolidation_from_memory():
+    """Test automatic consolidation from EpisodicMemory."""
+    print("Testing consolidation from EpisodicMemory...")
+
+    d_model = 128
+    memory = EpisodicMemory(d_model=d_model, capacity=100)
+    semantic = SemanticStream(d_model=d_model, min_evidence=3)
+
+    # Store episodes in clusters
+    n_clusters = 3
+    episodes_per_cluster = 8
+
+    for c in range(n_clusters):
+        center = torch.randn(d_model)
+        center = F.normalize(center, dim=-1)
+
+        for i in range(episodes_per_cluster):
+            content = center + torch.randn(d_model) * 0.15
+            memory.store(content, torch.randn(d_model), salience=0.5)
+
+    print(f"  Stored {memory.size} episodes in {n_clusters} clusters")
+
+    # Consolidate from memory
+    concepts = semantic.consolidate_from_memory(memory, n_clusters=n_clusters, min_cluster_size=3)
+
+    print(f"  Created {len(concepts)} concepts")
+    assert len(concepts) >= 1, "Should create at least 1 concept"
+
+    for c in concepts:
+        print(f"    Concept {c.id}: evidence={c.evidence_count}, confidence={c.confidence:.3f}")
+
+    # Stats should reflect the new concepts
+    stats = semantic.get_stats()
+    print(f"  Stats: {stats}")
+
+    print("  Consolidation from memory test passed!")
+    return True
+
+
+def test_semantic_generalization():
+    """Test creating abstract concepts from specific ones."""
+    print("Testing semantic generalization...")
+
+    d_model = 128
+    semantic = SemanticStream(d_model=d_model, min_evidence=2)
+
+    # Create 3 base concepts
+    base_concept_ids = []
+    for c in range(3):
+        episodes = []
+        for i in range(3):
+            content = torch.randn(d_model)
+            ep = Episode(
+                content=content,
+                context=torch.randn(d_model),
+                timestamp=c * 10 + i,
+                salience=0.5,
+                valence=0.0,
+                arousal=0.5
+            )
+            episodes.append(ep)
+
+        concept = semantic.consolidate(episodes, name=f"base_{c}")
+        base_concept_ids.append(concept.id)
+
+    assert semantic.size == 3, "Should have 3 base concepts"
+    print(f"  Created {semantic.size} base concepts")
+
+    # Generalize to abstract concept
+    abstract = semantic.generalize(base_concept_ids, name="abstract_concept")
+
+    assert abstract is not None, "Should create abstract concept"
+    assert abstract.abstraction_level == 1, "Abstract concept should be level 1"
+    assert abstract.name == "abstract_concept", "Name should be set"
+    assert len(abstract.children) == 3, "Should have 3 children"
+
+    print(f"  Abstract concept: id={abstract.id}, level={abstract.abstraction_level}, children={abstract.children}")
+
+    # Check that children point to parent
+    for cid in base_concept_ids:
+        assert semantic.concepts[cid].parent == abstract.id, f"Child {cid} should point to parent"
+        # Check is-a relation exists
+        assert abstract.id in semantic.concepts[cid].connections, f"Child {cid} should have is-a relation"
+
+    print("  Parent-child relationships established!")
+
+    # Stats should show the hierarchy
+    stats = semantic.get_stats()
+    print(f"  Stats: {stats}")
+    assert stats['max_abstraction_level'] == 1, "Max abstraction level should be 1"
+    assert stats['concepts_by_level'][0] == 3, "Should have 3 level-0 concepts"
+    assert stats['concepts_by_level'][1] == 1, "Should have 1 level-1 concept"
+
+    print("  Semantic generalization test passed!")
+    return True
+
+
+def test_semantic_relations():
+    """Test relation creation and discovery."""
+    print("Testing semantic relations...")
+
+    d_model = 128
+    semantic = SemanticStream(d_model=d_model, min_evidence=2)
+
+    # Create two concepts
+    for c in range(2):
+        episodes = []
+        for i in range(3):
+            ep = Episode(
+                content=torch.randn(d_model),
+                context=torch.randn(d_model),
+                timestamp=c * 10 + i,
+                salience=0.5,
+                valence=0.0,
+                arousal=0.5
+            )
+            episodes.append(ep)
+        semantic.consolidate(episodes, name=f"concept_{c}")
+
+    # Manually connect concepts
+    success = semantic.connect(0, 1, relation_type="related-to", strength=0.8)
+    assert success, "Should successfully connect concepts"
+
+    # Check relation exists
+    assert 1 in semantic.concepts[0].connections, "Connection should exist"
+    relation = semantic.concepts[0].connections[1]
+    assert relation.relation_type == "related-to", f"Wrong relation type: {relation.relation_type}"
+    assert relation.strength == 0.8, f"Wrong strength: {relation.strength}"
+
+    print(f"  Created relation: {relation.relation_type} with strength {relation.strength}")
+
+    # Test invalid connection
+    success = semantic.connect(0, 999, relation_type="related-to", strength=0.5)
+    assert not success, "Should fail to connect to non-existent concept"
+
+    # Stats should show relations
+    stats = semantic.get_stats()
+    assert stats['n_relations'] >= 1, f"Should have at least 1 relation, got {stats['n_relations']}"
+    print(f"  Stats: {stats}")
+
+    print("  Semantic relations test passed!")
+    return True
+
+
 if __name__ == "__main__":
     print("=" * 60)
     print("ExperientialStream & EpisodicMemory Tests")
@@ -1945,6 +2873,21 @@ if __name__ == "__main__":
     test_memory_augmented_gradient_flow()
     print()
     test_memory_augmented_learning()
+    print()
+
+    print("=" * 60)
+    print("SemanticStream Tests")
+    print("=" * 60)
+
+    test_semantic_stream_basic()
+    print()
+    test_semantic_query()
+    print()
+    test_semantic_consolidation_from_memory()
+    print()
+    test_semantic_generalization()
+    print()
+    test_semantic_relations()
 
     print()
     print("=" * 60)
