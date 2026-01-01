@@ -720,19 +720,30 @@ def consolidate_to_semantic(
 
 ## 8. Implementation Checklist
 
-- [ ] Define EpisodicConfig
-- [ ] Implement Episode dataclass
-- [ ] Implement EpisodicBuffer
-- [ ] Implement EpisodicStream.crystallize
-- [ ] Implement EpisodicStream.store
-- [ ] Implement EpisodicStream.retrieve (hard)
+- [ ] Define EpisodicConfig (using constructor args instead)
+- [x] Implement Episode dataclass (`experiential.py`)
+- [x] Implement EpisodicBuffer → EpisodicMemory class
+- [x] Implement EpisodicStream.crystallize → should_crystallize()
+- [x] Implement EpisodicStream.store → store()
+- [x] Implement EpisodicStream.retrieve (hard) → retrieve(), retrieve_by_time(), retrieve_by_salience()
 - [ ] Implement EpisodicStream.retrieve_soft (differentiable)
-- [ ] Implement decay mechanism
-- [ ] Implement eviction policies
+- [ ] Implement decay mechanism (decay_rate defined, not yet applied)
+- [x] Implement eviction policies (priority-based: salience × recency × retrieval_count)
 - [ ] Add retrieval contrastive loss
 - [ ] Add resume-after-interruption training
 - [ ] Implement consolidation interface
-- [ ] Test memory persistence across chunks
+- [x] Test memory persistence across chunks
+
+### Current Implementation (`experiential.py`)
+
+The `EpisodicMemory` class provides:
+- Episode dataclass with timestamp, content, context, salience, affect, retrieval_count
+- `store()` - store episodes with automatic capacity management
+- `retrieve()` - similarity-based retrieval with top-k
+- `retrieve_by_time()` - get most recent episodes
+- `retrieve_by_salience()` - get most salient episodes
+- `should_crystallize()` - threshold-based crystallization decision
+- Priority-based eviction: `salience × recency × (1 + retrieval_count)`
 
 ---
 

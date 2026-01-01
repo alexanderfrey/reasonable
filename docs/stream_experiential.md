@@ -553,16 +553,22 @@ def apply_skills(
 
 ## 8. Implementation Checklist
 
-- [ ] Define ExperientialConfig
-- [ ] Implement StateEncoder
-- [ ] Implement PredictionHead
-- [ ] Implement SalienceGate
-- [ ] Implement ExperientialStream
-- [ ] Add prediction loss
-- [ ] Integrate with GPT forward pass
-- [ ] Add interface to EpisodicStream
-- [ ] Test on simple sequences
+- [x] Define ExperientialConfig
+- [ ] Implement StateEncoder (currently using simpler mid/end split)
+- [x] Implement PredictionHead (MLP predictor in ExperientialStream)
+- [x] Implement SalienceGate (surprise × arousal × |valence|)
+- [x] Implement ExperientialStream (`experiential.py`)
+- [x] Add prediction loss (InfoNCE contrastive loss)
+- [x] Integrate with GPT forward pass (`model.py` - return_hidden_states)
+- [x] Add interface to EpisodicStream (EpisodicMemory class)
+- [x] Test on simple sequences (100% accuracy on synthetic data)
 - [ ] Evaluate: does surprise correlate with narrative events?
+
+### Additional features implemented:
+- [x] Persistent state (GRU-style) across chunks
+- [x] Affect prediction (valence [-1,1], arousal [0,1])
+- [x] Multiscale prediction (multiple temporal horizons)
+- [x] Integration as auxiliary loss during pretraining (`pretrain.py`)
 
 ---
 

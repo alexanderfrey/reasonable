@@ -612,20 +612,38 @@ intrinsic_reward = (
 ## 10. Next Steps
 
 ### Immediate (Conceptual)
-- [ ] Define precise interfaces between streams
-- [ ] Specify what information each stream stores and how
-- [ ] Design the "crystallization" and "consolidation" mechanisms
+- [x] Define precise interfaces between streams
+- [x] Specify what information each stream stores and how
+- [x] Design the "crystallization" and "consolidation" mechanisms
 
 ### Near-term (Architectural)
-- [ ] Sketch module structure
-- [ ] Define loss functions for each stream
+- [x] Sketch module structure
+- [x] Define loss functions for each stream (InfoNCE contrastive)
 - [ ] Plan training curriculum
 
 ### Medium-term (Implementation)
-- [ ] Implement ExperientialStream with slots
-- [ ] Implement EpisodicStream with memory buffer
-- [ ] Implement consolidation mechanism
-- [ ] Integrate with existing GPT backbone
+- [x] Implement ExperientialStream (`experiential.py`)
+  - [x] Prediction head (MLP predictor: h_mid → h_end)
+  - [x] Surprise computation (1 - cosine_similarity)
+  - [x] Affect prediction (valence [-1,1], arousal [0,1])
+  - [x] Salience gating (surprise × arousal × |valence|)
+  - [x] Persistent state (GRU-style) across chunks
+  - [x] Multiscale prediction (multiple temporal horizons)
+- [x] Implement EpisodicMemory (`experiential.py`)
+  - [x] Episode dataclass (content, context, salience, affect)
+  - [x] store() with crystallization threshold
+  - [x] retrieve() by similarity, time, salience
+  - [x] Capacity management with priority-based eviction
+- [ ] Implement SemanticStream (consolidation from episodes)
+- [x] Integrate with existing GPT backbone (`model.py`, `pretrain.py`)
+
+### Remaining Work
+- [ ] Implement differentiable retrieval (retrieve_soft)
+- [ ] Add decay mechanism to episodic memory
+- [ ] Implement semantic consolidation
+- [ ] Implement procedural stream
+- [ ] Add resume-after-interruption training
+- [ ] Evaluate: does surprise correlate with narrative events?
 
 ---
 
