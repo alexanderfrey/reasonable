@@ -24,6 +24,9 @@ import logging
 from typing import Optional
 import wandb
 
+# Experiential stream (optional auxiliary loss)
+from experiential import ExperientialStream, experiential_loss
+
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
@@ -1483,6 +1486,7 @@ def save_checkpoint(args: Namespace, epoch: int, global_step: int, model: nn.Mod
                       scaler: Optional[GradScaler], current_loss: float, best_eval_loss: float, model_config: dict,
                       wandb_run_id: Optional[str] = None, # W&B run ID for traceability
                       scheduler: Optional[optim.lr_scheduler._LRScheduler] = None,
+                      experiential_module: Optional[nn.Module] = None,
                       is_best: bool = False, is_final: bool = False):
     """
     Saves a training checkpoint and logs it to Weights & Biases as an artifact if enabled.
@@ -1503,6 +1507,8 @@ def save_checkpoint(args: Namespace, epoch: int, global_step: int, model: nn.Mod
         save_dict["scheduler_state_dict"] = scheduler.state_dict()
     if scaler is not None: # Ensure scaler is not None before accessing state_dict
         save_dict["scaler_state_dict"] = scaler.state_dict()
+    if experiential_module is not None:
+        save_dict["experiential_state_dict"] = experiential_module.state_dict()
 
     checkpoint_base_name = ""
     # Aliases will be dynamically built
@@ -1721,10 +1727,14 @@ class CUDAGraphTrainStep:
 
 
 def train_step(model, batch, criterion, scaler, device, use_amp, use_bf16, vocab_size,
-               gradient_accumulation_steps: int, cudagraph_runner: CUDAGraphTrainStep | None = None):
+               gradient_accumulation_steps: int, cudagraph_runner: CUDAGraphTrainStep | None = None,
+               experiential_module: Optional[nn.Module] = None, experiential_weight: float = 0.1):
     """
     Performs a single forward pass, calculates loss, scales it for accumulation,
     and performs backward pass. Does NOT step optimizer or zero grads.
+
+    When experiential_module is provided, also computes experiential loss as auxiliary objective.
+    Returns (lm_loss, exp_loss) or (lm_loss, None) if experiential is disabled.
     """
     if cudagraph_runner is not None:
         return cudagraph_runner(batch)
@@ -1749,6 +1759,7 @@ def train_step(model, batch, criterion, scaler, device, use_amp, use_bf16, vocab
         # Older PyTorch versions may not have this; safe to ignore
         pass
 
+    exp_loss_value = None
     try:
         from torch.amp import autocast
         # Determine autocast dtype: bf16 > fp16 > disabled
@@ -1763,14 +1774,28 @@ def train_step(model, batch, criterion, scaler, device, use_amp, use_bf16, vocab
             amp_enabled = False
 
         with autocast("cuda", enabled=amp_enabled, dtype=amp_dtype):
-            logits, _ = model(input_ids)
-            # Calculate raw loss (unscaled)
-            loss = criterion(logits.view(-1, vocab_size), labels.view(-1))
+            # Get hidden states if experiential is enabled
+            return_hidden = experiential_module is not None
+            logits, hidden_states = model(input_ids, return_hidden_states=return_hidden)
+
+            # Calculate LM loss (unscaled)
+            lm_loss = criterion(logits.view(-1, vocab_size), labels.view(-1))
             del logits  # Free 4GB+ before backward pass
+
+            # Calculate experiential loss if enabled
+            if experiential_module is not None and hidden_states is not None:
+                exp_output = experiential_module(hidden_states)
+                exp_loss = experiential_loss(exp_output['prediction'], exp_output['target'])
+                exp_loss_value = exp_loss.item()
+                # Combined loss
+                loss = lm_loss + experiential_weight * exp_loss
+                del hidden_states, exp_output
+            else:
+                loss = lm_loss
 
         if torch.isnan(loss) or torch.isinf(loss):
             logger.warning("NaN/Inf loss detected during forward. Skipping backward for this batch.")
-            return None, loss.item()
+            return None, exp_loss_value
 
         loss_scaled = loss / gradient_accumulation_steps
 
@@ -1783,11 +1808,11 @@ def train_step(model, batch, criterion, scaler, device, use_amp, use_bf16, vocab
             scaler.scale(loss_scaled).backward()
         else:
             loss_scaled.backward()
-        return loss.item(), None
+        return lm_loss.item(), exp_loss_value
 
     except Exception as e:
          logger.error(f"Error during backward pass: {e}", exc_info=True)
-         return None, loss.item()
+         return None, exp_loss_value
 
 def train(args: Namespace):
     """Main function to orchestrate the training process with gradient accumulation."""
@@ -1858,8 +1883,44 @@ def train(args: Namespace):
     # If load_checkpoint returned a wandb_run_id, and W&B init happened after, you might re-init or ensure args.wandb_run_id was set prior.
     # For this example, we assume args.wandb_run_id is set externally if specific run resumption is needed.
 
+    # --- Experiential Stream (optional) ---
+    experiential_module = None
+    if getattr(args, 'use_experiential', False):
+        d_model = model_config.get('d_model', model.config.d_model if hasattr(model, 'config') else 768)
+        experiential_module = ExperientialStream(d_model=d_model).to(device)
+
+        # Try to load from training checkpoint first (if resuming)
+        exp_loaded = False
+        if args.resume_from_checkpoint:
+            ckpt_path = args.resume_from_checkpoint
+            if ckpt_path == "latest":
+                ckpt_path = _find_latest_checkpoint(args.output_dir)
+            if ckpt_path and os.path.isfile(ckpt_path):
+                ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+                if 'experiential_state_dict' in ckpt:
+                    experiential_module.load_state_dict(ckpt['experiential_state_dict'])
+                    logger.info(f"Loaded experiential module from checkpoint: {ckpt_path}")
+                    exp_loaded = True
+
+        # If not loaded from training checkpoint, try pretrained experiential checkpoint
+        if not exp_loaded and args.experiential_checkpoint and os.path.exists(args.experiential_checkpoint):
+            exp_ckpt = torch.load(args.experiential_checkpoint, map_location=device, weights_only=False)
+            experiential_module.load_state_dict(exp_ckpt['model_state_dict'])
+            logger.info(f"Loaded experiential module from {args.experiential_checkpoint}")
+
+        # Add experiential parameters to optimizer
+        exp_params = sum(p.numel() for p in experiential_module.parameters())
+        optimizer.add_param_group({
+            'params': list(experiential_module.parameters()),
+            'lr': args.learning_rate,
+            'weight_decay': args.weight_decay
+        })
+        logger.info(f"Experiential stream enabled: {exp_params:,} parameters, weight={args.experiential_weight}")
+
     # Surface the effective model size right before training kicks off.
     current_trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    if experiential_module is not None:
+        current_trainable_params += sum(p.numel() for p in experiential_module.parameters())
     logger.info(
         "Starting training with %s trainable parameters (%.3fB).",
         f"{current_trainable_params:,}",
@@ -1933,7 +1994,10 @@ def train(args: Namespace):
     # --- Training Loop ---
     logger.info(f"\nStarting training from epoch {start_epoch + 1}...")
     model.train()
+    if experiential_module is not None:
+        experiential_module.train()
     total_loss_accum_for_log = 0.0
+    total_exp_loss_accum_for_log = 0.0
     micro_steps_in_log_period = 0
     can_toggle_sync = hasattr(model, "require_backward_grad_sync")
 
@@ -1958,18 +2022,30 @@ def train(args: Namespace):
             if can_toggle_sync:
                 model.require_backward_grad_sync = do_sync
 
-            step_loss_unscaled, error_info = train_step(
+            # Reset experiential state for each batch (random samples, not sequential)
+            # In future: maintain state for truly sequential data (e.g., streaming)
+            if experiential_module is not None and hasattr(experiential_module, 'reset_state'):
+                experiential_module.reset_state(batch_size=batch["input_ids"].size(0))
+
+            step_loss_unscaled, exp_loss_info = train_step(
                 model, batch, criterion, scaler, device, use_amp, use_bf16, vocab_size,
-                gradient_accumulation_steps, cudagraph_runner=cudagraph_runner
+                gradient_accumulation_steps, cudagraph_runner=cudagraph_runner,
+                experiential_module=experiential_module,
+                experiential_weight=getattr(args, 'experiential_weight', 0.1)
             )
 
             if step_loss_unscaled is not None:
                 total_loss_accum_for_log += step_loss_unscaled
                 micro_steps_in_log_period += 1
-            elif error_info is not None:
-                 total_loss_accum_for_log += error_info
+                # Track experiential loss if available
+                if exp_loss_info is not None and experiential_module is not None:
+                    total_exp_loss_accum_for_log += exp_loss_info
+            elif exp_loss_info is not None:
+                 # exp_loss_info may contain error info when step failed
+                 if isinstance(exp_loss_info, (int, float)):
+                     total_loss_accum_for_log += exp_loss_info
                  micro_steps_in_log_period += 1
-                 logger.warning(f"Step {batch_idx+1}: Handled non-fatal error in train_step. Loss: {error_info:.4f}")
+                 logger.warning(f"Step {batch_idx+1}: Handled non-fatal error in train_step.")
 
             if (is_final_accumulation_step or is_last_batch_in_epoch) and step_loss_unscaled is not None :
                 current_micro_batch_loss = step_loss_unscaled
@@ -2021,6 +2097,10 @@ def train(args: Namespace):
                                 "Step": global_step, "LR": f"{optimizer.param_groups[0]['lr']:.2e}"
                             }
                             if scaler: log_postfix["Scale"] = f"{scaler.get_scale():.1f}"
+                            # Add experiential loss to postfix if enabled
+                            if experiential_module is not None and micro_steps_in_log_period > 0:
+                                avg_exp_loss = total_exp_loss_accum_for_log / micro_steps_in_log_period
+                                log_postfix["ExpL"] = f"{avg_exp_loss:.4f}"
                             if args.is_main_process and hasattr(progress_bar, "set_postfix"):
                                 progress_bar.set_postfix(log_postfix)
 
@@ -2035,9 +2115,13 @@ def train(args: Namespace):
                                 }
                                 if scaler:
                                     log_data["train/amp_scale"] = scaler.get_scale()
+                                # Log experiential loss if enabled
+                                if experiential_module is not None and micro_steps_in_log_period > 0:
+                                    log_data["train/experiential_loss"] = total_exp_loss_accum_for_log / micro_steps_in_log_period
                                 wandb.log(log_data, step=global_step)
 
                             total_loss_accum_for_log = 0.0
+                            total_exp_loss_accum_for_log = 0.0
                             micro_steps_in_log_period = 0
                         else: # Log interval hit, but no successful micro-steps in period
                             log_postfix = {"Step": global_step, "LR": f"{optimizer.param_groups[0]['lr']:.2e}"}
@@ -2093,7 +2177,7 @@ def train(args: Namespace):
                                     if math.isnan(save_loss_for_ckpt) and 'current_micro_batch_loss' in locals(): save_loss_for_ckpt = current_micro_batch_loss # fallback
                                     save_checkpoint(args, epoch, global_step, model, optimizer, scaler,
                                                     save_loss_for_ckpt, best_eval_loss, model_config, wandb_run_id=current_wandb_run_id,
-                                                    scheduler=scheduler, is_best=True)
+                                                    scheduler=scheduler, experiential_module=experiential_module, is_best=True)
                         except Exception as e:
                             logger.error(f"Error during evaluation run at step {global_step}: {e}", exc_info=True)
                         finally:
@@ -2106,7 +2190,7 @@ def train(args: Namespace):
                         if math.isnan(save_loss_for_ckpt) and 'current_micro_batch_loss' in locals(): save_loss_for_ckpt = current_micro_batch_loss
                         save_checkpoint(args, epoch, global_step, model, optimizer, scaler,
                                         save_loss_for_ckpt, best_eval_loss, model_config, wandb_run_id=current_wandb_run_id,
-                                        scheduler=scheduler, is_best=False)
+                                        scheduler=scheduler, experiential_module=experiential_module, is_best=False)
 
                     # --- Periodic Debug Generation ---
                     if args.is_main_process and args.debug_generate_interval > 0 and global_step % args.debug_generate_interval == 0 and global_step > 0:
@@ -2301,6 +2385,13 @@ if __name__ == "__main__":
     parser.add_argument('--wandb_run_id', type=str, default=None, help="Weights & Biases specific run ID to resume.")
     parser.add_argument('--disable_wandb', action='store_true', help="Disable Weights & Biases logging.")
 
+    # --- Experiential Stream Arguments ---
+    parser.add_argument('--use_experiential', action='store_true',
+                        help="Enable experiential stream auxiliary loss during training.")
+    parser.add_argument('--experiential_weight', type=float, default=0.1,
+                        help="Weight for experiential loss (default: 0.1).")
+    parser.add_argument('--experiential_checkpoint', type=str, default=None,
+                        help="Path to pretrained experiential module checkpoint (optional).")
 
     args = parser.parse_args()
 

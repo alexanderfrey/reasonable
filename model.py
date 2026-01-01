@@ -320,13 +320,15 @@ class GPT(nn.Module):
             self.kv_caches.append((k_cache, v_cache))
 
     def forward(
-        self, 
-        input_ids: torch.Tensor, 
-        input_pos: Optional[torch.Tensor] = None
+        self,
+        input_ids: torch.Tensor,
+        input_pos: Optional[torch.Tensor] = None,
+        return_hidden_states: bool = False
     ):
         # input_ids: [B, S]
         # input_pos: [S] (integers indicating position in sequence)
-        
+        # return_hidden_states: if True, returns (logits, hidden_states) instead of (logits, None)
+
         if input_pos is None:
             # Default to 0..S if not provided (assume prompt w/o cache)
             input_pos = torch.arange(input_ids.size(1), device=input_ids.device)
@@ -364,8 +366,13 @@ class GPT(nn.Module):
             else:
                 x = layer(x, cos, sin, kv_cache=layer_cache, input_pos=input_pos)
 
-        x = self.final_norm(x)
-        logits = self.lm_head(x)
+        hidden_states = self.final_norm(x)
+        logits = self.lm_head(hidden_states)
+
+        # Return hidden states if requested (for experiential stream, probing, etc.)
+        if return_hidden_states:
+            return logits, hidden_states
+
         # Keep API compatible with callers expecting (logits, kv_cache_out)
         return logits, None
 

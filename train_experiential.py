@@ -1,5 +1,5 @@
 """
-Training script for Experiential Stream v0.1
+Training script for Experiential Stream
 
 Validates the core idea: can we predict "what comes next" in latent space?
 
@@ -7,11 +7,11 @@ Usage:
     # Quick sanity check (random data)
     python train_experiential.py --mode sanity
 
-    # Train on pretrained model's representations
-    python train_experiential.py --mode train --checkpoint path/to/model.pt
+    # Train on your pretrained model
+    python train_experiential.py --mode train
 
-    # Use existing tokenized data
-    python train_experiential.py --mode train --checkpoint path/to/model.pt --data_dir path/to/data
+    # Custom settings
+    python train_experiential.py --mode train --batch_size 16 --lr 3e-4
 """
 
 import argparse
@@ -30,11 +30,15 @@ from tqdm import tqdm
 
 # Local imports
 from experiential import (
-    ExperientialStreamV01,
+    ExperientialStream,
     experiential_loss,
     prediction_accuracy,
     compute_metrics
 )
+
+# Default paths for this project
+DEFAULT_CHECKPOINT = "tiny_pretrain_output/model_best_eval.pt"
+DEFAULT_DATA_DIR = "tiny_pretrain_output"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -47,37 +51,45 @@ class HiddenStateExtractor(nn.Module):
     """
     Wraps a GPT model to extract hidden states before lm_head.
 
-    This avoids modifying the original model.py.
+    Only runs through transformer layers, skipping lm_head for efficiency.
     """
 
     def __init__(self, model: nn.Module):
         super().__init__()
         self.model = model
-        self._hidden_states = None
 
-        # Register hook on final_norm to capture hidden states
-        self._hook = self.model.final_norm.register_forward_hook(self._capture_hidden)
-
-    def _capture_hidden(self, module, input, output):
-        """Hook to capture hidden states after final_norm."""
-        self._hidden_states = output
-
-    def forward(self, input_ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, input_ids: torch.Tensor) -> Tuple[None, torch.Tensor]:
         """
-        Forward pass that returns both logits and hidden states.
+        Forward pass that returns hidden states only (no logits).
 
         Returns:
-            logits: [batch, seq_len, vocab_size]
+            None (placeholder for logits)
             hidden_states: [batch, seq_len, d_model]
         """
-        logits, _ = self.model(input_ids)
-        hidden_states = self._hidden_states
-        self._hidden_states = None  # clear for next call
-        return logits, hidden_states
+        seq_len = input_ids.size(1)
+        device = input_ids.device
+
+        # Get RoPE embeddings
+        input_pos = torch.arange(seq_len, device=device)
+        cos = self.model.cos_cached[input_pos]
+        sin = self.model.sin_cached[input_pos]
+
+        # Run embedding
+        x = self.model.token_embedding(input_ids)
+
+        # Run through transformer layers (without KV cache)
+        for layer in self.model.layers:
+            x = layer(x, cos, sin, kv_cache=None, input_pos=None)
+
+        # Final normalization
+        hidden_states = self.model.final_norm(x)
+
+        # Skip lm_head - we don't need logits
+        return None, hidden_states
 
     def remove_hook(self):
-        """Clean up hook when done."""
-        self._hook.remove()
+        """Compatibility method - nothing to clean up now."""
+        pass
 
 
 class RandomDataLoader:
@@ -124,9 +136,20 @@ def load_model(checkpoint_path: str, device: torch.device) -> nn.Module:
     args = checkpoint.get('args', {})
     if isinstance(args, dict):
         # Merge args into config (args may have more complete info)
-        for key in ['vocab_size', 'd_model', 'n_head', 'n_layer', 'max_seq_len', 'n_kv_head']:
+        for key in ['vocab_size', 'd_model', 'n_head', 'n_layer', 'max_seq_len', 'n_kv_head', 'd_ff']:
             if key in args and key not in saved_config:
                 saved_config[key] = args[key]
+
+    # Infer d_ff from checkpoint weights if not in config
+    d_ff = saved_config.get('d_ff')
+    if d_ff is None:
+        # Try to infer from FFN weight shapes: gate_up_proj is [2*d_ff, d_model]
+        state_dict = checkpoint.get('model_state_dict', {})
+        for key, tensor in state_dict.items():
+            if 'ffn.gate_up_proj.weight' in key:
+                d_ff = tensor.shape[0] // 2
+                logger.info(f"Inferred d_ff={d_ff} from checkpoint weights")
+                break
 
     # Create config
     config = GPTConfig(
@@ -137,6 +160,7 @@ def load_model(checkpoint_path: str, device: torch.device) -> nn.Module:
         max_seq_len=saved_config.get('max_seq_len', 1024),
         n_kv_head=saved_config.get('n_kv_head'),
         dropout=saved_config.get('dropout', 0.0),
+        d_ff=d_ff,
     )
 
     logger.info(f"Model config: d_model={config.d_model}, n_layer={config.n_layer}")
@@ -184,13 +208,14 @@ def create_small_model(device: torch.device) -> Tuple[nn.Module, 'GPTConfig']:
 
 def train_experiential(
     extractor: HiddenStateExtractor,
-    experiential: ExperientialStreamV01,
+    experiential: nn.Module,  # V01 or V02
     dataloader,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
     n_epochs: int = 1,
     log_interval: int = 10,
-    freeze_backbone: bool = True
+    freeze_backbone: bool = True,
+    max_steps: Optional[int] = None
 ) -> dict:
     """
     Train the experiential module on hidden states from the backbone.
@@ -204,6 +229,7 @@ def train_experiential(
         n_epochs: Number of epochs
         log_interval: Steps between logging
         freeze_backbone: If True, don't update backbone (recommended for v0.1)
+        max_steps: Maximum training steps (overrides epochs if set)
 
     Returns:
         dict with training history
@@ -230,10 +256,20 @@ def train_experiential(
         epoch_acc = 0.0
         epoch_steps = 0
 
+        # Reset persistent state at start of each epoch
+        # (since batches are random samples, not sequential)
+        if hasattr(experiential, 'reset_state'):
+            experiential.reset_state()
+
         pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{n_epochs}", leave=True)
 
         for batch_idx, batch in enumerate(pbar):
             input_ids = batch["input_ids"].to(device)
+
+            # Reset state for each batch (random samples, not sequential)
+            # In future: maintain state for truly sequential data
+            if hasattr(experiential, 'reset_state'):
+                experiential.reset_state(batch_size=input_ids.size(0))
 
             # Get hidden states from frozen backbone
             with torch.no_grad() if freeze_backbone else torch.enable_grad():
@@ -274,6 +310,14 @@ def train_experiential(
             history['surprise_mean'].append(surprise_mean)
             history['surprise_std'].append(surprise_std)
 
+            # Check max_steps
+            if max_steps is not None and total_steps >= max_steps:
+                break
+
+        # Check max_steps for outer loop
+        if max_steps is not None and total_steps >= max_steps:
+            break
+
         # Epoch summary
         avg_loss = epoch_loss / max(epoch_steps, 1)
         avg_acc = epoch_acc / max(epoch_steps, 1)
@@ -285,6 +329,18 @@ def train_experiential(
     logger.info(f"Training complete: {total_steps} steps in {elapsed:.1f}s")
 
     return history
+
+
+def create_experiential_module(d_model: int, device: torch.device = None):
+    """Create experiential module."""
+    module = ExperientialStream(d_model=d_model)
+
+    if device:
+        module = module.to(device)
+
+    n_params = sum(p.numel() for p in module.parameters())
+    logger.info(f"Created ExperientialStream: {n_params:,} parameters")
+    return module
 
 
 def run_sanity_check(device: torch.device, n_steps: int = 100):
@@ -300,10 +356,7 @@ def run_sanity_check(device: torch.device, n_steps: int = 100):
     extractor = HiddenStateExtractor(model)
 
     # Create experiential module
-    experiential = ExperientialStreamV01(
-        d_model=config.d_model,
-        n_heads=4
-    ).to(device)
+    experiential = create_experiential_module(config.d_model, device)
 
     # Random data
     dataloader = RandomDataLoader(
@@ -372,35 +425,35 @@ def run_training(
     data_dir: Optional[str] = None,
     n_epochs: int = 3,
     batch_size: int = 8,
+    seq_len: int = 512,
     learning_rate: float = 1e-4,
     max_steps: Optional[int] = None,
-    output_dir: str = "experiential_output"
+    output_dir: str = "experiential_output",
 ):
     """
     Train experiential module on pretrained model's representations.
     """
     logger.info("=" * 60)
-    logger.info("Training Experiential Stream v0.1")
+    logger.info("Training Experiential Stream")
+    logger.info(f"  batch_size={batch_size}, seq_len={seq_len}, lr={learning_rate}")
     logger.info("=" * 60)
 
     os.makedirs(output_dir, exist_ok=True)
 
-    # Load model
+    # Load model (use defaults if not specified)
+    checkpoint_path = checkpoint_path or DEFAULT_CHECKPOINT
+    data_dir = data_dir or DEFAULT_DATA_DIR
+
     if checkpoint_path and os.path.exists(checkpoint_path):
         model, config = load_model(checkpoint_path, device)
     else:
-        logger.warning("No checkpoint provided, using small test model")
+        logger.warning(f"Checkpoint not found at {checkpoint_path}, using small test model")
         model, config = create_small_model(device)
 
     extractor = HiddenStateExtractor(model)
 
     # Create experiential module
-    experiential = ExperientialStreamV01(
-        d_model=config.d_model,
-        n_heads=4
-    ).to(device)
-
-    logger.info(f"Experiential module parameters: {sum(p.numel() for p in experiential.parameters()):,}")
+    experiential = create_experiential_module(config.d_model, device)
 
     # Setup data
     if data_dir and os.path.exists(data_dir):
@@ -417,8 +470,8 @@ def run_training(
 
             token_file = meta.get('token_file') or meta_files[0].replace('_metadata.json', '_tokens.bin')
             num_examples = meta.get('num_examples', 1000)
-            max_seq_len = meta.get('max_seq_len', 512)
-            stride = meta.get('stride', max_seq_len)
+            max_seq_len = seq_len  # Use our seq_len, not the one from metadata
+            stride = max_seq_len
 
             logger.info(f"Loading data from {token_file}")
             dataset = PretokenizedDataset(
@@ -437,7 +490,7 @@ def run_training(
             n_batches = max_steps or 500
             dataloader = RandomDataLoader(
                 vocab_size=config.vocab_size,
-                seq_len=min(512, config.max_seq_len),
+                seq_len=seq_len,
                 batch_size=batch_size,
                 n_batches=n_batches,
                 device=device
@@ -448,7 +501,7 @@ def run_training(
         n_batches = max_steps or 500
         dataloader = RandomDataLoader(
             vocab_size=config.vocab_size,
-            seq_len=min(512, config.max_seq_len),
+            seq_len=seq_len,
             batch_size=batch_size,
             n_batches=n_batches,
             device=device
@@ -470,7 +523,8 @@ def run_training(
         device=device,
         n_epochs=n_epochs,
         log_interval=10,
-        freeze_backbone=True
+        freeze_backbone=True,
+        max_steps=max_steps
     )
 
     # Save results
@@ -478,7 +532,7 @@ def run_training(
     logger.info(f"Final accuracy (last 10): {final_acc:.4f}")
 
     # Save model
-    save_path = os.path.join(output_dir, "experiential_v01.pt")
+    save_path = os.path.join(output_dir, "experiential.pt")
     torch.save({
         'model_state_dict': experiential.state_dict(),
         'd_model': config.d_model,
@@ -493,7 +547,7 @@ def run_training(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train Experiential Stream v0.1")
+    parser = argparse.ArgumentParser(description="Train Experiential Stream")
 
     parser.add_argument(
         "--mode",
@@ -506,13 +560,13 @@ def main():
         "--checkpoint",
         type=str,
         default=None,
-        help="Path to pretrained model checkpoint"
+        help=f"Path to pretrained model checkpoint (default: {DEFAULT_CHECKPOINT})"
     )
     parser.add_argument(
         "--data_dir",
         type=str,
         default=None,
-        help="Directory containing tokenized data"
+        help=f"Directory containing tokenized data (default: {DEFAULT_DATA_DIR})"
     )
     parser.add_argument(
         "--output_dir",
@@ -527,6 +581,12 @@ def main():
         help="Batch size"
     )
     parser.add_argument(
+        "--seq_len",
+        type=int,
+        default=512,
+        help="Sequence length (shorter = less memory)"
+    )
+    parser.add_argument(
         "--n_epochs",
         type=int,
         default=3,
@@ -535,7 +595,7 @@ def main():
     parser.add_argument(
         "--lr",
         type=float,
-        default=1e-4,
+        default=3e-4,
         help="Learning rate"
     )
     parser.add_argument(
@@ -564,9 +624,10 @@ def main():
             data_dir=args.data_dir,
             n_epochs=args.n_epochs,
             batch_size=args.batch_size,
+            seq_len=args.seq_len,
             learning_rate=args.lr,
             max_steps=args.max_steps,
-            output_dir=args.output_dir
+            output_dir=args.output_dir,
         )
 
 
