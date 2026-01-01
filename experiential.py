@@ -568,18 +568,20 @@ class ExperientialStream(nn.Module):
         Returns:
             dict with:
                 - state: [batch, d_model] current state (h_mid)
-                - prediction: [batch, d_model] predicted future (pred h_end)
-                - target: [batch, d_model] actual future (h_end, detached)
-                - surprise: [batch] prediction error (0=expected, 1=surprising)
+                - prediction: [batch, d_model] predicted future (what we expect)
+                - target: [batch, d_model] = modulated_output (what we commit to, detached)
+                    NOTE: This is the CLOSED LOOP - predictor learns to predict committed output
+                - h_end: [batch, d_model] raw world state (before self-modulation)
+                - surprise: [batch] prediction error vs h_end (0=expected, 1=surprising)
                 - predicted_surprise: [batch] self-predicted surprise (what I thought I'd feel)
                 - meta_surprise: [batch] |predicted_surprise - surprise| (self-awareness signal)
                 - valence: [batch] emotional valence (-1=negative, 1=positive)
                 - arousal: [batch] activation level (0=calm, 1=excited)
                 - salience: [batch] importance signal (surprise × arousal × |valence| × (1 + meta_surprise))
-                - modulated_output: [batch, d_model] h_end adjusted by self-knowledge
+                - modulated_output: [batch, d_model] h_end adjusted by self-knowledge = target
                     (high confidence → h_end, low confidence → fallback to prior)
                 - confidence_gate: [batch, d_model] how much we trusted h_end per dimension
-                - persistent_state: [batch, d_model] updated persistent state
+                - persistent_state: [batch, d_model] updated from modulated_output (closed loop)
                 - gate_values: [batch, d_model] state gate activations (if persistent)
         """
         batch_size, seq_len, d_model = hidden_states.shape
@@ -666,29 +668,34 @@ class ExperientialStream(nn.Module):
             # Blend: confident → use h_end, uncertain → use fallback
             modulated_output = confidence_gate * h_end + (1 - confidence_gate) * fallback
 
-        # Update persistent state
+        # Update persistent state with MODULATED output (closes the feedback loop)
+        # This means: what the system commits to → becomes input to next prediction
         gate_values = None
         if self.use_persistent_state and update_state:
-            # Compute new state using gated update
-            new_state = self._update_state(h_end.detach(), prev_state)
+            # Compute new state using gated update with MODULATED output
+            # Key insight: prev_state for next step = what we committed to, not raw h_end
+            new_state = self._update_state(modulated_output.detach(), prev_state)
             self._persistent_state = new_state.detach()  # Detach to prevent huge graphs
 
             # Track gate values for analysis
             with torch.no_grad():
-                gate_input = torch.cat([h_end, prev_state], dim=-1)
+                gate_input = torch.cat([modulated_output, prev_state], dim=-1)
                 gate_values = self.state_gate(gate_input)
 
         return {
             'state': h_mid,
             'prediction': prediction,
-            'target': h_end.detach(),  # stop gradient for contrastive loss
+            # TARGET is now modulated_output: predictor learns to predict committed output
+            # This closes the loop: predict(prev_committed) → next_committed
+            'target': modulated_output.detach(),  # stop gradient for contrastive loss
             'surprise': surprise,
             'predicted_surprise': predicted_surprise,
             'meta_surprise': meta_surprise,
             'valence': valence,
             'arousal': arousal,
             'salience': salience,
-            'modulated_output': modulated_output,  # h_end adjusted by self-knowledge
+            'h_end': h_end.detach(),               # raw world state (for analysis)
+            'modulated_output': modulated_output,  # h_end adjusted by self-knowledge (= target)
             'confidence_gate': confidence_gate,    # how much we trusted h_end
             'mid_idx': mid_idx,
             'end_idx': end_idx if end_idx != -1 else seq_len - 1,

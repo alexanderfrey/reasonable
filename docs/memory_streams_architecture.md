@@ -579,14 +579,32 @@ modulated_output = confidence_gate * h_end + (1 - confidence_gate) * fallback
 # 5. Self-modulation loss: train confidence to track meta-surprise (v0.3.1)
 self_mod_loss = MSE(confidence_mean, 1 - meta_surprise)  # Low confidence when uncertain
 # combined_loss = exp_loss + meta_weight * meta_loss + self_mod_weight * self_mod_loss
+
+# 6. CLOSED LOOP: target = modulated_output, state updated with modulated_output (v0.3.2)
+target = modulated_output  # Predictor learns to predict what system COMMITS TO
+prev_state_next = gate * modulated_output + (1 - gate) * prev_state  # Next step sees committed output
+# This closes: self-prediction → affects output → affects next input → affects next prediction
 ```
 
-**The feedback loop**: High meta-surprise → higher salience → crystallize into memory AND lower confidence → conservative processing → system learns from and adapts to moments of self-ignorance.
+**The CLOSED feedback loop** (v0.3.2):
+```
+step N:   predict(h_mid, prev_state) → prediction
+          surprise = |prediction - h_end|           # How surprising was the world?
+          meta_surprise = |predicted_surprise - surprise|  # How well did I know myself?
+          confidence = f(h_end, meta_surprise)      # How confident am I?
+          modulated_output = blend(h_end, fallback, confidence)  # What I commit to
+          target = modulated_output                 # Learn to predict committed output
+          prev_state → update with modulated_output # Next step sees this
 
-**Key insight**: Self-predictions now AFFECT behavior, not just memory. When the system doesn't know itself (high meta-surprise), it:
+step N+1: predict(h_mid, prev_state=modulated_output_N) → prediction
+          # The predictor now learns: given what I committed to before,
+          # predict what I will commit to next
+```
+
+**Key insight**: Self-predictions now AFFECT behavior AND future predictions. When the system doesn't know itself:
 - Boosts salience (remember this moment)
 - Reduces confidence (blend toward fallback/prior)
-- Creates modulated output (what gets stored in memory)
+- Creates modulated output (what gets stored AND becomes input to next prediction)
 
 **Test results on real data (1000 steps with self_mod_loss)**:
 - Meta-surprise decreased by **36%** (0.102 → 0.065)
@@ -595,7 +613,7 @@ self_mod_loss = MSE(confidence_mean, 1 - meta_surprise)  # Low confidence when u
 - Self-mod loss decreased from 0.009 → 0.002
 - Modulation magnitude decreased 33.5% (less correction needed as system learns)
 
-This confirms the feedback loop is working: the system learns to be less confident when it doesn't know itself.
+The system now has a true closed loop: self-knowledge affects processing, which affects what gets predicted next.
 
 Next steps for deeper self-awareness:
 - Predict what memories will be retrieved
@@ -716,6 +734,10 @@ intrinsic_reward = (
   - [x] Self-predictions now AFFECT processing, not just memory
   - [x] `self_mod_loss`: train confidence to inversely track meta-surprise (v0.3.1)
   - [x] Verified: -0.49 correlation between meta-surprise and confidence
+- [x] Close the feedback loop (v0.3.2)
+  - [x] `target = modulated_output`: predictor learns to predict committed output
+  - [x] `prev_state` updated with modulated_output: next step sees committed output
+  - [x] True closed loop: self-prediction → output → next input → next prediction
 - [ ] Add decay mechanism to episodic memory
 - [ ] Implement procedural stream
 - [ ] Add resume-after-interruption training
