@@ -211,6 +211,122 @@ class EpisodicMemory(nn.Module):
         sorted_eps = sorted(self.episodes, key=lambda x: x.salience, reverse=True)
         return sorted_eps[:top_k]
 
+    def retrieve_soft(
+        self,
+        query: torch.Tensor,
+        temperature: float = 0.1,
+        salience_weight: float = 0.0
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Differentiable retrieval for end-to-end training.
+
+        Computes soft attention over all episodes and returns weighted sum.
+        Gradients flow through both query and the returned values.
+
+        Args:
+            query: [batch, d_model] or [d_model] - query vector(s)
+            temperature: softmax temperature (lower = sharper attention)
+            salience_weight: how much to weight by salience (0 = pure similarity)
+
+        Returns:
+            values: [batch, d_model] - weighted sum of episode contents
+            weights: [batch, n_episodes] - attention weights over episodes
+        """
+        # Handle empty memory
+        if not self.episodes:
+            if query.dim() == 1:
+                return torch.zeros(self.d_model, device=query.device), torch.zeros(0, device=query.device)
+            else:
+                batch_size = query.size(0)
+                return torch.zeros(batch_size, self.d_model, device=query.device), torch.zeros(batch_size, 0, device=query.device)
+
+        # Ensure query is 2D: [batch, d_model]
+        if query.dim() == 1:
+            query = query.unsqueeze(0)
+            squeeze_output = True
+        else:
+            squeeze_output = False
+
+        batch_size = query.size(0)
+        device = query.device
+
+        # Stack episode contents: [n_episodes, d_model]
+        # Keep on same device as query for gradient flow
+        episode_contents = torch.stack([ep.content.to(device) for ep in self.episodes])
+        n_episodes = episode_contents.size(0)
+
+        # Normalize for cosine similarity
+        query_norm = F.normalize(query, dim=-1)  # [batch, d_model]
+        content_norm = F.normalize(episode_contents, dim=-1)  # [n_episodes, d_model]
+
+        # Compute similarities: [batch, n_episodes]
+        similarities = torch.mm(query_norm, content_norm.t()) / temperature
+
+        # Optionally weight by salience
+        if salience_weight > 0:
+            saliences = torch.tensor(
+                [ep.salience for ep in self.episodes],
+                device=device,
+                dtype=query.dtype
+            )
+            # Log-salience bonus (so it doesn't dominate)
+            salience_bonus = salience_weight * torch.log1p(saliences)
+            similarities = similarities + salience_bonus.unsqueeze(0)
+
+        # Softmax to get attention weights
+        weights = F.softmax(similarities, dim=-1)  # [batch, n_episodes]
+
+        # Weighted sum of episode contents
+        # [batch, n_episodes] @ [n_episodes, d_model] = [batch, d_model]
+        values = torch.mm(weights, episode_contents)
+
+        # Update retrieval counts (based on attention, not hard selection)
+        with torch.no_grad():
+            # Increment counts proportionally to attention
+            avg_weights = weights.mean(dim=0)  # [n_episodes]
+            for i, ep in enumerate(self.episodes):
+                ep.retrieval_count += int(avg_weights[i].item() > 0.1)
+
+        if squeeze_output:
+            values = values.squeeze(0)
+            weights = weights.squeeze(0)
+
+        return values, weights
+
+    def get_content_matrix(self, device: Optional[torch.device] = None) -> torch.Tensor:
+        """
+        Get all episode contents as a matrix.
+
+        Args:
+            device: device to place tensor on
+
+        Returns:
+            contents: [n_episodes, d_model] or empty tensor if no episodes
+        """
+        if not self.episodes:
+            return torch.zeros(0, self.d_model, device=device)
+        contents = torch.stack([ep.content for ep in self.episodes])
+        if device is not None:
+            contents = contents.to(device)
+        return contents
+
+    def get_context_matrix(self, device: Optional[torch.device] = None) -> torch.Tensor:
+        """
+        Get all episode contexts as a matrix.
+
+        Args:
+            device: device to place tensor on
+
+        Returns:
+            contexts: [n_episodes, d_model] or empty tensor if no episodes
+        """
+        if not self.episodes:
+            return torch.zeros(0, self.d_model, device=device)
+        contexts = torch.stack([ep.context for ep in self.episodes])
+        if device is not None:
+            contexts = contexts.to(device)
+        return contexts
+
     def _evict_lowest_priority(self):
         """Remove the least important episode to make room."""
         if not self.episodes:
@@ -1113,6 +1229,135 @@ def test_episodic_memory_with_experiential():
     return True
 
 
+def test_retrieve_soft():
+    """Test differentiable retrieval."""
+    print("Testing retrieve_soft (differentiable retrieval)...")
+
+    d_model = 128
+    memory = EpisodicMemory(d_model=d_model, capacity=100)
+
+    # Test with empty memory
+    query = torch.randn(d_model, requires_grad=True)
+    values, weights = memory.retrieve_soft(query)
+    assert values.shape == (d_model,), f"Empty memory should return zeros of shape {d_model}"
+    assert weights.shape == (0,), "Empty memory should return empty weights"
+    print("  Empty memory handling works")
+
+    # Store some episodes with known content
+    n_episodes = 5
+    episode_contents = []
+    for i in range(n_episodes):
+        content = torch.randn(d_model)
+        content = F.normalize(content, dim=-1)  # Normalize for easier testing
+        episode_contents.append(content)
+        memory.store(content, torch.randn(d_model), salience=0.5 + 0.1 * i)
+
+    # Test 1: Query that matches a specific episode
+    query = episode_contents[2].clone().requires_grad_(True)
+    values, weights = memory.retrieve_soft(query, temperature=0.1)
+
+    assert values.shape == (d_model,), f"Values shape wrong: {values.shape}"
+    assert weights.shape == (n_episodes,), f"Weights shape wrong: {weights.shape}"
+    assert weights.sum().item() - 1.0 < 1e-5, "Weights should sum to 1"
+
+    # The matching episode should have highest weight
+    assert weights[2].item() > weights.max().item() - 0.01, \
+        f"Query should match episode 2 most (weight={weights[2]:.3f})"
+
+    print(f"  Retrieval weights: {weights.detach().numpy().round(3)}")
+    print(f"  Highest weight at index: {weights.argmax().item()} (expected 2)")
+
+    # Test 2: Gradient flow
+    loss = values.sum()
+    loss.backward()
+    assert query.grad is not None, "Gradients should flow through retrieve_soft"
+    assert query.grad.abs().sum() > 0, "Gradients should be non-zero"
+    print("  Gradient flow works!")
+
+    # Test 3: Batched query
+    batch_size = 4
+    batch_query = torch.randn(batch_size, d_model)
+    batch_values, batch_weights = memory.retrieve_soft(batch_query)
+
+    assert batch_values.shape == (batch_size, d_model), \
+        f"Batched values shape wrong: {batch_values.shape}"
+    assert batch_weights.shape == (batch_size, n_episodes), \
+        f"Batched weights shape wrong: {batch_weights.shape}"
+    print(f"  Batched retrieval works: {batch_values.shape}")
+
+    # Test 4: Temperature effect
+    query = episode_contents[0].clone()
+    _, weights_hot = memory.retrieve_soft(query, temperature=1.0)  # softer
+    _, weights_cold = memory.retrieve_soft(query, temperature=0.01)  # sharper
+
+    # Cold temperature should be more peaked
+    assert weights_cold.max() > weights_hot.max(), \
+        "Lower temperature should produce sharper attention"
+    print(f"  Temperature effect: hot_max={weights_hot.max():.3f}, cold_max={weights_cold.max():.3f}")
+
+    # Test 5: Salience weighting
+    _, weights_no_sal = memory.retrieve_soft(torch.randn(d_model), salience_weight=0.0)
+    _, weights_with_sal = memory.retrieve_soft(torch.randn(d_model), salience_weight=1.0)
+
+    # With salience weighting, higher salience episodes should get more weight
+    # Episode 4 has highest salience (0.9)
+    print(f"  Salience effect: no_sal[4]={weights_no_sal[4]:.3f}, with_sal[4]={weights_with_sal[4]:.3f}")
+
+    print("  retrieve_soft test passed!")
+    return True
+
+
+def test_retrieve_soft_learning():
+    """Test that retrieve_soft enables learning."""
+    print("Testing retrieve_soft enables learning...")
+
+    d_model = 64
+    batch_size = 16
+    n_steps = 50
+
+    # Create memory with some episodes
+    memory = EpisodicMemory(d_model=d_model, capacity=20)
+    for i in range(10):
+        memory.store(torch.randn(d_model), torch.randn(d_model), salience=0.5)
+
+    # Create a simple query projector to train
+    query_proj = nn.Linear(d_model, d_model)
+    optimizer = torch.optim.Adam(query_proj.parameters(), lr=0.01)
+
+    # Training task: make retrieval output match a target
+    target = torch.randn(d_model)
+
+    losses = []
+    for step in range(n_steps):
+        # Random input
+        x = torch.randn(batch_size, d_model)
+
+        # Project to query space
+        query = query_proj(x)
+
+        # Retrieve from memory
+        retrieved, weights = memory.retrieve_soft(query, temperature=0.5)
+
+        # Loss: retrieved should match target
+        loss = F.mse_loss(retrieved, target.expand(batch_size, -1))
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        losses.append(loss.item())
+
+    # Loss should decrease
+    initial_loss = sum(losses[:5]) / 5
+    final_loss = sum(losses[-5:]) / 5
+    print(f"  Initial loss: {initial_loss:.4f}")
+    print(f"  Final loss: {final_loss:.4f}")
+
+    assert final_loss < initial_loss, "Loss should decrease with training"
+    print("  retrieve_soft learning test passed!")
+    return True
+
+
 if __name__ == "__main__":
     print("=" * 60)
     print("ExperientialStream & EpisodicMemory Tests")
@@ -1137,6 +1382,10 @@ if __name__ == "__main__":
     test_episodic_memory_basic()
     print()
     test_episodic_memory_with_experiential()
+    print()
+    test_retrieve_soft()
+    print()
+    test_retrieve_soft_learning()
 
     print()
     print("=" * 60)
