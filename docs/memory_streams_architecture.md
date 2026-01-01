@@ -634,7 +634,13 @@ intrinsic_reward = (
   - [x] store() with crystallization threshold
   - [x] retrieve() by similarity, time, salience
   - [x] Capacity management with priority-based eviction
-- [ ] Implement SemanticStream (consolidation from episodes)
+- [x] Implement SemanticStream (consolidation from episodes)
+  - [x] ConceptRelation and Concept dataclasses
+  - [x] PatternExtractor (attention-based pooling)
+  - [x] RelationPredictor (6 relation types)
+  - [x] consolidate() and consolidate_from_memory()
+  - [x] query() and query_soft() (differentiable)
+  - [x] connect() and generalize()
 - [x] Integrate with existing GPT backbone (`model.py`, `pretrain.py`)
 
 ### Remaining Work
@@ -644,11 +650,12 @@ intrinsic_reward = (
   - [x] Automatic crystallization during forward pass
   - [x] Combined loss (LM + experiential prediction)
   - [x] Full gradient flow through retrieval
+- [x] Implement semantic consolidation (SemanticStream)
 - [ ] Add decay mechanism to episodic memory
-- [ ] Implement semantic consolidation
 - [ ] Implement procedural stream
 - [ ] Add resume-after-interruption training
-- [ ] Evaluate: does surprise correlate with narrative events?
+- [ ] Validate on narrative data: does surprise correlate with events?
+- [ ] Integrate SemanticStream with MemoryAugmentedGPT
 
 ---
 
