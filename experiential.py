@@ -25,8 +25,8 @@ Usage:
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict, Optional
-from dataclasses import dataclass
+from typing import Dict, Optional, List, Tuple
+from dataclasses import dataclass, field
 
 
 @dataclass
@@ -36,6 +36,230 @@ class ExperientialConfig:
     predictor_hidden_mult: int = 2
     temperature: float = 0.1
     split_ratio: float = 0.5  # first half / second half split
+
+
+@dataclass
+class Episode:
+    """A discrete memory of something that happened."""
+    timestamp: int              # when (global step / position)
+    content: torch.Tensor       # what (embedding of the event) [d_model]
+    context: torch.Tensor       # surrounding state when it happened [d_model]
+    salience: float             # how important (surprise × affect)
+    valence: float = 0.0        # emotional valence at the time
+    arousal: float = 0.0        # arousal level at the time
+    retrieval_count: int = 0    # how often accessed (for consolidation)
+
+    def to(self, device: torch.device) -> 'Episode':
+        """Move episode tensors to device."""
+        return Episode(
+            timestamp=self.timestamp,
+            content=self.content.to(device),
+            context=self.context.to(device),
+            salience=self.salience,
+            valence=self.valence,
+            arousal=self.arousal,
+            retrieval_count=self.retrieval_count
+        )
+
+
+class EpisodicMemory(nn.Module):
+    """
+    Episodic memory buffer — stores crystallized experiences.
+
+    Key concepts:
+    - Crystallization: high-salience moments become discrete memories
+    - Retrieval: find relevant memories by similarity to current state
+    - Decay: old, unused memories fade or get consolidated
+
+    Usage:
+        memory = EpisodicMemory(d_model=768, capacity=1000)
+
+        # During experience
+        if memory.should_crystallize(salience):
+            memory.store(state, context, salience, timestamp)
+
+        # During recall
+        retrieved = memory.retrieve(query_state, top_k=5)
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        capacity: int = 1000,
+        crystallization_threshold: float = 0.3,
+        decay_rate: float = 0.01
+    ):
+        super().__init__()
+        self.d_model = d_model
+        self.capacity = capacity
+        self.crystallization_threshold = crystallization_threshold
+        self.decay_rate = decay_rate
+
+        # Episode storage
+        self.episodes: List[Episode] = []
+
+        # Global timestamp counter
+        self._global_step = 0
+
+    @property
+    def size(self) -> int:
+        """Current number of stored episodes."""
+        return len(self.episodes)
+
+    def should_crystallize(self, salience: float) -> bool:
+        """Decide whether a moment should become a memory."""
+        return salience > self.crystallization_threshold
+
+    def store(
+        self,
+        content: torch.Tensor,
+        context: torch.Tensor,
+        salience: float,
+        valence: float = 0.0,
+        arousal: float = 0.0,
+        timestamp: Optional[int] = None
+    ) -> Episode:
+        """
+        Store a new episode in memory.
+
+        Args:
+            content: the state embedding to store [d_model]
+            context: the context/prediction at the time [d_model]
+            salience: importance score
+            valence: emotional valence
+            arousal: arousal level
+            timestamp: optional explicit timestamp
+
+        Returns:
+            The stored Episode
+        """
+        if timestamp is None:
+            timestamp = self._global_step
+
+        episode = Episode(
+            timestamp=timestamp,
+            content=content.detach().cpu(),
+            context=context.detach().cpu(),
+            salience=salience,
+            valence=valence,
+            arousal=arousal,
+            retrieval_count=0
+        )
+
+        # Manage capacity
+        if len(self.episodes) >= self.capacity:
+            self._evict_lowest_priority()
+
+        self.episodes.append(episode)
+        self._global_step += 1
+
+        return episode
+
+    def retrieve(
+        self,
+        query: torch.Tensor,
+        top_k: int = 5,
+        min_salience: float = 0.0
+    ) -> List[Tuple[Episode, float]]:
+        """
+        Retrieve relevant episodes by similarity to query.
+
+        Args:
+            query: current state to match against [d_model]
+            top_k: number of episodes to retrieve
+            min_salience: minimum salience threshold for retrieval
+
+        Returns:
+            List of (episode, similarity_score) tuples, sorted by similarity
+        """
+        if not self.episodes:
+            return []
+
+        query_cpu = query.detach().cpu()
+        query_norm = F.normalize(query_cpu, dim=-1)
+
+        # Compute similarities
+        scores = []
+        for ep in self.episodes:
+            if ep.salience < min_salience:
+                continue
+            content_norm = F.normalize(ep.content, dim=-1)
+            sim = torch.dot(query_norm, content_norm).item()
+            scores.append((ep, sim))
+
+        # Sort by similarity (descending)
+        scores.sort(key=lambda x: x[1], reverse=True)
+
+        # Update retrieval counts for top-k
+        for ep, _ in scores[:top_k]:
+            ep.retrieval_count += 1
+
+        return scores[:top_k]
+
+    def retrieve_by_time(
+        self,
+        recent_n: int = 10
+    ) -> List[Episode]:
+        """Retrieve most recent episodes."""
+        return self.episodes[-recent_n:]
+
+    def retrieve_by_salience(
+        self,
+        top_k: int = 10
+    ) -> List[Episode]:
+        """Retrieve most salient episodes."""
+        sorted_eps = sorted(self.episodes, key=lambda x: x.salience, reverse=True)
+        return sorted_eps[:top_k]
+
+    def _evict_lowest_priority(self):
+        """Remove the least important episode to make room."""
+        if not self.episodes:
+            return
+
+        # Priority = salience × recency_factor × (1 + retrieval_count)
+        # Lower priority = more likely to evict
+        current_time = self._global_step
+        priorities = []
+        for i, ep in enumerate(self.episodes):
+            age = current_time - ep.timestamp + 1
+            recency = 1.0 / (1 + self.decay_rate * age)
+            priority = ep.salience * recency * (1 + 0.1 * ep.retrieval_count)
+            priorities.append((i, priority))
+
+        # Find and remove lowest priority
+        min_idx = min(priorities, key=lambda x: x[1])[0]
+        self.episodes.pop(min_idx)
+
+    def decay_salience(self, factor: float = 0.99):
+        """Apply decay to all episode saliences (for consolidation)."""
+        for ep in self.episodes:
+            ep.salience *= factor
+
+    def clear(self):
+        """Clear all episodes."""
+        self.episodes = []
+
+    def get_stats(self) -> Dict[str, float]:
+        """Get memory statistics."""
+        if not self.episodes:
+            return {
+                'size': 0,
+                'avg_salience': 0.0,
+                'avg_retrieval_count': 0.0,
+                'avg_age': 0.0
+            }
+
+        saliences = [ep.salience for ep in self.episodes]
+        retrieval_counts = [ep.retrieval_count for ep in self.episodes]
+        ages = [self._global_step - ep.timestamp for ep in self.episodes]
+
+        return {
+            'size': len(self.episodes),
+            'avg_salience': sum(saliences) / len(saliences),
+            'max_salience': max(saliences),
+            'avg_retrieval_count': sum(retrieval_counts) / len(retrieval_counts),
+            'avg_age': sum(ages) / len(ages)
+        }
 
 
 class ExperientialStream(nn.Module):
@@ -754,9 +978,144 @@ def test_persistent_state_learning():
     return True
 
 
+def test_episodic_memory_basic():
+    """Test basic episodic memory operations."""
+    print("Testing episodic memory basics...")
+
+    d_model = 128
+    capacity = 10
+
+    memory = EpisodicMemory(d_model=d_model, capacity=capacity, crystallization_threshold=0.3)
+
+    # Initially empty
+    assert memory.size == 0, "Memory should start empty"
+
+    # Store some episodes
+    for i in range(5):
+        content = torch.randn(d_model)
+        context = torch.randn(d_model)
+        salience = 0.5 + 0.1 * i  # Increasing salience
+
+        memory.store(content, context, salience, valence=0.1, arousal=0.5)
+
+    assert memory.size == 5, f"Memory should have 5 episodes, got {memory.size}"
+
+    print(f"  Stored 5 episodes, size={memory.size}")
+
+    # Test crystallization threshold
+    assert memory.should_crystallize(0.5), "0.5 should pass threshold 0.3"
+    assert not memory.should_crystallize(0.2), "0.2 should not pass threshold 0.3"
+
+    # Test retrieval by similarity
+    query = memory.episodes[2].content.clone()  # Query with known episode
+    retrieved = memory.retrieve(query, top_k=3)
+
+    assert len(retrieved) == 3, f"Should retrieve 3 episodes, got {len(retrieved)}"
+    assert retrieved[0][0].timestamp == 2, "First retrieved should be the queried episode"
+    assert retrieved[0][1] > 0.99, "First retrieved should have similarity ~1.0"
+
+    print(f"  Retrieval works: top match similarity = {retrieved[0][1]:.4f}")
+
+    # Test retrieval count increment
+    assert retrieved[0][0].retrieval_count == 1, "Retrieval count should be 1"
+
+    # Test retrieval by salience
+    top_salient = memory.retrieve_by_salience(top_k=2)
+    assert len(top_salient) == 2, "Should get 2 most salient"
+    assert top_salient[0].salience >= top_salient[1].salience, "Should be sorted by salience"
+
+    # Test retrieval by time
+    recent = memory.retrieve_by_time(recent_n=2)
+    assert len(recent) == 2, "Should get 2 most recent"
+    assert recent[-1].timestamp > recent[-2].timestamp, "Last should be most recent"
+
+    print("  Retrieval by salience and time work!")
+
+    # Test capacity management (eviction)
+    for i in range(10):  # Add more than capacity
+        memory.store(torch.randn(d_model), torch.randn(d_model), 0.5)
+
+    assert memory.size == capacity, f"Memory should be at capacity {capacity}, got {memory.size}"
+
+    print(f"  Capacity management works: size capped at {memory.size}")
+
+    # Test stats
+    stats = memory.get_stats()
+    assert 'size' in stats and stats['size'] == capacity
+    assert 'avg_salience' in stats
+    assert 'avg_retrieval_count' in stats
+
+    print(f"  Stats: {stats}")
+
+    # Test clear
+    memory.clear()
+    assert memory.size == 0, "Memory should be empty after clear"
+
+    print("  Episodic memory basics test passed!")
+    return True
+
+
+def test_episodic_memory_with_experiential():
+    """Test episodic memory integration with experiential stream."""
+    print("Testing episodic memory with experiential stream...")
+
+    d_model = 128
+    batch_size = 8
+    seq_len = 64
+
+    exp = ExperientialStream(d_model=d_model, use_affect=True)
+    memory = EpisodicMemory(d_model=d_model, capacity=100, crystallization_threshold=0.1)
+
+    # Process several batches and store high-salience moments
+    n_batches = 20
+    crystallized_count = 0
+
+    for batch_idx in range(n_batches):
+        hidden_states = torch.randn(batch_size, seq_len, d_model)
+        exp.reset_state(batch_size=batch_size)
+
+        output = exp(hidden_states)
+
+        # Check each sample in batch for crystallization
+        for i in range(batch_size):
+            salience = output['salience'][i].item()
+
+            if memory.should_crystallize(salience):
+                memory.store(
+                    content=output['target'][i],
+                    context=output['prediction'][i],
+                    salience=salience,
+                    valence=output['valence'][i].item(),
+                    arousal=output['arousal'][i].item()
+                )
+                crystallized_count += 1
+
+    print(f"  Processed {n_batches * batch_size} experiences")
+    print(f"  Crystallized {crystallized_count} episodes ({crystallized_count/(n_batches*batch_size)*100:.1f}%)")
+    print(f"  Memory size: {memory.size}")
+
+    # Verify some episodes were stored
+    assert memory.size > 0, "Should have stored some episodes"
+
+    # Test retrieval with a new query
+    query = torch.randn(d_model)
+    retrieved = memory.retrieve(query, top_k=5)
+
+    print(f"  Retrieved {len(retrieved)} episodes for query")
+    if retrieved:
+        print(f"  Top match salience: {retrieved[0][0].salience:.4f}, similarity: {retrieved[0][1]:.4f}")
+
+    # Test stats
+    stats = memory.get_stats()
+    print(f"  Memory stats: size={stats['size']}, avg_salience={stats['avg_salience']:.4f}")
+
+    print("  Episodic memory integration test passed!")
+    return True
+
+
 if __name__ == "__main__":
     print("=" * 60)
-    print("ExperientialStream Tests")
+    print("ExperientialStream & EpisodicMemory Tests")
     print("=" * 60)
 
     test_shapes()
@@ -774,6 +1133,10 @@ if __name__ == "__main__":
     test_persistent_state()
     print()
     test_persistent_state_learning()
+    print()
+    test_episodic_memory_basic()
+    print()
+    test_episodic_memory_with_experiential()
 
     print()
     print("=" * 60)
