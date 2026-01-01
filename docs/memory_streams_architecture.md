@@ -638,7 +638,12 @@ intrinsic_reward = (
 - [x] Integrate with existing GPT backbone (`model.py`, `pretrain.py`)
 
 ### Remaining Work
-- [ ] Implement differentiable retrieval (retrieve_soft)
+- [x] Implement differentiable retrieval (retrieve_soft)
+- [x] Implement memory-augmented generation (MemoryAugmentedGPT)
+  - [x] Three integration modes: residual, gated, cross-attention
+  - [x] Automatic crystallization during forward pass
+  - [x] Combined loss (LM + experiential prediction)
+  - [x] Full gradient flow through retrieval
 - [ ] Add decay mechanism to episodic memory
 - [ ] Implement semantic consolidation
 - [ ] Implement procedural stream

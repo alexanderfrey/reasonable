@@ -726,24 +726,35 @@ def consolidate_to_semantic(
 - [x] Implement EpisodicStream.crystallize → should_crystallize()
 - [x] Implement EpisodicStream.store → store()
 - [x] Implement EpisodicStream.retrieve (hard) → retrieve(), retrieve_by_time(), retrieve_by_salience()
-- [ ] Implement EpisodicStream.retrieve_soft (differentiable)
+- [x] Implement EpisodicStream.retrieve_soft (differentiable)
 - [ ] Implement decay mechanism (decay_rate defined, not yet applied)
 - [x] Implement eviction policies (priority-based: salience × recency × retrieval_count)
 - [ ] Add retrieval contrastive loss
 - [ ] Add resume-after-interruption training
 - [ ] Implement consolidation interface
 - [x] Test memory persistence across chunks
+- [x] Implement memory-augmented generation (MemoryAugmentedGPT)
 
 ### Current Implementation (`experiential.py`)
 
-The `EpisodicMemory` class provides:
+**EpisodicMemory class**:
 - Episode dataclass with timestamp, content, context, salience, affect, retrieval_count
 - `store()` - store episodes with automatic capacity management
 - `retrieve()` - similarity-based retrieval with top-k
 - `retrieve_by_time()` - get most recent episodes
 - `retrieve_by_salience()` - get most salient episodes
+- `retrieve_soft()` - differentiable retrieval with soft attention (enables end-to-end training)
+- `get_content_matrix()` / `get_context_matrix()` - batch access to stored episodes
 - `should_crystallize()` - threshold-based crystallization decision
 - Priority-based eviction: `salience × recency × (1 + retrieval_count)`
+
+**MemoryAugmentedGPT class**:
+- Wraps any GPT model to add episodic memory capabilities
+- Three integration modes: `residual`, `gated`, `attention`
+- Automatic crystallization of high-salience moments during forward pass
+- Query projection for retrieval matching
+- `memory_augmented_loss()` - combined LM + experiential prediction loss
+- Full gradient flow through memory retrieval and integration
 
 ---
 
