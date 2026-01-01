@@ -830,15 +830,17 @@ def combined_experiential_loss(
     output: Dict[str, torch.Tensor],
     exp_weight: float = 1.0,
     meta_weight: float = 0.1,
+    self_mod_weight: float = 0.1,
     temperature: float = 0.1
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """
-    Combined loss for experiential prediction and meta-surprise.
+    Combined loss for experiential prediction, meta-surprise, and self-modulation.
 
     Args:
         output: dict from ExperientialStream.forward()
         exp_weight: weight for experiential prediction loss
         meta_weight: weight for meta-surprise loss
+        self_mod_weight: weight for self-modulation loss
         temperature: temperature for contrastive loss
 
     Returns:
@@ -866,6 +868,18 @@ def combined_experiential_loss(
         loss_dict['meta_loss'] = meta_loss.item()
         loss_dict['mean_meta_surprise'] = output['meta_surprise'].mean().item()
         total_loss = total_loss + meta_weight * meta_loss
+
+    # Self-modulation loss: confidence should inversely track meta-surprise
+    # High meta-surprise ("I don't know myself") → low confidence → blend toward fallback
+    # This gives the self-modulator a direct training signal
+    if output.get('confidence_gate') is not None and output.get('meta_surprise') is not None:
+        confidence_mean = output['confidence_gate'].mean(dim=-1)  # [B]
+        # Target: high meta-surprise → low confidence, low meta-surprise → high confidence
+        target_confidence = 1 - output['meta_surprise'].detach()  # [B], detach to not affect meta predictor
+        self_mod_loss = F.mse_loss(confidence_mean, target_confidence)
+        loss_dict['self_mod_loss'] = self_mod_loss.item()
+        loss_dict['mean_confidence'] = confidence_mean.mean().item()
+        total_loss = total_loss + self_mod_weight * self_mod_loss
 
     loss_dict['total_loss'] = total_loss.item()
     return total_loss, loss_dict

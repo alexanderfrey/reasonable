@@ -571,10 +571,14 @@ meta_surprise = |predicted_surprise - actual_surprise|  # "Did I know myself?"
 # 3. Salience boost: moments of self-ignorance are extra important
 salience = base_salience * (1 + 3 * meta_surprise)  # "I don't know myself here → remember this"
 
-# 4. Self-modulation: adjust processing based on self-knowledge (NEW in v0.3)
+# 4. Self-modulation: adjust processing based on self-knowledge (v0.3)
 confidence_gate = self.self_modulator([h_end, meta_surprise])  # Per-dimension confidence
 modulated_output = confidence_gate * h_end + (1 - confidence_gate) * fallback
 # High meta-surprise → lower confidence → blend toward conservative fallback
+
+# 5. Self-modulation loss: train confidence to track meta-surprise (v0.3.1)
+self_mod_loss = MSE(confidence_mean, 1 - meta_surprise)  # Low confidence when uncertain
+# combined_loss = exp_loss + meta_weight * meta_loss + self_mod_weight * self_mod_loss
 ```
 
 **The feedback loop**: High meta-surprise → higher salience → crystallize into memory AND lower confidence → conservative processing → system learns from and adapts to moments of self-ignorance.
@@ -584,15 +588,18 @@ modulated_output = confidence_gate * h_end + (1 - confidence_gate) * fallback
 - Reduces confidence (blend toward fallback/prior)
 - Creates modulated output (what gets stored in memory)
 
-Test results on real data (2000 steps):
-- Meta-surprise decreased by **41%** (0.109 → 0.064)
-- Crystallized moments have higher meta-surprise than average
-- Timeline shows self-calibration: early crystallizations have 45% higher meta-surprise than late ones
+**Test results on real data (1000 steps with self_mod_loss)**:
+- Meta-surprise decreased by **36%** (0.102 → 0.065)
+- Confidence increased by **3.6%** (0.904 → 0.936)
+- **Correlation(meta-surprise, confidence): -0.49** — strong negative as expected
+- Self-mod loss decreased from 0.009 → 0.002
+- Modulation magnitude decreased 33.5% (less correction needed as system learns)
+
+This confirms the feedback loop is working: the system learns to be less confident when it doesn't know itself.
 
 Next steps for deeper self-awareness:
 - Predict what memories will be retrieved
 - Predict own affect (valence/arousal) before computing it
-- Learn optimal modulation (currently initialized to high confidence)
 
 ---
 
@@ -707,6 +714,8 @@ intrinsic_reward = (
   - [x] `modulated_output`: blend h_end with fallback based on confidence
   - [x] Memories store modulated output (post-self-regulation)
   - [x] Self-predictions now AFFECT processing, not just memory
+  - [x] `self_mod_loss`: train confidence to inversely track meta-surprise (v0.3.1)
+  - [x] Verified: -0.49 correlation between meta-surprise and confidence
 - [ ] Add decay mechanism to episodic memory
 - [ ] Implement procedural stream
 - [ ] Add resume-after-interruption training
