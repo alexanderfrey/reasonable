@@ -1,25 +1,34 @@
 """
-Experiential Stream — Minimal Implementation
+Experiential Stream — Memory Crystallization via Relative Surprisal × Novelty
 
-Validates the core premise: can we predict "what comes next" in latent space?
+Computes what moments are worth remembering using:
+- Relative surprisal: token CE loss minus running baseline (EMA)
+  This captures "more surprising than usual" not just "rare token"
+- Novelty: how unlike existing memories the current representation is
+  This prevents storing redundant memories
 
-Uses model's own hidden states directly (predictive coding style):
-- h_mid = hidden state at sequence midpoint (model's "current state")
-- h_end = hidden state at sequence end (model's "future state")
-- predictor: h_mid → predicted h_end
-- surprise = distance(predicted h_end, actual h_end)
+Surprise signal:
+  s_t = -log p(x_t | x_<t)                    # per-token CE loss
+  excess_t = (s_t - ema_mu) / (ema_sigma + eps)  # relative to baseline
+  novelty_t = 1 - max_cosine(h_t, memory)     # unlike stored memories
+  surprise_t = relu(excess_t) * novelty_t     # both conditions
+  chunk_surprise = mean(topk(surprise_t, k))  # robust aggregation
 
 Usage:
-    from experiential import ExperientialStream, experiential_loss
+    from experiential import ExperientialStream
 
-    # Create module (only needs a small predictor MLP)
     exp = ExperientialStream(d_model=768)
 
-    # Forward pass (on hidden states from transformer)
-    output = exp(hidden_states)  # hidden_states: [B, seq_len, d_model]
+    # Forward pass with per-token CE and memory keys
+    output = exp(
+        hidden_states,
+        per_token_ce=ce_loss,      # [B, seq_len]
+        memory_keys=memory.keys()   # [num_memories, d_model] or None
+    )
 
-    # Compute loss
-    loss = experiential_loss(output['prediction'], output['target'])
+    # Use chunk_surprise for crystallization decisions
+    if output['chunk_surprise'] > threshold:
+        memory.store(...)
 """
 
 import torch
@@ -113,6 +122,27 @@ class EpisodicMemory(nn.Module):
     def should_crystallize(self, salience: float) -> bool:
         """Decide whether a moment should become a memory."""
         return salience > self.crystallization_threshold
+
+    def get_keys(self, device: Optional[torch.device] = None) -> Optional[torch.Tensor]:
+        """
+        Get all memory content vectors stacked as a tensor.
+
+        Used for novelty computation: comparing current hidden states
+        against all stored memories to avoid redundant storage.
+
+        Args:
+            device: target device for the tensor
+
+        Returns:
+            [num_memories, d_model] tensor or None if empty
+        """
+        if not self.episodes:
+            return None
+
+        keys = torch.stack([ep.content for ep in self.episodes])  # [num_memories, d_model]
+        if device is not None:
+            keys = keys.to(device)
+        return keys
 
     def store(
         self,
@@ -458,7 +488,11 @@ class ExperientialStream(nn.Module):
         use_persistent_state: bool = True,
         use_affect: bool = True,
         use_meta_surprise: bool = True,
-        tbptt_steps: int = 0
+        tbptt_steps: int = 0,
+        # New surprise signal parameters
+        ema_decay: float = 0.99,
+        surprise_topk: int = 8,
+        novelty_weight: float = 1.0
     ):
         super().__init__()
         self.d_model = d_model
@@ -466,6 +500,17 @@ class ExperientialStream(nn.Module):
         self.use_persistent_state = use_persistent_state
         self.use_affect = use_affect
         self.use_meta_surprise = use_meta_surprise
+
+        # Relative surprisal parameters
+        self.ema_decay = ema_decay
+        self.surprise_topk = surprise_topk
+        self.novelty_weight = novelty_weight
+        self.eps = 1e-8
+
+        # EMA buffers for baseline CE tracking
+        self.register_buffer('ema_mu', torch.tensor(2.0))  # Start with reasonable prior
+        self.register_buffer('ema_sigma', torch.tensor(1.0))
+        self.register_buffer('ema_initialized', torch.tensor(False))
 
         # Predictor input size depends on whether we use persistent state
         # With persistent state: [h_mid, prev_state] → predicted h_end
@@ -549,8 +594,10 @@ class ExperientialStream(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
-        """Initialize predictor output near zero (start with identity-ish)."""
-        nn.init.zeros_(self.predictor[-1].weight)
+        """Initialize predictor output with values that produce reasonable predictions."""
+        # Use standard xavier init. We need predictions with meaningful magnitude
+        # (target hidden states have norm ~8-10). Gain=0.01 was too conservative.
+        nn.init.xavier_uniform_(self.predictor[-1].weight, gain=0.5)
         nn.init.zeros_(self.predictor[-1].bias)
         if self.use_persistent_state:
             # Initialize gate to 0.5 (balanced between old and new)
@@ -564,6 +611,138 @@ class ExperientialStream(nn.Module):
             # This means h_end passes through unchanged until the system learns
             nn.init.zeros_(self.self_modulator[-2].weight)
             nn.init.constant_(self.self_modulator[-2].bias, 2.0)  # sigmoid(2) ≈ 0.88
+
+    def compute_excess_surprisal(
+        self,
+        per_token_ce: torch.Tensor,
+        update_ema: bool = True
+    ) -> torch.Tensor:
+        """
+        Compute surprisal relative to running baseline.
+
+        Args:
+            per_token_ce: [B, seq_len] per-token cross-entropy loss
+            update_ema: whether to update running statistics (set False for eval)
+
+        Returns:
+            excess: [B, seq_len] normalized surprisal (positive = above baseline)
+        """
+        # Update EMA during training
+        if update_ema and self.training:
+            batch_mu = per_token_ce.mean()
+            batch_sigma = per_token_ce.std().clamp(min=self.eps)
+
+            if not self.ema_initialized:
+                self.ema_mu.copy_(batch_mu)
+                self.ema_sigma.copy_(batch_sigma)
+                self.ema_initialized.fill_(True)
+            else:
+                self.ema_mu.mul_(self.ema_decay).add_(batch_mu * (1 - self.ema_decay))
+                self.ema_sigma.mul_(self.ema_decay).add_(batch_sigma * (1 - self.ema_decay))
+
+        # Normalize: (CE - mean) / std
+        excess = (per_token_ce - self.ema_mu) / (self.ema_sigma + self.eps)
+        return excess
+
+    def compute_novelty(
+        self,
+        hidden_states: torch.Tensor,
+        memory_keys: Optional[torch.Tensor]
+    ) -> torch.Tensor:
+        """
+        Compute novelty = 1 - max_cosine(h_t, memory).
+
+        Args:
+            hidden_states: [B, seq_len, d_model]
+            memory_keys: [num_memories, d_model] or None
+
+        Returns:
+            novelty: [B, seq_len] in [0, 1], 1 = completely novel
+        """
+        batch_size, seq_len, d_model = hidden_states.shape
+        device = hidden_states.device
+
+        # No memories yet → everything is novel
+        if memory_keys is None or memory_keys.numel() == 0:
+            return torch.ones(batch_size, seq_len, device=device)
+
+        # Normalize for cosine similarity
+        h_norm = F.normalize(hidden_states, dim=-1)  # [B, seq_len, d_model]
+        m_norm = F.normalize(memory_keys, dim=-1)     # [num_memories, d_model]
+
+        # Compute similarities: [B, seq_len, num_memories]
+        similarities = torch.einsum('bsd,md->bsm', h_norm, m_norm)
+
+        # Max similarity per position (most similar memory)
+        max_sim, _ = similarities.max(dim=-1)  # [B, seq_len]
+
+        # Novelty = 1 - max_sim (clamp to handle numerical issues)
+        novelty = (1.0 - max_sim).clamp(min=0.0, max=1.0)
+        return novelty
+
+    def compute_surprise_signal(
+        self,
+        per_token_ce: torch.Tensor,
+        hidden_states: torch.Tensor,
+        memory_keys: Optional[torch.Tensor] = None,
+        update_ema: bool = True
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Compute relative surprisal × novelty signal.
+
+        This is the main surprise computation:
+        - excess_t = (CE_t - ema_mu) / ema_sigma  (relative to baseline)
+        - novelty_t = 1 - max_cosine(h_t, memory)  (unlike stored memories)
+        - surprise_t = relu(excess_t) * novelty_t  (both conditions)
+        - chunk_surprise = mean(topk(surprise_t))  (robust aggregation)
+
+        Args:
+            per_token_ce: [B, seq_len] per-token cross-entropy loss
+            hidden_states: [B, seq_len, d_model]
+            memory_keys: [num_memories, d_model] or None
+            update_ema: whether to update running statistics
+
+        Returns:
+            dict with:
+                - surprise_t: [B, seq_len] per-token surprise
+                - excess_t: [B, seq_len] relative surprisal
+                - novelty_t: [B, seq_len] novelty vs memory
+                - chunk_surprise: [B] aggregated chunk surprise
+                - ema_mu: current baseline mean
+                - ema_sigma: current baseline std
+        """
+        batch_size, seq_len = per_token_ce.shape
+
+        # 1. Excess surprisal relative to baseline
+        excess = self.compute_excess_surprisal(per_token_ce, update_ema)  # [B, seq_len]
+
+        # 2. Novelty vs memory
+        novelty = self.compute_novelty(hidden_states, memory_keys)  # [B, seq_len]
+
+        # 3. Combine: relu(excess) * novelty
+        # relu ensures we only care about above-baseline surprisal
+        # multiplication means both conditions must hold
+        if self.novelty_weight > 0:
+            surprise_t = F.relu(excess) * (novelty ** self.novelty_weight)
+        else:
+            surprise_t = F.relu(excess)
+
+        # 4. Aggregate: top-k mean for robustness
+        topk = min(self.surprise_topk, seq_len)
+        if topk > 0 and topk < seq_len:
+            topk_vals, _ = surprise_t.topk(topk, dim=-1)
+            chunk_surprise = topk_vals.mean(dim=-1)
+        else:
+            chunk_surprise = surprise_t.mean(dim=-1)
+
+        return {
+            'surprise_t': surprise_t,
+            'excess_t': excess,
+            'novelty_t': novelty,
+            'chunk_surprise': chunk_surprise,
+            'ema_mu': self.ema_mu.item(),
+            'ema_sigma': self.ema_sigma.item(),
+        }
 
     def reset_state(self, batch_size: Optional[int] = None):
         """Reset persistent state (call at start of new sequence/episode)."""
@@ -609,34 +788,46 @@ class ExperientialStream(nn.Module):
         hidden_states: torch.Tensor,
         mid_idx: Optional[int] = None,
         end_idx: Optional[int] = None,
-        update_state: bool = True
+        update_state: bool = True,
+        per_token_ce: Optional[torch.Tensor] = None,
+        memory_keys: Optional[torch.Tensor] = None
     ) -> Dict[str, torch.Tensor]:
         """
-        Predict future hidden state from current hidden state.
+        Process hidden states and compute surprise/salience for crystallization.
+
+        NEW: When per_token_ce is provided, uses relative surprisal × novelty signal:
+            - excess = (CE - baseline) / std  (relative to EMA)
+            - novelty = 1 - max_cosine(h, memory)  (unlike stored)
+            - surprise = relu(excess) * novelty  (both conditions)
+
+        When per_token_ce is None, falls back to MLP-based h_mid→h_end prediction.
 
         Args:
             hidden_states: [batch, seq_len, d_model] from transformer
             mid_idx: optional custom midpoint index (default: seq_len * split_ratio)
             end_idx: optional custom endpoint index (default: -1)
             update_state: whether to update persistent state after this forward pass
+            per_token_ce: [batch, seq_len] per-token cross-entropy loss (NEW)
+            memory_keys: [num_memories, d_model] for novelty computation (NEW)
 
         Returns:
             dict with:
                 - state: [batch, d_model] current state (h_mid)
                 - prediction: [batch, d_model] predicted future (what we expect)
                 - target: [batch, d_model] = modulated_output (what we commit to, detached)
-                    NOTE: This is the CLOSED LOOP - predictor learns to predict committed output
                 - h_end: [batch, d_model] raw world state (before self-modulation)
-                - surprise: [batch] prediction error vs h_end (0=expected, 1=surprising)
-                - predicted_surprise: [batch] self-predicted surprise (what I thought I'd feel)
-                - meta_surprise: [batch] |predicted_surprise - surprise| (self-awareness signal)
+                - surprise: [batch] chunk surprise (either CE-based or MLP-based)
+                - surprise_t: [batch, seq_len] per-token surprise (if CE-based)
+                - excess_t: [batch, seq_len] relative surprisal (if CE-based)
+                - novelty_t: [batch, seq_len] novelty vs memory (if CE-based)
+                - predicted_surprise: [batch] self-predicted surprise
+                - meta_surprise: [batch] |predicted_surprise - surprise|
                 - valence: [batch] emotional valence (-1=negative, 1=positive)
                 - arousal: [batch] activation level (0=calm, 1=excited)
-                - salience: [batch] importance signal (surprise × arousal × |valence| × (1 + meta_surprise))
-                - modulated_output: [batch, d_model] h_end adjusted by self-knowledge = target
-                    (high confidence → h_end, low confidence → fallback to prior)
-                - confidence_gate: [batch, d_model] how much we trusted h_end per dimension
-                - persistent_state: [batch, d_model] updated from modulated_output (closed loop)
+                - salience: [batch] importance signal for crystallization
+                - modulated_output: [batch, d_model] h_end adjusted by self-knowledge
+                - confidence_gate: [batch, d_model] how much we trusted h_end
+                - persistent_state: [batch, d_model] updated state
                 - gate_values: [batch, d_model] state gate activations (if persistent)
         """
         batch_size, seq_len, d_model = hidden_states.shape
@@ -669,12 +860,41 @@ class ExperientialStream(nn.Module):
         if self.use_meta_surprise:
             predicted_surprise = self.surprise_predictor(predictor_input).squeeze(-1)  # [B]
 
-        # Compute surprise (no gradient needed for this metric)
-        with torch.no_grad():
-            pred_norm = F.normalize(prediction, dim=-1)
-            target_norm = F.normalize(h_end, dim=-1)
-            similarity = (pred_norm * target_norm).sum(dim=-1)
-            surprise = 1 - similarity
+        # Compute surprise signal
+        # NEW: Use relative surprisal × novelty when per_token_ce is provided
+        # FALLBACK: Use MLP-based h_mid→h_end prediction when not
+        surprise_t = None
+        excess_t = None
+        novelty_t = None
+
+        if per_token_ce is not None:
+            # NEW: Relative surprisal × novelty signal
+            # This is better because:
+            # 1. Uses GPT's own prediction error (principled)
+            # 2. Normalizes by baseline (avoids storing rare proper nouns)
+            # 3. Filters by novelty (avoids storing redundant memories)
+            #
+            # Alignment note: per_token_ce[i] is CE for predicting token i+1 using hidden state i
+            # So per_token_ce is [B, seq_len-1], use hidden_states[:, :-1, :] to match
+            hidden_for_surprise = hidden_states[:, :-1, :] if seq_len > 1 else hidden_states
+            surprise_signal = self.compute_surprise_signal(
+                per_token_ce=per_token_ce,
+                hidden_states=hidden_for_surprise,
+                memory_keys=memory_keys,
+                update_ema=self.training
+            )
+            surprise = surprise_signal['chunk_surprise']
+            surprise_t = surprise_signal['surprise_t']
+            excess_t = surprise_signal['excess_t']
+            novelty_t = surprise_signal['novelty_t']
+        else:
+            # FALLBACK: MLP-based surprise (for backward compatibility)
+            # This predicts h_end from h_mid, but the MLP can't know future tokens
+            with torch.no_grad():
+                pred_norm = F.normalize(prediction, dim=-1)
+                target_norm = F.normalize(h_end, dim=-1)
+                similarity = (pred_norm * target_norm).sum(dim=-1)
+                surprise = 1 - similarity
 
         # Compute meta-surprise: how wrong was my self-prediction?
         # This measures self-calibration: "Did I know how I would react?"
@@ -776,7 +996,13 @@ class ExperientialStream(nn.Module):
             'end_idx': end_idx if end_idx != -1 else seq_len - 1,
             'persistent_state': self._persistent_state,
             'prev_state': prev_state,
-            'gate_values': gate_values
+            'gate_values': gate_values,
+            # NEW: Per-token surprise signal (only when per_token_ce provided)
+            'surprise_t': surprise_t,              # [B, seq_len] per-token surprise
+            'excess_t': excess_t,                  # [B, seq_len] relative surprisal
+            'novelty_t': novelty_t,                # [B, seq_len] novelty vs memory
+            'ema_mu': self.ema_mu.item() if per_token_ce is not None else None,
+            'ema_sigma': self.ema_sigma.item() if per_token_ce is not None else None,
         }
 
     def forward_multiscale(
@@ -1284,7 +1510,28 @@ class MemoryAugmentedGPT(nn.Module):
 
         # 4. Experiential processing (for crystallization and prediction)
         if self.experiential is not None:
-            exp_output = self.experiential(hidden_states)
+            # Compute per-token CE loss for the new surprise signal
+            # logits[:, i] predicts token at position i+1
+            # So we shift: logits[:-1] predicts tokens[1:]
+            vocab_size = logits.size(-1)
+            shift_logits = logits[:, :-1, :].contiguous()
+            shift_labels = input_ids[:, 1:].contiguous()
+            per_token_ce = F.cross_entropy(
+                shift_logits.view(-1, vocab_size),
+                shift_labels.view(-1),
+                reduction='none'
+            ).view(batch_size, -1)  # [B, seq_len-1]
+
+            # Get memory keys for novelty computation
+            memory_keys = self.memory.get_keys(device=device)
+
+            # Call experiential stream with the new surprise signal
+            # Note: per_token_ce is [B, seq_len-1], alignment handled inside experiential
+            exp_output = self.experiential(
+                hidden_states,  # Full hidden states for h_mid/h_end extraction
+                per_token_ce=per_token_ce,
+                memory_keys=memory_keys
+            )
             memory_output.update({
                 'prediction': exp_output['prediction'],
                 'target': exp_output['target'],
@@ -1295,6 +1542,12 @@ class MemoryAugmentedGPT(nn.Module):
                 'modulated_output': exp_output.get('modulated_output'),
                 'confidence_gate': exp_output.get('confidence_gate'),
                 'meta_surprise': exp_output.get('meta_surprise'),
+                # NEW: Per-token surprise signal components
+                'surprise_t': exp_output.get('surprise_t'),
+                'excess_t': exp_output.get('excess_t'),
+                'novelty_t': exp_output.get('novelty_t'),
+                'ema_mu': exp_output.get('ema_mu'),
+                'ema_sigma': exp_output.get('ema_sigma'),
             })
 
             # 5. Crystallize high-salience moments into episodic memory

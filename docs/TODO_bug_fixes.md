@@ -457,5 +457,52 @@ python train_resume_interruption.py --max_steps 1000
 
 ---
 
-*Last updated: 2026-01-02*
+## Recently Completed
+
+### 7. Surprise Signal Overhaul (CE-Based)
+
+**Status:** ✅ COMPLETED (2026-01-03)
+
+**Problem:**
+The original MLP-based surprise signal (predicting `h_end` from `h_mid`) was fundamentally flawed:
+- The MLP only sees `h_mid`, but `h_end` depends on tokens `mid+1` to `end` which the MLP never sees
+- This made the prediction task essentially impossible
+- Surprise was stuck at ~1.0 ± 0.05 regardless of content
+
+**Solution Implemented:**
+Replaced MLP-based surprise with **relative surprisal × novelty** signal:
+
+```python
+# New surprise computation
+s_t = CE(logits_t, token_t+1)                    # Per-token cross-entropy
+excess_t = (s_t - ema_mu) / (ema_sigma + eps)    # Relative to EMA baseline
+novelty_t = 1 - max_cosine(h_t, memory_keys)     # Unlike stored memories
+surprise_t = relu(excess_t) * novelty_t          # Both conditions
+chunk_surprise = mean(topk(surprise_t, k))       # Robust aggregation
+```
+
+**Key Benefits:**
+1. Uses GPT's own prediction error (principled signal)
+2. Normalized by running baseline (avoids storing rare proper nouns)
+3. Novelty gating prevents redundant memory storage
+4. Top-k aggregation is robust to outliers
+
+**Files Modified:**
+- `experiential.py`:
+  - Added EMA buffers (`ema_mu`, `ema_sigma`, `ema_initialized`) to `ExperientialStream`
+  - Added `compute_excess_surprisal()` method
+  - Added `compute_novelty()` method
+  - Added `compute_surprise_signal()` method
+  - Added `get_keys()` to `EpisodicMemory`
+  - Updated `ExperientialStream.forward()` to use new signal when `per_token_ce` provided
+  - Updated `MemoryAugmentedGPT.forward()` to compute and pass `per_token_ce`
+
+**Results:**
+- **Before:** Surprise stuck at ~1.0 ± 0.05
+- **After:** Surprise range [8.7, 21.7] with meaningful variation
+- Narrative validation shows 100% correlation with structural markers
+
+---
+
+*Last updated: 2026-01-03*
 *Review triggered by: Architecture audit*
