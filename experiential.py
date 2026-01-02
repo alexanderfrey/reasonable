@@ -1219,6 +1219,10 @@ class MemoryAugmentedGPT(nn.Module):
         batch_size, seq_len = input_ids.shape
         device = input_ids.device
 
+        # Ensure semantic stream is on the correct device (may not be after loading)
+        if self.semantic is not None:
+            self.semantic = self.semantic.to(device)
+
         # 1. CAUSAL RETRIEVAL: Query memory BEFORE seeing current sequence
         # This uses prev_memory_query (from previous step), not current hidden states
         episodic_retrieved = None
@@ -1838,6 +1842,11 @@ class SemanticStream(nn.Module):
         # Stack episode embeddings
         device = episodes[0].content.device
         episode_embeddings = torch.stack([ep.content.to(device) for ep in episodes])
+
+        # Ensure all SemanticStream modules are on the same device
+        self.pattern_extractor = self.pattern_extractor.to(device)
+        self.relation_predictor = self.relation_predictor.to(device)
+        self.query_projection = self.query_projection.to(device)
 
         # Extract common pattern
         pattern = self.pattern_extractor(episode_embeddings)

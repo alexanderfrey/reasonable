@@ -52,15 +52,26 @@ def load_model(checkpoint_path: str, device: torch.device):
     config_dict = ckpt.get('config', {})
     args = ckpt.get('args', {})
 
+    # If config is empty, try to load from base checkpoint referenced in args
+    if not config_dict and 'checkpoint' in args:
+        base_ckpt_path = args['checkpoint']
+        print(f"Loading base config from: {base_ckpt_path}")
+        if os.path.exists(base_ckpt_path):
+            base_ckpt = torch.load(base_ckpt_path, map_location='cpu', weights_only=False)
+            config_dict = base_ckpt.get('config', {})
+
     config = GPTConfig(
         vocab_size=config_dict.get('vocab_size', 128256),
         d_model=config_dict.get('d_model', 1024),
-        n_head=config_dict.get('n_head', 16),
+        n_head=config_dict.get('n_head', 8),
         n_layer=config_dict.get('n_layer', 12),
-        max_seq_len=config_dict.get('max_seq_len', 2048),
-        n_kv_head=config_dict.get('n_kv_head'),
-        d_ff=config_dict.get('d_ff'),
+        max_seq_len=config_dict.get('max_seq_len', 1024),
+        n_kv_head=config_dict.get('n_kv_head', 4),
+        d_ff=config_dict.get('d_ff', 4096),
     )
+
+    print(f"Model config: d_model={config.d_model}, n_head={config.n_head}, "
+          f"n_kv_head={config.n_kv_head}, d_ff={config.d_ff}")
 
     gpt = GPT(config)
     memory_gpt = MemoryAugmentedGPT(
@@ -278,7 +289,8 @@ def load_narrative_text(source: str, max_chars: int = 50000) -> str:
     """Load narrative text from file or use built-in sample."""
     if os.path.exists(source):
         with open(source, 'r', encoding='utf-8', errors='ignore') as f:
-            text = f.read()[:max_chars]
+            # Read only max_chars without loading entire file
+            text = f.read(max_chars)
         print(f"Loaded {len(text)} characters from {source}")
         return text
 
