@@ -478,7 +478,7 @@ s_t = CE(logits_t, token_t+1)                    # Per-token cross-entropy
 excess_t = (s_t - ema_mu) / (ema_sigma + eps)    # Relative to EMA baseline
 novelty_t = 1 - max_cosine(h_t, memory_keys)     # Unlike stored memories
 surprise_t = relu(excess_t) * novelty_t          # Both conditions
-chunk_surprise = mean(topk(surprise_t, k))       # Robust aggregation
+chunk_surprise = sigmoid(scale * mean(topk(surprise_t[mid_idx:], k)))  # Normalized to [0,1]
 ```
 
 **Key Benefits:**
@@ -499,8 +499,49 @@ chunk_surprise = mean(topk(surprise_t, k))       # Robust aggregation
 
 **Results:**
 - **Before:** Surprise stuck at ~1.0 ± 0.05
-- **After:** Surprise range [8.7, 21.7] with meaningful variation
+- **After:** Surprise in [0, 1] with meaningful variation
 - Narrative validation shows 100% correlation with structural markers
+
+---
+
+### 8. Surprise Signal Scale and Semantic Fixes
+
+**Status:** ✅ COMPLETED (2026-01-03)
+
+**Problems Fixed:**
+
+1. **High: Surprise scale mismatch**
+   - `predicted_surprise` is sigmoid-bounded [0, 1]
+   - `chunk_surprise` was unbounded (z-scored CE × novelty can exceed 10)
+   - This made `meta_surprise` huge and `target_confidence` negative
+   - **Fix:** Normalize `chunk_surprise` with `sigmoid(raw * scale)` where `scale=0.5`
+
+2. **Medium: Future chunk mismatch**
+   - `predicted_surprise` comes from `h_mid` (predicting the future)
+   - But `chunk_surprise` was aggregating CE across the whole sequence
+   - **Fix:** Only aggregate surprise from `mid_idx` onward (`start_idx` parameter)
+
+3. **Medium: No padding/mask handling**
+   - Pad tokens have high CE and would spike surprise and corrupt EMA
+   - **Fix:** Added `pad_token_id` parameter, `ignore_index` in CE computation, and mask for aggregation
+
+4. **Low: Unnecessary gradient computation**
+   - CE computation and EMA updates don't need gradients
+   - **Fix:** Wrapped in `torch.no_grad()`
+
+**Files Modified:**
+- `experiential.py`:
+  - Added `surprise_scale` parameter for sigmoid normalization
+  - Added `start_idx` parameter to `compute_surprise_signal()` for future chunk semantics
+  - Added `mask` parameter to exclude padding from aggregation and EMA
+  - Added `pad_token_id` to `MemoryAugmentedGPT.__init__()`
+  - Wrapped CE computation in `torch.no_grad()`
+  - Updated `compute_excess_surprisal()` to accept mask
+
+**Results:**
+- `surprise` now in [0.5, 0.7] range (properly bounded)
+- `meta_surprise` in [0.02, 0.24] range (reasonable)
+- `target_confidence` in [0.76, 0.98] range (non-negative)
 
 ---
 

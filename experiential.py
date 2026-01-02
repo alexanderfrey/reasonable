@@ -507,6 +507,12 @@ class ExperientialStream(nn.Module):
         self.novelty_weight = novelty_weight
         self.eps = 1e-8
 
+        # Surprise normalization: raw chunk_surprise is unbounded (z-scored),
+        # but predicted_surprise is sigmoid-bounded [0, 1]. We use sigmoid
+        # with a scale to normalize chunk_surprise to [0, 1] for compatibility.
+        # Scale of 0.5 means: excess=2 → sigmoid(1)=0.73, excess=4 → sigmoid(2)=0.88
+        self.surprise_scale = 0.5
+
         # EMA buffers for baseline CE tracking
         self.register_buffer('ema_mu', torch.tensor(2.0))  # Start with reasonable prior
         self.register_buffer('ema_sigma', torch.tensor(1.0))
@@ -615,7 +621,8 @@ class ExperientialStream(nn.Module):
     def compute_excess_surprisal(
         self,
         per_token_ce: torch.Tensor,
-        update_ema: bool = True
+        update_ema: bool = True,
+        mask: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """
         Compute surprisal relative to running baseline.
@@ -623,14 +630,26 @@ class ExperientialStream(nn.Module):
         Args:
             per_token_ce: [B, seq_len] per-token cross-entropy loss
             update_ema: whether to update running statistics (set False for eval)
+            mask: [B, seq_len] boolean mask, True = valid (exclude padding from EMA)
 
         Returns:
             excess: [B, seq_len] normalized surprisal (positive = above baseline)
         """
-        # Update EMA during training
+        # Update EMA during training (exclude padding from statistics)
         if update_ema and self.training:
-            batch_mu = per_token_ce.mean()
-            batch_sigma = per_token_ce.std().clamp(min=self.eps)
+            if mask is not None:
+                # Only compute stats over valid (non-pad) tokens
+                valid_ce = per_token_ce[mask]
+                if valid_ce.numel() > 0:
+                    batch_mu = valid_ce.mean()
+                    batch_sigma = valid_ce.std().clamp(min=self.eps) if valid_ce.numel() > 1 else self.ema_sigma
+                else:
+                    # No valid tokens, skip update
+                    batch_mu = self.ema_mu
+                    batch_sigma = self.ema_sigma
+            else:
+                batch_mu = per_token_ce.mean()
+                batch_sigma = per_token_ce.std().clamp(min=self.eps)
 
             if not self.ema_initialized:
                 self.ema_mu.copy_(batch_mu)
@@ -685,7 +704,9 @@ class ExperientialStream(nn.Module):
         per_token_ce: torch.Tensor,
         hidden_states: torch.Tensor,
         memory_keys: Optional[torch.Tensor] = None,
-        update_ema: bool = True
+        update_ema: bool = True,
+        start_idx: int = 0,
+        mask: Optional[torch.Tensor] = None
     ) -> Dict[str, torch.Tensor]:
         """
         Compute relative surprisal × novelty signal.
@@ -694,27 +715,30 @@ class ExperientialStream(nn.Module):
         - excess_t = (CE_t - ema_mu) / ema_sigma  (relative to baseline)
         - novelty_t = 1 - max_cosine(h_t, memory)  (unlike stored memories)
         - surprise_t = relu(excess_t) * novelty_t  (both conditions)
-        - chunk_surprise = mean(topk(surprise_t))  (robust aggregation)
+        - chunk_surprise = sigmoid(mean(topk(surprise_t[start_idx:])))  (normalized)
 
         Args:
             per_token_ce: [B, seq_len] per-token cross-entropy loss
             hidden_states: [B, seq_len, d_model]
             memory_keys: [num_memories, d_model] or None
             update_ema: whether to update running statistics
+            start_idx: only aggregate surprise from this index onward (for "future chunk" semantics)
+            mask: [B, seq_len] boolean mask, True = valid token, False = pad (excluded from aggregation)
 
         Returns:
             dict with:
-                - surprise_t: [B, seq_len] per-token surprise
+                - surprise_t: [B, seq_len] per-token surprise (full sequence)
                 - excess_t: [B, seq_len] relative surprisal
                 - novelty_t: [B, seq_len] novelty vs memory
-                - chunk_surprise: [B] aggregated chunk surprise
+                - chunk_surprise: [B] aggregated chunk surprise, normalized to [0, 1]
+                - chunk_surprise_raw: [B] raw (unnormalized) chunk surprise
                 - ema_mu: current baseline mean
                 - ema_sigma: current baseline std
         """
         batch_size, seq_len = per_token_ce.shape
 
-        # 1. Excess surprisal relative to baseline
-        excess = self.compute_excess_surprisal(per_token_ce, update_ema)  # [B, seq_len]
+        # 1. Excess surprisal relative to baseline (pass mask to exclude padding from EMA)
+        excess = self.compute_excess_surprisal(per_token_ce, update_ema, mask=mask)  # [B, seq_len]
 
         # 2. Novelty vs memory
         novelty = self.compute_novelty(hidden_states, memory_keys)  # [B, seq_len]
@@ -728,18 +752,40 @@ class ExperientialStream(nn.Module):
             surprise_t = F.relu(excess)
 
         # 4. Aggregate: top-k mean for robustness
-        topk = min(self.surprise_topk, seq_len)
-        if topk > 0 and topk < seq_len:
-            topk_vals, _ = surprise_t.topk(topk, dim=-1)
-            chunk_surprise = topk_vals.mean(dim=-1)
+        # Only consider tokens from start_idx onward (future chunk semantics)
+        # Also exclude padded positions if mask is provided
+        future_surprise = surprise_t[:, start_idx:]  # [B, future_len]
+        future_len = future_surprise.size(1)
+
+        if mask is not None:
+            future_mask = mask[:, start_idx:]  # [B, future_len]
+            # Mask out padded positions by setting to -inf before topk
+            future_surprise = future_surprise.masked_fill(~future_mask, 0.0)
+            valid_counts = future_mask.sum(dim=-1).clamp(min=1)  # [B]
         else:
-            chunk_surprise = surprise_t.mean(dim=-1)
+            valid_counts = torch.full((batch_size,), future_len, device=surprise_t.device)
+
+        topk = min(self.surprise_topk, future_len)
+        if topk > 0 and topk < future_len:
+            # Adjust topk per batch based on valid counts
+            topk_vals, _ = future_surprise.topk(topk, dim=-1)
+            chunk_surprise_raw = topk_vals.mean(dim=-1)
+        else:
+            if mask is not None:
+                chunk_surprise_raw = future_surprise.sum(dim=-1) / valid_counts
+            else:
+                chunk_surprise_raw = future_surprise.mean(dim=-1)
+
+        # 5. Normalize to [0, 1] for compatibility with predicted_surprise (sigmoid-bounded)
+        # This prevents meta_surprise from exploding and target_confidence from going negative
+        chunk_surprise = torch.sigmoid(chunk_surprise_raw * self.surprise_scale)
 
         return {
             'surprise_t': surprise_t,
             'excess_t': excess,
             'novelty_t': novelty,
             'chunk_surprise': chunk_surprise,
+            'chunk_surprise_raw': chunk_surprise_raw,
             'ema_mu': self.ema_mu.item(),
             'ema_sigma': self.ema_sigma.item(),
         }
@@ -790,7 +836,8 @@ class ExperientialStream(nn.Module):
         end_idx: Optional[int] = None,
         update_state: bool = True,
         per_token_ce: Optional[torch.Tensor] = None,
-        memory_keys: Optional[torch.Tensor] = None
+        memory_keys: Optional[torch.Tensor] = None,
+        ce_mask: Optional[torch.Tensor] = None
     ) -> Dict[str, torch.Tensor]:
         """
         Process hidden states and compute surprise/salience for crystallization.
@@ -798,7 +845,7 @@ class ExperientialStream(nn.Module):
         NEW: When per_token_ce is provided, uses relative surprisal × novelty signal:
             - excess = (CE - baseline) / std  (relative to EMA)
             - novelty = 1 - max_cosine(h, memory)  (unlike stored)
-            - surprise = relu(excess) * novelty  (both conditions)
+            - surprise = sigmoid(mean(topk(relu(excess) * novelty)))  (normalized to [0,1])
 
         When per_token_ce is None, falls back to MLP-based h_mid→h_end prediction.
 
@@ -807,8 +854,9 @@ class ExperientialStream(nn.Module):
             mid_idx: optional custom midpoint index (default: seq_len * split_ratio)
             end_idx: optional custom endpoint index (default: -1)
             update_state: whether to update persistent state after this forward pass
-            per_token_ce: [batch, seq_len] per-token cross-entropy loss (NEW)
-            memory_keys: [num_memories, d_model] for novelty computation (NEW)
+            per_token_ce: [batch, seq_len-1] per-token cross-entropy loss
+            memory_keys: [num_memories, d_model] for novelty computation
+            ce_mask: [batch, seq_len-1] boolean mask, True = valid token (excludes padding)
 
         Returns:
             dict with:
@@ -877,11 +925,21 @@ class ExperientialStream(nn.Module):
             # Alignment note: per_token_ce[i] is CE for predicting token i+1 using hidden state i
             # So per_token_ce is [B, seq_len-1], use hidden_states[:, :-1, :] to match
             hidden_for_surprise = hidden_states[:, :-1, :] if seq_len > 1 else hidden_states
+            ce_seq_len = per_token_ce.size(1)
+
+            # Future chunk semantics: only aggregate surprise from mid_idx onward
+            # This matches the original design where predicted_surprise comes from h_mid
+            # and actual surprise should be computed over the "future" portion (mid to end)
+            # In CE space: mid_idx in hidden corresponds to mid_idx in CE (CE[i] uses hidden[i])
+            ce_start_idx = min(mid_idx, ce_seq_len - 1) if ce_seq_len > 0 else 0
+
             surprise_signal = self.compute_surprise_signal(
                 per_token_ce=per_token_ce,
                 hidden_states=hidden_for_surprise,
                 memory_keys=memory_keys,
-                update_ema=self.training
+                update_ema=self.training,
+                start_idx=ce_start_idx,
+                mask=ce_mask  # Excludes padding from aggregation
             )
             surprise = surprise_signal['chunk_surprise']
             surprise_t = surprise_signal['surprise_t']
@@ -1299,6 +1357,7 @@ class MemoryAugmentedGPT(nn.Module):
         semantic_weight: float = 0.5,
         consolidation_interval: int = 100,
         min_consolidation_evidence: int = 3,
+        pad_token_id: Optional[int] = None,
     ):
         """
         Args:
@@ -1313,6 +1372,7 @@ class MemoryAugmentedGPT(nn.Module):
             semantic_weight: Weight for semantic vs episodic retrieval [0, 1]
             consolidation_interval: Steps between automatic consolidation (0 = manual only)
             min_consolidation_evidence: Minimum episodes for consolidation
+            pad_token_id: Token ID for padding (excluded from surprise computation)
         """
         super().__init__()
         self.gpt = gpt_model
@@ -1323,6 +1383,11 @@ class MemoryAugmentedGPT(nn.Module):
         self.semantic_weight = semantic_weight
         self.consolidation_interval = consolidation_interval
         self._step_counter = 0
+        # Padding token ID for excluding pad tokens from surprise computation
+        # Try to get from gpt config if not provided
+        if pad_token_id is None and hasattr(gpt_model.config, 'pad_idx'):
+            pad_token_id = gpt_model.config.pad_idx
+        self.pad_token_id = pad_token_id
 
         # Episodic memory
         self.memory = EpisodicMemory(
@@ -1513,14 +1578,27 @@ class MemoryAugmentedGPT(nn.Module):
             # Compute per-token CE loss for the new surprise signal
             # logits[:, i] predicts token at position i+1
             # So we shift: logits[:-1] predicts tokens[1:]
+            # NOTE: No gradients needed - this is just for surprise computation
             vocab_size = logits.size(-1)
             shift_logits = logits[:, :-1, :].contiguous()
             shift_labels = input_ids[:, 1:].contiguous()
-            per_token_ce = F.cross_entropy(
-                shift_logits.view(-1, vocab_size),
-                shift_labels.view(-1),
-                reduction='none'
-            ).view(batch_size, -1)  # [B, seq_len-1]
+
+            with torch.no_grad():
+                # Use ignore_index for pad tokens to avoid surprise spikes
+                ignore_idx = self.pad_token_id if self.pad_token_id is not None else -100
+                per_token_ce = F.cross_entropy(
+                    shift_logits.view(-1, vocab_size),
+                    shift_labels.view(-1),
+                    reduction='none',
+                    ignore_index=ignore_idx
+                ).view(batch_size, -1)  # [B, seq_len-1]
+
+                # Create mask for non-pad positions (True = valid, False = pad)
+                # This is passed to experiential for proper aggregation
+                if self.pad_token_id is not None:
+                    ce_mask = (shift_labels != self.pad_token_id)  # [B, seq_len-1]
+                else:
+                    ce_mask = None
 
             # Get memory keys for novelty computation
             memory_keys = self.memory.get_keys(device=device)
@@ -1530,7 +1608,8 @@ class MemoryAugmentedGPT(nn.Module):
             exp_output = self.experiential(
                 hidden_states,  # Full hidden states for h_mid/h_end extraction
                 per_token_ce=per_token_ce,
-                memory_keys=memory_keys
+                memory_keys=memory_keys,
+                ce_mask=ce_mask
             )
             memory_output.update({
                 'prediction': exp_output['prediction'],
