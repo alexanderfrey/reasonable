@@ -174,11 +174,20 @@ def train_epoch(
         targets = input_ids[:, 1:].contiguous()
         input_ids = input_ids[:, :-1].contiguous()
 
-        # Forward pass
+        # Reset experiential state for each batch (shuffled data, not sequential)
+        # This prevents state from leaking across unrelated documents
+        if memory_gpt.experiential is not None:
+            memory_gpt.experiential.reset_state(batch_size=input_ids.size(0))
+
+        # Forward pass with causal memory retrieval
+        # For shuffled data, prev_memory_query=None means no memory retrieval
+        # (each batch is an independent sequence, no previous context to query from)
+        # Memories are still crystallized and available for sequential evaluation
         logits, hidden, mem_out = memory_gpt(
             input_ids,
             crystallize=True,
-            use_memory=True
+            use_memory=True,
+            prev_memory_query=None  # No causal query for shuffled batches
         )
 
         # Compute loss
@@ -212,7 +221,7 @@ def train_epoch(
         history['lm_loss'].append(loss_dict['lm_loss'])
         history['exp_loss'].append(loss_dict.get('exp_loss', 0.0))
         history['accuracy'].append(acc)
-        history['memory_size'].append(mem_out['memory_size'])
+        history['memory_size'].append(mem_out['episodic_size'])
         history['surprise'].append(surprise)
 
         # Log
@@ -221,7 +230,7 @@ def train_epoch(
             pbar.set_postfix({
                 'loss': f'{avg_loss:.4f}',
                 'lm': f'{loss_dict["lm_loss"]:.3f}',
-                'mem': mem_out['memory_size'],
+                'mem': mem_out['episodic_size'],
                 'acc': f'{acc:.3f}'
             })
 

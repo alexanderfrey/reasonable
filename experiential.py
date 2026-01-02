@@ -411,7 +411,8 @@ class ExperientialStream(nn.Module):
         use_layer_norm: bool = True,
         use_persistent_state: bool = True,
         use_affect: bool = True,
-        use_meta_surprise: bool = True
+        use_meta_surprise: bool = True,
+        tbptt_steps: int = 0
     ):
         super().__init__()
         self.d_model = d_model
@@ -493,6 +494,12 @@ class ExperientialStream(nn.Module):
         self.register_buffer('_persistent_state', None)
         self._batch_size = None
 
+        # Truncated BPTT settings
+        # tbptt_steps > 0: allow gradients for K steps, then detach
+        # tbptt_steps = 0: always detach (original behavior, prevents OOM but no state learning)
+        self.tbptt_steps = tbptt_steps
+        self._steps_since_detach = 0
+
         self._init_weights()
 
     def _init_weights(self):
@@ -516,11 +523,13 @@ class ExperientialStream(nn.Module):
         """Reset persistent state (call at start of new sequence/episode)."""
         self._persistent_state = None
         self._batch_size = batch_size
+        self._steps_since_detach = 0  # Reset TBPTT counter
 
     def detach_state(self):
         """Detach state from computation graph (for truncated BPTT)."""
         if self._persistent_state is not None:
             self._persistent_state = self._persistent_state.detach()
+        self._steps_since_detach = 0  # Reset counter on manual detach
 
     def get_state(self) -> Optional[torch.Tensor]:
         """Get current persistent state."""
@@ -636,11 +645,13 @@ class ExperientialStream(nn.Module):
             arousal = self.arousal_head(h_end).squeeze(-1)  # [B]
 
             # Salience = how important is this moment?
-            # High surprise + high arousal + strong valence = very salient
+            # NOTE: Affect (arousal, valence) is computed but NOT used for salience
+            # because affect heads are unsupervised. Using them would make
+            # crystallization decisions partially random. Salience = surprise only.
             # Meta-surprise boost: moments of self-ignorance are extra important
             #   "I don't know myself here" → pay attention, remember this
             with torch.no_grad():
-                base_salience = surprise * arousal * valence.abs()
+                base_salience = surprise  # Affect removed: was surprise * arousal * valence.abs()
                 if meta_surprise is not None:
                     # Boost salience by meta-surprise with 3x amplification
                     # Range: [1, 1 + 3*max_ms] where max_ms ≈ 0.5 early → [1, 2.5]
@@ -672,15 +683,33 @@ class ExperientialStream(nn.Module):
         # This means: what the system commits to → becomes input to next prediction
         gate_values = None
         if self.use_persistent_state and update_state:
-            # Compute new state using gated update with MODULATED output
-            # Key insight: prev_state for next step = what we committed to, not raw h_end
-            new_state = self._update_state(modulated_output.detach(), prev_state)
-            self._persistent_state = new_state.detach()  # Detach to prevent huge graphs
+            # Truncated BPTT: allow gradients for tbptt_steps, then detach
+            # This enables learning what to retain while preventing unbounded graph growth
+            if self.tbptt_steps > 0:
+                # Compute new state WITH gradients
+                new_state = self._update_state(modulated_output, prev_state)
 
-            # Track gate values for analysis
-            with torch.no_grad():
+                self._steps_since_detach += 1
+                if self._steps_since_detach >= self.tbptt_steps:
+                    # Time to truncate: detach to prevent further backprop
+                    self._persistent_state = new_state.detach()
+                    self._steps_since_detach = 0
+                else:
+                    # Keep gradients flowing
+                    self._persistent_state = new_state
+
+                # Track gate values (with gradients since we want to train the gate)
                 gate_input = torch.cat([modulated_output, prev_state], dim=-1)
                 gate_values = self.state_gate(gate_input)
+            else:
+                # Original behavior: always detach (no state learning, but safe from OOM)
+                new_state = self._update_state(modulated_output.detach(), prev_state)
+                self._persistent_state = new_state.detach()
+
+                # Track gate values for analysis only
+                with torch.no_grad():
+                    gate_input = torch.cat([modulated_output, prev_state], dim=-1)
+                    gate_values = self.state_gate(gate_input)
 
         return {
             'state': h_mid,
@@ -1115,10 +1144,15 @@ class MemoryAugmentedGPT(nn.Module):
         crystallize: bool = True,
         use_memory: bool = True,
         use_semantic: bool = True,
-        return_memory_weights: bool = False
+        return_memory_weights: bool = False,
+        prev_memory_query: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, torch.Tensor, Dict]:
         """
-        Forward pass with memory retrieval and optional crystallization.
+        Forward pass with CAUSAL memory retrieval and optional crystallization.
+
+        CAUSAL MEMORY: Memory is retrieved using prev_memory_query (from previous
+        step), NOT the current sequence's hidden states. This ensures that memory
+        retrieval doesn't leak information from future tokens to earlier positions.
 
         Args:
             input_ids: [batch, seq_len] input token IDs
@@ -1127,61 +1161,51 @@ class MemoryAugmentedGPT(nn.Module):
             use_memory: Whether to retrieve and use episodic memories
             use_semantic: Whether to retrieve and use semantic knowledge
             return_memory_weights: Include retrieval weights in output
+            prev_memory_query: [batch, d_model] query from PREVIOUS step for causal
+                retrieval. If None, memory retrieval is skipped (first step).
 
         Returns:
             logits: [batch, seq_len, vocab_size] output logits
             hidden_states: [batch, seq_len, d_model] final hidden states
-            memory_output: dict with experiential/memory info
+            memory_output: dict with experiential/memory info including:
+                - 'next_memory_query': [batch, d_model] query for next step
         """
         batch_size, seq_len = input_ids.shape
         device = input_ids.device
 
-        # 1. Get hidden states from GPT
+        # 1. CAUSAL RETRIEVAL: Query memory BEFORE seeing current sequence
+        # This uses prev_memory_query (from previous step), not current hidden states
+        episodic_retrieved = None
+        semantic_retrieved = None
+        episodic_weights = None
+        semantic_weights = None
+
+        if prev_memory_query is not None:
+            # Use previous step's query for causal memory retrieval
+            query = prev_memory_query  # Already projected by previous step
+
+            # 1a. Episodic retrieval (causal: query is from before this sequence)
+            if use_memory and self.memory.size > 0:
+                episodic_retrieved, episodic_weights = self.memory.retrieve_soft(
+                    query,
+                    temperature=self.retrieval_temperature
+                )
+
+            # 1b. Semantic retrieval (causal: query is from before this sequence)
+            if use_semantic and self.semantic is not None and self.semantic.size > 0:
+                semantic_retrieved, semantic_weights = self.semantic.query_soft(
+                    query,
+                    temperature=self.retrieval_temperature
+                )
+
+        # 2. Get hidden states from GPT
         logits, hidden_states = self.gpt(
             input_ids,
             input_pos=input_pos,
             return_hidden_states=True
         )
 
-        memory_output = {
-            'retrieved_episodic': None,
-            'retrieved_semantic': None,
-            'episodic_weights': None,
-            'semantic_weights': None,
-            'crystallized': False,
-            'consolidated': False,
-            'episodic_size': self.memory.size,
-            'semantic_size': self.semantic.size if self.semantic else 0
-        }
-
-        # 2. Retrieve from episodic and semantic memory
-        query_state = hidden_states[:, -1, :]
-        query = self.query_proj(query_state)
-
-        episodic_retrieved = None
-        semantic_retrieved = None
-
-        # 2a. Episodic retrieval
-        if use_memory and self.memory.size > 0:
-            episodic_retrieved, episodic_weights = self.memory.retrieve_soft(
-                query,
-                temperature=self.retrieval_temperature
-            )
-            memory_output['retrieved_episodic'] = episodic_retrieved
-            if return_memory_weights:
-                memory_output['episodic_weights'] = episodic_weights
-
-        # 2b. Semantic retrieval
-        if use_semantic and self.semantic is not None and self.semantic.size > 0:
-            semantic_retrieved, semantic_weights = self.semantic.query_soft(
-                query,
-                temperature=self.retrieval_temperature
-            )
-            memory_output['retrieved_semantic'] = semantic_retrieved
-            if return_memory_weights:
-                memory_output['semantic_weights'] = semantic_weights
-
-        # 3. Integrate memory with hidden states
+        # 3. Integrate memory with hidden states (memory was retrieved causally)
         if episodic_retrieved is not None or semantic_retrieved is not None:
             hidden_states = self._integrate_memory(
                 hidden_states,
@@ -1190,6 +1214,23 @@ class MemoryAugmentedGPT(nn.Module):
             )
             # Recompute logits with memory-augmented hidden states
             logits = self.gpt.lm_head(self.gpt.final_norm(hidden_states))
+
+        # 4. Prepare query for NEXT step (causal: computed after processing current)
+        # This query will be used by the next step to retrieve relevant memories
+        current_query_state = hidden_states[:, -1, :]
+        next_memory_query = self.query_proj(current_query_state)
+
+        memory_output = {
+            'retrieved_episodic': episodic_retrieved,
+            'retrieved_semantic': semantic_retrieved,
+            'episodic_weights': episodic_weights if return_memory_weights else None,
+            'semantic_weights': semantic_weights if return_memory_weights else None,
+            'crystallized': False,
+            'consolidated': False,
+            'episodic_size': self.memory.size,
+            'semantic_size': self.semantic.size if self.semantic else 0,
+            'next_memory_query': next_memory_query,  # For causal retrieval in next step
+        }
 
         # 4. Experiential processing (for crystallization and prediction)
         if self.experiential is not None:
@@ -1333,6 +1374,33 @@ class MemoryAugmentedGPT(nn.Module):
         if self.experiential is not None:
             self.experiential.reset_state()
 
+    def reset_hidden_state(self):
+        """
+        Reset experiential hidden state but KEEP all memories.
+
+        This is the key operation for resume-after-interruption training:
+        - Simulates "forgetting" the immediate context (what was just processed)
+        - Preserves episodic and semantic memories
+        - Forces the model to rely on memory retrieval for context
+
+        Use case:
+            # Process chunks 1..N, building memory
+            for chunk in chunks[:interrupt_point]:
+                model(chunk, crystallize=True)
+
+            # Interrupt: forget immediate context
+            model.reset_hidden_state()
+
+            # Resume: must use memory to understand
+            for chunk in chunks[interrupt_point:]:
+                logits, _, _ = model(chunk, use_memory=True)
+                # Loss on these chunks forces memory to be useful
+        """
+        if self.experiential is not None:
+            self.experiential.reset_state()
+        # Note: episodic memory (self.memory) and semantic memory (self.semantic)
+        # are intentionally NOT cleared - that's the whole point
+
     def consolidate(self, n_clusters: int = 5, min_cluster_size: int = 3) -> int:
         """
         Consolidate episodic memories into semantic concepts.
@@ -1409,6 +1477,8 @@ def memory_augmented_loss(
     memory_output: Dict,
     lm_weight: float = 1.0,
     exp_weight: float = 0.1,
+    meta_weight: float = 0.01,
+    self_mod_weight: float = 0.01,
     retrieval_weight: float = 0.0
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """
@@ -1420,6 +1490,8 @@ def memory_augmented_loss(
         memory_output: output dict from MemoryAugmentedGPT.forward()
         lm_weight: weight for language modeling loss
         exp_weight: weight for experiential prediction loss
+        meta_weight: weight for meta-surprise loss (trains surprise predictor)
+        self_mod_weight: weight for self-modulation loss (trains confidence gate)
         retrieval_weight: weight for retrieval contrastive loss (if applicable)
 
     Returns:
@@ -1438,13 +1510,20 @@ def memory_augmented_loss(
 
     total_loss = lm_weight * lm_loss
 
-    # Experiential prediction loss
+    # Experiential prediction loss (now uses combined_experiential_loss for full training)
+    # This trains: predictor, surprise_predictor, and self_modulator
     if 'prediction' in memory_output and memory_output['prediction'] is not None:
-        exp_loss = experiential_loss(
-            memory_output['prediction'],
-            memory_output['target']
+        exp_loss, exp_dict = combined_experiential_loss(
+            memory_output,
+            exp_weight=1.0,  # Base weight, scaled by exp_weight below
+            meta_weight=meta_weight / exp_weight if exp_weight > 0 else 0.0,
+            self_mod_weight=self_mod_weight / exp_weight if exp_weight > 0 else 0.0,
         )
-        loss_dict['exp_loss'] = exp_loss.item()
+        loss_dict['exp_loss'] = exp_dict.get('exp_loss', 0.0)
+        loss_dict['meta_loss'] = exp_dict.get('meta_loss', 0.0)
+        loss_dict['self_mod_loss'] = exp_dict.get('self_mod_loss', 0.0)
+        loss_dict['mean_meta_surprise'] = exp_dict.get('mean_meta_surprise', 0.0)
+        loss_dict['mean_confidence'] = exp_dict.get('mean_confidence', 0.0)
         total_loss = total_loss + exp_weight * exp_loss
 
     # Memory statistics (for logging)

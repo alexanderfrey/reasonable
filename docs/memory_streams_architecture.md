@@ -112,7 +112,7 @@ class Episode:
     timestamp: int              # when (global step / position)
     content: Tensor            # what (embedding of the event)
     context: Tensor            # surrounding state when it happened
-    salience: float            # how important (surprise × affect)
+    salience: float            # how important (currently: surprise only; affect pending supervision)
     retrieval_count: int = 0   # how often accessed (for consolidation)
 
 
@@ -132,26 +132,26 @@ class EpisodicStream:
     def should_crystallize(
         self,
         experience: ExperientialState,
-        affect: float
+        affect: float  # NOTE: affect not currently used (unsupervised)
     ) -> bool:
         """Does this moment become a memory?"""
-        # High surprise + high affect = remember this
+        # High surprise = remember this (affect removed pending supervision)
         # Routine continuation = let it flow past
-        salience = experience.surprise * affect
+        salience = experience.surprise  # Was: surprise * affect
         return salience > self.crystallization_threshold
 
     def crystallize(
         self,
         experience: ExperientialState,
         timestamp: int,
-        affect: float
+        affect: float  # NOTE: not currently used
     ) -> Episode:
         """Convert a moment of experience into a discrete memory."""
         episode = Episode(
             timestamp=timestamp,
             content=experience.state,
             context=experience.predictions,  # what we expected
-            salience=experience.surprise * affect
+            salience=experience.surprise  # Was: surprise * affect
         )
         self._store(episode)
         return episode
@@ -614,6 +614,40 @@ step N+1: predict(h_mid, prev_state=modulated_output_N) → prediction
 - Modulation magnitude decreased 33.5% (less correction needed as system learns)
 
 The system now has a true closed loop: self-knowledge affects processing, which affects what gets predicted next.
+
+### Bug Fixes and Improvements (v0.3.3)
+
+Six architectural issues were fixed:
+
+**1. Causal Memory Retrieval** (Critical)
+Memory is now queried using `prev_memory_query` from the PREVIOUS step, not the current sequence's final hidden state. This prevents future tokens from leaking information to earlier positions via the memory pathway.
+
+```python
+# OLD (non-causal): query = hidden_states[:, -1, :]  # Sees full sequence!
+# NEW (causal): use prev_memory_query from previous step
+logits, hidden, mem_out = memory_gpt(input_ids, prev_memory_query=prev_query)
+next_query = mem_out['next_memory_query']  # Pass to next step
+```
+
+**2. Closed Loop Training Enabled**
+`memory_augmented_loss()` now uses `combined_experiential_loss()`, so `surprise_predictor` and `self_modulator` actually receive gradients during training.
+
+**3. Truncated BPTT for State Learning**
+New `tbptt_steps` parameter enables gradient flow through state updates:
+```python
+ExperientialStream(d_model=512, tbptt_steps=5)  # Gradients flow for 5 steps
+```
+
+**4. Salience Simplified**
+Salience no longer uses unsupervised affect heads:
+```python
+# OLD: salience = surprise * arousal * valence.abs()  # Random affect!
+# NEW: salience = surprise  # Clean, trainable signal
+```
+
+**5-6. Training Script Fixes**
+- State properly reset per batch for shuffled data
+- Dictionary key fixed (`episodic_size` not `memory_size`)
 
 Next steps for deeper self-awareness:
 - Predict what memories will be retrieved
