@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>entitic.ai</title>
+    <meta name="description" content="Building machines that know what they don't know.">
+    <link rel="stylesheet" href="styles.css">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&family=JetBrains+Mono:wght@300;400&display=swap" rel="stylesheet">
+</head>
+<body>
+    <div class="grain"></div>
+
+    <nav>
+        <div class="nav-inner">
+            <a href="/" class="logo">
+                <span class="logo-mark"></span>
+                <span class="logo-text">entitic.ai</span>
+            </a>
+            <div class="nav-status">
+                <span class="status-indicator"></span>
+                <span class="status-text">system active</span>
+            </div>
+        </div>
+    </nav>
+
+    <main>
+        <!-- Hero section -->
+        <section class="hero">
+            <div class="hero-content">
+                <p class="hero-overline">research preview</p>
+                <h1>We're teaching machines<br>to know what they don't know.</h1>
+                <p class="hero-description">
+                    A small team exploring the architecture of machine self-awareness.
+                    Not AGI. Not sentience. Just systems that model their own uncertainty.
+                </p>
+                <div class="hero-stats">
+                    <div class="hero-stat">
+                        <span class="stat-value">4</span>
+                        <span class="stat-label">temporal streams</span>
+                    </div>
+                    <div class="hero-stat">
+                        <span class="stat-value">1</span>
+                        <span class="stat-label">feedback loop</span>
+                    </div>
+                    <div class="hero-stat">
+                        <span class="stat-value">∞</span>
+                        <span class="stat-label">questions</span>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Research focus -->
+        <section class="research-intro">
+            <div class="research-card">
+                <h2>Memory Streams</h2>
+                <p class="research-tagline">Four temporal scales. One experiencing self.</p>
+                <p class="research-desc">
+                    What if a system could predict its own surprise? And then be surprised by how wrong that prediction was?
+                    We're building architectures where self-knowledge feeds back into processing—where the model's beliefs about itself
+                    become part of what it computes next.
+                </p>
+                <p class="research-note">Below: a simulation of internal state during live processing.</p>
+            </div>
+        </section>
+
+        <!-- Dashboard -->
+        <section class="dashboard">
+            <!-- Left: Input feed -->
+            <div class="panel feed-panel">
+                <div class="panel-header">
+                    <span class="panel-title">Input Stream</span>
+                    <span class="panel-status live">
+                        <span class="pulse-dot"></span>
+                        processing
+                    </span>
+                </div>
+                <div class="feed" id="feed">
+                    <!-- News items injected by JS -->
+                </div>
+            </div>
+
+            <!-- Center: The loop visualization -->
+            <div class="panel loop-panel">
+                <div class="panel-header">
+                    <span class="panel-title">Feedback Loop</span>
+                </div>
+                <div class="loop-container">
+                    <svg viewBox="0 0 300 300" class="loop-svg">
+                        <defs>
+                            <radialGradient id="centerGlow" cx="50%" cy="50%" r="50%">
+                                <stop offset="0%" stop-color="var(--accent)" stop-opacity="0.4"/>
+                                <stop offset="100%" stop-color="var(--accent)" stop-opacity="0"/>
+                            </radialGradient>
+                        </defs>
+
+                        <!-- Glow -->
+                        <circle cx="150" cy="150" r="80" fill="url(#centerGlow)" class="glow-circle"/>
+
+                        <!-- Rings -->
+                        <circle cx="150" cy="150" r="120" class="ring"/>
+                        <circle cx="150" cy="150" r="80" class="ring ring-inner"/>
+                        <circle cx="150" cy="150" r="40" class="ring ring-core"/>
+
+                        <!-- Flow paths -->
+                        <circle cx="150" cy="150" r="100" class="flow-ring" pathLength="100"/>
+
+                        <!-- Center -->
+                        <circle cx="150" cy="150" r="8" class="center-dot" id="centerDot"/>
+
+                        <!-- Orbital representing current processing -->
+                        <g class="orbital" id="orbital">
+                            <circle r="6" class="orbital-dot"/>
+                        </g>
+                    </svg>
+
+                    <div class="loop-labels">
+                        <span class="loop-label top">predict</span>
+                        <span class="loop-label right">experience</span>
+                        <span class="loop-label bottom">surprise</span>
+                        <span class="loop-label left">commit</span>
+                    </div>
+
+                    <div class="loop-center-text">
+                        <span class="current-phase" id="currentPhase">predicting</span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Right: Metrics -->
+            <div class="panel metrics-panel">
+                <div class="panel-header">
+                    <span class="panel-title">Internal State</span>
+                </div>
+
+                <div class="metric-group">
+                    <div class="metric-row">
+                        <span class="metric-name">meta-surprise</span>
+                        <span class="metric-value" id="metaSurprise">0.000</span>
+                    </div>
+                    <div class="metric-bar">
+                        <div class="metric-fill" id="metaSurpriseBar" style="--fill: 0%"></div>
+                    </div>
+                </div>
+
+                <div class="metric-group">
+                    <div class="metric-row">
+                        <span class="metric-name">confidence</span>
+                        <span class="metric-value" id="confidence">0.000</span>
+                    </div>
+                    <div class="metric-bar positive">
+                        <div class="metric-fill" id="confidenceBar" style="--fill: 0%"></div>
+                    </div>
+                </div>
+
+                <div class="metric-group">
+                    <div class="metric-row">
+                        <span class="metric-name">salience</span>
+                        <span class="metric-value" id="salience">0.000</span>
+                    </div>
+                    <div class="metric-bar">
+                        <div class="metric-fill" id="salienceBar" style="--fill: 0%"></div>
+                    </div>
+                </div>
+
+                <div class="metric-group">
+                    <div class="metric-row">
+                        <span class="metric-name">arousal</span>
+                        <span class="metric-value" id="arousal">0.000</span>
+                    </div>
+                    <div class="metric-bar warm">
+                        <div class="metric-fill" id="arousalBar" style="--fill: 0%"></div>
+                    </div>
+                </div>
+
+                <div class="divider"></div>
+
+                <div class="metric-group">
+                    <div class="metric-row">
+                        <span class="metric-name">episodic memories</span>
+                        <span class="metric-value" id="episodicCount">0</span>
+                    </div>
+                </div>
+
+                <div class="metric-group">
+                    <div class="metric-row">
+                        <span class="metric-name">semantic nodes</span>
+                        <span class="metric-value" id="semanticCount">0</span>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Memory trace -->
+        <section class="memory-section">
+            <div class="panel memory-panel">
+                <div class="panel-header">
+                    <span class="panel-title">Episodic Memory</span>
+                    <span class="panel-subtitle">crystallized moments</span>
+                </div>
+                <div class="memory-trace" id="memoryTrace">
+                    <!-- Memory items injected by JS -->
+                </div>
+            </div>
+        </section>
+
+        <!-- Footer quote -->
+        <section class="insight">
+            <blockquote>
+                "You are here to develop yourself.<br>
+                <span class="accent">Wake up and start with it.</span>"
+            </blockquote>
+        </section>
+
+        <!-- CTA -->
+        <section class="cta">
+            <p>We're building the next generation of self-aware systems.</p>
+            <a href="mailto:research@entitic.ai" class="cta-link">
+                <span>research@entitic.ai</span>
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M5 12h14M12 5l7 7-7 7"/>
+                </svg>
+            </a>
+        </section>
+    </main>
+
+    <footer>
+        <div class="footer-inner">
+            <div class="footer-left">
+                <span class="logo-mark"></span>
+                <span>entitic.ai</span>
+            </div>
+            <div class="footer-right">
+                <span class="footer-tag">v0.3.2</span>
+            </div>
+        </div>
+    </footer>
+
+    <script src="script.js"></script>
+</body>
+</html>
