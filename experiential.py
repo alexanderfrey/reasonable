@@ -87,13 +87,17 @@ class EpisodicMemory(nn.Module):
         d_model: int,
         capacity: int = 1000,
         crystallization_threshold: float = 0.3,
-        decay_rate: float = 0.01
+        decay_rate: float = 0.01,
+        decay_on_store: bool = True,
+        min_salience: float = 0.05
     ):
         super().__init__()
         self.d_model = d_model
         self.capacity = capacity
         self.crystallization_threshold = crystallization_threshold
         self.decay_rate = decay_rate
+        self.decay_on_store = decay_on_store
+        self.min_salience = min_salience  # Memories below this salience are pruned
 
         # Episode storage
         self.episodes: List[Episode] = []
@@ -145,6 +149,10 @@ class EpisodicMemory(nn.Module):
             arousal=arousal,
             retrieval_count=0
         )
+
+        # Apply decay to existing memories before adding new one
+        if self.decay_on_store:
+            self.apply_decay()
 
         # Manage capacity
         if len(self.episodes) >= self.capacity:
@@ -347,9 +355,41 @@ class EpisodicMemory(nn.Module):
         self.episodes.pop(min_idx)
 
     def decay_salience(self, factor: float = 0.99):
-        """Apply decay to all episode saliences (for consolidation)."""
+        """Apply multiplicative decay to all episode saliences."""
         for ep in self.episodes:
             ep.salience *= factor
+
+    def apply_decay(self):
+        """
+        Apply time-based decay to all memories and prune faded ones.
+
+        Decay formula: salience *= (1 - decay_rate) ^ age_since_last_decay
+        Memories below min_salience are removed.
+
+        This should be called periodically (e.g., on each store or every N steps).
+        """
+        if not self.episodes or self.decay_rate <= 0:
+            return
+
+        # Apply decay based on age (memories that haven't been refreshed fade)
+        decay_factor = 1 - self.decay_rate
+        current_time = self._global_step
+
+        for ep in self.episodes:
+            # Decay based on time since storage
+            age = current_time - ep.timestamp
+            if age > 0:
+                # Exponential decay: older memories fade more
+                ep.salience *= (decay_factor ** age)
+
+            # Retrieval refreshes memory (reduces effective age)
+            # Each retrieval adds back some salience
+            if ep.retrieval_count > 0:
+                refresh_bonus = min(0.1 * ep.retrieval_count, 0.5)  # Cap at 50% boost
+                ep.salience = min(1.0, ep.salience * (1 + refresh_bonus))
+
+        # Prune memories that have faded below threshold
+        self.episodes = [ep for ep in self.episodes if ep.salience >= self.min_salience]
 
     def clear(self):
         """Clear all episodes."""
@@ -369,12 +409,18 @@ class EpisodicMemory(nn.Module):
         retrieval_counts = [ep.retrieval_count for ep in self.episodes]
         ages = [self._global_step - ep.timestamp for ep in self.episodes]
 
+        # Count memories at risk of pruning (within 2x of min_salience)
+        at_risk = sum(1 for s in saliences if s < self.min_salience * 2)
+
         return {
             'size': len(self.episodes),
             'avg_salience': sum(saliences) / len(saliences),
+            'min_salience': min(saliences),
             'max_salience': max(saliences),
+            'at_risk_count': at_risk,  # Memories close to being pruned
             'avg_retrieval_count': sum(retrieval_counts) / len(retrieval_counts),
-            'avg_age': sum(ages) / len(ages)
+            'avg_age': sum(ages) / len(ages),
+            'max_age': max(ages)
         }
 
 

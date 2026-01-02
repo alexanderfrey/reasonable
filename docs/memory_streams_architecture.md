@@ -772,10 +772,10 @@ intrinsic_reward = (
   - [x] `target = modulated_output`: predictor learns to predict committed output
   - [x] `prev_state` updated with modulated_output: next step sees committed output
   - [x] True closed loop: self-prediction → output → next input → next prediction
-- [ ] Add decay mechanism to episodic memory
+- [x] Add decay mechanism to episodic memory (time-based decay, retrieval refresh, auto-prune)
 - [ ] Implement procedural stream
-- [ ] Add resume-after-interruption training
-- [ ] Validate on narrative data: does surprise correlate with events?
+- [x] Add resume-after-interruption training (`train_resume_interruption.py`)
+- [x] Validate on narrative data (`validate_narrative_surprise.py`)
 - [ ] Extend self-awareness: predict retrieval, affect
 
 ---
