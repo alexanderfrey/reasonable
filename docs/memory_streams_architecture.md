@@ -776,7 +776,13 @@ intrinsic_reward = (
 - [ ] Implement procedural stream
 - [x] Add resume-after-interruption training (`train_resume_interruption.py`)
 - [x] Validate on narrative data (`validate_narrative_surprise.py`)
-- [ ] Extend self-awareness: predict retrieval, affect
+- [x] Extend self-awareness: predict retrieval, affect (v0.4)
+  - [x] `retrieval_predictor`: predict what memory will be retrieved ("What will I remember?")
+  - [x] `affect_predictor`: predict valence/arousal before computing ("How will I feel?")
+  - [x] `meta_retrieval_surprise`: |predicted_retrieval - actual_retrieval|
+  - [x] `meta_affect_surprise`: |predicted_affect - actual_affect|
+  - [x] `meta_retrieval_loss` and `meta_affect_loss`: train extended self-awareness
+  - [x] Integrated with `combined_experiential_loss` and `memory_augmented_loss`
 
 ---
 
@@ -792,6 +798,6 @@ This design connects to:
 ---
 
 *Document created: 2024-12-31*
-*Last updated: 2026-01-02*
-*Status: Implementation in progress - Self-modulation (self-awareness v0.3) implemented*
+*Last updated: 2026-01-03*
+*Status: Implementation in progress - Extended self-awareness (v0.4) implemented*
 *Related: docs/narrative_experience_architecture.md*

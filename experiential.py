@@ -587,6 +587,26 @@ class ExperientialStream(nn.Module):
                 nn.Sigmoid()
             )
 
+            # Extended self-awareness: predict retrieval before it happens
+            # "What will I remember?" - predict what memory will be retrieved
+            # Input: predictor_input (h_mid + prev_state)
+            # Output: predicted memory embedding [d_model]
+            self.retrieval_predictor = nn.Sequential(
+                nn.Linear(predictor_input_dim, meta_hidden),
+                nn.GELU(),
+                nn.Linear(meta_hidden, d_model)
+            )
+
+            # Extended self-awareness: predict affect before computing it
+            # "How will I feel?" - predict valence and arousal before experiencing
+            # Input: predictor_input (h_mid + prev_state)
+            # Output: [predicted_valence, predicted_arousal]
+            self.affect_predictor = nn.Sequential(
+                nn.Linear(predictor_input_dim, meta_hidden),
+                nn.GELU(),
+                nn.Linear(meta_hidden, 2)  # [valence, arousal]
+            )
+
         # Persistent state buffer (not a parameter, just a buffer)
         self.register_buffer('_persistent_state', None)
         self._batch_size = None
@@ -617,6 +637,12 @@ class ExperientialStream(nn.Module):
             # This means h_end passes through unchanged until the system learns
             nn.init.zeros_(self.self_modulator[-2].weight)
             nn.init.constant_(self.self_modulator[-2].bias, 2.0)  # sigmoid(2) ≈ 0.88
+            # Initialize retrieval predictor with small weights (start uncertain)
+            nn.init.xavier_uniform_(self.retrieval_predictor[-1].weight, gain=0.1)
+            nn.init.zeros_(self.retrieval_predictor[-1].bias)
+            # Initialize affect predictor to predict neutral (valence=0, arousal=0.5)
+            nn.init.zeros_(self.affect_predictor[-1].weight)
+            nn.init.zeros_(self.affect_predictor[-1].bias)  # tanh(0)=0, sigmoid(0)=0.5
 
     def compute_excess_surprisal(
         self,
@@ -837,7 +863,8 @@ class ExperientialStream(nn.Module):
         update_state: bool = True,
         per_token_ce: Optional[torch.Tensor] = None,
         memory_keys: Optional[torch.Tensor] = None,
-        ce_mask: Optional[torch.Tensor] = None
+        ce_mask: Optional[torch.Tensor] = None,
+        retrieved_memory: Optional[torch.Tensor] = None
     ) -> Dict[str, torch.Tensor]:
         """
         Process hidden states and compute surprise/salience for crystallization.
@@ -849,6 +876,12 @@ class ExperientialStream(nn.Module):
 
         When per_token_ce is None, falls back to MLP-based h_mid→h_end prediction.
 
+        Extended self-awareness (v0.4):
+            - Predict retrieval: "What will I remember?" before memory is retrieved
+            - Predict affect: "How will I feel?" before computing valence/arousal
+            - meta_retrieval_surprise: |predicted_retrieval - actual_retrieval|
+            - meta_affect_surprise: |predicted_affect - actual_affect|
+
         Args:
             hidden_states: [batch, seq_len, d_model] from transformer
             mid_idx: optional custom midpoint index (default: seq_len * split_ratio)
@@ -857,6 +890,7 @@ class ExperientialStream(nn.Module):
             per_token_ce: [batch, seq_len-1] per-token cross-entropy loss
             memory_keys: [num_memories, d_model] for novelty computation
             ce_mask: [batch, seq_len-1] boolean mask, True = valid token (excludes padding)
+            retrieved_memory: [batch, d_model] actual retrieved memory (for meta_retrieval_surprise)
 
         Returns:
             dict with:
@@ -872,6 +906,11 @@ class ExperientialStream(nn.Module):
                 - meta_surprise: [batch] |predicted_surprise - surprise|
                 - valence: [batch] emotional valence (-1=negative, 1=positive)
                 - arousal: [batch] activation level (0=calm, 1=excited)
+                - predicted_valence: [batch] self-predicted valence
+                - predicted_arousal: [batch] self-predicted arousal
+                - meta_affect_surprise: [batch] |predicted_affect - actual_affect|
+                - predicted_retrieval: [batch, d_model] self-predicted memory retrieval
+                - meta_retrieval_surprise: [batch] |predicted_retrieval - actual_retrieval|
                 - salience: [batch] importance signal for crystallization
                 - modulated_output: [batch, d_model] h_end adjusted by self-knowledge
                 - confidence_gate: [batch, d_model] how much we trusted h_end
@@ -905,8 +944,25 @@ class ExperientialStream(nn.Module):
         # This is the self-awareness signal: "How surprised will I be?"
         predicted_surprise = None
         meta_surprise = None
+        # Extended self-awareness predictions
+        predicted_retrieval = None
+        meta_retrieval_surprise = None
+        predicted_valence = None
+        predicted_arousal = None
+        meta_affect_surprise = None
+
         if self.use_meta_surprise:
             predicted_surprise = self.surprise_predictor(predictor_input).squeeze(-1)  # [B]
+
+            # Extended self-awareness: predict retrieval BEFORE it happens
+            # "What will I remember?" - predict what memory will be retrieved
+            predicted_retrieval = self.retrieval_predictor(predictor_input)  # [B, d_model]
+
+            # Extended self-awareness: predict affect BEFORE computing it
+            # "How will I feel?" - predict valence and arousal
+            affect_pred = self.affect_predictor(predictor_input)  # [B, 2]
+            predicted_valence = torch.tanh(affect_pred[:, 0])  # [B] in [-1, 1]
+            predicted_arousal = torch.sigmoid(affect_pred[:, 1])  # [B] in [0, 1]
 
         # Compute surprise signal
         # NEW: Use relative surprisal × novelty when per_token_ce is provided
@@ -968,6 +1024,16 @@ class ExperientialStream(nn.Module):
             valence = self.valence_head(h_end).squeeze(-1)  # [B]
             arousal = self.arousal_head(h_end).squeeze(-1)  # [B]
 
+            # Compute meta-affect-surprise: "Did I know how I would feel?"
+            if self.use_meta_surprise and predicted_valence is not None:
+                # Compare predicted affect to actual affect
+                # Valence error in [-1, 1] → abs error in [0, 2], normalize to [0, 1]
+                valence_error = (predicted_valence - valence.detach()).abs() / 2.0
+                # Arousal error in [0, 1] → abs error in [0, 1]
+                arousal_error = (predicted_arousal - arousal.detach()).abs()
+                # Combined meta-affect-surprise (average of both)
+                meta_affect_surprise = (valence_error + arousal_error) / 2.0  # [B] in [0, 1]
+
             # Salience = how important is this moment?
             # NOTE: Affect (arousal, valence) is computed but NOT used for salience
             # because affect heads are unsupervised. Using them would make
@@ -982,6 +1048,16 @@ class ExperientialStream(nn.Module):
                     salience = base_salience * (1 + 3 * meta_surprise)
                 else:
                     salience = base_salience
+
+        # Compute meta-retrieval-surprise: "Did I know what I would remember?"
+        # Compare predicted retrieval to actual retrieved memory (if provided)
+        if self.use_meta_surprise and predicted_retrieval is not None and retrieved_memory is not None:
+            # Cosine distance between predicted and actual retrieval
+            # 1 - cosine_similarity gives us a distance in [0, 2], we use [0, 1]
+            pred_norm = F.normalize(predicted_retrieval, dim=-1)
+            actual_norm = F.normalize(retrieved_memory, dim=-1)
+            retrieval_similarity = (pred_norm * actual_norm).sum(dim=-1)  # [B]
+            meta_retrieval_surprise = (1 - retrieval_similarity) / 2.0  # [B] in [0, 1]
 
         # Self-modulation: adjust processing based on self-knowledge
         # This is where meta-surprise AFFECTS behavior, not just memory
@@ -1046,6 +1122,13 @@ class ExperientialStream(nn.Module):
             'meta_surprise': meta_surprise,
             'valence': valence,
             'arousal': arousal,
+            # Extended self-awareness: affect prediction
+            'predicted_valence': predicted_valence,
+            'predicted_arousal': predicted_arousal,
+            'meta_affect_surprise': meta_affect_surprise,
+            # Extended self-awareness: retrieval prediction
+            'predicted_retrieval': predicted_retrieval,
+            'meta_retrieval_surprise': meta_retrieval_surprise,
             'salience': salience,
             'h_end': h_end.detach(),               # raw world state (for analysis)
             'modulated_output': modulated_output,  # h_end adjusted by self-knowledge (= target)
@@ -1192,21 +1275,81 @@ def meta_surprise_loss(
     return F.mse_loss(predicted_surprise, actual_surprise.detach())
 
 
+def meta_affect_loss(
+    predicted_valence: torch.Tensor,
+    predicted_arousal: torch.Tensor,
+    actual_valence: torch.Tensor,
+    actual_arousal: torch.Tensor
+) -> torch.Tensor:
+    """
+    Loss for training affect prediction (extended self-awareness).
+
+    The system learns to predict its own emotional response before experiencing it.
+    This is training for: "How will I feel?"
+
+    Uses MSE loss between predicted and actual valence/arousal values.
+
+    Args:
+        predicted_valence: [batch] predicted valence (-1 to 1)
+        predicted_arousal: [batch] predicted arousal (0 to 1)
+        actual_valence: [batch] actual valence (-1 to 1, should be detached)
+        actual_arousal: [batch] actual arousal (0 to 1, should be detached)
+
+    Returns:
+        Scalar loss value
+    """
+    valence_loss = F.mse_loss(predicted_valence, actual_valence.detach())
+    arousal_loss = F.mse_loss(predicted_arousal, actual_arousal.detach())
+    return (valence_loss + arousal_loss) / 2.0
+
+
+def meta_retrieval_loss(
+    predicted_retrieval: torch.Tensor,
+    actual_retrieval: torch.Tensor
+) -> torch.Tensor:
+    """
+    Loss for training retrieval prediction (extended self-awareness).
+
+    The system learns to predict what memories will be retrieved before retrieval.
+    This is training for: "What will I remember?"
+
+    Uses cosine similarity loss between predicted and actual retrieved memory.
+
+    Args:
+        predicted_retrieval: [batch, d_model] predicted memory embedding
+        actual_retrieval: [batch, d_model] actual retrieved memory (should be detached)
+
+    Returns:
+        Scalar loss value
+    """
+    # Cosine similarity loss: 1 - cosine_similarity
+    pred_norm = F.normalize(predicted_retrieval, dim=-1)
+    actual_norm = F.normalize(actual_retrieval.detach(), dim=-1)
+    similarity = (pred_norm * actual_norm).sum(dim=-1)  # [batch]
+    # Loss = 1 - similarity (we want similarity to be 1)
+    return (1 - similarity).mean()
+
+
 def combined_experiential_loss(
     output: Dict[str, torch.Tensor],
     exp_weight: float = 1.0,
     meta_weight: float = 0.1,
     self_mod_weight: float = 0.1,
+    affect_weight: float = 0.1,
+    retrieval_weight: float = 0.1,
     temperature: float = 0.1
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """
-    Combined loss for experiential prediction, meta-surprise, and self-modulation.
+    Combined loss for experiential prediction, meta-surprise, self-modulation,
+    and extended self-awareness (affect prediction, retrieval prediction).
 
     Args:
         output: dict from ExperientialStream.forward()
         exp_weight: weight for experiential prediction loss
         meta_weight: weight for meta-surprise loss
         self_mod_weight: weight for self-modulation loss
+        affect_weight: weight for meta-affect loss (extended self-awareness)
+        retrieval_weight: weight for meta-retrieval loss (extended self-awareness)
         temperature: temperature for contrastive loss
 
     Returns:
@@ -1246,6 +1389,34 @@ def combined_experiential_loss(
         loss_dict['self_mod_loss'] = self_mod_loss.item()
         loss_dict['mean_confidence'] = confidence_mean.mean().item()
         total_loss = total_loss + self_mod_weight * self_mod_loss
+
+    # Extended self-awareness: meta-affect loss (predict own emotional response)
+    if (output.get('predicted_valence') is not None and
+        output.get('predicted_arousal') is not None and
+        output.get('valence') is not None and
+        output.get('arousal') is not None):
+        affect_loss = meta_affect_loss(
+            output['predicted_valence'],
+            output['predicted_arousal'],
+            output['valence'],
+            output['arousal']
+        )
+        loss_dict['affect_loss'] = affect_loss.item()
+        if output.get('meta_affect_surprise') is not None:
+            loss_dict['mean_meta_affect_surprise'] = output['meta_affect_surprise'].mean().item()
+        total_loss = total_loss + affect_weight * affect_loss
+
+    # Extended self-awareness: meta-retrieval loss (predict what will be retrieved)
+    if (output.get('predicted_retrieval') is not None and
+        output.get('retrieved_memory') is not None):
+        retrieval_loss = meta_retrieval_loss(
+            output['predicted_retrieval'],
+            output['retrieved_memory']
+        )
+        loss_dict['retrieval_loss'] = retrieval_loss.item()
+        if output.get('meta_retrieval_surprise') is not None:
+            loss_dict['mean_meta_retrieval_surprise'] = output['meta_retrieval_surprise'].mean().item()
+        total_loss = total_loss + retrieval_weight * retrieval_loss
 
     loss_dict['total_loss'] = total_loss.item()
     return total_loss, loss_dict
@@ -1603,13 +1774,23 @@ class MemoryAugmentedGPT(nn.Module):
             # Get memory keys for novelty computation
             memory_keys = self.memory.get_keys(device=device)
 
+            # Combine retrieved memories for extended self-awareness
+            # Use episodic as primary, semantic as fallback
+            retrieved_for_meta = None
+            if episodic_retrieved is not None:
+                retrieved_for_meta = episodic_retrieved
+            elif semantic_retrieved is not None:
+                retrieved_for_meta = semantic_retrieved
+
             # Call experiential stream with the new surprise signal
             # Note: per_token_ce is [B, seq_len-1], alignment handled inside experiential
+            # Pass retrieved_memory for extended self-awareness (meta-retrieval-surprise)
             exp_output = self.experiential(
                 hidden_states,  # Full hidden states for h_mid/h_end extraction
                 per_token_ce=per_token_ce,
                 memory_keys=memory_keys,
-                ce_mask=ce_mask
+                ce_mask=ce_mask,
+                retrieved_memory=retrieved_for_meta
             )
             memory_output.update({
                 'prediction': exp_output['prediction'],
@@ -1621,7 +1802,15 @@ class MemoryAugmentedGPT(nn.Module):
                 'modulated_output': exp_output.get('modulated_output'),
                 'confidence_gate': exp_output.get('confidence_gate'),
                 'meta_surprise': exp_output.get('meta_surprise'),
-                # NEW: Per-token surprise signal components
+                # Extended self-awareness: affect prediction
+                'predicted_valence': exp_output.get('predicted_valence'),
+                'predicted_arousal': exp_output.get('predicted_arousal'),
+                'meta_affect_surprise': exp_output.get('meta_affect_surprise'),
+                # Extended self-awareness: retrieval prediction
+                'predicted_retrieval': exp_output.get('predicted_retrieval'),
+                'meta_retrieval_surprise': exp_output.get('meta_retrieval_surprise'),
+                'retrieved_memory': retrieved_for_meta,  # For loss computation
+                # Per-token surprise signal components
                 'surprise_t': exp_output.get('surprise_t'),
                 'excess_t': exp_output.get('excess_t'),
                 'novelty_t': exp_output.get('novelty_t'),
@@ -1861,7 +2050,8 @@ def memory_augmented_loss(
     exp_weight: float = 0.1,
     meta_weight: float = 0.01,
     self_mod_weight: float = 0.01,
-    retrieval_weight: float = 0.0
+    affect_weight: float = 0.01,
+    retrieval_weight: float = 0.01
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """
     Combined loss for memory-augmented generation.
@@ -1874,7 +2064,8 @@ def memory_augmented_loss(
         exp_weight: weight for experiential prediction loss
         meta_weight: weight for meta-surprise loss (trains surprise predictor)
         self_mod_weight: weight for self-modulation loss (trains confidence gate)
-        retrieval_weight: weight for retrieval contrastive loss (if applicable)
+        affect_weight: weight for meta-affect loss (extended self-awareness)
+        retrieval_weight: weight for meta-retrieval loss (extended self-awareness)
 
     Returns:
         total_loss: combined scalar loss
@@ -1893,19 +2084,26 @@ def memory_augmented_loss(
     total_loss = lm_weight * lm_loss
 
     # Experiential prediction loss (now uses combined_experiential_loss for full training)
-    # This trains: predictor, surprise_predictor, and self_modulator
+    # This trains: predictor, surprise_predictor, self_modulator, affect_predictor, retrieval_predictor
     if 'prediction' in memory_output and memory_output['prediction'] is not None:
         exp_loss, exp_dict = combined_experiential_loss(
             memory_output,
             exp_weight=1.0,  # Base weight, scaled by exp_weight below
             meta_weight=meta_weight / exp_weight if exp_weight > 0 else 0.0,
             self_mod_weight=self_mod_weight / exp_weight if exp_weight > 0 else 0.0,
+            affect_weight=affect_weight / exp_weight if exp_weight > 0 else 0.0,
+            retrieval_weight=retrieval_weight / exp_weight if exp_weight > 0 else 0.0,
         )
         loss_dict['exp_loss'] = exp_dict.get('exp_loss', 0.0)
         loss_dict['meta_loss'] = exp_dict.get('meta_loss', 0.0)
         loss_dict['self_mod_loss'] = exp_dict.get('self_mod_loss', 0.0)
         loss_dict['mean_meta_surprise'] = exp_dict.get('mean_meta_surprise', 0.0)
         loss_dict['mean_confidence'] = exp_dict.get('mean_confidence', 0.0)
+        # Extended self-awareness metrics
+        loss_dict['affect_loss'] = exp_dict.get('affect_loss', 0.0)
+        loss_dict['retrieval_loss'] = exp_dict.get('retrieval_loss', 0.0)
+        loss_dict['mean_meta_affect_surprise'] = exp_dict.get('mean_meta_affect_surprise', 0.0)
+        loss_dict['mean_meta_retrieval_surprise'] = exp_dict.get('mean_meta_retrieval_surprise', 0.0)
         total_loss = total_loss + exp_weight * exp_loss
 
     # Memory statistics (for logging)
@@ -2898,6 +3096,210 @@ def test_meta_surprise_learning():
     # Meta-surprise should decrease as system learns to predict itself
     # Note: this may not always hold with random data, but gives us a baseline
     print("  Meta-surprise learning test completed!")
+    return True
+
+
+def test_extended_self_awareness():
+    """Test extended self-awareness: affect and retrieval prediction."""
+    print("Testing extended self-awareness...")
+
+    batch_size = 8
+    seq_len = 64
+    d_model = 128
+
+    exp = ExperientialStream(
+        d_model=d_model,
+        use_meta_surprise=True,
+        use_affect=True,
+        use_persistent_state=True
+    )
+    hidden_states = torch.randn(batch_size, seq_len, d_model)
+
+    # Test without retrieved memory
+    output = exp(hidden_states)
+
+    # Check new outputs exist
+    assert output['predicted_valence'] is not None, "predicted_valence should exist"
+    assert output['predicted_arousal'] is not None, "predicted_arousal should exist"
+    assert output['predicted_retrieval'] is not None, "predicted_retrieval should exist"
+
+    # Check shapes
+    assert output['predicted_valence'].shape == (batch_size,), \
+        f"Wrong predicted_valence shape: {output['predicted_valence'].shape}"
+    assert output['predicted_arousal'].shape == (batch_size,), \
+        f"Wrong predicted_arousal shape: {output['predicted_arousal'].shape}"
+    assert output['predicted_retrieval'].shape == (batch_size, d_model), \
+        f"Wrong predicted_retrieval shape: {output['predicted_retrieval'].shape}"
+
+    # Check ranges
+    assert (output['predicted_valence'] >= -1).all() and (output['predicted_valence'] <= 1).all(), \
+        "predicted_valence should be in [-1, 1]"
+    assert (output['predicted_arousal'] >= 0).all() and (output['predicted_arousal'] <= 1).all(), \
+        "predicted_arousal should be in [0, 1]"
+
+    # Test meta_affect_surprise computation
+    assert output['meta_affect_surprise'] is not None, "meta_affect_surprise should exist"
+    assert output['meta_affect_surprise'].shape == (batch_size,), \
+        f"Wrong meta_affect_surprise shape: {output['meta_affect_surprise'].shape}"
+    assert (output['meta_affect_surprise'] >= 0).all() and (output['meta_affect_surprise'] <= 1).all(), \
+        "meta_affect_surprise should be in [0, 1]"
+
+    # meta_retrieval_surprise should be None without retrieved_memory
+    assert output['meta_retrieval_surprise'] is None, \
+        "meta_retrieval_surprise should be None without retrieved_memory"
+
+    print(f"  predicted_valence range: [{output['predicted_valence'].min():.3f}, {output['predicted_valence'].max():.3f}]")
+    print(f"  predicted_arousal range: [{output['predicted_arousal'].min():.3f}, {output['predicted_arousal'].max():.3f}]")
+    print(f"  meta_affect_surprise mean: {output['meta_affect_surprise'].mean():.3f}")
+
+    print("  Extended self-awareness shapes and ranges correct!")
+    return True
+
+
+def test_meta_retrieval_surprise():
+    """Test meta-retrieval-surprise with actual retrieved memory."""
+    print("Testing meta-retrieval-surprise...")
+
+    batch_size = 8
+    seq_len = 64
+    d_model = 128
+
+    exp = ExperientialStream(
+        d_model=d_model,
+        use_meta_surprise=True,
+        use_affect=True,
+        use_persistent_state=True
+    )
+    hidden_states = torch.randn(batch_size, seq_len, d_model)
+    retrieved_memory = torch.randn(batch_size, d_model)
+
+    output = exp(hidden_states, retrieved_memory=retrieved_memory)
+
+    # Now meta_retrieval_surprise should exist
+    assert output['meta_retrieval_surprise'] is not None, \
+        "meta_retrieval_surprise should exist with retrieved_memory"
+    assert output['meta_retrieval_surprise'].shape == (batch_size,), \
+        f"Wrong meta_retrieval_surprise shape: {output['meta_retrieval_surprise'].shape}"
+    assert (output['meta_retrieval_surprise'] >= 0).all() and (output['meta_retrieval_surprise'] <= 1).all(), \
+        "meta_retrieval_surprise should be in [0, 1]"
+
+    print(f"  meta_retrieval_surprise mean: {output['meta_retrieval_surprise'].mean():.3f}")
+
+    # Test that if retrieved_memory matches predicted_retrieval, surprise is low
+    output2 = exp(hidden_states)  # Reset state
+    predicted_retrieval = output2['predicted_retrieval'].detach()
+    output3 = exp(hidden_states, retrieved_memory=predicted_retrieval)
+
+    # When retrieved matches predicted, surprise should be near 0
+    # (may not be exactly 0 due to normalization, but should be low)
+    print(f"  meta_retrieval_surprise with matching retrieval: {output3['meta_retrieval_surprise'].mean():.4f}")
+
+    print("  Meta-retrieval-surprise test passed!")
+    return True
+
+
+def test_extended_self_awareness_gradients():
+    """Test that extended self-awareness modules receive gradients."""
+    print("Testing extended self-awareness gradients...")
+
+    batch_size = 8
+    seq_len = 64
+    d_model = 128
+
+    exp = ExperientialStream(
+        d_model=d_model,
+        use_meta_surprise=True,
+        use_affect=True,
+        use_persistent_state=True
+    )
+    hidden_states = torch.randn(batch_size, seq_len, d_model, requires_grad=True)
+    retrieved_memory = torch.randn(batch_size, d_model)
+
+    output = exp(hidden_states, retrieved_memory=retrieved_memory)
+
+    # Compute losses
+    affect_loss = meta_affect_loss(
+        output['predicted_valence'],
+        output['predicted_arousal'],
+        output['valence'],
+        output['arousal']
+    )
+    retrieval_loss = meta_retrieval_loss(
+        output['predicted_retrieval'],
+        retrieved_memory
+    )
+
+    total_loss = affect_loss + retrieval_loss
+    total_loss.backward()
+
+    # Check gradients flow to new predictors
+    affect_has_grad = any(
+        p.grad is not None and p.grad.abs().sum() > 0
+        for p in exp.affect_predictor.parameters()
+    )
+    retrieval_has_grad = any(
+        p.grad is not None and p.grad.abs().sum() > 0
+        for p in exp.retrieval_predictor.parameters()
+    )
+
+    assert affect_has_grad, "affect_predictor should receive gradients"
+    assert retrieval_has_grad, "retrieval_predictor should receive gradients"
+
+    print("  Extended self-awareness gradients flow correctly!")
+    return True
+
+
+def test_combined_loss_with_extended():
+    """Test combined_experiential_loss with extended self-awareness."""
+    print("Testing combined loss with extended self-awareness...")
+
+    batch_size = 8
+    seq_len = 64
+    d_model = 128
+
+    exp = ExperientialStream(
+        d_model=d_model,
+        use_meta_surprise=True,
+        use_affect=True,
+        use_persistent_state=True
+    )
+    hidden_states = torch.randn(batch_size, seq_len, d_model)
+    retrieved_memory = torch.randn(batch_size, d_model)
+
+    output = exp(hidden_states, retrieved_memory=retrieved_memory)
+    # Add retrieved_memory to output for loss computation
+    output['retrieved_memory'] = retrieved_memory
+
+    loss, loss_dict = combined_experiential_loss(
+        output,
+        exp_weight=1.0,
+        meta_weight=0.1,
+        self_mod_weight=0.1,
+        affect_weight=0.1,
+        retrieval_weight=0.1
+    )
+
+    # Check all expected losses are present
+    assert 'exp_loss' in loss_dict, "exp_loss should be in loss_dict"
+    assert 'meta_loss' in loss_dict, "meta_loss should be in loss_dict"
+    assert 'self_mod_loss' in loss_dict, "self_mod_loss should be in loss_dict"
+    assert 'affect_loss' in loss_dict, "affect_loss should be in loss_dict"
+    assert 'retrieval_loss' in loss_dict, "retrieval_loss should be in loss_dict"
+    assert 'mean_meta_affect_surprise' in loss_dict, "mean_meta_affect_surprise should be in loss_dict"
+    assert 'mean_meta_retrieval_surprise' in loss_dict, "mean_meta_retrieval_surprise should be in loss_dict"
+
+    # Loss should be finite
+    assert not torch.isnan(loss) and not torch.isinf(loss), "Loss should be finite"
+
+    print(f"  exp_loss: {loss_dict['exp_loss']:.4f}")
+    print(f"  meta_loss: {loss_dict['meta_loss']:.4f}")
+    print(f"  affect_loss: {loss_dict['affect_loss']:.4f}")
+    print(f"  retrieval_loss: {loss_dict['retrieval_loss']:.4f}")
+    print(f"  mean_meta_affect_surprise: {loss_dict['mean_meta_affect_surprise']:.4f}")
+    print(f"  mean_meta_retrieval_surprise: {loss_dict['mean_meta_retrieval_surprise']:.4f}")
+    print(f"  total_loss: {loss_dict['total_loss']:.4f}")
+
+    print("  Combined loss with extended self-awareness test passed!")
     return True
 
 
@@ -4151,6 +4553,14 @@ if __name__ == "__main__":
     test_meta_surprise_gradients()
     print()
     test_meta_surprise_learning()
+    print()
+    test_extended_self_awareness()
+    print()
+    test_meta_retrieval_surprise()
+    print()
+    test_extended_self_awareness_gradients()
+    print()
+    test_combined_loss_with_extended()
     print()
     test_self_modulation()
     print()
