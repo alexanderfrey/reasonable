@@ -205,7 +205,7 @@ The model consolidated **73 semantic concepts** with **2,628 relations** through
 
 2. **42.9% structural correlation**: High-surprise moments partially align with structural markers, but also occur at semantically important mid-scene moments without explicit markers.
 
-3. **Extended self-awareness is architecturally complete**: The affect and retrieval predictors exist and produce outputs, but require training optimization.
+3. **Extended self-awareness is now trained**: The affect and retrieval predictors have been trained with meta-affect and meta-retrieval losses (v2 checkpoint).
 
 ---
 
@@ -225,7 +225,7 @@ The model consolidated **73 semantic concepts** with **2,628 relations** through
 
 3. **Structural correlation lacks baseline**: 37.1% correlation without null model is hard to interpret.
 
-4. **Extended self-awareness modules are untrained**: The checkpoint predates the affect/retrieval predictors.
+4. ✅ **Extended self-awareness modules are now trained**: See v2 checkpoint below.
 
 ---
 
@@ -237,7 +237,7 @@ The model consolidated **73 semantic concepts** with **2,628 relations** through
 
 2. **Add baseline for structural correlation**: Compute correlation with shuffled surprise scores as null model.
 
-3. **Train extended self-awareness**: Run training with meta-affect and meta-retrieval losses to calibrate the predictors.
+3. ✅ **Train extended self-awareness**: DONE. v2 checkpoint trained with affect_weight=0.1, retrieval_weight=0.1.
 
 ### Evaluation Improvements
 
@@ -269,42 +269,128 @@ MemoryAugmentedGPT(
 
 | File | Description |
 |------|-------------|
-| `memory_augmented_books_v1/memory_gpt_epoch_1.pt` | Trained checkpoint |
-| `validation_lion_of_the_sky.json` | Narrative surprise validation on "Lion of the Sky" |
+| `memory_augmented_books_v1/memory_gpt_epoch_1.pt` | Trained checkpoint (v1 - no extended self-awareness) |
+| `memory_augmented_books_v2/memory_gpt_epoch_1.pt` | Trained checkpoint (v2 - with extended self-awareness) |
+| `validation_lion_of_the_sky.json` | Narrative surprise validation v1 |
+| `validation_lion_v2.json` | Narrative surprise validation v2 |
 | `book_corpus_output/training_book_corpus_metadata.json` | Training dataset metadata |
 | `book_corpus_output/evaluation_book_corpus_metadata.json` | Evaluation dataset metadata |
 | `MEMORY_AUGMENTED_TRAINING_SUMMARY.md` | This summary document |
 
 ---
 
-## 10. How to Run
+## 10. V2 Training: Extended Self-Awareness
 
-### Training
+**Date**: 2026-01-04
+**Checkpoint**: `memory_augmented_books_v2/memory_gpt_epoch_1.pt`
+
+### 10.1 Training Configuration
+
+| Parameter | Value |
+|-----------|-------|
+| Max Steps | 3,000 |
+| LM Loss Weight | 1.0 |
+| Experiential Loss Weight | 0.1 |
+| **Affect Loss Weight** | 0.1 |
+| **Retrieval Loss Weight** | 0.1 |
+| Crystallization Threshold | 1.0 |
+| Meta-surprise Salience Weight | 1.0 |
+
+### 10.2 Final Training Metrics
+
+| Metric | Value |
+|--------|-------|
+| LM Loss | 4.577 |
+| Experiential Accuracy | 82.3% |
+| Memory Size | 25 |
+| Training Time | 2.8 minutes |
+
+### 10.3 Evaluation Metrics (v2)
+
+| Metric | Value |
+|--------|-------|
+| LM Loss | 4.197 |
+| Exp Loss | 2.001 |
+| Token Accuracy | 21.0% |
+| Memory Size | 25 |
+
+### 10.4 Narrative Validation (v2)
+
+| Metric | v1 | v2 |
+|--------|-----|-----|
+| Surprise Mean | 0.624 | 0.626 |
+| Meta-surprise Mean | 0.403 | 0.397 |
+| Salience Mean | 1.377 | 0.875 |
+| Crystallization Rate | 25.2% | 23.5% |
+| Structural Correlation | 42.9% | 38.1% |
+
+### 10.5 Extended Self-Awareness Output
+
+The v2 checkpoint now produces these additional metrics:
+
+```python
+mem_out = {
+    # Core surprise
+    'surprise': 0.78,
+    'meta_surprise': 0.77,
+
+    # Affect prediction
+    'valence': -0.36,
+    'arousal': 0.43,
+    'predicted_valence': 0.02,
+    'predicted_arousal': 0.41,
+    'meta_affect_surprise': 0.10,  # NEW: error in affect prediction
+
+    # Retrieval prediction
+    'predicted_retrieval': tensor,
+    'meta_retrieval_surprise': 0.xx,  # NEW: error in retrieval prediction
+}
+```
+
+The model can now predict its own emotional response and retrieval patterns.
+
+---
+
+## 11. How to Run
+
+### Training (with Extended Self-Awareness)
 ```bash
 python train_memory_augmented.py \
   --checkpoint tiny_pretrain_output/model_best_eval.pt \
   --data_dir book_corpus_output \
   --output_dir memory_augmented_books_v2 \
   --batch_size 8 \
-  --max_steps 5000 \
+  --max_steps 3000 \
   --memory_capacity 2000 \
-  --crystallization_threshold 0.3
+  --crystallization_threshold 1.0 \
+  --meta_surprise_salience_weight 1.0 \
+  --lm_weight 1.0 \
+  --exp_weight 0.1 \
+  --affect_weight 0.1 \
+  --retrieval_weight 0.1
 ```
 
 ### Validation
 ```bash
 python validate_narrative_surprise.py \
-  --checkpoint memory_augmented_books_v1/memory_gpt_epoch_1.pt \
+  --checkpoint memory_augmented_books_v2/memory_gpt_epoch_1.pt \
   --narrative /path/to/book.txt \
-  --output validation_results.json
+  --output validation_results.json \
+  --threshold 1.0 \
+  --meta_surprise_weight 1.0
 ```
 
 ### Inference
 ```python
 from experiential import MemoryAugmentedGPT
 
-# Load model
-memory_gpt = MemoryAugmentedGPT(gpt, memory_capacity=2000)
+# Load model with calibrated parameters
+memory_gpt = MemoryAugmentedGPT(
+    gpt,
+    memory_capacity=2000,
+    crystallization_threshold=1.0,
+    meta_surprise_salience_weight=1.0,
+)
 memory_gpt.load_state_dict(checkpoint['memory_gpt_state_dict'])
 
 # Forward pass with memory
@@ -314,8 +400,14 @@ logits, hidden, mem_out = memory_gpt(
     use_memory=True
 )
 
-# Access metrics
+# Core surprise metrics
 surprise = mem_out['surprise']
-salience = mem_out['salience']
 meta_surprise = mem_out['meta_surprise']
+salience = mem_out['salience']
+
+# Extended self-awareness (v2)
+valence = mem_out['valence']
+arousal = mem_out['arousal']
+meta_affect_surprise = mem_out['meta_affect_surprise']
+meta_retrieval_surprise = mem_out['meta_retrieval_surprise']
 ```

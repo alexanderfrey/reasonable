@@ -147,6 +147,8 @@ def train_epoch(
     max_steps: Optional[int] = None,
     lm_weight: float = 1.0,
     exp_weight: float = 0.1,
+    affect_weight: float = 0.1,
+    retrieval_weight: float = 0.1,
     accumulation_steps: int = 1,
 ) -> Dict[str, List[float]]:
     """Train for one epoch."""
@@ -162,6 +164,11 @@ def train_epoch(
         'accuracy': [],
         'memory_size': [],
         'surprise': [],
+        # Extended self-awareness metrics
+        'affect_loss': [],
+        'retrieval_loss': [],
+        'meta_affect_surprise': [],
+        'meta_retrieval_surprise': [],
     }
 
     total_loss = 0.0
@@ -190,11 +197,13 @@ def train_epoch(
             prev_memory_query=None  # No causal query for shuffled batches
         )
 
-        # Compute loss
+        # Compute loss (includes extended self-awareness losses)
         loss, loss_dict = memory_augmented_loss(
             logits, targets, mem_out,
             lm_weight=lm_weight,
-            exp_weight=exp_weight
+            exp_weight=exp_weight,
+            affect_weight=affect_weight,
+            retrieval_weight=retrieval_weight,
         )
 
         # Scale for gradient accumulation
@@ -223,15 +232,22 @@ def train_epoch(
         history['accuracy'].append(acc)
         history['memory_size'].append(mem_out['episodic_size'])
         history['surprise'].append(surprise)
+        # Extended self-awareness metrics
+        history['affect_loss'].append(loss_dict.get('affect_loss', 0.0))
+        history['retrieval_loss'].append(loss_dict.get('retrieval_loss', 0.0))
+        history['meta_affect_surprise'].append(loss_dict.get('mean_meta_affect_surprise', 0.0))
+        history['meta_retrieval_surprise'].append(loss_dict.get('mean_meta_retrieval_surprise', 0.0))
 
         # Log
         if step % log_interval == 0:
             avg_loss = total_loss / (step + 1)
+            affect_loss = loss_dict.get('affect_loss', 0.0)
             pbar.set_postfix({
                 'loss': f'{avg_loss:.4f}',
                 'lm': f'{loss_dict["lm_loss"]:.3f}',
                 'mem': mem_out['episodic_size'],
-                'acc': f'{acc:.3f}'
+                'acc': f'{acc:.3f}',
+                'aff': f'{affect_loss:.3f}',
             })
 
         if max_steps and step >= max_steps:
@@ -311,6 +327,14 @@ def main():
     # Loss weights
     parser.add_argument("--lm_weight", type=float, default=1.0)
     parser.add_argument("--exp_weight", type=float, default=0.1)
+    # Extended self-awareness loss weights
+    parser.add_argument("--affect_weight", type=float, default=0.1,
+                        help="Weight for meta-affect loss (predict own emotions)")
+    parser.add_argument("--retrieval_weight", type=float, default=0.1,
+                        help="Weight for meta-retrieval loss (predict what will be remembered)")
+    # Salience calibration
+    parser.add_argument("--meta_surprise_salience_weight", type=float, default=1.0,
+                        help="How much meta-surprise boosts salience (default 1.0)")
 
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--log_interval", type=int, default=50)
@@ -322,7 +346,11 @@ def main():
     logger.info("Memory-Augmented GPT Training")
     logger.info(f"  Integration: {args.integration}")
     logger.info(f"  Memory capacity: {args.memory_capacity}")
+    logger.info(f"  Crystallization threshold: {args.crystallization_threshold}")
+    logger.info(f"  Meta-surprise salience weight: {args.meta_surprise_salience_weight}")
     logger.info(f"  Batch size: {args.batch_size} x {args.accumulation_steps} accumulation")
+    logger.info(f"  Loss weights: lm={args.lm_weight}, exp={args.exp_weight}, "
+                f"affect={args.affect_weight}, retrieval={args.retrieval_weight}")
     logger.info("=" * 60)
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -337,6 +365,7 @@ def main():
         crystallization_threshold=args.crystallization_threshold,
         memory_integration=args.integration,
         use_experiential=True,
+        meta_surprise_salience_weight=args.meta_surprise_salience_weight,
     ).to(device)
 
     n_params = sum(p.numel() for p in memory_gpt.parameters() if p.requires_grad)
@@ -370,6 +399,8 @@ def main():
             max_steps=args.max_steps,
             lm_weight=args.lm_weight,
             exp_weight=args.exp_weight,
+            affect_weight=args.affect_weight,
+            retrieval_weight=args.retrieval_weight,
             accumulation_steps=args.accumulation_steps,
         )
         all_history.append(history)
