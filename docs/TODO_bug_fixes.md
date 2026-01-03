@@ -545,5 +545,301 @@ chunk_surprise = sigmoid(scale * mean(topk(surprise_t[mid_idx:], k)))  # Normali
 
 ---
 
-*Last updated: 2026-01-03*
+---
+
+# Open Improvements (2026-01-04)
+
+These are enhancements to pursue now that the core bugs are fixed and v2 training is complete.
+
+---
+
+## High Priority
+
+### 9. Widen Surprise Dynamic Range
+
+**Status:** 🔲 TODO
+
+**Problem:**
+Surprise is compressed to a ~0.15 range (0.57-0.72 on Lion of the Sky validation). The top 10 narrative moments differ by only ~0.09. This limits the model's ability to discriminate between moderately surprising and highly surprising content.
+
+**Evidence:**
+```
+Surprise Range: [0.567, 0.723]  (only 0.156 spread)
+Surprise σ: 0.023               (very tight)
+```
+
+**Why This Matters:**
+- Salience depends on surprise: `salience = surprise * (1 + weight * meta_surprise)`
+- If surprise has low variance, salience discrimination is weak
+- Memory crystallization decisions become noisy
+
+**Proposed Solutions:**
+
+**Option A: Temperature Scaling**
+Add a learnable or tunable temperature to the surprise sigmoid:
+```python
+# Current
+chunk_surprise = torch.sigmoid(raw_surprise * 0.5)
+
+# Proposed
+chunk_surprise = torch.sigmoid(raw_surprise * temperature)  # temperature > 1 spreads output
+```
+
+**Option B: Different Surprise Formulation**
+Replace z-scored CE with something more discriminative:
+```python
+# Current: excess_t = (CE_t - ema_mu) / ema_sigma
+# Option: Use percentile rank instead of z-score
+rank_t = (CE_t > ema_percentiles).sum() / len(ema_percentiles)
+```
+
+**Option C: Per-Document Normalization**
+Instead of global EMA, normalize within each document:
+```python
+doc_mu = CE_tokens.mean()
+doc_sigma = CE_tokens.std()
+excess_t = (CE_t - doc_mu) / doc_sigma
+```
+
+**Files to Modify:**
+- `experiential.py`: `compute_surprise_signal()`, possibly add temperature parameter
+
+**Testing:**
+After fix, surprise range should span at least 0.3-0.4 on narrative validation.
+
+---
+
+### 10. Evaluate Memory Retrieval Quality
+
+**Status:** 🔲 TODO
+
+**Problem:**
+We don't know if retrieved episodic memories actually improve prediction. The memory system could be adding noise rather than signal.
+
+**What to Measure:**
+
+1. **Perplexity with/without retrieval:**
+   ```python
+   # Run evaluation twice on same data
+   ppl_with_memory = evaluate(model, data, use_memory=True)
+   ppl_without_memory = evaluate(model, data, use_memory=False)
+   memory_benefit = ppl_without_memory - ppl_with_memory  # Should be positive
+   ```
+
+2. **Retrieval relevance:**
+   - Are retrieved memories semantically related to current context?
+   - Measure cosine similarity between query and retrieved content
+
+3. **Temporal coherence:**
+   - Does retrieval improve prediction at narrative callback points?
+   - Test on passages that reference earlier events
+
+**Proposed Evaluation Script:**
+```python
+# eval_memory_benefit.py
+def evaluate_memory_benefit(model, dataloader, device):
+    """Compare perplexity with and without memory retrieval."""
+    ppl_with = compute_perplexity(model, dataloader, use_memory=True)
+    ppl_without = compute_perplexity(model, dataloader, use_memory=False)
+
+    print(f"Perplexity with memory: {ppl_with:.3f}")
+    print(f"Perplexity without memory: {ppl_without:.3f}")
+    print(f"Memory benefit: {ppl_without - ppl_with:.3f}")
+```
+
+**Files to Create:**
+- `eval_memory_benefit.py`: New evaluation script
+
+**Success Criteria:**
+- Memory retrieval should reduce perplexity by at least 0.1
+- If not, investigate retrieval mechanism or training signal
+
+---
+
+### 11. Train Valence Prediction Longer
+
+**Status:** 🔲 TODO
+
+**Problem:**
+After 3000 steps of v2 training, arousal prediction is accurate but valence is not:
+```python
+arousal: 0.43 actual vs 0.41 predicted  # Good!
+valence: -0.36 actual vs 0.02 predicted  # Bad!
+```
+
+**Why Valence is Harder:**
+- Valence (positive/negative) requires semantic understanding
+- Arousal (intensity) correlates with surface features (exclamation marks, rare words)
+- 3000 steps may be insufficient for valence calibration
+
+**Proposed Solutions:**
+
+**Option A: More Training**
+Run v3 with more steps:
+```bash
+python train_memory_augmented.py \
+  --max_steps 10000 \
+  --affect_weight 0.2 \  # Increase weight
+  ...
+```
+
+**Option B: Valence Supervision**
+Add weak labels from sentiment lexicons:
+```python
+# Use VADER or similar for weak valence labels
+from nltk.sentiment import SentimentIntensityAnalyzer
+sia = SentimentIntensityAnalyzer()
+valence_target = sia.polarity_scores(text)['compound']  # [-1, 1]
+```
+
+**Option C: Contrastive Valence**
+Train valence to distinguish positive from negative passages:
+```python
+# Within a batch, valence should be higher for positive content
+positive_samples = batch[valence_labels > 0]
+negative_samples = batch[valence_labels < 0]
+contrastive_loss = margin_loss(valence(positive), valence(negative))
+```
+
+**Files to Modify:**
+- `train_memory_augmented.py`: Increase `--affect_weight` or `--max_steps`
+- Optionally: Add valence supervision signal to `experiential.py`
+
+**Testing:**
+After fix, valence prediction error should decrease from 0.38 to < 0.15.
+
+---
+
+## Medium Priority
+
+### 12. Add Structural Correlation Baseline
+
+**Status:** 🔲 TODO
+
+**Problem:**
+We report 38-43% correlation between high-surprise moments and structural markers, but this number is meaningless without a null model. Random noise might achieve 30% correlation just by chance.
+
+**What to Do:**
+```python
+def compute_baseline_correlation(surprise_values, structural_positions, n_permutations=1000):
+    """Compute expected correlation under null hypothesis (random surprise)."""
+    observed = correlation(surprise_values, structural_positions)
+
+    null_correlations = []
+    for _ in range(n_permutations):
+        shuffled = np.random.permutation(surprise_values)
+        null_correlations.append(correlation(shuffled, structural_positions))
+
+    p_value = (np.array(null_correlations) >= observed).mean()
+    return observed, np.mean(null_correlations), np.std(null_correlations), p_value
+```
+
+**Expected Output:**
+```
+Observed correlation: 38.1%
+Null mean: 25.0% ± 3.2%
+p-value: 0.001
+→ Surprise identifies structure 13% better than random (p < 0.01)
+```
+
+**Files to Modify:**
+- `validate_narrative_surprise.py`: Add permutation test
+
+---
+
+### 13. Crystallization Weighting: Surprise vs Meta-Surprise
+
+**Status:** 🔲 TODO
+
+**Problem:**
+Crystallization is driven more by meta-surprise than raw surprise:
+```
+Crystallized moments: surprise=0.645, meta-surprise=0.628
+Not crystallized:     surprise=0.621, meta-surprise=0.329
+Delta:                surprise +0.02, meta-surprise +0.30
+```
+
+The model remembers "moments of self-ignorance" more than narrative peaks.
+
+**Current Salience Formula:**
+```python
+salience = surprise * (1 + weight * meta_surprise)
+```
+
+**Proposed Fix:**
+Make the balance configurable:
+```python
+salience = (surprise_weight * surprise) + (meta_weight * meta_surprise)
+# or
+salience = surprise ** alpha * (1 + meta_surprise) ** beta
+```
+
+**Files to Modify:**
+- `experiential.py`: Add `surprise_weight` and `meta_weight` parameters
+
+---
+
+## Lower Priority
+
+### 14. Benchmark Against Vanilla GPT
+
+**Status:** 🔲 TODO
+
+**Problem:**
+We don't have a quantitative measure of how much the memory system helps compared to the base GPT model.
+
+**What to Do:**
+1. Run base GPT on same evaluation data
+2. Compare perplexity, token accuracy
+3. Test on long-context tasks where memory should help
+
+**Proposed Tasks:**
+- Long-document perplexity (does memory help predict later paragraphs?)
+- Narrative cloze (fill in character names mentioned earlier)
+- Temporal ordering (which event happened first?)
+
+---
+
+### 15. Sequential Evaluation Mode
+
+**Status:** 🔲 TODO
+
+**Problem:**
+Current validation uses shuffled batches where each batch is independent. This doesn't test the memory system's ability to maintain coherence across a narrative.
+
+**What to Do:**
+Add sequential evaluation mode to `validate_narrative_surprise.py`:
+```python
+def sequential_evaluation(model, tokens, chunk_size=512):
+    """Process narrative sequentially, allowing memory to persist."""
+    model.reset_memory()
+
+    for i in range(0, len(tokens), chunk_size):
+        chunk = tokens[i:i+chunk_size]
+        logits, hidden, mem_out = model(
+            chunk,
+            crystallize=True,
+            use_memory=True,
+            prev_memory_query=prev_query  # Use previous chunk's query
+        )
+        prev_query = mem_out['next_memory_query']
+
+        # Track how retrieval affects later chunks
+        ...
+```
+
+---
+
+## Implementation Order
+
+1. **#10 (Eval memory benefit)** - Critical to know if memory helps at all
+2. **#9 (Widen surprise range)** - High impact on crystallization quality
+3. **#12 (Baseline correlation)** - Quick win, validates existing results
+4. **#11 (Train valence)** - Just needs more training time
+5. **#13 (Salience weighting)** - Tuning, depends on #9
+6. **#14, #15 (Benchmarks)** - Nice to have
+
+---
+
+*Last updated: 2026-01-04*
 *Review triggered by: Architecture audit*
