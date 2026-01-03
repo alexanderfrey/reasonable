@@ -717,7 +717,7 @@ intrinsic_reward = (
 ### Near-term (Architectural)
 - [x] Sketch module structure
 - [x] Define loss functions for each stream (InfoNCE contrastive)
-- [ ] Plan training curriculum
+- [~] Plan training curriculum — **N/A for text prediction**: end-to-end training with combined loss works fine; no staging or curriculum needed
 
 ### Medium-term (Implementation)
 - [x] Implement ExperientialStream (`experiential.py`)
@@ -773,7 +773,7 @@ intrinsic_reward = (
   - [x] `prev_state` updated with modulated_output: next step sees committed output
   - [x] True closed loop: self-prediction → output → next input → next prediction
 - [x] Add decay mechanism to episodic memory (time-based decay, retrieval refresh, auto-prune)
-- [ ] Implement procedural stream
+- [~] Implement procedural stream — **N/A for text prediction**: skills are implicit in transformer weights; procedural stream is for agentic systems with explicit, runtime-learnable, composable skills. Design preserved in `docs/stream_procedural.md` if needed later.
 - [x] Add resume-after-interruption training (`train_resume_interruption.py`)
 - [x] Validate on narrative data (`validate_narrative_surprise.py`)
 - [x] Extend self-awareness: predict retrieval, affect (v0.4)
@@ -799,5 +799,5 @@ This design connects to:
 
 *Document created: 2024-12-31*
 *Last updated: 2026-01-03*
-*Status: Implementation in progress - Extended self-awareness (v0.4) implemented*
+*Status: **Complete for text prediction** - Experiential, Episodic, Semantic streams + extended self-awareness (v0.4) implemented. Procedural stream and training curriculum marked N/A for this use case.*
 *Related: docs/narrative_experience_architecture.md*
