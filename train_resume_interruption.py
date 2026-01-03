@@ -532,21 +532,36 @@ def evaluate_memory_dependency(
 
             # === With memory ===
             memory_gpt.reset_memory()
+            prev_memory_query = None  # Track query for causal retrieval
 
-            # Build memory
+            # Build memory (with causal query passing)
             for i in range(interrupt_point):
                 chunk = doc_chunks.chunks[i].unsqueeze(0).to(device)
-                memory_gpt(chunk[:, :-1], crystallize=True, use_memory=True)
+                _, _, mem_out = memory_gpt(
+                    chunk[:, :-1],
+                    crystallize=True,
+                    use_memory=True,
+                    prev_memory_query=prev_memory_query
+                )
+                prev_memory_query = mem_out.get('next_memory_query')
 
-            # Interrupt and evaluate
+            # Interrupt: reset hidden state but keep memory AND query
             memory_gpt.reset_hidden_state()
+            # prev_memory_query preserved - represents context from before interrupt
 
             for i in range(interrupt_point, doc_chunks.n_chunks):
                 chunk = doc_chunks.chunks[i].unsqueeze(0).to(device)
                 targets = chunk[:, 1:].contiguous()
                 inputs = chunk[:, :-1].contiguous()
 
-                logits, _, _ = memory_gpt(inputs, crystallize=False, use_memory=True)
+                logits, _, mem_out = memory_gpt(
+                    inputs,
+                    crystallize=False,
+                    use_memory=True,
+                    prev_memory_query=prev_memory_query
+                )
+                prev_memory_query = mem_out.get('next_memory_query')
+
                 loss = F.cross_entropy(
                     logits.view(-1, logits.size(-1)),
                     targets.view(-1)
@@ -555,8 +570,9 @@ def evaluate_memory_dependency(
 
             # === Without memory ===
             memory_gpt.reset_memory()
+            # No query tracking needed - we won't use memory
 
-            # Build memory (but we won't use it)
+            # Process chunks but don't use memory
             for i in range(interrupt_point):
                 chunk = doc_chunks.chunks[i].unsqueeze(0).to(device)
                 memory_gpt(chunk[:, :-1], crystallize=True, use_memory=False)
@@ -569,6 +585,7 @@ def evaluate_memory_dependency(
                 targets = chunk[:, 1:].contiguous()
                 inputs = chunk[:, :-1].contiguous()
 
+                # No prev_memory_query - memory won't be retrieved anyway
                 logits, _, _ = memory_gpt(inputs, crystallize=False, use_memory=False)
                 loss = F.cross_entropy(
                     logits.view(-1, logits.size(-1)),
@@ -749,6 +766,7 @@ def main():
         memory_integration=args.integration,
         use_experiential=True,
         use_semantic=True,
+        pad_token_id=args.eos_token_id,  # EOS is used for padding in this dataset
     ).to(device)
 
     logger.info(f"Created MemoryAugmentedGPT with {args.integration} integration")
