@@ -492,7 +492,9 @@ class ExperientialStream(nn.Module):
         # New surprise signal parameters
         ema_decay: float = 0.99,
         surprise_topk: int = 8,
-        novelty_weight: float = 1.0
+        novelty_weight: float = 1.0,
+        # Salience computation parameters
+        meta_surprise_salience_weight: float = 1.0,  # How much meta-surprise boosts salience
     ):
         super().__init__()
         self.d_model = d_model
@@ -500,6 +502,7 @@ class ExperientialStream(nn.Module):
         self.use_persistent_state = use_persistent_state
         self.use_affect = use_affect
         self.use_meta_surprise = use_meta_surprise
+        self.meta_surprise_salience_weight = meta_surprise_salience_weight
 
         # Relative surprisal parameters
         self.ema_decay = ema_decay
@@ -1040,12 +1043,14 @@ class ExperientialStream(nn.Module):
             # crystallization decisions partially random. Salience = surprise only.
             # Meta-surprise boost: moments of self-ignorance are extra important
             #   "I don't know myself here" → pay attention, remember this
+            # Weight is configurable (default 1.0, was 3.0) to prevent uncalibrated
+            # meta-surprise from dominating salience.
             with torch.no_grad():
                 base_salience = surprise  # Affect removed: was surprise * arousal * valence.abs()
-                if meta_surprise is not None:
-                    # Boost salience by meta-surprise with 3x amplification
-                    # Range: [1, 1 + 3*max_ms] where max_ms ≈ 0.5 early → [1, 2.5]
-                    salience = base_salience * (1 + 3 * meta_surprise)
+                if meta_surprise is not None and self.meta_surprise_salience_weight > 0:
+                    # Boost salience by meta-surprise with configurable weight
+                    # Range: [1, 1 + weight*max_ms] where max_ms ≈ 0.5-1.0
+                    salience = base_salience * (1 + self.meta_surprise_salience_weight * meta_surprise)
                 else:
                     salience = base_salience
 
@@ -1529,6 +1534,7 @@ class MemoryAugmentedGPT(nn.Module):
         consolidation_interval: int = 100,
         min_consolidation_evidence: int = 3,
         pad_token_id: Optional[int] = None,
+        meta_surprise_salience_weight: float = 1.0,  # How much meta-surprise boosts salience
     ):
         """
         Args:
@@ -1544,6 +1550,7 @@ class MemoryAugmentedGPT(nn.Module):
             consolidation_interval: Steps between automatic consolidation (0 = manual only)
             min_consolidation_evidence: Minimum episodes for consolidation
             pad_token_id: Token ID for padding (excluded from surprise computation)
+            meta_surprise_salience_weight: How much meta-surprise boosts salience (default 1.0, was 3.0)
         """
         super().__init__()
         self.gpt = gpt_model
@@ -1582,7 +1589,8 @@ class MemoryAugmentedGPT(nn.Module):
                 d_model=self.d_model,
                 use_affect=True,
                 use_persistent_state=True,
-                use_meta_surprise=True  # Enable self-modulation
+                use_meta_surprise=True,  # Enable self-modulation
+                meta_surprise_salience_weight=meta_surprise_salience_weight,
             )
         else:
             self.experiential = None

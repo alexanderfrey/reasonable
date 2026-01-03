@@ -44,7 +44,12 @@ class SurpriseMoment:
     crystallized: bool      # Whether this became a memory
 
 
-def load_model(checkpoint_path: str, device: torch.device):
+def load_model(
+    checkpoint_path: str,
+    device: torch.device,
+    crystallization_threshold: Optional[float] = None,
+    meta_surprise_salience_weight: float = 1.0,
+):
     """Load trained memory-augmented model."""
     print(f"Loading checkpoint: {checkpoint_path}")
     ckpt = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
@@ -73,12 +78,18 @@ def load_model(checkpoint_path: str, device: torch.device):
     print(f"Model config: d_model={config.d_model}, n_head={config.n_head}, "
           f"n_kv_head={config.n_kv_head}, d_ff={config.d_ff}")
 
+    # Use provided threshold or default from checkpoint
+    threshold = crystallization_threshold if crystallization_threshold is not None else args.get('crystallization_threshold', 0.2)
+    print(f"Crystallization threshold: {threshold}")
+    print(f"Meta-surprise salience weight: {meta_surprise_salience_weight}")
+
     gpt = GPT(config)
     memory_gpt = MemoryAugmentedGPT(
         gpt,
         memory_capacity=args.get('memory_capacity', 1000),
-        crystallization_threshold=args.get('crystallization_threshold', 0.2),
+        crystallization_threshold=threshold,
         memory_integration=args.get('integration', 'gated'),
+        meta_surprise_salience_weight=meta_surprise_salience_weight,
     )
 
     memory_gpt.load_state_dict(ckpt['memory_gpt_state_dict'], strict=False)
@@ -363,12 +374,22 @@ def main():
     parser.add_argument("--top_k", type=int, default=10, help="Number of top moments to show")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--output", help="Optional: save results to JSON")
+    # Threshold calibration arguments
+    parser.add_argument("--threshold", type=float, default=None,
+                        help="Crystallization threshold (default: from checkpoint)")
+    parser.add_argument("--meta_surprise_weight", type=float, default=1.0,
+                        help="Meta-surprise salience weight (default: 1.0, was 3.0)")
 
     args = parser.parse_args()
     device = torch.device(args.device)
 
     # Load model
-    memory_gpt, config = load_model(args.checkpoint, device)
+    memory_gpt, config = load_model(
+        args.checkpoint,
+        device,
+        crystallization_threshold=args.threshold,
+        meta_surprise_salience_weight=args.meta_surprise_weight,
+    )
 
     # Load tokenizer
     print(f"Loading tokenizer: {args.tokenizer}")
