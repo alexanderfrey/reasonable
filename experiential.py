@@ -34,7 +34,7 @@ Usage:
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict, Optional, List, Tuple
+from typing import Dict, Optional, List, Tuple, Any
 from dataclasses import dataclass, field
 
 
@@ -1549,7 +1549,8 @@ class MemoryAugmentedGPT(nn.Module):
         gpt_model: nn.Module,
         memory_capacity: int = 1000,
         crystallization_threshold: float = 0.3,
-        memory_integration: str = 'gated',  # 'residual', 'gated', or 'attention'
+        memory_integration: str = 'gated',  # 'residual', 'gated', 'attention', or 'cross_attention'
+        cross_attention_top_k: int = 8,
         memory_weight: float = 0.1,
         use_experiential: bool = True,
         use_semantic: bool = True,
@@ -1565,7 +1566,8 @@ class MemoryAugmentedGPT(nn.Module):
             gpt_model: Pre-existing GPT model to wrap
             memory_capacity: Maximum episodes to store
             crystallization_threshold: Salience threshold for storing memories
-            memory_integration: How to integrate memories ('residual', 'gated', 'attention')
+            memory_integration: How to integrate memories ('residual', 'gated', 'attention', 'cross_attention')
+            cross_attention_top_k: Top-k episodic memories to attend in cross-attention
             memory_weight: Base weight for memory contribution (for residual mode)
             use_experiential: Whether to use experiential stream for surprise/salience
             use_semantic: Whether to use semantic memory for abstracted knowledge
@@ -1580,6 +1582,7 @@ class MemoryAugmentedGPT(nn.Module):
         self.gpt = gpt_model
         self.d_model = gpt_model.config.d_model
         self.memory_integration = memory_integration
+        self.cross_attention_top_k = cross_attention_top_k
         self.memory_weight = memory_weight
         self.retrieval_temperature = retrieval_temperature
         self.semantic_weight = semantic_weight
@@ -1638,7 +1641,7 @@ class MemoryAugmentedGPT(nn.Module):
                 )
 
         elif memory_integration == 'attention':
-            # Cross-attention to memory
+            # Cross-attention to memory (single aggregated vector)
             self.memory_attention = nn.MultiheadAttention(
                 self.d_model,
                 num_heads=4,
@@ -1653,6 +1656,31 @@ class MemoryAugmentedGPT(nn.Module):
                     batch_first=True
                 )
                 self.semantic_norm = nn.LayerNorm(self.d_model)
+
+        elif memory_integration == 'cross_attention':
+            # Cross-attention to TOP-K memories in the bank
+            # This allows each token position to attend to different memories
+            self.memory_cross_attn = nn.MultiheadAttention(
+                self.d_model,
+                num_heads=8,  # More heads for richer attention patterns
+                batch_first=True,
+                dropout=0.1
+            )
+            self.memory_cross_norm = nn.LayerNorm(self.d_model)
+            # Feed-forward after attention (like transformer block)
+            self.memory_ffn = nn.Sequential(
+                nn.Linear(self.d_model, self.d_model * 4),
+                nn.GELU(),
+                nn.Dropout(0.1),
+                nn.Linear(self.d_model * 4, self.d_model),
+                nn.Dropout(0.1)
+            )
+            self.memory_ffn_norm = nn.LayerNorm(self.d_model)
+            # Learnable gate to control memory influence
+            self.memory_influence_gate = nn.Sequential(
+                nn.Linear(self.d_model, 1),
+                nn.Sigmoid()
+            )
 
         # Query projection for retrieval
         self.query_proj = nn.Linear(self.d_model, self.d_model)
@@ -1749,12 +1777,18 @@ class MemoryAugmentedGPT(nn.Module):
             return_hidden_states=True
         )
 
+        # Save original logits/hidden for retrieval benefit loss
+        logits_without_memory = logits
+        hidden_states_original = hidden_states
+
         # 3. Integrate memory with hidden states (memory was retrieved causally)
         if episodic_retrieved is not None or semantic_retrieved is not None:
             hidden_states = self._integrate_memory(
                 hidden_states,
                 episodic_retrieved,
-                semantic_retrieved
+                semantic_retrieved,
+                episodic_weights=episodic_weights,
+                semantic_weights=semantic_weights
             )
             # Recompute logits with memory-augmented hidden states
             logits = self.gpt.lm_head(self.gpt.final_norm(hidden_states))
@@ -1763,6 +1797,9 @@ class MemoryAugmentedGPT(nn.Module):
         # This query will be used by the next step to retrieve relevant memories
         current_query_state = hidden_states[:, -1, :]
         next_memory_query = self.query_proj(current_query_state)
+
+        # Track memory size before crystallization for contrastive learning
+        memory_size_before = self.memory.size
 
         memory_output = {
             'retrieved_episodic': episodic_retrieved,
@@ -1774,6 +1811,12 @@ class MemoryAugmentedGPT(nn.Module):
             'episodic_size': self.memory.size,
             'semantic_size': self.semantic.size if self.semantic else 0,
             'next_memory_query': next_memory_query,  # For causal retrieval in next step
+            # For retrieval benefit loss: compare predictions with/without memory
+            'logits_without_memory': logits_without_memory,
+            # For contrastive learning: will be populated after crystallization
+            'memory_bank': None,
+            'query_for_contrastive': None,
+            'positive_memory_indices': None,
         }
 
         # 4. Experiential processing (for crystallization and prediction)
@@ -1867,6 +1910,36 @@ class MemoryAugmentedGPT(nn.Module):
                         )
                         memory_output['crystallized'] = True
 
+            # Populate contrastive learning data after crystallization
+            if self.memory.size >= 2:
+                memory_bank = self._get_memory_bank_tensor(device=hidden_states.device)
+                memory_output['memory_bank'] = memory_bank
+                memory_output['query_for_contrastive'] = next_memory_query
+
+                # Create positive indices: point to most recent memories for each batch item
+                # If new memories were created, use their indices; otherwise use random existing ones
+                new_memories_created = self.memory.size - memory_size_before
+                if new_memories_created > 0:
+                    # Use indices of newly created memories (most recent)
+                    positive_indices = torch.arange(
+                        self.memory.size - min(new_memories_created, batch_size),
+                        self.memory.size,
+                        device=hidden_states.device
+                    )
+                    # Pad or truncate to batch_size
+                    if len(positive_indices) < batch_size:
+                        positive_indices = positive_indices.repeat(
+                            (batch_size // len(positive_indices)) + 1
+                        )[:batch_size]
+                else:
+                    # No new memories - use random existing memories as weak positives
+                    positive_indices = torch.randint(
+                        0, self.memory.size,
+                        (batch_size,),
+                        device=hidden_states.device
+                    )
+                memory_output['positive_memory_indices'] = positive_indices
+
         # 6. Periodic consolidation (episodic → semantic)
         self._step_counter += 1
         if (self.consolidation_interval > 0 and
@@ -1884,7 +1957,9 @@ class MemoryAugmentedGPT(nn.Module):
         self,
         hidden_states: torch.Tensor,
         episodic_retrieved: Optional[torch.Tensor] = None,
-        semantic_retrieved: Optional[torch.Tensor] = None
+        semantic_retrieved: Optional[torch.Tensor] = None,
+        episodic_weights: Optional[torch.Tensor] = None,
+        semantic_weights: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """
         Integrate retrieved episodic and semantic memory into hidden states.
@@ -1893,6 +1968,8 @@ class MemoryAugmentedGPT(nn.Module):
             hidden_states: [batch, seq_len, d_model]
             episodic_retrieved: [batch, d_model] - retrieved episodic memories
             semantic_retrieved: [batch, d_model] - retrieved semantic knowledge
+            episodic_weights: [batch, n_episodes] retrieval weights for episodic bank
+            semantic_weights: [batch, n_concepts] retrieval weights for semantic bank
 
         Returns:
             augmented: [batch, seq_len, d_model]
@@ -1959,8 +2036,167 @@ class MemoryAugmentedGPT(nn.Module):
 
             return result
 
+        elif self.memory_integration == 'cross_attention':
+            result = hidden_states
+
+            if episodic_weights is None or episodic_retrieved is None:
+                return result
+
+            # Get full memory bank as tensor [num_memories, d_model]
+            memory_bank = self._get_memory_bank_tensor(device=hidden_states.device)
+
+            if memory_bank is not None and memory_bank.size(0) > 0:
+                if episodic_weights.dim() == 1:
+                    episodic_weights = episodic_weights.unsqueeze(0)
+
+                if episodic_weights.size(-1) != memory_bank.size(0):
+                    # Fallback: attend to full bank if weights are incompatible
+                    memory_bank = memory_bank.unsqueeze(0).expand(batch_size, -1, -1)
+                else:
+                    top_k = min(self.cross_attention_top_k, memory_bank.size(0))
+                    if top_k <= 0:
+                        return result
+                    topk = torch.topk(episodic_weights, top_k, dim=-1)
+                    indices = topk.indices  # [batch, top_k]
+                    memory_bank = memory_bank.unsqueeze(0).expand(batch_size, -1, -1)
+                    memory_bank = memory_bank.gather(
+                        1,
+                        indices.unsqueeze(-1).expand(-1, -1, d_model)
+                    )
+
+                # Cross-attention: hidden states attend to TOP-K memories
+                # Q: hidden_states [batch, seq_len, d_model]
+                # K, V: memory_bank [batch, top_k, d_model]
+                attended, _ = self.memory_cross_attn(
+                    result,
+                    memory_bank,
+                    memory_bank,
+                    need_weights=False
+                )
+
+                # Residual + LayerNorm (like transformer)
+                result = result + self.memory_cross_norm(attended)
+
+                # Feed-forward layer
+                ffn_out = self.memory_ffn(result)
+                result = result + self.memory_ffn_norm(ffn_out)
+
+                # Apply learned gate to control how much memory influences output
+                # This allows the model to ignore memory when not useful
+                gate = self.memory_influence_gate(hidden_states)  # [batch, seq_len, 1]
+                result = gate * result + (1 - gate) * hidden_states
+
+            return result
+
         else:
             raise ValueError(f"Unknown integration mode: {self.memory_integration}")
+
+    def _get_memory_bank_tensor(self, device: Optional[torch.device] = None) -> Optional[torch.Tensor]:
+        """
+        Get all episodic memories as a single tensor for cross-attention.
+
+        Args:
+            device: Device to place tensor on (uses memory content device if None)
+
+        Returns:
+            memory_bank: [num_memories, d_model] tensor of all memory contents,
+                        or None if no memories exist
+        """
+        if self.memory.size == 0:
+            return None
+
+        # Stack all memory contents into a single tensor
+        memory_contents = [ep.content for ep in self.memory.episodes]
+        memory_bank = torch.stack(memory_contents, dim=0)  # [num_memories, d_model]
+
+        # Move to specified device if needed
+        if device is not None and memory_bank.device != device:
+            memory_bank = memory_bank.to(device)
+
+        return memory_bank
+
+    def prepopulate_memory(
+        self,
+        dataloader: 'torch.utils.data.DataLoader',
+        device: torch.device,
+        max_steps: int = 500,
+        min_memories: int = 100,
+        force_store: bool = True
+    ) -> Dict[str, Any]:
+        """
+        Pre-populate memory bank before training for better cross-attention.
+
+        This gives the model memories to attend to from the start, avoiding
+        the cold-start problem where cross-attention has nothing to attend to.
+
+        Args:
+            dataloader: DataLoader providing input batches
+            device: Device to run on
+            max_steps: Maximum steps to run
+            min_memories: Minimum memories to create (early stop if reached)
+            force_store: If True, force-store memories regardless of salience threshold
+
+        Returns:
+            stats: Dict with prepopulation statistics
+        """
+        self.eval()
+        initial_size = self.memory.size
+        prev_memory_query = None
+
+        with torch.no_grad():
+            for step, batch in enumerate(dataloader):
+                if step >= max_steps:
+                    break
+                if self.memory.size >= min_memories:
+                    break
+
+                input_ids = batch['input_ids'].to(device)
+
+                # Forward pass with crystallization enabled
+                _, hidden_states, mem_out = self(
+                    input_ids,
+                    crystallize=not force_store,  # Don't auto-crystallize if force_store
+                    use_memory=False,  # Don't use memory during prepopulation
+                    prev_memory_query=prev_memory_query
+                )
+                prev_memory_query = mem_out.get('next_memory_query')
+
+                # Force-store memories if enabled
+                if force_store and self.memory.size < min_memories:
+                    batch_size = input_ids.size(0)
+                    # Sample positions from the hidden states to store as memories
+                    # Use end of sequence (most context-rich) as content
+                    # Use middle of sequence as context (prediction target)
+                    h_end = hidden_states[:, -1, :]  # [B, d_model]
+                    h_mid = hidden_states[:, hidden_states.size(1) // 2, :]  # [B, d_model]
+
+                    # Temporarily disable decay to prevent pruning during prepopulation
+                    original_decay_on_store = self.memory.decay_on_store
+                    self.memory.decay_on_store = False
+
+                    for i in range(batch_size):
+                        if self.memory.size >= min_memories:
+                            break
+                        # Store with high salience to survive future decay
+                        self.memory.store(
+                            content=h_end[i],
+                            context=h_mid[i],
+                            salience=0.8,  # High salience to survive decay
+                            valence=0.0,
+                            arousal=0.5
+                        )
+
+                    # Restore decay setting
+                    self.memory.decay_on_store = original_decay_on_store
+
+        self.train()
+
+        return {
+            'initial_size': initial_size,
+            'final_size': self.memory.size,
+            'memories_added': self.memory.size - initial_size,
+            'steps': step + 1 if 'step' in dir() else 0
+        }
 
     def reset_memory(self):
         """Clear all stored memories (episodic and semantic)."""
@@ -2074,6 +2310,53 @@ class MemoryAugmentedGPT(nn.Module):
         return result
 
 
+def contrastive_memory_loss(
+    query: torch.Tensor,
+    memory_bank: torch.Tensor,
+    positive_indices: torch.Tensor,
+    temperature: float = 0.1,
+    margin: float = 0.2
+) -> torch.Tensor:
+    """
+    Contrastive loss to teach which memories are relevant for a given query.
+
+    Uses InfoNCE-style contrastive learning where:
+    - Positive: memory created from similar context should be retrieved
+    - Negatives: other memories in the bank
+
+    Args:
+        query: [batch, d_model] query vectors
+        memory_bank: [num_memories, d_model] all memories
+        positive_indices: [batch] index of positive memory for each query
+        temperature: softmax temperature (lower = sharper)
+        margin: margin for triplet-style loss
+
+    Returns:
+        contrastive_loss: scalar loss
+    """
+    if memory_bank.size(0) < 2:
+        return torch.tensor(0.0, device=query.device)
+
+    batch_size = query.size(0)
+    num_memories = memory_bank.size(0)
+
+    # Normalize for cosine similarity
+    query_norm = F.normalize(query, dim=-1)  # [batch, d_model]
+    memory_norm = F.normalize(memory_bank, dim=-1)  # [num_memories, d_model]
+
+    # Compute all similarities: [batch, num_memories]
+    similarities = torch.matmul(query_norm, memory_norm.T) / temperature
+
+    # Create labels (positive memory index for each query)
+    # Clamp to valid range in case of stale indices
+    labels = positive_indices.clamp(0, num_memories - 1)
+
+    # Cross-entropy loss (InfoNCE)
+    loss = F.cross_entropy(similarities, labels)
+
+    return loss
+
+
 def memory_augmented_loss(
     lm_logits: torch.Tensor,
     targets: torch.Tensor,
@@ -2083,13 +2366,17 @@ def memory_augmented_loss(
     meta_weight: float = 0.01,
     self_mod_weight: float = 0.01,
     affect_weight: float = 0.01,
-    retrieval_weight: float = 0.01
+    retrieval_weight: float = 0.01,
+    retrieval_benefit_weight: float = 0.1,
+    retrieval_benefit_margin: float = 0.0,
+    contrastive_weight: float = 0.1,
+    contrastive_temperature: float = 0.1
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """
     Combined loss for memory-augmented generation.
 
     Args:
-        lm_logits: [batch, seq_len, vocab] model output logits
+        lm_logits: [batch, seq_len, vocab] model output logits (WITH memory)
         targets: [batch, seq_len] target token IDs
         memory_output: output dict from MemoryAugmentedGPT.forward()
         lm_weight: weight for language modeling loss
@@ -2098,6 +2385,8 @@ def memory_augmented_loss(
         self_mod_weight: weight for self-modulation loss (trains confidence gate)
         affect_weight: weight for meta-affect loss (extended self-awareness)
         retrieval_weight: weight for meta-retrieval loss (extended self-awareness)
+        retrieval_benefit_weight: weight for retrieval benefit loss (trains retrieval to help)
+        retrieval_benefit_margin: margin for hinge loss (only penalize if memory hurts by > margin)
 
     Returns:
         total_loss: combined scalar loss
@@ -2137,6 +2426,50 @@ def memory_augmented_loss(
         loss_dict['mean_meta_affect_surprise'] = exp_dict.get('mean_meta_affect_surprise', 0.0)
         loss_dict['mean_meta_retrieval_surprise'] = exp_dict.get('mean_meta_retrieval_surprise', 0.0)
         total_loss = total_loss + exp_weight * exp_loss
+
+    # Retrieval benefit loss - trains the model to USE retrieved memories effectively
+    # If memory retrieval hurts prediction, add a penalty
+    if retrieval_benefit_weight > 0 and 'logits_without_memory' in memory_output:
+        logits_without_memory = memory_output['logits_without_memory']
+        if logits_without_memory is not None:
+            # Compute loss WITHOUT memory integration
+            lm_loss_without_memory = F.cross_entropy(
+                logits_without_memory.view(-1, logits_without_memory.size(-1)),
+                targets.view(-1),
+                ignore_index=-100
+            )
+
+            # Retrieval benefit = how much memory HELPS (negative = memory hurts)
+            # We want loss_with_memory < loss_without_memory
+            # Hinge loss: penalize when memory hurts by more than margin
+            retrieval_harm = lm_loss - lm_loss_without_memory + retrieval_benefit_margin
+            retrieval_benefit_loss = F.relu(retrieval_harm)  # Only penalize harm
+
+            loss_dict['lm_loss_without_memory'] = lm_loss_without_memory.item()
+            loss_dict['retrieval_benefit'] = (lm_loss_without_memory - lm_loss).item()  # positive = good
+            loss_dict['retrieval_benefit_loss'] = retrieval_benefit_loss.item()
+
+            total_loss = total_loss + retrieval_benefit_weight * retrieval_benefit_loss
+
+    # Contrastive memory loss - teaches which memories are relevant for which queries
+    # This helps the model learn meaningful memory-query relationships
+    if contrastive_weight > 0:
+        memory_bank = memory_output.get('memory_bank')
+        query_for_contrastive = memory_output.get('query_for_contrastive')
+        positive_memory_indices = memory_output.get('positive_memory_indices')
+
+        if (memory_bank is not None and query_for_contrastive is not None
+                and positive_memory_indices is not None and memory_bank.size(0) >= 2):
+            contrastive_loss = contrastive_memory_loss(
+                query_for_contrastive,
+                memory_bank,
+                positive_memory_indices,
+                temperature=contrastive_temperature
+            )
+            loss_dict['contrastive_loss'] = contrastive_loss.item()
+            total_loss = total_loss + contrastive_weight * contrastive_loss
+        else:
+            loss_dict['contrastive_loss'] = 0.0
 
     # Memory statistics (for logging)
     loss_dict['episodic_size'] = memory_output.get('episodic_size', 0)
