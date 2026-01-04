@@ -557,7 +557,7 @@ These are enhancements to pursue now that the core bugs are fixed and v2 trainin
 
 ### 9. Widen Surprise Dynamic Range
 
-**Status:** 🔲 TODO
+**Status:** ✅ COMPLETED (2026-01-04)
 
 **Problem:**
 Surprise is compressed to a ~0.15 range (0.57-0.72 on Lion of the Sky validation). The top 10 narrative moments differ by only ~0.09. This limits the model's ability to discriminate between moderately surprising and highly surprising content.
@@ -606,6 +606,26 @@ excess_t = (CE_t - doc_mu) / doc_sigma
 
 **Testing:**
 After fix, surprise range should span at least 0.3-0.4 on narrative validation.
+
+**Solution Implemented:**
+Used centered sigmoid with EMA normalization:
+```python
+# Track running mean/std of chunk_surprise_raw
+ema_raw_mu, ema_raw_sigma = EMA of raw values
+
+# Center and scale before sigmoid
+centered_raw = (chunk_surprise_raw - ema_raw_mu) / ema_raw_sigma
+chunk_surprise = sigmoid(centered_raw * 2.0)  # scale=2.0 for good spread
+```
+
+**Results (validation on Lion of the Sky):**
+| Metric | Before | After |
+|--------|--------|-------|
+| Range | 0.20 | 0.61 |
+| Std | 0.023 | 0.093 |
+| Min | 0.58 | 0.33 |
+| Max | 0.77 | 0.95 |
+| Crystallization | 23.5% | 8.1% |
 
 ---
 

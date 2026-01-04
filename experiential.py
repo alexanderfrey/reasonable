@@ -511,15 +511,20 @@ class ExperientialStream(nn.Module):
         self.eps = 1e-8
 
         # Surprise normalization: raw chunk_surprise is unbounded (z-scored),
-        # but predicted_surprise is sigmoid-bounded [0, 1]. We use sigmoid
-        # with a scale to normalize chunk_surprise to [0, 1] for compatibility.
-        # Scale of 0.5 means: excess=2 → sigmoid(1)=0.73, excess=4 → sigmoid(2)=0.88
-        self.surprise_scale = 0.5
+        # but predicted_surprise is sigmoid-bounded [0, 1]. We use centered sigmoid:
+        #   chunk_surprise = sigmoid((raw - ema_raw_mu) * scale / ema_raw_sigma)
+        # This centers output around 0.5 and spreads across full [0, 1] range.
+        self.surprise_scale = 2.0  # Higher scale = more spread
 
         # EMA buffers for baseline CE tracking
         self.register_buffer('ema_mu', torch.tensor(2.0))  # Start with reasonable prior
         self.register_buffer('ema_sigma', torch.tensor(1.0))
         self.register_buffer('ema_initialized', torch.tensor(False))
+
+        # EMA buffers for chunk_surprise_raw normalization (to center sigmoid)
+        self.register_buffer('ema_raw_mu', torch.tensor(1.0))  # Mean of chunk_surprise_raw
+        self.register_buffer('ema_raw_sigma', torch.tensor(1.0))  # Std of chunk_surprise_raw
+        self.register_buffer('ema_raw_initialized', torch.tensor(False))
 
         # Predictor input size depends on whether we use persistent state
         # With persistent state: [h_mid, prev_state] → predicted h_end
@@ -805,9 +810,26 @@ class ExperientialStream(nn.Module):
             else:
                 chunk_surprise_raw = future_surprise.mean(dim=-1)
 
-        # 5. Normalize to [0, 1] for compatibility with predicted_surprise (sigmoid-bounded)
-        # This prevents meta_surprise from exploding and target_confidence from going negative
-        chunk_surprise = torch.sigmoid(chunk_surprise_raw * self.surprise_scale)
+        # 5. Normalize to [0, 1] using centered sigmoid
+        # This spreads surprise across full [0, 1] range instead of being stuck > 0.5
+        with torch.no_grad():
+            batch_raw_mean = chunk_surprise_raw.mean()
+            # Use unbiased=False to avoid warning on single samples
+            batch_raw_std = chunk_surprise_raw.std(unbiased=False).clamp(min=self.eps)
+
+            if update_ema:
+                if not self.ema_raw_initialized:
+                    self.ema_raw_mu.copy_(batch_raw_mean)
+                    self.ema_raw_sigma.copy_(batch_raw_std)
+                    self.ema_raw_initialized.fill_(True)
+                else:
+                    self.ema_raw_mu.mul_(self.ema_decay).add_(batch_raw_mean * (1 - self.ema_decay))
+                    self.ema_raw_sigma.mul_(self.ema_decay).add_(batch_raw_std * (1 - self.ema_decay))
+
+        # Center by subtracting EMA mean, scale by EMA std
+        # This makes sigmoid output centered around 0.5 with good spread
+        centered_raw = (chunk_surprise_raw - self.ema_raw_mu) / (self.ema_raw_sigma + self.eps)
+        chunk_surprise = torch.sigmoid(centered_raw * self.surprise_scale)
 
         return {
             'surprise_t': surprise_t,
@@ -817,6 +839,8 @@ class ExperientialStream(nn.Module):
             'chunk_surprise_raw': chunk_surprise_raw,
             'ema_mu': self.ema_mu.item(),
             'ema_sigma': self.ema_sigma.item(),
+            'ema_raw_mu': self.ema_raw_mu.item(),
+            'ema_raw_sigma': self.ema_raw_sigma.item(),
         }
 
     def reset_state(self, batch_size: Optional[int] = None):
