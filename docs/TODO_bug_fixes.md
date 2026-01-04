@@ -631,48 +631,66 @@ chunk_surprise = sigmoid(centered_raw * 2.0)  # scale=2.0 for good spread
 
 ### 10. Evaluate Memory Retrieval Quality
 
-**Status:** 🔲 TODO
+**Status:** ✅ COMPLETED (2026-01-04) - Retrieval works, effect is slightly negative but not significant
 
 **Problem:**
 We don't know if retrieved episodic memories actually improve prediction. The memory system could be adding noise rather than signal.
 
-**What to Measure:**
+**Evaluation Implemented:**
+Created `eval_memory_benefit.py` with:
+1. Memory building phase: Run through training data with `crystallize=True` to populate memory
+2. Evaluation phase: Compare perplexity on eval data with/without memory retrieval
+3. Causal retrieval: Chain `prev_memory_query` between batches (required for retrieval to work)
 
-1. **Perplexity with/without retrieval:**
-   ```python
-   # Run evaluation twice on same data
-   ppl_with_memory = evaluate(model, data, use_memory=True)
-   ppl_without_memory = evaluate(model, data, use_memory=False)
-   memory_benefit = ppl_without_memory - ppl_with_memory  # Should be positive
-   ```
-
-2. **Retrieval relevance:**
-   - Are retrieved memories semantically related to current context?
-   - Measure cosine similarity between query and retrieved content
-
-3. **Temporal coherence:**
-   - Does retrieval improve prediction at narrative callback points?
-   - Test on passages that reference earlier events
-
-**Proposed Evaluation Script:**
+**Key Implementation Detail:**
+The causal memory retrieval requires explicitly passing `prev_memory_query` between forward calls:
 ```python
-# eval_memory_benefit.py
-def evaluate_memory_benefit(model, dataloader, device):
-    """Compare perplexity with and without memory retrieval."""
-    ppl_with = compute_perplexity(model, dataloader, use_memory=True)
-    ppl_without = compute_perplexity(model, dataloader, use_memory=False)
-
-    print(f"Perplexity with memory: {ppl_with:.3f}")
-    print(f"Perplexity without memory: {ppl_without:.3f}")
-    print(f"Memory benefit: {ppl_without - ppl_with:.3f}")
+# Retrieval only works on batch 2+ when prev_memory_query is available
+prev_memory_query = None
+for batch in dataloader:
+    logits, hidden, mem_out = model(
+        input_ids,
+        use_memory=True,
+        prev_memory_query=prev_memory_query  # Chain from previous batch
+    )
+    prev_memory_query = mem_out['next_memory_query']  # For next batch
 ```
 
-**Files to Create:**
-- `eval_memory_benefit.py`: New evaluation script
+**Results (v2 checkpoint, 500 build steps, 200 eval steps):**
 
-**Success Criteria:**
-- Memory retrieval should reduce perplexity by at least 0.1
-- If not, investigate retrieval mechanism or training signal
+| Metric | With Memory | Without Memory | Benefit |
+|--------|-------------|----------------|---------|
+| Perplexity | 73.40 | 73.32 | **-0.08 (-0.10%)** |
+| Loss | 4.296 | 4.295 | -0.001 |
+| Steps w/ Retrieval | 199/200 | 0/200 | - |
+
+**Retrieval Statistics:**
+- Memory size: 26 (after 500 build steps)
+- Avg max episodic weight: 0.077 (low relevance)
+- Avg max semantic weight: 0.060
+- Samples with retrieval: 99/100
+
+**Conclusion (current evidence):**
+Retrieval is functioning (199/200 steps show retrieval), but the net effect is **slightly negative and below the script's significance threshold** (ΔPPL -0.08 vs cutoff -0.10). Treat this as "no significant benefit yet," not definitive harm.
+
+**Caveats:**
+- The "steps with retrieval" count only checks that weights exist, not that retrieval is strong or useful.
+- 200 eval steps is a small sample; run-to-run variance could swamp a 0.08 PPL delta.
+- Retrieval weight magnitude needs a baseline (e.g., compare against uniform max).
+
+**Root Causes to Investigate:**
+1. **Low retrieval weights** (0.077 avg max) suggest queries don't match stored memories well
+2. **Training didn't optimize for retrieval benefit** - the model wasn't trained to use retrieved memories effectively
+3. **Random memory content** - memories are crystallized based on salience, not retrieval utility
+
+**Potential Fixes:**
+1. Add retrieval-based training signal (predict next tokens using retrieved memory)
+2. Train query/key projections to improve relevance matching
+3. Increase memory capacity and/or lower threshold to store more diverse memories
+4. Use contrastive learning to train useful retrieval
+
+**Files Created:**
+- `eval_memory_benefit.py`: Full evaluation script with memory building, causal retrieval, and comparison
 
 ---
 
