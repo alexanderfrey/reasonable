@@ -261,7 +261,7 @@ def create_dataloader(
 
     logger.info(f"Loading {split} data: {num_examples:,} examples from {token_file}")
 
-    if sequential and split == "training":
+    if sequential:
         if doc_metadata_path is None:
             doc_metadata_path = os.path.join(data_dir, "book_corpus_metadata.json")
         dataset = DocumentSequentialDataset(
@@ -272,7 +272,9 @@ def create_dataloader(
             dtype_name=dtype_name,
             data_type=split.capitalize()
         )
-        batch_sampler = DocSequentialBatchSampler(dataset.doc_ids, batch_size, drop_last=True)
+        # For evaluation, don't drop last batch to test on all data
+        drop_last = (split == "training")
+        batch_sampler = DocSequentialBatchSampler(dataset.doc_ids, batch_size, drop_last=drop_last)
         dataloader = DataLoader(
             dataset,
             batch_sampler=batch_sampler,
@@ -451,15 +453,33 @@ def evaluate(
     memory_gpt: MemoryAugmentedGPT,
     dataloader: DataLoader,
     device: torch.device,
-    max_steps: int = 100
+    max_steps: int = 100,
+    sequential: bool = False
 ) -> Dict[str, float]:
-    """Evaluate the model."""
+    """
+    Evaluate the model.
+
+    Args:
+        memory_gpt: The memory-augmented model
+        dataloader: Evaluation data loader
+        device: Device to run on
+        max_steps: Maximum evaluation steps
+        sequential: If True, chain queries across batches and handle doc boundaries
+
+    Returns:
+        Dict with evaluation metrics including retrieval benefit
+    """
     memory_gpt.eval()
 
     total_lm_loss = 0.0
+    total_lm_loss_without_memory = 0.0
     total_exp_loss = 0.0
     total_acc = 0.0
     n_steps = 0
+    n_retrievals = 0
+
+    prev_memory_query = None
+    prev_doc_id = None
 
     with torch.no_grad():
         for step, batch in enumerate(dataloader):
@@ -470,27 +490,73 @@ def evaluate(
             targets = input_ids[:, 1:].contiguous()
             input_ids = input_ids[:, :-1].contiguous()
 
+            # Handle document boundaries in sequential mode
+            if sequential:
+                doc_ids = batch.get("doc_id")
+                if doc_ids is not None:
+                    batch_doc_id = int(doc_ids[0])
+                    if prev_doc_id is None or batch_doc_id != prev_doc_id:
+                        # New document - reset state but keep memories
+                        memory_gpt.reset_hidden_state()
+                        prev_memory_query = None
+                        prev_doc_id = batch_doc_id
+            else:
+                # Non-sequential: reset state each batch
+                if memory_gpt.experiential is not None:
+                    memory_gpt.experiential.reset_state(batch_size=input_ids.size(0))
+
+            # Forward WITH memory
             logits, hidden, mem_out = memory_gpt(
                 input_ids,
-                crystallize=False,
-                use_memory=True
+                crystallize=False,  # Don't modify memory during eval
+                use_memory=True,
+                prev_memory_query=prev_memory_query
             )
 
-            loss, loss_dict = memory_augmented_loss(logits, targets, mem_out)
+            # Update query for next batch (sequential mode)
+            if sequential and mem_out.get('next_memory_query') is not None:
+                prev_memory_query = mem_out['next_memory_query']
 
+            # Track if retrieval happened
+            if mem_out.get('episodic_weights') is not None:
+                weights = mem_out['episodic_weights']
+                if weights.numel() > 0 and weights.max().item() > 0.01:
+                    n_retrievals += 1
+
+            # Compute loss with memory
+            loss, loss_dict = memory_augmented_loss(logits, targets, mem_out)
             total_lm_loss += loss_dict['lm_loss']
             total_exp_loss += loss_dict.get('exp_loss', 0.0)
+
+            # Compute loss WITHOUT memory for retrieval benefit
+            logits_without = mem_out.get('logits_without_memory')
+            if logits_without is not None:
+                lm_loss_without = torch.nn.functional.cross_entropy(
+                    logits_without.view(-1, logits_without.size(-1)),
+                    targets.view(-1),
+                    ignore_index=-100
+                ).item()
+                total_lm_loss_without_memory += lm_loss_without
+            else:
+                total_lm_loss_without_memory += loss_dict['lm_loss']
 
             if mem_out.get('prediction') is not None:
                 total_acc += prediction_accuracy(mem_out['prediction'], mem_out['target'])
 
             n_steps += 1
 
+    avg_lm_loss = total_lm_loss / n_steps
+    avg_lm_loss_without = total_lm_loss_without_memory / n_steps
+    retrieval_benefit = avg_lm_loss_without - avg_lm_loss  # positive = memory helps
+
     return {
-        'lm_loss': total_lm_loss / n_steps,
+        'lm_loss': avg_lm_loss,
+        'lm_loss_without_memory': avg_lm_loss_without,
+        'retrieval_benefit': retrieval_benefit,
         'exp_loss': total_exp_loss / n_steps,
         'accuracy': total_acc / n_steps,
-        'memory_size': memory_gpt.memory.size
+        'memory_size': memory_gpt.memory.size,
+        'retrieval_rate': n_retrievals / n_steps if n_steps > 0 else 0.0,
     }
 
 
@@ -594,7 +660,14 @@ def main():
         sequential=args.sequential,
         doc_metadata_path=args.doc_metadata
     )
-    eval_loader = create_dataloader(args.data_dir, args.batch_size, args.seq_len, "evaluation")
+    eval_loader = create_dataloader(
+        args.data_dir,
+        args.batch_size,
+        args.seq_len,
+        "evaluation",
+        sequential=args.sequential,
+        doc_metadata_path=args.doc_metadata
+    )
 
     # Optimizer - only train memory components
     memory_params = [p for n, p in memory_gpt.named_parameters()
@@ -642,9 +715,16 @@ def main():
         all_history.append(history)
 
         # Evaluate
-        eval_metrics = evaluate(memory_gpt, eval_loader, device, max_steps=100)
+        eval_metrics = evaluate(
+            memory_gpt, eval_loader, device,
+            max_steps=100,
+            sequential=args.sequential
+        )
+        ret_ben = eval_metrics.get('retrieval_benefit', 0.0)
+        ret_rate = eval_metrics.get('retrieval_rate', 0.0)
         logger.info(f"Eval: lm_loss={eval_metrics['lm_loss']:.4f}, "
-                    f"exp_loss={eval_metrics['exp_loss']:.4f}, "
+                    f"ret_benefit={ret_ben:+.4f}, "
+                    f"ret_rate={ret_rate:.2%}, "
                     f"acc={eval_metrics['accuracy']:.4f}, "
                     f"memory={eval_metrics['memory_size']}")
 
