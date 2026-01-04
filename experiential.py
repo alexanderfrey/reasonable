@@ -1560,6 +1560,7 @@ class MemoryAugmentedGPT(nn.Module):
         min_consolidation_evidence: int = 3,
         pad_token_id: Optional[int] = None,
         meta_surprise_salience_weight: float = 1.0,  # How much meta-surprise boosts salience
+        retrieval_salience_weight: float = 0.0,  # Bias retrieval toward high-salience memories
     ):
         """
         Args:
@@ -1577,6 +1578,7 @@ class MemoryAugmentedGPT(nn.Module):
             min_consolidation_evidence: Minimum episodes for consolidation
             pad_token_id: Token ID for padding (excluded from surprise computation)
             meta_surprise_salience_weight: How much meta-surprise boosts salience (default 1.0, was 3.0)
+            retrieval_salience_weight: Salience bias for episodic retrieval (0 = similarity only)
         """
         super().__init__()
         self.gpt = gpt_model
@@ -1586,6 +1588,7 @@ class MemoryAugmentedGPT(nn.Module):
         self.memory_weight = memory_weight
         self.retrieval_temperature = retrieval_temperature
         self.semantic_weight = semantic_weight
+        self.retrieval_salience_weight = retrieval_salience_weight
         self.consolidation_interval = consolidation_interval
         self._step_counter = 0
         # Padding token ID for excluding pad tokens from surprise computation
@@ -1760,7 +1763,8 @@ class MemoryAugmentedGPT(nn.Module):
             if use_memory and self.memory.size > 0:
                 episodic_retrieved, episodic_weights = self.memory.retrieve_soft(
                     query,
-                    temperature=self.retrieval_temperature
+                    temperature=self.retrieval_temperature,
+                    salience_weight=self.retrieval_salience_weight
                 )
 
             # 1b. Semantic retrieval (causal: query is from before this sequence)
@@ -1916,8 +1920,8 @@ class MemoryAugmentedGPT(nn.Module):
                 memory_output['memory_bank'] = memory_bank
                 memory_output['query_for_contrastive'] = next_memory_query
 
-                # Create positive indices: point to most recent memories for each batch item
-                # If new memories were created, use their indices; otherwise use random existing ones
+                # Create positive indices for contrastive loss.
+                # Prefer newly created memories; fall back to retrieved memory, then random.
                 new_memories_created = self.memory.size - memory_size_before
                 if new_memories_created > 0:
                     # Use indices of newly created memories (most recent)
@@ -1931,6 +1935,11 @@ class MemoryAugmentedGPT(nn.Module):
                         positive_indices = positive_indices.repeat(
                             (batch_size // len(positive_indices)) + 1
                         )[:batch_size]
+                elif episodic_weights is not None and episodic_weights.numel() > 0:
+                    if episodic_weights.dim() == 1:
+                        positive_indices = episodic_weights.argmax().repeat(batch_size)
+                    else:
+                        positive_indices = episodic_weights.argmax(dim=-1)
                 else:
                     # No new memories - use random existing memories as weak positives
                     positive_indices = torch.randint(

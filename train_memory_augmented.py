@@ -17,13 +17,15 @@ Usage:
 import argparse
 import json
 import logging
+import math
 import os
 import time
 from typing import Optional, Dict, List
 
+import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset, Sampler
 from tqdm import tqdm
 
 from experiential import (
@@ -99,7 +101,142 @@ def load_model(checkpoint_path: str, device: torch.device):
     return model, config
 
 
-def create_dataloader(data_dir: str, batch_size: int, seq_len: int, split: str = "training"):
+def _load_token_memmap(token_file_path: str, dtype_name: Optional[str], data_type: str):
+    if token_file_path.endswith(".npy"):
+        return np.load(token_file_path, mmap_mode="r")
+    if dtype_name is None:
+        dtype_name = "uint32"
+    return np.memmap(token_file_path, dtype=np.dtype(dtype_name), mode="r")
+
+
+class DocumentSequentialDataset(Dataset):
+    def __init__(
+        self,
+        token_file_path: str,
+        doc_metadata_path: str,
+        max_seq_len: int,
+        stride: int,
+        dtype_name: Optional[str],
+        data_type: str = "Data"
+    ):
+        self.token_file_path = token_file_path
+        self.max_seq_len = max_seq_len
+        self.stride = stride
+        self.data_type = data_type
+
+        if not os.path.exists(doc_metadata_path):
+            raise FileNotFoundError(f"Doc metadata not found: {doc_metadata_path}")
+
+        with open(doc_metadata_path, "r") as f:
+            doc_meta = json.load(f)
+        documents = doc_meta.get("documents", [])
+        if not documents:
+            raise ValueError(f"No documents found in {doc_metadata_path}")
+
+        self.tokens = _load_token_memmap(token_file_path, dtype_name, data_type)
+
+        self.start_positions = []
+        self.doc_ids = []
+        min_tokens_for_one_example = self.max_seq_len + 1
+
+        for doc_id, doc in enumerate(documents):
+            start = doc.get("start_token")
+            end = doc.get("end_token")
+            if start is None or end is None:
+                continue
+            if end - start < min_tokens_for_one_example:
+                continue
+            max_start = end - min_tokens_for_one_example
+            for pos in range(start, max_start + 1, self.stride):
+                self.start_positions.append(pos)
+                self.doc_ids.append(doc_id)
+
+        logger.info(
+            f"{self.data_type} Sequential Dataset: {len(self.start_positions):,} examples "
+            f"from {len(documents):,} documents using {self.token_file_path}"
+        )
+
+    def __len__(self):
+        return len(self.start_positions)
+
+    def __getitem__(self, idx):
+        if idx >= len(self.start_positions):
+            raise IndexError(
+                f"Index {idx} out of bounds for {len(self.start_positions)} {self.data_type} examples"
+            )
+
+        start_idx = self.start_positions[idx]
+        end_idx = start_idx + self.max_seq_len + 1
+        token_chunk = self.tokens[start_idx:end_idx]
+
+        input_ids = torch.tensor(token_chunk[:-1], dtype=torch.long)
+        labels = torch.tensor(token_chunk[1:], dtype=torch.long)
+
+        if input_ids.shape[0] != self.max_seq_len or labels.shape[0] != self.max_seq_len:
+            raise ValueError(
+                f"Data loading error: Unexpected sequence length at index {idx}. "
+                f"Input: {input_ids.shape[0]}, Label: {labels.shape[0]}, Expected: {self.max_seq_len}."
+            )
+
+        return {
+            "input_ids": input_ids,
+            "labels": labels,
+            "doc_id": self.doc_ids[idx],
+        }
+
+
+class DocSequentialBatchSampler(Sampler[List[int]]):
+    def __init__(self, doc_ids: List[int], batch_size: int, drop_last: bool = True):
+        self.doc_ids = doc_ids
+        self.batch_size = batch_size
+        self.drop_last = drop_last
+        self._length = self._compute_length()
+
+    def _compute_length(self) -> int:
+        if not self.doc_ids:
+            return 0
+        total = 0
+        current_doc = self.doc_ids[0]
+        count = 0
+        for doc_id in self.doc_ids:
+            if doc_id != current_doc:
+                total += count // self.batch_size if self.drop_last else math.ceil(count / self.batch_size)
+                current_doc = doc_id
+                count = 0
+            count += 1
+        total += count // self.batch_size if self.drop_last else math.ceil(count / self.batch_size)
+        return total
+
+    def __iter__(self):
+        batch = []
+        current_doc = None
+        for idx, doc_id in enumerate(self.doc_ids):
+            if current_doc is None:
+                current_doc = doc_id
+            if doc_id != current_doc:
+                if batch and (not self.drop_last):
+                    yield batch
+                batch = []
+                current_doc = doc_id
+            batch.append(idx)
+            if len(batch) == self.batch_size:
+                yield batch
+                batch = []
+        if batch and not self.drop_last:
+            yield batch
+
+    def __len__(self):
+        return self._length
+
+
+def create_dataloader(
+    data_dir: str,
+    batch_size: int,
+    seq_len: int,
+    split: str = "training",
+    sequential: bool = False,
+    doc_metadata_path: Optional[str] = None
+):
     """Create dataloader from pretokenized data."""
     from pretrain import PretokenizedDataset
     import glob
@@ -119,21 +256,41 @@ def create_dataloader(data_dir: str, batch_size: int, seq_len: int, split: str =
         token_file = os.path.join(data_dir, os.path.basename(token_file))
 
     num_examples = meta['num_examples']
+    dtype_name = meta.get('dtype')
+    stride = meta.get('stride', seq_len)
 
     logger.info(f"Loading {split} data: {num_examples:,} examples from {token_file}")
 
-    dataset = PretokenizedDataset(
-        token_file, num_examples, seq_len, seq_len, data_type=split.capitalize()
-    )
-
-    dataloader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=(split == "training"),
-        num_workers=2,
-        pin_memory=True,
-        drop_last=True
-    )
+    if sequential and split == "training":
+        if doc_metadata_path is None:
+            doc_metadata_path = os.path.join(data_dir, "book_corpus_metadata.json")
+        dataset = DocumentSequentialDataset(
+            token_file,
+            doc_metadata_path,
+            max_seq_len=seq_len,
+            stride=stride,
+            dtype_name=dtype_name,
+            data_type=split.capitalize()
+        )
+        batch_sampler = DocSequentialBatchSampler(dataset.doc_ids, batch_size, drop_last=True)
+        dataloader = DataLoader(
+            dataset,
+            batch_sampler=batch_sampler,
+            num_workers=2,
+            pin_memory=True
+        )
+    else:
+        dataset = PretokenizedDataset(
+            token_file, num_examples, seq_len, seq_len, data_type=split.capitalize()
+        )
+        dataloader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=(split == "training"),
+            num_workers=2,
+            pin_memory=True,
+            drop_last=True
+        )
 
     return dataloader
 
@@ -149,7 +306,10 @@ def train_epoch(
     exp_weight: float = 0.1,
     affect_weight: float = 0.1,
     retrieval_weight: float = 0.1,
+    retrieval_benefit_weight: float = 0.1,
+    contrastive_weight: float = 0.1,
     accumulation_steps: int = 1,
+    sequential: bool = False,
 ) -> Dict[str, List[float]]:
     """Train for one epoch."""
     memory_gpt.train()
@@ -169,10 +329,18 @@ def train_epoch(
         'retrieval_loss': [],
         'meta_affect_surprise': [],
         'meta_retrieval_surprise': [],
+        # Retrieval benefit metrics
+        'retrieval_benefit': [],
+        'retrieval_benefit_loss': [],
+        # Contrastive loss
+        'contrastive_loss': [],
     }
 
     total_loss = 0.0
     optimizer.zero_grad()
+
+    prev_memory_query = None
+    prev_doc_id = None
 
     pbar = tqdm(dataloader, desc="Training")
     for step, batch in enumerate(pbar):
@@ -181,10 +349,22 @@ def train_epoch(
         targets = input_ids[:, 1:].contiguous()
         input_ids = input_ids[:, :-1].contiguous()
 
-        # Reset experiential state for each batch (shuffled data, not sequential)
-        # This prevents state from leaking across unrelated documents
-        if memory_gpt.experiential is not None:
-            memory_gpt.experiential.reset_state(batch_size=input_ids.size(0))
+        if sequential:
+            doc_ids = batch.get("doc_id")
+            if doc_ids is None:
+                raise ValueError("Sequential training requires doc_id in batch")
+            if (doc_ids != doc_ids[0]).any():
+                logger.warning("Batch spans multiple documents; resetting sequence state")
+            batch_doc_id = int(doc_ids[0])
+            if prev_doc_id is None or batch_doc_id != prev_doc_id:
+                memory_gpt.reset_hidden_state()
+                prev_memory_query = None
+                prev_doc_id = batch_doc_id
+        else:
+            # Reset experiential state for each batch (shuffled data, not sequential)
+            # This prevents state from leaking across unrelated documents
+            if memory_gpt.experiential is not None:
+                memory_gpt.experiential.reset_state(batch_size=input_ids.size(0))
 
         # Forward pass with causal memory retrieval
         # For shuffled data, prev_memory_query=None means no memory retrieval
@@ -194,8 +374,12 @@ def train_epoch(
             input_ids,
             crystallize=True,
             use_memory=True,
-            prev_memory_query=None  # No causal query for shuffled batches
+            prev_memory_query=prev_memory_query
         )
+        if sequential and mem_out.get('next_memory_query') is not None:
+            prev_memory_query = mem_out['next_memory_query'].detach()
+        elif not sequential:
+            prev_memory_query = None
 
         # Compute loss (includes extended self-awareness losses)
         loss, loss_dict = memory_augmented_loss(
@@ -204,6 +388,8 @@ def train_epoch(
             exp_weight=exp_weight,
             affect_weight=affect_weight,
             retrieval_weight=retrieval_weight,
+            retrieval_benefit_weight=retrieval_benefit_weight,
+            contrastive_weight=contrastive_weight,
         )
 
         # Scale for gradient accumulation
@@ -237,17 +423,22 @@ def train_epoch(
         history['retrieval_loss'].append(loss_dict.get('retrieval_loss', 0.0))
         history['meta_affect_surprise'].append(loss_dict.get('mean_meta_affect_surprise', 0.0))
         history['meta_retrieval_surprise'].append(loss_dict.get('mean_meta_retrieval_surprise', 0.0))
+        # Retrieval benefit metrics
+        history['retrieval_benefit'].append(loss_dict.get('retrieval_benefit', 0.0))
+        history['retrieval_benefit_loss'].append(loss_dict.get('retrieval_benefit_loss', 0.0))
+        # Contrastive loss
+        history['contrastive_loss'].append(loss_dict.get('contrastive_loss', 0.0))
 
         # Log
         if step % log_interval == 0:
             avg_loss = total_loss / (step + 1)
-            affect_loss = loss_dict.get('affect_loss', 0.0)
+            retrieval_benefit = loss_dict.get('retrieval_benefit', 0.0)
             pbar.set_postfix({
                 'loss': f'{avg_loss:.4f}',
                 'lm': f'{loss_dict["lm_loss"]:.3f}',
                 'mem': mem_out['episodic_size'],
                 'acc': f'{acc:.3f}',
-                'aff': f'{affect_loss:.3f}',
+                'ret_ben': f'{retrieval_benefit:.3f}',  # positive = memory helps
             })
 
         if max_steps and step >= max_steps:
@@ -318,9 +509,13 @@ def main():
     parser.add_argument("--max_steps", type=int, default=None)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--accumulation_steps", type=int, default=4)
+    parser.add_argument("--sequential", action="store_true",
+                        help="Train sequentially over corpus with doc-boundary resets")
+    parser.add_argument("--doc_metadata", default=None,
+                        help="Path to document metadata (default: data_dir/book_corpus_metadata.json)")
 
     # Memory params
-    parser.add_argument("--integration", choices=['residual', 'gated', 'attention'], default='gated')
+    parser.add_argument("--integration", choices=['residual', 'gated', 'attention', 'cross_attention'], default='gated')
     parser.add_argument("--memory_capacity", type=int, default=1000)
     parser.add_argument("--crystallization_threshold", type=float, default=0.2)
 
@@ -332,6 +527,17 @@ def main():
                         help="Weight for meta-affect loss (predict own emotions)")
     parser.add_argument("--retrieval_weight", type=float, default=0.1,
                         help="Weight for meta-retrieval loss (predict what will be remembered)")
+    # Retrieval benefit loss - trains memory to actually help prediction
+    parser.add_argument("--retrieval_benefit_weight", type=float, default=0.1,
+                        help="Weight for retrieval benefit loss (penalize when memory hurts)")
+    # Contrastive learning for memory relevance
+    parser.add_argument("--contrastive_weight", type=float, default=0.1,
+                        help="Weight for contrastive memory loss (teach which memories are relevant)")
+    # Memory pre-population (for cross-attention cold start)
+    parser.add_argument("--prepopulate_steps", type=int, default=500,
+                        help="Steps to run for memory pre-population (0 to disable)")
+    parser.add_argument("--min_memories", type=int, default=100,
+                        help="Minimum memories to create during pre-population")
     # Salience calibration
     parser.add_argument("--meta_surprise_salience_weight", type=float, default=1.0,
                         help="How much meta-surprise boosts salience (default 1.0)")
@@ -342,6 +548,10 @@ def main():
     args = parser.parse_args()
     device = torch.device(args.device)
 
+    if args.sequential and args.batch_size != 1:
+        logger.warning("Sequential training requires batch_size=1; overriding.")
+        args.batch_size = 1
+
     logger.info("=" * 60)
     logger.info("Memory-Augmented GPT Training")
     logger.info(f"  Integration: {args.integration}")
@@ -349,8 +559,12 @@ def main():
     logger.info(f"  Crystallization threshold: {args.crystallization_threshold}")
     logger.info(f"  Meta-surprise salience weight: {args.meta_surprise_salience_weight}")
     logger.info(f"  Batch size: {args.batch_size} x {args.accumulation_steps} accumulation")
+    logger.info(f"  Sequential training: {args.sequential}")
     logger.info(f"  Loss weights: lm={args.lm_weight}, exp={args.exp_weight}, "
-                f"affect={args.affect_weight}, retrieval={args.retrieval_weight}")
+                f"affect={args.affect_weight}, retrieval={args.retrieval_weight}, "
+                f"retrieval_benefit={args.retrieval_benefit_weight}, "
+                f"contrastive={args.contrastive_weight}")
+    logger.info(f"  Pre-population: {args.prepopulate_steps} steps, min {args.min_memories} memories")
     logger.info("=" * 60)
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -372,7 +586,14 @@ def main():
     logger.info(f"Trainable parameters: {n_params:,}")
 
     # Data
-    train_loader = create_dataloader(args.data_dir, args.batch_size, args.seq_len, "training")
+    train_loader = create_dataloader(
+        args.data_dir,
+        args.batch_size,
+        args.seq_len,
+        "training",
+        sequential=args.sequential,
+        doc_metadata_path=args.doc_metadata
+    )
     eval_loader = create_dataloader(args.data_dir, args.batch_size, args.seq_len, "evaluation")
 
     # Optimizer - only train memory components
@@ -381,6 +602,18 @@ def main():
     optimizer = torch.optim.AdamW(memory_params, lr=args.lr, weight_decay=0.01)
 
     logger.info(f"Optimizing {len(memory_params)} parameter groups")
+
+    # Pre-populate memory bank (avoids cold-start for cross-attention)
+    if args.prepopulate_steps > 0:
+        logger.info(f"\n--- Pre-populating memory bank ---")
+        prepop_stats = memory_gpt.prepopulate_memory(
+            train_loader,
+            device,
+            max_steps=args.prepopulate_steps,
+            min_memories=args.min_memories
+        )
+        logger.info(f"Pre-population complete: {prepop_stats['memories_added']} memories created "
+                    f"in {prepop_stats['steps']} steps (total: {prepop_stats['final_size']})")
 
     # Training loop
     all_history = []
@@ -401,7 +634,10 @@ def main():
             exp_weight=args.exp_weight,
             affect_weight=args.affect_weight,
             retrieval_weight=args.retrieval_weight,
+            retrieval_benefit_weight=args.retrieval_benefit_weight,
+            contrastive_weight=args.contrastive_weight,
             accumulation_steps=args.accumulation_steps,
+            sequential=args.sequential,
         )
         all_history.append(history)
 
