@@ -244,12 +244,22 @@ def create_dataloader(
     # Find metadata
     pattern = os.path.join(data_dir, f"{split}*_metadata.json")
     meta_files = glob.glob(pattern)
+    # Exclude document-only metadata files
+    meta_files = [p for p in meta_files if "doc_metadata" not in os.path.basename(p)]
 
     if not meta_files:
         raise FileNotFoundError(f"No metadata found matching {pattern}")
 
-    with open(meta_files[0]) as f:
-        meta = json.load(f)
+    meta_files.sort()
+    meta = None
+    for path in meta_files:
+        with open(path) as f:
+            candidate = json.load(f)
+        if 'num_examples' in candidate:
+            meta = candidate
+            break
+    if meta is None:
+        raise KeyError(f"No split metadata with num_examples found for {pattern}")
 
     token_file = meta.get('token_file')
     if token_file and not os.path.isabs(token_file):
@@ -263,7 +273,29 @@ def create_dataloader(
 
     if sequential:
         if doc_metadata_path is None:
-            doc_metadata_path = os.path.join(data_dir, "book_corpus_metadata.json")
+            doc_metadata_path = meta.get("doc_metadata") or meta.get("doc_metadata_path")
+            if doc_metadata_path:
+                if not os.path.isabs(doc_metadata_path):
+                    doc_metadata_path = os.path.join(data_dir, doc_metadata_path)
+            else:
+                split_doc_meta = os.path.join(data_dir, f"{split}_book_corpus_metadata.json")
+                if os.path.exists(split_doc_meta):
+                    doc_metadata_path = split_doc_meta
+                else:
+                    fallback_doc_meta = os.path.join(data_dir, "book_corpus_metadata.json")
+                    if os.path.exists(fallback_doc_meta):
+                        doc_metadata_path = fallback_doc_meta
+                        if split != "training":
+                            logger.warning(
+                                "Sequential %s uses %s; doc boundaries may not match split.",
+                                split,
+                                fallback_doc_meta
+                            )
+                    else:
+                        raise FileNotFoundError(
+                            f"No doc metadata found for split={split}. "
+                            f"Tried {split_doc_meta} and {fallback_doc_meta}."
+                        )
         dataset = DocumentSequentialDataset(
             token_file,
             doc_metadata_path,
@@ -510,7 +542,8 @@ def evaluate(
                 input_ids,
                 crystallize=False,  # Don't modify memory during eval
                 use_memory=True,
-                prev_memory_query=prev_memory_query
+                prev_memory_query=prev_memory_query,
+                return_memory_weights=True
             )
 
             # Update query for next batch (sequential mode)

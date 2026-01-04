@@ -87,19 +87,35 @@ def load_model(checkpoint_path: str, device: torch.device) -> MemoryAugmentedGPT
     return memory_gpt
 
 
-def create_dataloader(data_dir: str, batch_size: int, seq_len: int, split: str = "evaluation"):
+def create_dataloader(
+    data_dir: str,
+    batch_size: int,
+    seq_len: int,
+    split: str = "evaluation",
+    num_workers: int = 2
+):
     """Create dataloader from pretokenized data."""
     from pretrain import PretokenizedDataset
     import glob
 
     pattern = os.path.join(data_dir, f"{split}*_metadata.json")
     meta_files = glob.glob(pattern)
+    # Exclude document-only metadata files
+    meta_files = [p for p in meta_files if "doc_metadata" not in os.path.basename(p)]
 
     if not meta_files:
         raise FileNotFoundError(f"No metadata found matching {pattern}")
 
-    with open(meta_files[0]) as f:
-        meta = json.load(f)
+    meta_files.sort()
+    meta = None
+    for path in meta_files:
+        with open(path) as f:
+            candidate = json.load(f)
+        if 'num_examples' in candidate:
+            meta = candidate
+            break
+    if meta is None:
+        raise KeyError(f"No split metadata with num_examples found for {pattern}")
 
     token_file = meta.get('token_file')
     if token_file and not os.path.isabs(token_file):
@@ -116,7 +132,7 @@ def create_dataloader(data_dir: str, batch_size: int, seq_len: int, split: str =
         dataset,
         batch_size=batch_size,
         shuffle=False,  # Deterministic for fair comparison
-        num_workers=2,
+        num_workers=num_workers,
         pin_memory=True,
         drop_last=True
     )
@@ -168,10 +184,10 @@ def apply_memory_random(model: MemoryAugmentedGPT, seed: int) -> None:
     if model.memory.size == 0:
         return
     device = model.memory.episodes[0].content.device
-    generator = torch.Generator(device=device).manual_seed(seed)
+    torch.manual_seed(seed)
     for ep in model.memory.episodes:
-        ep.content = torch.randn_like(ep.content, generator=generator)
-        ep.context = torch.randn_like(ep.context, generator=generator)
+        ep.content = torch.randn(ep.content.shape, device=device, dtype=ep.content.dtype)
+        ep.context = torch.randn(ep.context.shape, device=device, dtype=ep.context.dtype)
 
 
 def bootstrap_mean_ci(
@@ -573,6 +589,7 @@ def main():
     parser.add_argument("--data_dir", default="book_corpus_output", help="Data directory")
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--seq_len", type=int, default=512)
+    parser.add_argument("--num_workers", type=int, default=2, help="DataLoader workers")
     parser.add_argument("--build_steps", type=int, default=500, help="Steps to build memories")
     parser.add_argument("--eval_steps", type=int, default=200, help="Steps to evaluate")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -601,7 +618,11 @@ def main():
         print("\n[Phase 1] Building memories from training data...")
         try:
             train_dataloader = create_dataloader(
-                args.data_dir, args.batch_size, args.seq_len, split="training"
+                args.data_dir,
+                args.batch_size,
+                args.seq_len,
+                split="training",
+                num_workers=args.num_workers
             )
             build_stats = build_memories(
                 model, train_dataloader, device,
@@ -628,7 +649,11 @@ def main():
     # Phase 2: Load evaluation data
     print("\n[Phase 2] Loading evaluation data...")
     eval_dataloader = create_dataloader(
-        args.data_dir, args.batch_size, args.seq_len, split="evaluation"
+        args.data_dir,
+        args.batch_size,
+        args.seq_len,
+        split="evaluation",
+        num_workers=args.num_workers
     )
 
     # Phase 3: Evaluate WITH memory
