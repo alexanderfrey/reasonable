@@ -431,6 +431,13 @@ def train_epoch(
 
         # Scale for gradient accumulation
         loss = loss / accumulation_steps
+
+        # Verify loss tensor is on a CUDA device if training on GPU
+        # (comparing device types rather than exact device IDs)
+        if device.type == 'cuda' and loss.device.type != 'cuda':
+            logger.warning(f"Step {step}: loss tensor on {loss.device}, expected {device}")
+            loss = loss.to(device)
+
         loss.backward()
 
         total_loss += loss.item() * accumulation_steps
@@ -471,8 +478,9 @@ def train_epoch(
                 memory_gpt.memory,
                 top_k=memory_log_top_k,
                 max_chars=memory_log_max_chars,
+                step=step,
             )
-            logger.info("Top episodic memories (by salience):\n%s", memory_report)
+            logger.info("%s", memory_report)
 
         # Log
         if step % log_interval == 0:
@@ -492,11 +500,25 @@ def train_epoch(
     return history
 
 
-def _format_top_episodes(memory, top_k: int, max_chars: int) -> str:
+def _format_top_episodes(memory, top_k: int, max_chars: int, step: Optional[int] = None) -> str:
     if memory.size == 0:
-        return "(memory empty)"
+        header = "Episodic memory snapshot"
+        if step is not None:
+            header += f" (step {step})"
+        return f"{header}\n- memory empty"
     episodes = sorted(memory.episodes, key=lambda e: e.salience, reverse=True)[:top_k]
-    lines = []
+    most_retrieved = sorted(memory.episodes, key=lambda e: e.retrieval_count, reverse=True)[:top_k]
+    global_step = getattr(memory, "_global_step", None)
+    header = "Episodic memory snapshot"
+    if step is not None:
+        header += f" (step {step})"
+    lines = [
+        header,
+        f"- memory size: {memory.size}",
+        "- top episodes (by salience):",
+        "  #  salience  retr  age  text",
+        "  -- --------  ----  ---  ----",
+    ]
     for i, ep in enumerate(episodes, start=1):
         text = ep.text or ""
         if text:
@@ -505,8 +527,32 @@ def _format_top_episodes(memory, top_k: int, max_chars: int) -> str:
             text = "(no text stored)"
         if max_chars > 0 and len(text) > max_chars:
             text = text[: max_chars - 3] + "..."
+        if global_step is not None:
+            age = max(0, global_step - ep.timestamp)
+            age_str = f"{age:>3d}"
+        else:
+            age_str = " --"
         lines.append(
-            f"{i}. salience={ep.salience:.3f} retrievals={ep.retrieval_count} text={text}"
+            f"  {i:>2d} {ep.salience:>8.3f}  {ep.retrieval_count:>4d}  {age_str}  {text}"
+        )
+    lines.append("- most retrieved episodes:")
+    lines.append("  #  retr  salience  age  text")
+    lines.append("  -- ----  --------  ---  ----")
+    for i, ep in enumerate(most_retrieved, start=1):
+        text = ep.text or ""
+        if text:
+            text = " ".join(text.split())
+        else:
+            text = "(no text stored)"
+        if max_chars > 0 and len(text) > max_chars:
+            text = text[: max_chars - 3] + "..."
+        if global_step is not None:
+            age = max(0, global_step - ep.timestamp)
+            age_str = f"{age:>3d}"
+        else:
+            age_str = " --"
+        lines.append(
+            f"  {i:>2d} {ep.retrieval_count:>4d}  {ep.salience:>8.3f}  {age_str}  {text}"
         )
     return "\n".join(lines)
 
@@ -668,8 +714,10 @@ def main():
     parser.add_argument("--contrastive_weight", type=float, default=0.1,
                         help="Weight for contrastive memory loss (teach which memories are relevant)")
     # Memory pre-population (for cross-attention cold start)
+    parser.add_argument("--prepopulate", action="store_true",
+                        help="Enable memory pre-population before training (default: off)")
     parser.add_argument("--prepopulate_steps", type=int, default=500,
-                        help="Steps to run for memory pre-population (0 to disable)")
+                        help="Steps to run for memory pre-population when enabled")
     parser.add_argument("--min_memories", type=int, default=100,
                         help="Minimum memories to create during pre-population")
     # Salience calibration
@@ -704,7 +752,10 @@ def main():
                 f"affect={args.affect_weight}, retrieval={args.retrieval_weight}, "
                 f"retrieval_benefit={args.retrieval_benefit_weight}, "
                 f"contrastive={args.contrastive_weight}")
-    logger.info(f"  Pre-population: {args.prepopulate_steps} steps, min {args.min_memories} memories")
+    if args.prepopulate:
+        logger.info(f"  Pre-population: {args.prepopulate_steps} steps, min {args.min_memories} memories")
+    else:
+        logger.info("  Pre-population: disabled")
     logger.info(
         "  Memory logging: every %s steps, top_k=%s, max_chars=%s",
         args.memory_log_interval,
@@ -779,7 +830,7 @@ def main():
     logger.info(f"Optimizing {len(memory_params)} parameter groups")
 
     # Pre-populate memory bank (avoids cold-start for cross-attention)
-    if args.prepopulate_steps > 0:
+    if args.prepopulate and args.prepopulate_steps > 0:
         logger.info(f"\n--- Pre-populating memory bank ---")
         prepop_stats = memory_gpt.prepopulate_memory(
             train_loader,
@@ -789,6 +840,8 @@ def main():
         )
         logger.info(f"Pre-population complete: {prepop_stats['memories_added']} memories created "
                     f"in {prepop_stats['steps']} steps (total: {prepop_stats['final_size']})")
+    elif args.prepopulate:
+        logger.warning("Pre-population enabled but prepopulate_steps <= 0; skipping.")
 
     # Training loop
     all_history = []

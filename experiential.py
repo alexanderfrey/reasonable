@@ -178,10 +178,12 @@ class EpisodicMemory(nn.Module):
         if timestamp is None:
             timestamp = self._global_step
 
+        # Keep tensors on their original device (GPU) to avoid device mismatches
+        # during backward pass. The .detach() prevents gradients from flowing back.
         episode = Episode(
             timestamp=timestamp,
-            content=content.detach().cpu(),
-            context=context.detach().cpu(),
+            content=content.detach().clone(),
+            context=context.detach().clone(),
             salience=salience,
             valence=valence,
             arousal=arousal,
@@ -464,13 +466,13 @@ class EpisodicMemory(nn.Module):
         }
 
     def snapshot(self) -> Dict[str, object]:
-        """Capture episodic memory contents for saving."""
+        """Capture episodic memory contents for saving (moves to CPU for checkpointing)."""
         episodes = []
         for ep in self.episodes:
             episodes.append(Episode(
                 timestamp=ep.timestamp,
-                content=ep.content.detach().clone(),
-                context=ep.context.detach().clone(),
+                content=ep.content.detach().cpu().clone(),
+                context=ep.context.detach().cpu().clone(),
                 salience=ep.salience,
                 valence=ep.valence,
                 arousal=ep.arousal,
@@ -483,9 +485,19 @@ class EpisodicMemory(nn.Module):
             'global_step': self._global_step,
         }
 
-    def restore(self, snapshot: Dict[str, object]) -> None:
-        """Restore episodic memory from a snapshot."""
-        self.episodes = snapshot.get('episodes', [])
+    def restore(self, snapshot: Dict[str, object], device: Optional[torch.device] = None) -> None:
+        """Restore episodic memory from a snapshot.
+
+        Args:
+            snapshot: Saved memory state from snapshot()
+            device: Device to move episode tensors to (None = keep as-is)
+        """
+        episodes = snapshot.get('episodes', [])
+        if device is not None:
+            # Move all episode tensors to the specified device
+            self.episodes = [ep.to(device) for ep in episodes]
+        else:
+            self.episodes = episodes
         self._global_step = snapshot.get('global_step', 0)
 
 
@@ -704,6 +716,14 @@ class ExperientialStream(nn.Module):
         Returns:
             excess: [B, seq_len] normalized surprisal (positive = above baseline)
         """
+        device = per_token_ce.device
+
+        # Ensure EMA buffers are on the correct device (may be needed after model.to(device))
+        if self.ema_mu.device != device:
+            self.ema_mu = self.ema_mu.to(device)
+            self.ema_sigma = self.ema_sigma.to(device)
+            self.ema_initialized = self.ema_initialized.to(device)
+
         # Update EMA during training (exclude padding from statistics)
         if update_ema and self.training:
             if mask is not None:
@@ -729,7 +749,13 @@ class ExperientialStream(nn.Module):
                 self.ema_sigma.mul_(self.ema_decay).add_(batch_sigma * (1 - self.ema_decay))
 
         # Normalize: (CE - mean) / std
-        excess = (per_token_ce - self.ema_mu) / (self.ema_sigma + self.eps)
+        # Ensure EMA buffers are on the same device as input
+        ema_mu = self.ema_mu
+        ema_sigma = self.ema_sigma
+        if ema_mu.device != per_token_ce.device:
+            ema_mu = ema_mu.to(per_token_ce.device)
+            ema_sigma = ema_sigma.to(per_token_ce.device)
+        excess = (per_token_ce - ema_mu) / (ema_sigma + self.eps)
         return excess
 
     def compute_novelty(
@@ -847,6 +873,14 @@ class ExperientialStream(nn.Module):
 
         # 5. Normalize to [0, 1] using centered sigmoid
         # This spreads surprise across full [0, 1] range instead of being stuck > 0.5
+        device = chunk_surprise_raw.device
+
+        # Ensure raw EMA buffers are on the correct device
+        if self.ema_raw_mu.device != device:
+            self.ema_raw_mu = self.ema_raw_mu.to(device)
+            self.ema_raw_sigma = self.ema_raw_sigma.to(device)
+            self.ema_raw_initialized = self.ema_raw_initialized.to(device)
+
         with torch.no_grad():
             batch_raw_mean = chunk_surprise_raw.mean()
             # Use unbiased=False to avoid warning on single samples
@@ -863,7 +897,13 @@ class ExperientialStream(nn.Module):
 
         # Center by subtracting EMA mean, scale by EMA std
         # This makes sigmoid output centered around 0.5 with good spread
-        centered_raw = (chunk_surprise_raw - self.ema_raw_mu) / (self.ema_raw_sigma + self.eps)
+        # Ensure EMA buffers are on the same device as input
+        ema_raw_mu = self.ema_raw_mu
+        ema_raw_sigma = self.ema_raw_sigma
+        if ema_raw_mu.device != chunk_surprise_raw.device:
+            ema_raw_mu = ema_raw_mu.to(chunk_surprise_raw.device)
+            ema_raw_sigma = ema_raw_sigma.to(chunk_surprise_raw.device)
+        centered_raw = (chunk_surprise_raw - ema_raw_mu) / (ema_raw_sigma + self.eps)
         chunk_surprise = torch.sigmoid(centered_raw * self.surprise_scale)
 
         return {
@@ -905,10 +945,18 @@ class ExperientialStream(nn.Module):
             # Initialize to zeros (no prior context)
             self._persistent_state = torch.zeros(batch_size, self.d_model, device=device)
             self._batch_size = batch_size
+        elif self._persistent_state.device != device:
+            # Move existing state to correct device
+            self._persistent_state = self._persistent_state.to(device)
         return self._persistent_state
 
     def _update_state(self, h_end: torch.Tensor, prev_state: torch.Tensor) -> torch.Tensor:
         """Update persistent state using gated combination."""
+        # Ensure both tensors are on the same device
+        device = h_end.device
+        if prev_state.device != device:
+            prev_state = prev_state.to(device)
+
         # Gate controls: how much of h_end to incorporate vs keeping prev_state
         gate_input = torch.cat([h_end, prev_state], dim=-1)
         gate = self.state_gate(gate_input)  # [B, d_model], values in [0, 1]
@@ -1175,7 +1223,7 @@ class ExperientialStream(nn.Module):
                     gate_input = torch.cat([modulated_output, prev_state], dim=-1)
                     gate_values = self.state_gate(gate_input)
 
-        return {
+        output = {
             'state': h_mid,
             'prediction': prediction,
             # TARGET is now modulated_output: predictor learns to predict committed output
@@ -1209,6 +1257,14 @@ class ExperientialStream(nn.Module):
             'ema_mu': self.ema_mu.item() if per_token_ce is not None else None,
             'ema_sigma': self.ema_sigma.item() if per_token_ce is not None else None,
         }
+
+        # Ensure all tensors are on the same device as hidden_states
+        device = hidden_states.device
+        for key, value in list(output.items()):
+            if torch.is_tensor(value) and value.device != device:
+                output[key] = value.to(device)
+
+        return output
 
     def forward_multiscale(
         self,
@@ -1386,6 +1442,11 @@ def meta_retrieval_loss(
     Returns:
         Scalar loss value
     """
+    device = predicted_retrieval.device
+    # Ensure actual_retrieval is on the same device
+    if actual_retrieval.device != device:
+        actual_retrieval = actual_retrieval.to(device)
+
     # Cosine similarity loss: 1 - cosine_similarity
     pred_norm = F.normalize(predicted_retrieval, dim=-1)
     actual_norm = F.normalize(actual_retrieval.detach(), dim=-1)
@@ -1813,6 +1874,8 @@ class MemoryAugmentedGPT(nn.Module):
         """
         batch_size, seq_len = input_ids.shape
         device = input_ids.device
+        if prev_memory_query is not None and prev_memory_query.device != device:
+            prev_memory_query = prev_memory_query.to(device)
 
         # Ensure semantic stream is on the correct device (may not be after loading)
         if self.semantic is not None:
@@ -2032,6 +2095,11 @@ class MemoryAugmentedGPT(nn.Module):
 
         memory_output['episodic_size'] = self.memory.size
         memory_output['semantic_size'] = self.semantic.size if self.semantic else 0
+
+        # Ensure all tensors in memory_output are on the correct device
+        for key, value in list(memory_output.items()):
+            if torch.is_tensor(value) and value.device != device:
+                memory_output[key] = value.to(device)
 
         return logits, hidden_states, memory_output
 
@@ -2424,6 +2492,13 @@ def contrastive_memory_loss(
 
     batch_size = query.size(0)
     num_memories = memory_bank.size(0)
+    device = query.device
+
+    # Ensure all tensors are on the same device
+    if memory_bank.device != device:
+        memory_bank = memory_bank.to(device)
+    if positive_indices.device != device:
+        positive_indices = positive_indices.to(device)
 
     # Normalize for cosine similarity
     query_norm = F.normalize(query, dim=-1)  # [batch, d_model]
@@ -2478,6 +2553,12 @@ def memory_augmented_loss(
         loss_dict: breakdown of individual losses including memory stats
     """
     loss_dict = {}
+    device = lm_logits.device
+
+    # Align memory_output tensors to the same device as logits to avoid device mismatches.
+    for key, value in list(memory_output.items()):
+        if torch.is_tensor(value) and value.device != device:
+            memory_output[key] = value.to(device)
 
     # Language modeling loss
     lm_loss = F.cross_entropy(
@@ -2564,6 +2645,24 @@ def memory_augmented_loss(
 
     loss_dict['total_loss'] = total_loss.item()
     return total_loss, loss_dict
+
+
+def verify_tensor_devices(tensors_dict: Dict[str, torch.Tensor], expected_device: torch.device) -> List[str]:
+    """
+    Verify all tensors in a dict are on the expected device.
+
+    Args:
+        tensors_dict: Dictionary mapping names to tensors
+        expected_device: The device all tensors should be on
+
+    Returns:
+        List of names of tensors that are on the wrong device (empty if all correct)
+    """
+    wrong_device = []
+    for name, tensor in tensors_dict.items():
+        if torch.is_tensor(tensor) and tensor.device != expected_device:
+            wrong_device.append(f"{name}: {tensor.device}")
+    return wrong_device
 
 
 # --- Semantic Stream (Consolidation) ---
