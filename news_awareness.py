@@ -39,6 +39,7 @@ from typing import Optional, List, Dict, Any, Set
 from collections import deque
 
 import torch
+import torch.nn.functional as F
 
 # Optional imports for news fetching
 try:
@@ -55,6 +56,7 @@ except ImportError:
     HAS_AIOHTTP = False
 
 from inference_memory import MemoryInference
+from experiential import memory_augmented_loss
 
 logging.basicConfig(
     level=logging.INFO,
@@ -138,6 +140,12 @@ class AwarenessState:
         'start_time': None,
         'last_update': None,
         'sources_seen': {},
+        # Training stats
+        'train_steps': 0,
+        'train_articles': 0,
+        'train_loss_sum': 0.0,
+        'train_lm_loss_sum': 0.0,
+        'train_retrieval_benefit_sum': 0.0,
     })
     high_surprise_articles: List[Dict] = field(default_factory=list)
 
@@ -160,6 +168,11 @@ class NewsAwarenessSystem:
         feeds: Optional[List[tuple]] = None,
         fetch_interval: int = 300,  # 5 minutes
         save_interval: int = 600,   # 10 minutes
+        # Training options
+        train: bool = False,
+        train_lr: float = 1e-6,
+        train_salience_threshold: float = 0.8,
+        checkpoint_interval: int = 100,
     ):
         self.state_dir = Path(state_dir)
         self.state_dir.mkdir(exist_ok=True)
@@ -167,6 +180,13 @@ class NewsAwarenessSystem:
         self.feeds = feeds or DEFAULT_FEEDS
         self.fetch_interval = fetch_interval
         self.save_interval = save_interval
+        self.checkpoint_path = checkpoint_path
+
+        # Training settings
+        self.train_mode = train
+        self.train_lr = train_lr
+        self.train_salience_threshold = train_salience_threshold
+        self.checkpoint_interval = checkpoint_interval
 
         # Initialize model
         logger.info("Initializing Memory-Augmented GPT...")
@@ -194,6 +214,11 @@ class NewsAwarenessSystem:
         if self.state.stats['start_time'] is None:
             self.state.stats['start_time'] = datetime.now().isoformat()
 
+        # Setup training if enabled
+        self.optimizer = None
+        if self.train_mode:
+            self._setup_training()
+
     def _load_state(self) -> AwarenessState:
         """Load persistent state."""
         state_path = self.state_dir / "awareness_state.pkl"
@@ -220,6 +245,170 @@ class NewsAwarenessSystem:
         self.inference.save_memory(str(memory_path))
 
         logger.info(f"Saved state: {self.inference.model.memory.size} memories")
+
+    def _setup_training(self):
+        """Setup training: freeze base layers, only train top layers + memory components."""
+        model = self.inference.model
+
+        # Freeze all parameters first
+        for param in model.parameters():
+            param.requires_grad = False
+
+        # Unfreeze specific components for continual learning:
+        # 1. Top 2 transformer layers (for adaptation)
+        # 2. Memory components (query/key projections, cross-attention)
+        # 3. Experiential stream components
+
+        trainable_params = []
+
+        # Unfreeze top 2 GPT layers
+        n_layers = len(model.gpt.layers)
+        for i in range(max(0, n_layers - 2), n_layers):
+            for param in model.gpt.layers[i].parameters():
+                param.requires_grad = True
+                trainable_params.append(param)
+
+        # Unfreeze memory projections
+        if hasattr(model, 'memory_query_proj'):
+            for param in model.memory_query_proj.parameters():
+                param.requires_grad = True
+                trainable_params.append(param)
+
+        if hasattr(model, 'memory_key_proj'):
+            for param in model.memory_key_proj.parameters():
+                param.requires_grad = True
+                trainable_params.append(param)
+
+        if hasattr(model, 'memory_value_proj'):
+            for param in model.memory_value_proj.parameters():
+                param.requires_grad = True
+                trainable_params.append(param)
+
+        # Unfreeze cross-attention for memory integration
+        if hasattr(model, 'memory_cross_attn'):
+            for param in model.memory_cross_attn.parameters():
+                param.requires_grad = True
+                trainable_params.append(param)
+
+        if hasattr(model, 'memory_gate'):
+            for param in model.memory_gate.parameters():
+                param.requires_grad = True
+                trainable_params.append(param)
+
+        # Unfreeze experiential stream (if exists)
+        if model.experiential is not None:
+            for param in model.experiential.parameters():
+                param.requires_grad = True
+                trainable_params.append(param)
+
+        # Count trainable params
+        n_trainable = sum(p.numel() for p in trainable_params)
+        n_total = sum(p.numel() for p in model.parameters())
+
+        logger.info(f"Training mode: {n_trainable:,} / {n_total:,} params trainable "
+                   f"({100*n_trainable/n_total:.1f}%)")
+        logger.info(f"  - Top 2 transformer layers")
+        logger.info(f"  - Memory projections and cross-attention")
+        logger.info(f"  - Experiential stream")
+        logger.info(f"  - LR: {self.train_lr}, salience threshold: {self.train_salience_threshold}")
+
+        # Create optimizer with very low learning rate
+        self.optimizer = torch.optim.AdamW(
+            [p for p in model.parameters() if p.requires_grad],
+            lr=self.train_lr,
+            weight_decay=0.01,
+        )
+
+        # Put model in train mode
+        model.train()
+
+    def train_on_article(self, text: str) -> Dict[str, float]:
+        """
+        Perform a single training step on article text.
+
+        Returns dict with loss values.
+        """
+        if self.optimizer is None:
+            return {}
+
+        model = self.inference.model
+        tokenizer = self.inference.tokenizer
+        device = self.inference.device
+
+        # Tokenize
+        tokens = tokenizer.encode(text, add_special_tokens=False)
+        if len(tokens) < 10:
+            return {}
+
+        # Truncate to max length
+        max_len = model.gpt.config.max_seq_len
+        if len(tokens) > max_len:
+            tokens = tokens[:max_len]
+
+        input_ids = torch.tensor([tokens], dtype=torch.long, device=device)
+        targets = input_ids.clone()
+
+        # Forward pass with memory
+        self.optimizer.zero_grad()
+
+        logits, hidden, mem_out = model(
+            input_ids,
+            crystallize=False,  # Don't crystallize during training step
+            use_memory=True,
+        )
+
+        # Compute loss
+        loss, loss_dict = memory_augmented_loss(
+            lm_logits=logits,
+            targets=targets,
+            memory_output=mem_out,
+            lm_weight=1.0,
+            retrieval_benefit_weight=0.1,
+            contrastive_weight=0.05,
+        )
+
+        # Backward pass
+        loss.backward()
+
+        # Gradient clipping
+        torch.nn.utils.clip_grad_norm_(
+            [p for p in model.parameters() if p.requires_grad],
+            max_norm=1.0
+        )
+
+        # Update weights
+        self.optimizer.step()
+
+        # Update stats (use .get() for backwards compatibility with old state)
+        self.state.stats['train_steps'] = self.state.stats.get('train_steps', 0) + 1
+        self.state.stats['train_loss_sum'] = self.state.stats.get('train_loss_sum', 0) + loss.item()
+        self.state.stats['train_lm_loss_sum'] = self.state.stats.get('train_lm_loss_sum', 0) + loss_dict.get('lm_loss', 0)
+        self.state.stats['train_retrieval_benefit_sum'] = self.state.stats.get('train_retrieval_benefit_sum', 0) + loss_dict.get('retrieval_benefit', 0)
+
+        return loss_dict
+
+    def _save_model_checkpoint(self):
+        """Save model weights checkpoint."""
+        checkpoint_path = self.state_dir / f"model_checkpoint_step{self.state.stats['train_steps']}.pt"
+
+        # Save model state
+        torch.save({
+            'memory_gpt_state_dict': self.inference.model.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict() if self.optimizer else None,
+            'train_steps': self.state.stats['train_steps'],
+            'train_articles': self.state.stats['train_articles'],
+        }, checkpoint_path)
+
+        logger.info(f"Saved model checkpoint: {checkpoint_path}")
+
+        # Also save as "latest"
+        latest_path = self.state_dir / "model_latest.pt"
+        torch.save({
+            'memory_gpt_state_dict': self.inference.model.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict() if self.optimizer else None,
+            'train_steps': self.state.stats['train_steps'],
+            'train_articles': self.state.stats['train_articles'],
+        }, latest_path)
 
     def fetch_feeds(self) -> List[NewsArticle]:
         """Fetch articles from all RSS feeds."""
@@ -319,6 +508,22 @@ class NewsAwarenessSystem:
                 # Keep only recent high-surprise
                 self.state.high_surprise_articles = \
                     self.state.high_surprise_articles[-100:]
+
+        # Training: learn from high-salience articles
+        if self.train_mode and article.salience >= self.train_salience_threshold:
+            train_result = self.train_on_article(text)
+            self.state.stats['train_articles'] = self.state.stats.get('train_articles', 0) + 1
+
+            logger.info(
+                f"Trained on [{article.source}] {article.title[:40]}... "
+                f"(sal={article.salience:.3f}, loss={train_result.get('total_loss', 0):.4f}, "
+                f"lm={train_result.get('lm_loss', 0):.4f}, ret_ben={train_result.get('retrieval_benefit', 0):.4f})"
+            )
+
+            # Periodic checkpoint
+            train_steps = self.state.stats.get('train_steps', 0)
+            if train_steps > 0 and train_steps % self.checkpoint_interval == 0:
+                self._save_model_checkpoint()
 
         # Add to history
         self.state.article_history.append(asdict(article))
@@ -514,6 +719,7 @@ def interactive_mode(system: NewsAwarenessSystem):
     print("  /important       - Show high-surprise articles")
     print("  /fetch           - Manually fetch and process news")
     print("  /inspect <n>     - Inspect episode #n with surprising tokens")
+    print("  /training        - Show training statistics")
     print("  /save            - Save current state")
     print("  /quit            - Exit")
     print()
@@ -608,6 +814,23 @@ def interactive_mode(system: NewsAwarenessSystem):
                 system._save_state()
                 print("State saved.")
 
+            elif cmd == '/training':
+                stats = system.state.stats
+                print("\nTraining Statistics:")
+                print(f"  Mode: {'ENABLED' if system.train_mode else 'DISABLED'}")
+                if system.train_mode:
+                    print(f"  Learning rate: {system.train_lr}")
+                    print(f"  Salience threshold: {system.train_salience_threshold}")
+                print(f"  Training steps: {stats.get('train_steps', 0)}")
+                print(f"  Articles trained on: {stats.get('train_articles', 0)}")
+                if stats.get('train_steps', 0) > 0:
+                    avg_loss = stats.get('train_loss_sum', 0) / stats['train_steps']
+                    avg_lm = stats.get('train_lm_loss_sum', 0) / stats['train_steps']
+                    avg_ret = stats.get('train_retrieval_benefit_sum', 0) / stats['train_steps']
+                    print(f"  Avg total loss: {avg_loss:.4f}")
+                    print(f"  Avg LM loss: {avg_lm:.4f}")
+                    print(f"  Avg retrieval benefit: {avg_ret:.4f}")
+
             elif cmd == '/memory':
                 print(system.inference.get_memory_summary(top_k=10))
 
@@ -668,6 +891,16 @@ def main():
     parser.add_argument("--fetch_once", action="store_true",
                         help="Fetch and process once, then exit")
 
+    # Training options (continual learning from high-salience articles)
+    parser.add_argument("--train", action="store_true",
+                        help="Enable continual learning from high-salience articles")
+    parser.add_argument("--train_lr", type=float, default=1e-6,
+                        help="Learning rate for training (default: 1e-6, very low)")
+    parser.add_argument("--train_salience_threshold", type=float, default=0.8,
+                        help="Minimum salience to trigger training (default: 0.8)")
+    parser.add_argument("--checkpoint_interval", type=int, default=100,
+                        help="Save model checkpoint every N training steps (default: 100)")
+
     args = parser.parse_args()
 
     # Check dependencies
@@ -684,6 +917,11 @@ def main():
         crystallization_threshold=args.crystallization_threshold,
         fetch_interval=args.fetch_interval,
         save_interval=args.save_interval,
+        # Training options
+        train=args.train,
+        train_lr=args.train_lr,
+        train_salience_threshold=args.train_salience_threshold,
+        checkpoint_interval=args.checkpoint_interval,
     )
 
     # Execute mode
