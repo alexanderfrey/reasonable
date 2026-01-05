@@ -271,12 +271,11 @@ class MemoryInference:
                 }
 
                 # Experiential stats
-                if mem_out.get('chunk_surprise') is not None:
-                    chunk_detail['surprise'] = mem_out['chunk_surprise'].item()
-                    total_surprise += chunk_detail['surprise']
-
                 if mem_out.get('surprise') is not None:
-                    chunk_detail['raw_surprise'] = mem_out['surprise'].mean().item()
+                    chunk_surprise = mem_out['surprise'].mean().item()
+                    chunk_detail['surprise'] = chunk_surprise
+                    total_surprise += chunk_surprise
+                    chunk_detail['raw_surprise'] = chunk_surprise
 
                 if mem_out.get('meta_surprise') is not None:
                     chunk_detail['meta_surprise'] = mem_out['meta_surprise'].mean().item()

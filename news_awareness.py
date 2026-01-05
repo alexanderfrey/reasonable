@@ -210,6 +210,7 @@ class NewsAwarenessSystem:
         self.train_lr = train_lr
         self.train_salience_threshold = train_salience_threshold
         self.checkpoint_interval = checkpoint_interval
+        self._train_prev_memory_query = None
 
         # Initialize model
         logger.info("Initializing Memory-Augmented GPT...")
@@ -373,12 +374,18 @@ class NewsAwarenessSystem:
 
         # Forward pass with memory
         self.optimizer.zero_grad()
+        prev_memory_query = self._train_prev_memory_query
 
         logits, hidden, mem_out = model(
             input_ids,
             crystallize=False,  # Don't crystallize during training step
             use_memory=True,
+            prev_memory_query=prev_memory_query,
         )
+        if mem_out.get('next_memory_query') is not None:
+            self._train_prev_memory_query = mem_out['next_memory_query'].detach()
+        else:
+            self._train_prev_memory_query = None
 
         # Compute loss
         loss, loss_dict = memory_augmented_loss(
