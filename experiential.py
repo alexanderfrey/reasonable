@@ -57,6 +57,8 @@ class Episode:
     valence: float = 0.0        # emotional valence at the time
     arousal: float = 0.0        # arousal level at the time
     retrieval_count: int = 0    # how often accessed (for consolidation)
+    text: Optional[str] = None  # human-readable text for this episode
+    token_ids: Optional[List[int]] = None  # raw token ids for later decoding
 
     def to(self, device: torch.device) -> 'Episode':
         """Move episode tensors to device."""
@@ -67,7 +69,9 @@ class Episode:
             salience=self.salience,
             valence=self.valence,
             arousal=self.arousal,
-            retrieval_count=self.retrieval_count
+            retrieval_count=self.retrieval_count,
+            text=self.text,
+            token_ids=list(self.token_ids) if self.token_ids is not None else None,
         )
 
 
@@ -151,7 +155,9 @@ class EpisodicMemory(nn.Module):
         salience: float,
         valence: float = 0.0,
         arousal: float = 0.0,
-        timestamp: Optional[int] = None
+        timestamp: Optional[int] = None,
+        text: Optional[str] = None,
+        token_ids: Optional[List[int]] = None,
     ) -> Episode:
         """
         Store a new episode in memory.
@@ -163,6 +169,8 @@ class EpisodicMemory(nn.Module):
             valence: emotional valence
             arousal: arousal level
             timestamp: optional explicit timestamp
+            text: optional human-readable text for this episode
+            token_ids: optional raw token ids for later decoding
 
         Returns:
             The stored Episode
@@ -177,7 +185,9 @@ class EpisodicMemory(nn.Module):
             salience=salience,
             valence=valence,
             arousal=arousal,
-            retrieval_count=0
+            retrieval_count=0,
+            text=text,
+            token_ids=list(token_ids) if token_ids is not None else None,
         )
 
         # Apply decay to existing memories before adding new one
@@ -452,6 +462,31 @@ class EpisodicMemory(nn.Module):
             'avg_age': sum(ages) / len(ages),
             'max_age': max(ages)
         }
+
+    def snapshot(self) -> Dict[str, object]:
+        """Capture episodic memory contents for saving."""
+        episodes = []
+        for ep in self.episodes:
+            episodes.append(Episode(
+                timestamp=ep.timestamp,
+                content=ep.content.detach().clone(),
+                context=ep.context.detach().clone(),
+                salience=ep.salience,
+                valence=ep.valence,
+                arousal=ep.arousal,
+                retrieval_count=ep.retrieval_count,
+                text=ep.text,
+                token_ids=list(ep.token_ids) if ep.token_ids is not None else None,
+            ))
+        return {
+            'episodes': episodes,
+            'global_step': self._global_step,
+        }
+
+    def restore(self, snapshot: Dict[str, object]) -> None:
+        """Restore episodic memory from a snapshot."""
+        self.episodes = snapshot.get('episodes', [])
+        self._global_step = snapshot.get('global_step', 0)
 
 
 class ExperientialStream(nn.Module):
@@ -1561,6 +1596,8 @@ class MemoryAugmentedGPT(nn.Module):
         pad_token_id: Optional[int] = None,
         meta_surprise_salience_weight: float = 1.0,  # How much meta-surprise boosts salience
         retrieval_salience_weight: float = 0.0,  # Bias retrieval toward high-salience memories
+        tokenizer: Optional[Any] = None,
+        max_text_tokens: Optional[int] = None,
     ):
         """
         Args:
@@ -1579,6 +1616,8 @@ class MemoryAugmentedGPT(nn.Module):
             pad_token_id: Token ID for padding (excluded from surprise computation)
             meta_surprise_salience_weight: How much meta-surprise boosts salience (default 1.0, was 3.0)
             retrieval_salience_weight: Salience bias for episodic retrieval (0 = similarity only)
+            tokenizer: Optional tokenizer with a .decode method for episode text
+            max_text_tokens: Optional max number of tokens to decode/store per episode
         """
         super().__init__()
         self.gpt = gpt_model
@@ -1591,6 +1630,11 @@ class MemoryAugmentedGPT(nn.Module):
         self.retrieval_salience_weight = retrieval_salience_weight
         self.consolidation_interval = consolidation_interval
         self._step_counter = 0
+        if tokenizer is not None:
+            self.tokenizer = tokenizer
+        else:
+            self.tokenizer = getattr(gpt_model, "tokenizer", None)
+        self.max_text_tokens = max_text_tokens
         # Padding token ID for excluding pad tokens from surprise computation
         # Try to get from gpt config if not provided
         if pad_token_id is None and hasattr(gpt_model.config, 'pad_idx'):
@@ -1707,6 +1751,32 @@ class MemoryAugmentedGPT(nn.Module):
 
         nn.init.xavier_uniform_(self.query_proj.weight)
         nn.init.zeros_(self.query_proj.bias)
+
+    def set_tokenizer(self, tokenizer: Any, max_text_tokens: Optional[int] = None) -> None:
+        """Attach a tokenizer for decoding episode text."""
+        self.tokenizer = tokenizer
+        if max_text_tokens is not None:
+            self.max_text_tokens = max_text_tokens
+
+    def _prepare_episode_text(
+        self,
+        input_ids: torch.Tensor,
+    ) -> Tuple[Optional[str], Optional[List[int]]]:
+        token_ids = input_ids.detach().cpu().tolist()
+        if self.pad_token_id is not None:
+            while token_ids and token_ids[-1] == self.pad_token_id:
+                token_ids.pop()
+        if self.max_text_tokens is not None and len(token_ids) > self.max_text_tokens:
+            token_ids = token_ids[-self.max_text_tokens:]
+
+        text = None
+        if self.tokenizer is not None and hasattr(self.tokenizer, "decode"):
+            try:
+                text = self.tokenizer.decode(token_ids, skip_special_tokens=True)
+            except TypeError:
+                text = self.tokenizer.decode(token_ids)
+
+        return text, token_ids
 
     def forward(
         self,
@@ -1905,12 +1975,15 @@ class MemoryAugmentedGPT(nn.Module):
                 for i in range(batch_size):
                     salience = exp_output['salience'][i].item()
                     if self.memory.should_crystallize(salience):
+                        text, token_ids = self._prepare_episode_text(input_ids[i])
                         self.memory.store(
                             content=modulated[i],
                             context=exp_output['prediction'][i],
                             salience=salience,
                             valence=exp_output['valence'][i].item(),
-                            arousal=exp_output['arousal'][i].item()
+                            arousal=exp_output['arousal'][i].item(),
+                            text=text,
+                            token_ids=token_ids,
                         )
                         memory_output['crystallized'] = True
 
@@ -2187,12 +2260,15 @@ class MemoryAugmentedGPT(nn.Module):
                         if self.memory.size >= min_memories:
                             break
                         # Store with high salience to survive future decay
+                        text, token_ids = self._prepare_episode_text(input_ids[i])
                         self.memory.store(
                             content=h_end[i],
                             context=h_mid[i],
                             salience=0.8,  # High salience to survive decay
                             valence=0.0,
-                            arousal=0.5
+                            arousal=0.5,
+                            text=text,
+                            token_ids=token_ids,
                         )
 
                     # Restore decay setting

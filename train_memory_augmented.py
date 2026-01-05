@@ -55,11 +55,11 @@ def load_model(checkpoint_path: str, device: torch.device):
 
     # Extract config
     saved_config = checkpoint.get('config', {})
-    args = checkpoint.get('args', {})
-    if isinstance(args, dict):
+    saved_args = checkpoint.get('args', {})
+    if isinstance(saved_args, dict):
         for key in ['vocab_size', 'd_model', 'n_head', 'n_layer', 'max_seq_len', 'n_kv_head', 'd_ff']:
-            if key in args and key not in saved_config:
-                saved_config[key] = args[key]
+            if key in saved_args and key not in saved_config:
+                saved_config[key] = saved_args[key]
 
     # Infer d_ff from weights if needed
     d_ff = saved_config.get('d_ff')
@@ -98,7 +98,7 @@ def load_model(checkpoint_path: str, device: torch.device):
     model.load_state_dict(state_dict, strict=False)
     model = model.to(device)
 
-    return model, config
+    return model, config, saved_args
 
 
 def _load_token_memmap(token_file_path: str, dtype_name: Optional[str], data_type: str):
@@ -612,6 +612,10 @@ def main():
                         help="Train sequentially over corpus with doc-boundary resets")
     parser.add_argument("--doc_metadata", default=None,
                         help="Path to document metadata (default: data_dir/book_corpus_metadata.json)")
+    parser.add_argument("--tokenizer_name", default=None,
+                        help="Tokenizer name for episode text decoding (defaults to checkpoint args if present)")
+    parser.add_argument("--max_text_tokens", type=int, default=None,
+                        help="Max tokens to decode/store per episode (default: no limit)")
 
     # Memory params
     parser.add_argument("--integration", choices=['residual', 'gated', 'attention', 'cross_attention'], default='gated')
@@ -669,7 +673,7 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
 
     # Load model
-    gpt, config = load_model(args.checkpoint, device)
+    gpt, config, saved_args = load_model(args.checkpoint, device)
 
     # Wrap with memory
     memory_gpt = MemoryAugmentedGPT(
@@ -680,6 +684,28 @@ def main():
         use_experiential=True,
         meta_surprise_salience_weight=args.meta_surprise_salience_weight,
     ).to(device)
+
+    tokenizer_name = args.tokenizer_name
+    if tokenizer_name is None and isinstance(saved_args, dict):
+        tokenizer_name = saved_args.get("tokenizer_name") or saved_args.get("tokenizer")
+    if tokenizer_name:
+        try:
+            from transformers import AutoTokenizer
+            logger.info(f"Loading tokenizer: {tokenizer_name}")
+            tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, trust_remote_code=True)
+            memory_gpt.set_tokenizer(tokenizer, max_text_tokens=args.max_text_tokens)
+            logger.info(
+                "Episode text decoding enabled (max_text_tokens=%s)",
+                "none" if args.max_text_tokens is None else args.max_text_tokens,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Failed to load tokenizer '%s': %s. Episode text will be unavailable.",
+                tokenizer_name,
+                exc,
+            )
+    else:
+        logger.info("Tokenizer not set; episode text will not be stored.")
 
     n_params = sum(p.numel() for p in memory_gpt.parameters() if p.requires_grad)
     logger.info(f"Trainable parameters: {n_params:,}")
@@ -770,6 +796,7 @@ def main():
             'config': vars(config),
             'args': vars(args),
             'eval_metrics': eval_metrics,
+            'episodic_memory': memory_gpt.memory.snapshot(),
         }, save_path)
         logger.info(f"Saved checkpoint to {save_path}")
 

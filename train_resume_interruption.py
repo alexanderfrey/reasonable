@@ -854,6 +854,7 @@ def main():
         'optimizer_state_dict': optimizer.state_dict(),
         'args': vars(args),
         'results': results,
+        'episodic_memory': memory_gpt.memory.snapshot(),
     }, checkpoint_path)
     logger.info(f"Saved checkpoint to {checkpoint_path}")
 
