@@ -58,8 +58,14 @@ document.addEventListener('DOMContentLoaded', () => {
         memoryTrace: document.getElementById('memoryTrace'),
         centerDot: document.getElementById('centerDot'),
         loopLabels: document.querySelectorAll('.loop-label'),
-        heroLogo: document.getElementById('heroLogo')
+        heroLogo: document.getElementById('heroLogo'),
+        geoCircle: document.querySelector('.geo-circle'),
+        header: document.querySelector('.site-header'),
+        hero: document.querySelector('.hero')
     };
+
+    // Initialize scroll-based circle animation
+    initScrollAnimation();
 
     // Initialize hero logo animations
     initStarfieldAnimation();
@@ -72,6 +78,94 @@ document.addEventListener('DOMContentLoaded', () => {
     console.log('%cMemory Streams \u2014 Four temporal scales. One experiencing self.', 'color: #5a6270;');
     console.log('%c"You are here to develop yourself. Wake up and start with it."', 'color: #9ba1ab; font-style: italic;');
 });
+
+function initScrollAnimation() {
+    const circle = elements.geoCircle;
+    const hero = elements.hero;
+
+    if (!circle || !hero) return;
+
+    // Store initial position
+    let initialRect = circle.getBoundingClientRect();
+    let initialTop = initialRect.top + window.scrollY;
+    let initialLeft = initialRect.left;
+    let initialWidth = initialRect.width;
+
+    // Target position (top left corner)
+    const targetTop = 24;
+    const targetLeft = 24;
+    const targetScale = 0.25;
+
+    let ticking = false;
+
+    function updateCirclePosition() {
+        const scrollY = window.scrollY;
+        const heroHeight = hero.offsetHeight;
+        const triggerPoint = heroHeight * 0.2;
+        const endPoint = heroHeight * 0.6;
+
+        // Calculate progress (0 = top, 1 = scrolled past trigger)
+        let progress = 0;
+        if (scrollY > triggerPoint) {
+            progress = Math.min((scrollY - triggerPoint) / (endPoint - triggerPoint), 1);
+        }
+
+        // Ease the progress
+        const easedProgress = easeOutCubic(progress);
+
+        if (progress > 0) {
+            // Calculate current position
+            const currentTop = initialTop - scrollY;
+            const currentLeft = initialLeft;
+
+            // Calculate translation needed
+            const translateX = (targetLeft - currentLeft) * easedProgress;
+            const translateY = (targetTop - currentTop) * easedProgress;
+            const scale = 1 - (1 - targetScale) * easedProgress;
+
+            circle.style.position = 'fixed';
+            circle.style.top = `${currentTop + translateY}px`;
+            circle.style.left = `${currentLeft + translateX}px`;
+            circle.style.transform = `scale(${scale})`;
+            circle.style.transformOrigin = 'top left';
+            circle.style.zIndex = '101';
+        } else {
+            // Reset to normal flow
+            circle.style.position = '';
+            circle.style.top = '';
+            circle.style.left = '';
+            circle.style.transform = '';
+            circle.style.transformOrigin = '';
+            circle.style.zIndex = '';
+        }
+
+        ticking = false;
+    }
+
+    function easeOutCubic(t) {
+        return 1 - Math.pow(1 - t, 3);
+    }
+
+    // Recalculate initial position on resize
+    window.addEventListener('resize', () => {
+        if (window.scrollY === 0) {
+            initialRect = circle.getBoundingClientRect();
+            initialTop = initialRect.top + window.scrollY;
+            initialLeft = initialRect.left;
+            initialWidth = initialRect.width;
+        }
+    });
+
+    window.addEventListener('scroll', () => {
+        if (!ticking) {
+            requestAnimationFrame(updateCirclePosition);
+            ticking = true;
+        }
+    });
+
+    // Initial call
+    updateCirclePosition();
+}
 
 function initStarfieldAnimation() {
     if (!elements.heroLogo) return;
