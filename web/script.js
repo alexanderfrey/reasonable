@@ -57,16 +57,122 @@ document.addEventListener('DOMContentLoaded', () => {
         currentPhase: document.getElementById('currentPhase'),
         memoryTrace: document.getElementById('memoryTrace'),
         centerDot: document.getElementById('centerDot'),
-        loopLabels: document.querySelectorAll('.loop-label')
+        loopLabels: document.querySelectorAll('.loop-label'),
+        heroLogo: document.getElementById('heroLogo')
     };
+
+    // Initialize hero logo animations
+    initStarfieldAnimation();
 
     // Start the simulation
     startSimulation();
 
     // Console easter egg
-    console.log('%c◉ entitic.ai', 'font-size: 24px; font-weight: bold; color: #6366f1;');
-    console.log('%cMemory Streams — Four temporal scales. One experiencing self.', 'color: #8b929a;');
+    console.log('%c\u25C9 entitic.ai', 'font-size: 24px; font-weight: bold; color: #818cf8;');
+    console.log('%cMemory Streams \u2014 Four temporal scales. One experiencing self.', 'color: #5a6270;');
+    console.log('%c"You are here to develop yourself. Wake up and start with it."', 'color: #9ba1ab; font-style: italic;');
 });
+
+function initStarfieldAnimation() {
+    if (!elements.heroLogo) return;
+
+    const svg = elements.heroLogo.querySelector('svg');
+    if (!svg) return;
+
+    // Get all stars in the starfield
+    const stars = svg.querySelectorAll('.starfield circle');
+    const centerX = 200;
+    const centerY = 200;
+    const radius = 160;
+
+    // Store original positions and convert to spherical coordinates
+    const starData = [];
+    stars.forEach((star) => {
+        const cx = parseFloat(star.getAttribute('cx'));
+        const cy = parseFloat(star.getAttribute('cy'));
+        const baseOpacity = parseFloat(star.getAttribute('opacity')) || 0.5;
+        const baseRadius = parseFloat(star.getAttribute('r')) || 2;
+
+        // Convert 2D position to spherical coordinates
+        const dx = cx - centerX;
+        const dy = cy - centerY;
+        const distFromCenter = Math.sqrt(dx * dx + dy * dy);
+
+        // Map to sphere: theta (horizontal angle), phi (vertical angle)
+        const theta = Math.atan2(dy, dx);
+        const phi = Math.acos(Math.min(1, distFromCenter / radius));
+
+        starData.push({
+            element: star,
+            theta: theta,
+            phi: phi,
+            baseOpacity: baseOpacity,
+            baseRadius: baseRadius,
+            originalR: baseRadius
+        });
+    });
+
+    // Animation loop for sphere rotation
+    let rotationY = 0;
+    let rotationX = 0;
+
+    function animateSphere() {
+        rotationY += 0.003; // Slow horizontal rotation
+        rotationX += 0.001; // Very slow vertical wobble
+
+        starData.forEach((data) => {
+            // Apply rotation to spherical coordinates
+            const newTheta = data.theta + rotationY;
+            const newPhi = data.phi + Math.sin(rotationX) * 0.1;
+
+            // Convert back to 3D cartesian
+            const x = radius * Math.sin(newPhi) * Math.cos(newTheta);
+            const y = radius * Math.sin(newPhi) * Math.sin(newTheta);
+            const z = radius * Math.cos(newPhi);
+
+            // Project to 2D with perspective
+            const perspective = 400;
+            const scale = perspective / (perspective + z);
+
+            const screenX = centerX + x * scale;
+            const screenY = centerY + y * scale;
+
+            // Update position
+            data.element.setAttribute('cx', screenX);
+            data.element.setAttribute('cy', screenY);
+
+            // Adjust size and opacity based on z-depth (closer = bigger/brighter)
+            const depthScale = (z + radius) / (2 * radius); // 0 to 1, front to back
+            const newOpacity = data.baseOpacity * (0.3 + depthScale * 0.7);
+            const newRadius = data.baseRadius * (0.6 + depthScale * 0.5);
+
+            data.element.setAttribute('opacity', newOpacity);
+            data.element.setAttribute('r', newRadius);
+        });
+
+        requestAnimationFrame(animateSphere);
+    }
+
+    animateSphere();
+
+    // Add CSS for boundary rotation
+    if (!document.getElementById('starfield-styles')) {
+        const style = document.createElement('style');
+        style.id = 'starfield-styles';
+        style.textContent = `
+            .circle-boundary {
+                animation: slowRotate 120s linear infinite;
+                transform-origin: 200px 200px;
+            }
+
+            @keyframes slowRotate {
+                from { transform: rotate(0deg); }
+                to { transform: rotate(360deg); }
+            }
+        `;
+        document.head.appendChild(style);
+    }
+}
 
 function startSimulation() {
     // Add initial feed items
