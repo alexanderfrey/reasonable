@@ -335,6 +335,9 @@ def train_epoch(
     optimizer: torch.optim.Optimizer,
     device: torch.device,
     log_interval: int = 50,
+    memory_log_interval: int = 0,
+    memory_log_top_k: int = 5,
+    memory_log_max_chars: int = 200,
     max_steps: Optional[int] = None,
     lm_weight: float = 1.0,
     exp_weight: float = 0.1,
@@ -463,6 +466,14 @@ def train_epoch(
         # Contrastive loss
         history['contrastive_loss'].append(loss_dict.get('contrastive_loss', 0.0))
 
+        if memory_log_interval and step % memory_log_interval == 0:
+            memory_report = _format_top_episodes(
+                memory_gpt.memory,
+                top_k=memory_log_top_k,
+                max_chars=memory_log_max_chars,
+            )
+            logger.info("Top episodic memories (by salience):\n%s", memory_report)
+
         # Log
         if step % log_interval == 0:
             avg_loss = total_loss / (step + 1)
@@ -479,6 +490,25 @@ def train_epoch(
             break
 
     return history
+
+
+def _format_top_episodes(memory, top_k: int, max_chars: int) -> str:
+    if memory.size == 0:
+        return "(memory empty)"
+    episodes = sorted(memory.episodes, key=lambda e: e.salience, reverse=True)[:top_k]
+    lines = []
+    for i, ep in enumerate(episodes, start=1):
+        text = ep.text or ""
+        if text:
+            text = " ".join(text.split())
+        else:
+            text = "(no text stored)"
+        if max_chars > 0 and len(text) > max_chars:
+            text = text[: max_chars - 3] + "..."
+        lines.append(
+            f"{i}. salience={ep.salience:.3f} retrievals={ep.retrieval_count} text={text}"
+        )
+    return "\n".join(lines)
 
 
 def evaluate(
@@ -608,8 +638,9 @@ def main():
     parser.add_argument("--max_steps", type=int, default=None)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--accumulation_steps", type=int, default=4)
-    parser.add_argument("--sequential", action="store_true",
-                        help="Train sequentially over corpus with doc-boundary resets")
+    parser.add_argument("--no-sequential", dest="sequential", action="store_false",
+                        help="Disable sequential training (shuffle batches and reset state)")
+    parser.set_defaults(sequential=True)
     parser.add_argument("--doc_metadata", default=None,
                         help="Path to document metadata (default: data_dir/book_corpus_metadata.json)")
     parser.add_argument("--tokenizer_name", default=None,
@@ -644,6 +675,12 @@ def main():
     # Salience calibration
     parser.add_argument("--meta_surprise_salience_weight", type=float, default=1.0,
                         help="How much meta-surprise boosts salience (default 1.0)")
+    parser.add_argument("--memory_log_interval", type=int, default=0,
+                        help="Steps between logging top episodic memories (0 = disable)")
+    parser.add_argument("--memory_log_top_k", type=int, default=5,
+                        help="How many top episodic memories to show")
+    parser.add_argument("--memory_log_max_chars", type=int, default=200,
+                        help="Max chars per episodic text snippet")
 
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--log_interval", type=int, default=50)
@@ -668,6 +705,12 @@ def main():
                 f"retrieval_benefit={args.retrieval_benefit_weight}, "
                 f"contrastive={args.contrastive_weight}")
     logger.info(f"  Pre-population: {args.prepopulate_steps} steps, min {args.min_memories} memories")
+    logger.info(
+        "  Memory logging: every %s steps, top_k=%s, max_chars=%s",
+        args.memory_log_interval,
+        args.memory_log_top_k,
+        args.memory_log_max_chars,
+    )
     logger.info("=" * 60)
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -761,6 +804,9 @@ def main():
             optimizer,
             device,
             log_interval=args.log_interval,
+            memory_log_interval=args.memory_log_interval,
+            memory_log_top_k=args.memory_log_top_k,
+            memory_log_max_chars=args.memory_log_max_chars,
             max_steps=args.max_steps,
             lm_weight=args.lm_weight,
             exp_weight=args.exp_weight,
