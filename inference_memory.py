@@ -218,9 +218,26 @@ class MemoryInference:
             'avg_surprise': 0.0,
             'crystallized_count': 0,
             'retrieved_memories': [],
+            # Experiential stats
+            'avg_meta_surprise': 0.0,
+            'avg_confidence': 0.0,
+            'avg_valence': 0.0,
+            'avg_arousal': 0.0,
+            'avg_salience': 0.0,
+            # EMA baseline stats
+            'ema_mu': None,
+            'ema_sigma': None,
+            # Per-chunk details
+            'chunk_details': [],
         }
 
+        # Accumulators
         total_surprise = 0.0
+        total_meta_surprise = 0.0
+        total_confidence = 0.0
+        total_valence = 0.0
+        total_arousal = 0.0
+        total_salience = 0.0
         prev_memory_query = None
 
         # Process in chunks
@@ -247,24 +264,64 @@ class MemoryInference:
                 if mem_out.get('next_memory_query') is not None:
                     prev_memory_query = mem_out['next_memory_query']
 
-                # Accumulate stats
-                if mem_out.get('chunk_surprise') is not None:
-                    total_surprise += mem_out['chunk_surprise'].item()
+                # Collect chunk details
+                chunk_detail = {
+                    'chunk_idx': results['chunks_processed'],
+                    'tokens': len(chunk_tokens),
+                }
 
+                # Experiential stats
+                if mem_out.get('chunk_surprise') is not None:
+                    chunk_detail['surprise'] = mem_out['chunk_surprise'].item()
+                    total_surprise += chunk_detail['surprise']
+
+                if mem_out.get('surprise') is not None:
+                    chunk_detail['raw_surprise'] = mem_out['surprise'].mean().item()
+
+                if mem_out.get('meta_surprise') is not None:
+                    chunk_detail['meta_surprise'] = mem_out['meta_surprise'].mean().item()
+                    total_meta_surprise += chunk_detail['meta_surprise']
+
+                if mem_out.get('confidence_gate') is not None:
+                    chunk_detail['confidence'] = mem_out['confidence_gate'].mean().item()
+                    total_confidence += chunk_detail['confidence']
+
+                if mem_out.get('valence') is not None:
+                    chunk_detail['valence'] = mem_out['valence'].mean().item()
+                    total_valence += chunk_detail['valence']
+
+                if mem_out.get('arousal') is not None:
+                    chunk_detail['arousal'] = mem_out['arousal'].mean().item()
+                    total_arousal += chunk_detail['arousal']
+
+                if mem_out.get('salience') is not None:
+                    chunk_detail['salience'] = mem_out['salience'].mean().item()
+                    total_salience += chunk_detail['salience']
+
+                # EMA baseline stats
+                if mem_out.get('ema_mu') is not None:
+                    results['ema_mu'] = mem_out['ema_mu']
+                    results['ema_sigma'] = mem_out.get('ema_sigma')
+
+                # Crystallization
                 if mem_out.get('crystallized', False):
                     results['crystallized_count'] += 1
+                    chunk_detail['crystallized'] = True
 
                 # Track retrieved memories
                 if mem_out.get('episodic_weights') is not None:
                     weights = mem_out['episodic_weights']
                     if weights.numel() > 0:
                         top_weight, top_idx = weights.max(dim=-1)
+                        chunk_detail['top_retrieval_weight'] = top_weight.item()
                         if top_weight.item() > 0.1:
                             results['retrieved_memories'].append({
                                 'chunk': results['chunks_processed'],
                                 'weight': top_weight.item(),
                                 'memory_idx': top_idx.item(),
                             })
+
+                results['chunk_details'].append(chunk_detail)
 
             results['chunks_processed'] += 1
 
@@ -275,7 +332,15 @@ class MemoryInference:
             start = end - overlap if end < len(tokens) else end
 
         results['memories_after'] = self.model.memory.size
-        results['avg_surprise'] = total_surprise / max(1, results['chunks_processed'])
+
+        # Compute averages
+        n_chunks = max(1, results['chunks_processed'])
+        results['avg_surprise'] = total_surprise / n_chunks
+        results['avg_meta_surprise'] = total_meta_surprise / n_chunks
+        results['avg_confidence'] = total_confidence / n_chunks
+        results['avg_valence'] = total_valence / n_chunks
+        results['avg_arousal'] = total_arousal / n_chunks
+        results['avg_salience'] = total_salience / n_chunks
 
         # Update global stats
         self.stats['chunks_processed'] += results['chunks_processed']
@@ -412,6 +477,77 @@ class MemoryInference:
 
         return self.tokenizer.decode(generated)
 
+    def get_experiential_state(self) -> Dict[str, Any]:
+        """Get current state of the experiential stream."""
+        exp = self.model.experiential
+        if exp is None:
+            return {'enabled': False}
+
+        state = {
+            'enabled': True,
+            'has_persistent_state': exp.get_state() is not None,
+            'd_model': exp.d_model,
+            'use_affect': exp.use_affect,
+            'use_meta_surprise': exp.use_meta_surprise,
+            'use_persistent_state': exp.use_persistent_state,
+        }
+
+        # EMA statistics (baseline for surprise)
+        state['ema_mu'] = exp.ema_mu.item()
+        state['ema_sigma'] = exp.ema_sigma.item()
+        state['ema_initialized'] = exp.ema_initialized.item()
+
+        # Raw surprise EMA
+        state['ema_raw_mu'] = exp.ema_raw_mu.item()
+        state['ema_raw_sigma'] = exp.ema_raw_sigma.item()
+
+        # Persistent state info
+        if exp.get_state() is not None:
+            ps = exp.get_state()
+            state['persistent_state_shape'] = list(ps.shape)
+            state['persistent_state_norm'] = ps.norm().item()
+            state['persistent_state_mean'] = ps.mean().item()
+            state['persistent_state_std'] = ps.std().item()
+
+        return state
+
+    def get_experiential_summary(self) -> str:
+        """Get human-readable summary of experiential state."""
+        state = self.get_experiential_state()
+
+        if not state.get('enabled'):
+            return "Experiential stream not enabled."
+
+        lines = [
+            "Experiential Stream State",
+            "=" * 50,
+            f"Model dimension: {state['d_model']}",
+            f"Features: affect={state['use_affect']}, meta_surprise={state['use_meta_surprise']}, persistent_state={state['use_persistent_state']}",
+            "",
+            "EMA Baseline Statistics:",
+            f"  CE baseline (mu): {state['ema_mu']:.4f}",
+            f"  CE spread (sigma): {state['ema_sigma']:.4f}",
+            f"  Initialized: {state['ema_initialized']}",
+            "",
+            "Raw Surprise EMA:",
+            f"  Mean: {state['ema_raw_mu']:.4f}",
+            f"  Sigma: {state['ema_raw_sigma']:.4f}",
+        ]
+
+        if state.get('persistent_state_shape'):
+            lines.extend([
+                "",
+                "Persistent State:",
+                f"  Shape: {state['persistent_state_shape']}",
+                f"  Norm: {state['persistent_state_norm']:.4f}",
+                f"  Mean: {state['persistent_state_mean']:.4f}",
+                f"  Std: {state['persistent_state_std']:.4f}",
+            ])
+        else:
+            lines.append("\nPersistent State: None (not initialized)")
+
+        return "\n".join(lines)
+
     def get_memory_summary(self, top_k: int = 10) -> str:
         """Get a human-readable summary of current memory state."""
         memory = self.model.memory
@@ -529,18 +665,23 @@ def interactive_mode(inference: MemoryInference):
     print("\n" + "=" * 60)
     print("Memory-Augmented GPT - Interactive Mode")
     print("=" * 60)
+    print(f"\nModel: d_model={inference.model.gpt.config.d_model}, "
+          f"Memory: {inference.model.memory.size} episodes")
     print("\nCommands:")
     print("  /process <text>  - Process text and accumulate memories")
     print("  /generate <prompt> - Generate continuation")
     print("  /query <text>    - Query memory for similar content")
     print("  /memory          - Show memory summary")
+    print("  /experiential    - Show experiential stream state")
     print("  /stats           - Show processing statistics")
+    print("  /detail          - Show detailed last result")
     print("  /save <path>     - Save memory state")
     print("  /load <path>     - Load memory state")
     print("  /clear           - Clear all memories")
     print("  /help            - Show this help")
     print("  /quit            - Exit")
-    print("\nOr just type text to process it.\n")
+    print("\nOr just type text to process it.")
+    print("Stats shown: Surprise | Confidence | Salience | Crystallized | Memory size\n")
 
     while True:
         try:
@@ -564,13 +705,18 @@ def interactive_mode(inference: MemoryInference):
                     print("  /generate <prompt> - Generate continuation")
                     print("  /query <text>    - Query memory for similar content")
                     print("  /memory          - Show memory summary")
+                    print("  /experiential    - Show experiential stream state")
                     print("  /stats           - Show processing statistics")
+                    print("  /detail          - Show last processing details")
                     print("  /save <path>     - Save memory state")
                     print("  /load <path>     - Load memory state")
                     print("  /clear           - Clear all memories")
 
                 elif cmd == '/memory':
                     print("\n" + inference.get_memory_summary())
+
+                elif cmd == '/experiential':
+                    print("\n" + inference.get_experiential_summary())
 
                 elif cmd == '/stats':
                     print(f"\nProcessing Statistics:")
@@ -579,6 +725,12 @@ def interactive_mode(inference: MemoryInference):
                     print(f"  Tokens processed: {inference.stats['tokens_processed']}")
                     print(f"  Memories crystallized: {inference.stats['memories_crystallized']}")
                     print(f"  Current memory size: {inference.model.memory.size}")
+                    # Show experiential EMA stats
+                    exp_state = inference.get_experiential_state()
+                    if exp_state.get('enabled'):
+                        print(f"\nExperiential Baseline:")
+                        print(f"  EMA mu (CE baseline): {exp_state['ema_mu']:.4f}")
+                        print(f"  EMA sigma (CE spread): {exp_state['ema_sigma']:.4f}")
 
                 elif cmd == '/clear':
                     inference.clear_memory()
@@ -596,15 +748,53 @@ def interactive_mode(inference: MemoryInference):
                     inference.load_memory(arg)
                     print(f"Loaded from {arg}")
 
+                elif cmd == '/detail':
+                    if not hasattr(inference, '_last_result') or inference._last_result is None:
+                        print("No processing results yet. Run /process <text> first.")
+                        continue
+                    result = inference._last_result
+                    print(f"\nLast Processing Details:")
+                    print(f"=" * 50)
+                    print(f"Tokens: {result['tokens_processed']} in {result['chunks_processed']} chunks")
+                    print(f"\nExperiential Metrics (averages):")
+                    print(f"  Surprise: {result['avg_surprise']:.4f}")
+                    print(f"  Meta-surprise: {result['avg_meta_surprise']:.4f}")
+                    print(f"  Confidence: {result['avg_confidence']:.4f}")
+                    print(f"  Valence: {result['avg_valence']:.4f}")
+                    print(f"  Arousal: {result['avg_arousal']:.4f}")
+                    print(f"  Salience: {result['avg_salience']:.4f}")
+                    if result.get('ema_mu') is not None:
+                        print(f"\nEMA Baseline:")
+                        print(f"  CE mean: {result['ema_mu']:.4f}")
+                        print(f"  CE sigma: {result['ema_sigma']:.4f}")
+                    print(f"\nMemory:")
+                    print(f"  Before: {result['memories_before']}, After: {result['memories_after']}")
+                    print(f"  Crystallized: {result['crystallized_count']}")
+                    if result['retrieved_memories']:
+                        print(f"  Retrievals: {len(result['retrieved_memories'])}")
+                    if result['chunk_details']:
+                        print(f"\nPer-chunk details (last 5):")
+                        for chunk in result['chunk_details'][-5:]:
+                            flags = []
+                            if chunk.get('crystallized'):
+                                flags.append("CRYST")
+                            flags_str = f" [{','.join(flags)}]" if flags else ""
+                            print(f"  Chunk {chunk['chunk_idx']}: surp={chunk.get('surprise', 0):.3f}, "
+                                  f"conf={chunk.get('confidence', 0):.3f}, "
+                                  f"sal={chunk.get('salience', 0):.3f}{flags_str}")
+
                 elif cmd == '/process':
                     if not arg:
                         print("Usage: /process <text>")
                         continue
                     result = inference.process_text(arg)
-                    print(f"\nProcessed {result['tokens_processed']} tokens")
-                    print(f"Surprise: {result['avg_surprise']:.3f}")
-                    print(f"Crystallized: {result['crystallized_count']} memories")
-                    print(f"Memory size: {result['memories_after']}")
+                    inference._last_result = result  # Store for /detail
+                    print(f"\nProcessed {result['tokens_processed']} tokens in {result['chunks_processed']} chunks")
+                    print(f"  Surprise: {result['avg_surprise']:.3f} | Meta-surprise: {result['avg_meta_surprise']:.3f}")
+                    print(f"  Confidence: {result['avg_confidence']:.3f} | Salience: {result['avg_salience']:.3f}")
+                    print(f"  Valence: {result['avg_valence']:.3f} | Arousal: {result['avg_arousal']:.3f}")
+                    print(f"  Crystallized: {result['crystallized_count']} | Memory: {result['memories_after']}")
+                    print("  (Use /detail for more info)")
 
                 elif cmd == '/generate':
                     if not arg:
@@ -639,10 +829,13 @@ def interactive_mode(inference: MemoryInference):
             else:
                 # Default: process text
                 result = inference.process_text(user_input)
+                inference._last_result = result  # Store for /detail
                 print(f"\nProcessed {result['tokens_processed']} tokens | "
                       f"Surprise: {result['avg_surprise']:.3f} | "
-                      f"Crystallized: {result['crystallized_count']} | "
-                      f"Memory: {result['memories_after']}")
+                      f"Conf: {result['avg_confidence']:.3f} | "
+                      f"Sal: {result['avg_salience']:.3f} | "
+                      f"Cryst: {result['crystallized_count']} | "
+                      f"Mem: {result['memories_after']}")
 
         except KeyboardInterrupt:
             print("\n\nInterrupted. Type /quit to exit.")

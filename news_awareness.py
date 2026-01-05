@@ -105,6 +105,12 @@ class NewsArticle:
     processed: bool = False
     crystallized: bool = False
     surprise_score: float = 0.0
+    # Experiential stats
+    meta_surprise: float = 0.0
+    confidence: float = 0.0
+    valence: float = 0.0
+    arousal: float = 0.0
+    salience: float = 0.0
 
     def to_text(self) -> str:
         """Convert to text for processing."""
@@ -281,10 +287,15 @@ class NewsAwarenessSystem:
             use_memory=True,
         )
 
-        # Update article
+        # Update article with experiential stats
         article.processed = True
         article.crystallized = result['crystallized_count'] > 0
         article.surprise_score = result['avg_surprise']
+        article.meta_surprise = result.get('avg_meta_surprise', 0.0)
+        article.confidence = result.get('avg_confidence', 0.0)
+        article.valence = result.get('avg_valence', 0.0)
+        article.arousal = result.get('avg_arousal', 0.0)
+        article.salience = result.get('avg_salience', 0.0)
 
         # Update state
         self.state.processed_ids.add(article.id)
@@ -335,11 +346,15 @@ class NewsAwarenessSystem:
                         'title': article.title,
                         'source': article.source,
                         'surprise': result['avg_surprise'],
+                        'salience': result.get('avg_salience', 0.0),
+                        'valence': result.get('avg_valence', 0.0),
+                        'arousal': result.get('avg_arousal', 0.0),
                     })
 
                     logger.info(
-                        f"Crystallized [{article.source}] {article.title[:60]}... "
-                        f"(surprise={result['avg_surprise']:.3f})"
+                        f"Crystallized [{article.source}] {article.title[:50]}... "
+                        f"(surp={result['avg_surprise']:.3f}, sal={result.get('avg_salience', 0):.3f}, "
+                        f"val={result.get('avg_valence', 0):.2f}, aro={result.get('avg_arousal', 0):.2f})"
                     )
 
             except Exception as e:
@@ -487,9 +502,12 @@ def interactive_mode(system: NewsAwarenessSystem):
     print("\n" + "=" * 60)
     print("News Awareness System - Interactive Mode")
     print("=" * 60)
+    print(f"\nMemory: {system.inference.model.memory.size} episodes | "
+          f"Articles processed: {system.state.stats['articles_processed']}")
     print("\nCommands:")
     print("  /query <text>    - Query accumulated knowledge")
     print("  /summary         - Show system summary")
+    print("  /experiential    - Show experiential stream state")
     print("  /recent          - Show recent crystallizations")
     print("  /briefing [topic]- Generate news briefing")
     print("  /sources         - Show source statistics")
@@ -543,12 +561,18 @@ def interactive_mode(system: NewsAwarenessSystem):
                 for source, count in list(summary['source_distribution'].items())[:5]:
                     print(f"  {source}: {count}")
 
+            elif cmd == '/experiential':
+                print("\n" + system.inference.get_experiential_summary())
+
             elif cmd == '/recent':
                 recent = system.get_recent_crystallizations(10)
                 print(f"\nRecent crystallized articles:")
                 for i, article in enumerate(recent, 1):
                     print(f"\n{i}. [{article['source']}] {article['title'][:60]}...")
-                    print(f"   Surprise: {article['surprise_score']:.3f}")
+                    print(f"   Surprise: {article['surprise_score']:.3f} | "
+                          f"Salience: {article.get('salience', 0):.3f} | "
+                          f"Valence: {article.get('valence', 0):.2f} | "
+                          f"Arousal: {article.get('arousal', 0):.2f}")
 
             elif cmd == '/briefing':
                 print("\nGenerating briefing...")
