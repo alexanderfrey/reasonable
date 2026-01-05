@@ -513,6 +513,7 @@ def interactive_mode(system: NewsAwarenessSystem):
     print("  /sources         - Show source statistics")
     print("  /important       - Show high-surprise articles")
     print("  /fetch           - Manually fetch and process news")
+    print("  /inspect <n>     - Inspect episode #n with surprising tokens")
     print("  /save            - Save current state")
     print("  /quit            - Exit")
     print()
@@ -609,6 +610,16 @@ def interactive_mode(system: NewsAwarenessSystem):
 
             elif cmd == '/memory':
                 print(system.inference.get_memory_summary(top_k=10))
+
+            elif cmd == '/inspect':
+                if not arg:
+                    print(f"Usage: /inspect <n>  (1 to {system.inference.model.memory.size})")
+                    continue
+                try:
+                    idx = int(arg)
+                    print("\n" + system.inference.format_episode_details(idx))
+                except ValueError:
+                    print(f"Invalid episode number: {arg}")
 
             else:
                 # Default: treat as query

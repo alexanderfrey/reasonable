@@ -637,6 +637,157 @@ class MemoryInference:
 
         return results
 
+    def get_episode_details(self, episode_idx: int, top_k_tokens: int = 10) -> Dict[str, Any]:
+        """Get detailed information about a specific episode including surprising tokens.
+
+        Args:
+            episode_idx: Index of the episode (1-based for user friendliness)
+            top_k_tokens: Number of top surprising tokens to show
+
+        Returns:
+            Dict with episode details
+        """
+        if episode_idx < 1 or episode_idx > self.model.memory.size:
+            return {'error': f'Episode index must be between 1 and {self.model.memory.size}'}
+
+        ep = self.model.memory.episodes[episode_idx - 1]
+
+        details = {
+            'index': episode_idx,
+            'timestamp': ep.timestamp,
+            'salience': ep.salience,
+            'valence': ep.valence,
+            'arousal': ep.arousal,
+            'retrieval_count': ep.retrieval_count,
+            'text': ep.text,
+            'has_token_surprises': ep.token_surprises is not None,
+        }
+
+        # Get surprising tokens if available
+        if ep.token_surprises is not None and ep.token_ids is not None:
+            surprising = ep.get_surprising_tokens(self.tokenizer, top_k=top_k_tokens)
+            details['top_surprising_tokens'] = surprising
+
+            # Also provide summary stats
+            details['token_count'] = len(ep.token_ids)
+            details['avg_surprise'] = sum(ep.token_surprises) / len(ep.token_surprises)
+            details['max_surprise'] = max(ep.token_surprises)
+            details['min_surprise'] = min(ep.token_surprises)
+
+        return details
+
+    def colorize_episode_text(self, episode_idx: int) -> str:
+        """Get episode text colorized by per-token surprise using ANSI codes.
+
+        Color scale (by percentile):
+        - Gray/dim: bottom 25% (expected tokens)
+        - White: 25-50%
+        - Yellow: 50-75%
+        - Red: 75-90%
+        - Bright red + bold: top 10% (most surprising)
+        """
+        if episode_idx < 1 or episode_idx > self.model.memory.size:
+            return f'Episode index must be between 1 and {self.model.memory.size}'
+
+        ep = self.model.memory.episodes[episode_idx - 1]
+
+        if ep.token_surprises is None or ep.token_ids is None:
+            return "(No per-token surprise data - cannot colorize)"
+
+        if self.tokenizer is None:
+            return "(No tokenizer loaded - cannot colorize)"
+
+        # ANSI color codes
+        RESET = '\033[0m'
+        DIM = '\033[2m'        # dim/gray for low surprise
+        NORMAL = '\033[0m'     # normal for medium-low
+        YELLOW = '\033[33m'    # yellow for medium-high
+        RED = '\033[31m'       # red for high
+        BOLD_RED = '\033[1;91m'  # bold bright red for very high
+
+        # Calculate percentile thresholds
+        surprises = ep.token_surprises
+        sorted_surp = sorted(surprises)
+        n = len(sorted_surp)
+
+        p25 = sorted_surp[int(n * 0.25)] if n > 0 else 0
+        p50 = sorted_surp[int(n * 0.50)] if n > 0 else 0
+        p75 = sorted_surp[int(n * 0.75)] if n > 0 else 0
+        p90 = sorted_surp[int(n * 0.90)] if n > 0 else 0
+
+        # Build colorized string
+        result = []
+        for i, (token_id, surprise) in enumerate(zip(ep.token_ids, surprises)):
+            try:
+                token_text = self.tokenizer.decode([token_id])
+            except:
+                token_text = f"[{token_id}]"
+
+            # Select color based on surprise percentile
+            if surprise >= p90:
+                color = BOLD_RED
+            elif surprise >= p75:
+                color = RED
+            elif surprise >= p50:
+                color = YELLOW
+            elif surprise >= p25:
+                color = NORMAL
+            else:
+                color = DIM
+
+            result.append(f"{color}{token_text}{RESET}")
+
+        return ''.join(result)
+
+    def format_episode_details(self, episode_idx: int, colorize: bool = True) -> str:
+        """Get formatted string of episode details."""
+        details = self.get_episode_details(episode_idx)
+
+        if 'error' in details:
+            return details['error']
+
+        lines = [
+            f"Episode #{details['index']}",
+            "=" * 50,
+            f"Salience: {details['salience']:.4f}",
+            f"Valence: {details['valence']:.4f} | Arousal: {details['arousal']:.4f}",
+            f"Retrieval count: {details['retrieval_count']}",
+            f"Timestamp: {details['timestamp']}",
+        ]
+
+        # Show colorized text if available
+        if colorize and details.get('has_token_surprises'):
+            lines.extend([
+                "",
+                "Colorized Text (gray=expected, yellow=notable, red=surprising):",
+                "-" * 50,
+                self.colorize_episode_text(episode_idx),
+                "-" * 50,
+            ])
+        elif details.get('text'):
+            text = details['text'][:300] + "..." if len(details['text']) > 300 else details['text']
+            lines.extend(["", "Text:", text])
+
+        if details.get('top_surprising_tokens'):
+            lines.extend([
+                "",
+                f"Token Statistics:",
+                f"  Count: {details['token_count']}",
+                f"  Avg surprise: {details['avg_surprise']:.4f}",
+                f"  Max surprise: {details['max_surprise']:.4f}",
+                "",
+                "Most Surprising Tokens:",
+            ])
+            for tok in details['top_surprising_tokens']:
+                token_text = tok['token_text'] or f"[id={tok['token_id']}]"
+                # Clean up token text for display
+                token_text = repr(token_text)[1:-1]  # Show escape chars
+                lines.append(f"  [{tok['index']:3d}] surp={tok['surprise']:.4f}: {token_text}")
+        else:
+            lines.append("\n(No per-token surprise data stored)")
+
+        return "\n".join(lines)
+
     def save_memory(self, path: str):
         """Save current memory state to disk."""
         state = {
@@ -675,6 +826,7 @@ def interactive_mode(inference: MemoryInference):
     print("  /experiential    - Show experiential stream state")
     print("  /stats           - Show processing statistics")
     print("  /detail          - Show detailed last result")
+    print("  /inspect <n>     - Inspect episode #n with surprising tokens")
     print("  /save <path>     - Save memory state")
     print("  /load <path>     - Load memory state")
     print("  /clear           - Clear all memories")
@@ -708,6 +860,7 @@ def interactive_mode(inference: MemoryInference):
                     print("  /experiential    - Show experiential stream state")
                     print("  /stats           - Show processing statistics")
                     print("  /detail          - Show last processing details")
+                    print("  /inspect <n>     - Inspect episode #n with surprising tokens")
                     print("  /save <path>     - Save memory state")
                     print("  /load <path>     - Load memory state")
                     print("  /clear           - Clear all memories")
@@ -822,6 +975,16 @@ def interactive_mode(inference: MemoryInference):
                         print("Usage: /file <path>")
                         continue
                     inference.process_file(arg)
+
+                elif cmd == '/inspect':
+                    if not arg:
+                        print(f"Usage: /inspect <n>  (1 to {inference.model.memory.size})")
+                        continue
+                    try:
+                        idx = int(arg)
+                        print("\n" + inference.format_episode_details(idx))
+                    except ValueError:
+                        print(f"Invalid episode number: {arg}")
 
                 else:
                     print(f"Unknown command: {cmd}")

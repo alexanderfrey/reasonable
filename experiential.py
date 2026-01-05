@@ -59,6 +59,10 @@ class Episode:
     retrieval_count: int = 0    # how often accessed (for consolidation)
     text: Optional[str] = None  # human-readable text for this episode
     token_ids: Optional[List[int]] = None  # raw token ids for later decoding
+    # Per-token surprise data
+    token_surprises: Optional[List[float]] = None  # per-token surprise scores
+    top_surprise_indices: Optional[List[int]] = None  # indices of most surprising tokens
+    top_surprise_scores: Optional[List[float]] = None  # scores of most surprising tokens
 
     def to(self, device: torch.device) -> 'Episode':
         """Move episode tensors to device."""
@@ -72,7 +76,44 @@ class Episode:
             retrieval_count=self.retrieval_count,
             text=self.text,
             token_ids=list(self.token_ids) if self.token_ids is not None else None,
+            token_surprises=list(self.token_surprises) if self.token_surprises is not None else None,
+            top_surprise_indices=list(self.top_surprise_indices) if self.top_surprise_indices is not None else None,
+            top_surprise_scores=list(self.top_surprise_scores) if self.top_surprise_scores is not None else None,
         )
+
+    def get_surprising_tokens(self, tokenizer=None, top_k: int = 5) -> List[Dict[str, Any]]:
+        """Get the most surprising tokens in this episode.
+
+        Args:
+            tokenizer: Optional tokenizer to decode token IDs
+            top_k: Number of top surprising tokens to return
+
+        Returns:
+            List of dicts with 'index', 'token_id', 'token_text', 'surprise'
+        """
+        if self.token_surprises is None or self.token_ids is None:
+            return []
+
+        # Get top-k indices by surprise
+        surprises = self.token_surprises
+        indices = sorted(range(len(surprises)), key=lambda i: surprises[i], reverse=True)[:top_k]
+
+        results = []
+        for idx in indices:
+            token_id = self.token_ids[idx] if idx < len(self.token_ids) else None
+            token_text = None
+            if tokenizer and token_id is not None:
+                try:
+                    token_text = tokenizer.decode([token_id])
+                except:
+                    pass
+            results.append({
+                'index': idx,
+                'token_id': token_id,
+                'token_text': token_text,
+                'surprise': surprises[idx],
+            })
+        return results
 
 
 class EpisodicMemory(nn.Module):
@@ -158,6 +199,8 @@ class EpisodicMemory(nn.Module):
         timestamp: Optional[int] = None,
         text: Optional[str] = None,
         token_ids: Optional[List[int]] = None,
+        token_surprises: Optional[List[float]] = None,
+        top_k_surprises: int = 10,
     ) -> Episode:
         """
         Store a new episode in memory.
@@ -171,12 +214,24 @@ class EpisodicMemory(nn.Module):
             timestamp: optional explicit timestamp
             text: optional human-readable text for this episode
             token_ids: optional raw token ids for later decoding
+            token_surprises: optional per-token surprise scores
+            top_k_surprises: number of top surprising tokens to pre-compute
 
         Returns:
             The stored Episode
         """
         if timestamp is None:
             timestamp = self._global_step
+
+        # Pre-compute top-k surprising tokens for quick access
+        top_surprise_indices = None
+        top_surprise_scores = None
+        if token_surprises is not None:
+            k = min(top_k_surprises, len(token_surprises))
+            indices = sorted(range(len(token_surprises)),
+                           key=lambda i: token_surprises[i], reverse=True)[:k]
+            top_surprise_indices = indices
+            top_surprise_scores = [token_surprises[i] for i in indices]
 
         # Keep tensors on their original device (GPU) to avoid device mismatches
         # during backward pass. The .detach() prevents gradients from flowing back.
@@ -190,6 +245,9 @@ class EpisodicMemory(nn.Module):
             retrieval_count=0,
             text=text,
             token_ids=list(token_ids) if token_ids is not None else None,
+            token_surprises=list(token_surprises) if token_surprises is not None else None,
+            top_surprise_indices=top_surprise_indices,
+            top_surprise_scores=top_surprise_scores,
         )
 
         # Apply decay to existing memories before adding new one
@@ -479,6 +537,9 @@ class EpisodicMemory(nn.Module):
                 retrieval_count=ep.retrieval_count,
                 text=ep.text,
                 token_ids=list(ep.token_ids) if ep.token_ids is not None else None,
+                token_surprises=list(ep.token_surprises) if ep.token_surprises is not None else None,
+                top_surprise_indices=list(ep.top_surprise_indices) if ep.top_surprise_indices is not None else None,
+                top_surprise_scores=list(ep.top_surprise_scores) if ep.top_surprise_scores is not None else None,
             ))
         return {
             'episodes': episodes,
@@ -2035,10 +2096,19 @@ class MemoryAugmentedGPT(nn.Module):
             # This means memories contain what the system "committed to" after reflection
             if crystallize:
                 modulated = exp_output.get('modulated_output', exp_output['target'])
+                # Get per-token surprise if available
+                surprise_t = exp_output.get('surprise_t')  # [B, seq_len]
+
                 for i in range(batch_size):
                     salience = exp_output['salience'][i].item()
                     if self.memory.should_crystallize(salience):
                         text, token_ids = self._prepare_episode_text(input_ids[i])
+
+                        # Extract per-token surprises for this sample
+                        token_surprises = None
+                        if surprise_t is not None:
+                            token_surprises = surprise_t[i].tolist()
+
                         self.memory.store(
                             content=modulated[i],
                             context=exp_output['prediction'][i],
@@ -2047,6 +2117,7 @@ class MemoryAugmentedGPT(nn.Module):
                             arousal=exp_output['arousal'][i].item(),
                             text=text,
                             token_ids=token_ids,
+                            token_surprises=token_surprises,
                         )
                         memory_output['crystallized'] = True
 
