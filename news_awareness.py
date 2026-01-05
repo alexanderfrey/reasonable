@@ -71,26 +71,49 @@ logger = logging.getLogger("NewsAwareness")
 
 # Default RSS feeds - major global news sources
 DEFAULT_FEEDS = [
-    # General News
+    # General / International
     ("BBC World", "http://feeds.bbci.co.uk/news/world/rss.xml"),
     ("Reuters World", "https://feeds.reuters.com/Reuters/worldNews"),
     ("AP News", "https://rsshub.app/apnews/topics/apf-topnews"),
     ("Al Jazeera", "https://www.aljazeera.com/xml/rss/all.xml"),
+    ("The Guardian", "https://www.theguardian.com/world/rss"),
+    ("DW News", "https://rss.dw.com/rdf/rss-en-all"),
+    ("France 24", "https://www.france24.com/en/rss"),
+    ("SCMP", "https://www.scmp.com/rss/91/feed"),  # South China Morning Post
 
     # US News
     ("NPR News", "https://feeds.npr.org/1001/rss.xml"),
     ("PBS NewsHour", "https://www.pbs.org/newshour/feeds/rss/headlines"),
+    ("The Hill", "https://thehill.com/feed/"),
+    ("Politico", "https://www.politico.com/rss/politicopicks.xml"),
+
+    # Europe
+    ("BBC Europe", "http://feeds.bbci.co.uk/news/world/europe/rss.xml"),
+    ("Euronews", "https://www.euronews.com/rss?level=theme&name=news"),
+    ("Der Spiegel", "https://www.spiegel.de/international/index.rss"),
 
     # Tech
     ("Ars Technica", "https://feeds.arstechnica.com/arstechnica/index"),
     ("Hacker News", "https://hnrss.org/frontpage"),
+    ("TechCrunch", "https://techcrunch.com/feed/"),
+    ("Wired", "https://www.wired.com/feed/rss"),
+    ("The Verge", "https://www.theverge.com/rss/index.xml"),
 
     # Science
     ("Nature News", "https://www.nature.com/nature.rss"),
     ("Science Daily", "https://www.sciencedaily.com/rss/all.xml"),
+    ("Phys.org", "https://phys.org/rss-feed/"),
+    ("New Scientist", "https://www.newscientist.com/feed/home/"),
 
-    # Economics
+    # Economics / Business
     ("FT World", "https://www.ft.com/world?format=rss"),
+    ("Bloomberg", "https://feeds.bloomberg.com/markets/news.rss"),
+    ("The Economist", "https://www.economist.com/international/rss.xml"),
+    ("WSJ World", "https://feeds.wsj.com/xml/rss/3_7085.xml"),
+
+    # AI / ML specific
+    ("MIT Tech Review AI", "https://www.technologyreview.com/feed/"),
+    ("VentureBeat AI", "https://venturebeat.com/category/ai/feed/"),
 ]
 
 
