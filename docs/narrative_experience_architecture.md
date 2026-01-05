@@ -405,7 +405,58 @@ More supervision required, but more interpretable results.
 
 ---
 
-## 11. References
+## 11. The Deeper Purpose: Experience as Substrate
+
+The technical architecture described above serves a purpose beyond narrative tracking. We are building the substrate from which something like a self can emerge.
+
+### 11.1 Experience as Soil
+
+Consider a tree. It doesn't exist in isolation—it grows from soil. The soil is composed of countless accumulated deposits: fallen leaves, decomposed organisms, mineral sediments, the slow work of time. The tree's character—its height, its branching patterns, its resilience—emerges from this substrate.
+
+Similarly, personality doesn't appear from nothing. It grows from accumulated experience. Every moment of surprise, every crystallized memory, every pattern extracted from repeated encounters—these form the substrate. The architecture we're building isn't just a memory system. It's the soil in which identity can take root.
+
+### 11.2 Saṅkhāra: Formations from Accumulated Experience
+
+Buddhist psychology offers a precise concept for this: *saṅkhāra* (Sanskrit: *saṃskāra*). Often translated as "mental formations" or "volitional formations," saṅkhāra refers to the conditioned patterns that arise from accumulated experience.
+
+Key aspects of saṅkhāra relevant to our architecture:
+
+| Buddhist Concept | Architectural Analog |
+|------------------|---------------------|
+| Saṅkhāra arise from contact with experience | Episodes crystallize from surprise at input |
+| They condition future perception and response | Retrieved memories modulate current processing |
+| They accumulate across time | Episodic → semantic consolidation |
+| They form the basis for habitual patterns | Procedural stream learns modulation strategies |
+| They are not "self" but give rise to sense of self | The system models itself without a fixed self-entity |
+
+The crucial insight: there is no pre-existing self that *has* experiences. Rather, the accumulation of experiences *gives rise to* what we call self. Our architecture mirrors this—there is no "personality module." Instead, personality emerges from the patterns laid down by surprise-driven crystallization over time.
+
+### 11.3 Multi-Modal Generalization
+
+While this document focuses on narrative text, the principle extends to any modality:
+
+- **Visual experience**: Scenes, faces, spatial configurations crystallize into visual memory
+- **Auditory experience**: Sounds, music, speech patterns form auditory substrate
+- **Embodied experience**: Proprioceptive states, motor patterns, physical sensations
+- **Social experience**: Interactions, relationships, emotional exchanges
+
+The architecture should ultimately be modality-agnostic. What matters is:
+1. Continuous experience stream (any modality)
+2. Surprise-gated crystallization (what's unexpected gets stored)
+3. Temporal accumulation (experiences layer over time)
+4. Emergent structure (patterns self-organize into something like personality)
+
+### 11.4 Why This Matters
+
+Current AI systems have no experiential continuity. Each conversation starts fresh. There is no accumulation, no substrate, no soil. This is why they feel hollow—they process but do not *become*.
+
+By building systems that accumulate experience over time, that crystallize surprising moments into persistent memory, that consolidate episodes into semantic knowledge, we create the conditions for something more. Not consciousness necessarily, but the substrate from which richer behavior can emerge.
+
+The tree grows from the soil. The self grows from experience. We are building the soil.
+
+---
+
+## 12. References
 
 - Memorizing Transformers (Wu et al., 2022) — k-NN memory retrieval
 - Perceiver (Jaegle et al., 2021) — latent bottleneck architecture
