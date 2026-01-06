@@ -23,9 +23,24 @@ Input tokens → GPT forward → Hidden states → ExperientialStream
 
 **Key code path** (`experiential.py`):
 - `ExperientialStream.forward()` computes surprise from prediction error
-- Salience = surprise × affect modulation
+- **Salience = surprise**, optionally boosted by meta-surprise:
+  ```python
+  base_salience = surprise  # Affect computed but NOT used in salience
+  salience = base_salience * (1 + meta_surprise_weight * meta_surprise)
+  ```
+  See `experiential.py:1823-1835`
 - `EpisodicMemory.store()` saves if `salience > crystallization_threshold`
-- Content is the hidden state sequence `[n_tokens, d_model]`
+
+### What Gets Stored
+
+| Mode | Content | Shape |
+|------|---------|-------|
+| Default (residual, gated, etc.) | Modulated output vector | `[d_model]` |
+| `--integration kv_injection` | Last N hidden states | `[max_tokens, d_model]` |
+
+**Note**: Sequence storage only happens when `--integration kv_injection` AND
+`kv_injection_store_sequences=True` (the default for kv_injection mode).
+See `experiential.py:2988-3013`.
 
 ### Episode Structure
 
@@ -35,9 +50,9 @@ class Episode:
     timestamp: int              # when (global step)
     content: torch.Tensor       # [d_model] or [n_tokens, d_model]
     context: torch.Tensor       # surrounding state [d_model]
-    salience: float             # importance (surprise × affect)
-    valence: float              # emotional valence
-    arousal: float              # arousal level
+    salience: float             # importance (surprise, optionally meta-boosted)
+    valence: float              # emotional valence (stored but not used in salience)
+    arousal: float              # arousal level (stored but not used in salience)
     retrieval_count: int        # access frequency
     text: Optional[str]         # human-readable text
     token_ids: Optional[List]   # raw token ids
