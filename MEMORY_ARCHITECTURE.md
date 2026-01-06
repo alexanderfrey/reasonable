@@ -108,6 +108,8 @@ Forward pass without memory → Compute loss_without_memory
                                     ↓
                         retrieval_benefit = loss_without - loss_with
                                     ↓
+                        query = prev_memory_query (from previous step)
+                                    ↓
             ┌───────────────────────┼───────────────────────┐
             ↓                       ↓                       ↓
     benefit > 0              benefit < 0              periodic check
@@ -116,10 +118,15 @@ Forward pass without memory → Compute loss_without_memory
     (EMA toward query)      (push away from query)  (merge into stronger)
 ```
 
+**Important**: The modification uses `prev_memory_query` - the query that was used to retrieve
+memories in the current step (computed at the end of the previous step). This ensures we modify
+memories based on the query that actually triggered their retrieval.
+
 ### 3.1 Content Refinement (`--enable_content_refinement`)
 
 When retrieval benefit > 0 (memory helped):
-- Nudge episode content toward the query that found it useful
+- Nudge episode content toward the query that triggered the retrieval
+- **Note**: Uses `prev_memory_query` (previous step's `next_memory_query`), not current step
 - Uses exponential moving average: `new = (1-α)·old + α·query`
 - For sequences: shift all tokens uniformly to preserve structure
 - Controlled by `--content_refinement_rate` (default 0.1)
@@ -127,7 +134,8 @@ When retrieval benefit > 0 (memory helped):
 ### 3.2 Content Correction (`--enable_content_correction`)
 
 When retrieval benefit < 0 (memory hurt):
-- Push episode content away from the harmful query
+- Push episode content away from the query that triggered harmful retrieval
+- **Note**: Uses `prev_memory_query` (same as refinement)
 - Track `harm_count` per episode
 - Delete if `harm_count >= threshold` and `harm_count > 2×benefit_count`
 - Controlled by `--content_correction_rate` (default 0.05)
