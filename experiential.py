@@ -192,6 +192,7 @@ class EpisodicMemory(nn.Module):
         decay_on_store: bool = True,
         min_salience: float = 0.05,
         dedup_threshold: float = 0.95,  # Reject memories with cosine sim > this to existing
+        retrieval_count_top_k: int = 8,
     ):
         super().__init__()
         self.d_model = d_model
@@ -201,6 +202,7 @@ class EpisodicMemory(nn.Module):
         self.decay_on_store = decay_on_store
         self.min_salience = min_salience  # Memories below this salience are pruned
         self.dedup_threshold = dedup_threshold  # Skip storing near-duplicates
+        self.retrieval_count_top_k = retrieval_count_top_k
 
         # Episode storage
         self.episodes: List[Episode] = []
@@ -577,10 +579,15 @@ class EpisodicMemory(nn.Module):
 
         # Update retrieval counts (based on attention, not hard selection)
         with torch.no_grad():
-            # Increment counts proportionally to attention
+            # Increment counts for the top-k attended episodes.
             avg_weights = weights.mean(dim=0)  # [n_episodes]
-            for i, ep in enumerate(self.episodes):
-                ep.retrieval_count += int(avg_weights[i].item() > 0.01)
+            self._last_retrieval_weights = avg_weights.detach().float().cpu()
+            top_k = max(0, int(self.retrieval_count_top_k))
+            if top_k > 0:
+                top_k = min(top_k, avg_weights.numel())
+                top_indices = torch.topk(avg_weights, k=top_k).indices.tolist()
+                for idx in top_indices:
+                    self.episodes[idx].retrieval_count += 1
 
         if squeeze_output:
             values = values.squeeze(0)
@@ -669,12 +676,6 @@ class EpisodicMemory(nn.Module):
             if age > 0:
                 # Exponential decay: older memories fade more
                 ep.salience *= (decay_factor ** age)
-
-            # Retrieval refreshes memory (reduces effective age)
-            # Each retrieval adds back some salience
-            if ep.retrieval_count > 0:
-                refresh_bonus = min(0.1 * ep.retrieval_count, 0.5)  # Cap at 50% boost
-                ep.salience = min(1.0, ep.salience * (1 + refresh_bonus))
 
         # Prune memories that have faded below threshold
         self.episodes = [ep for ep in self.episodes if ep.salience >= self.min_salience]
@@ -2005,6 +2006,7 @@ class MemoryAugmentedGPT(nn.Module):
             decay_rate=decay_rate,
             min_salience=min_salience,
             dedup_threshold=dedup_threshold,
+            retrieval_count_top_k=cross_attention_top_k,
         )
 
         # Optional retrieval gate (benefit-guided).

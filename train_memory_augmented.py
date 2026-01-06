@@ -588,6 +588,7 @@ def _format_top_episodes(memory, top_k: int, max_chars: int, step: Optional[int]
         return f"{header}\n- memory empty"
     episodes = sorted(memory.episodes, key=lambda e: e.salience, reverse=True)[:top_k]
     most_retrieved = sorted(memory.episodes, key=lambda e: e.retrieval_count, reverse=True)[:top_k]
+    last_weights = getattr(memory, "_last_retrieval_weights", None)
     global_step = getattr(memory, "_global_step", None)
     # Salience histogram (0.1-wide bins, clamped to [0.0, 1.0])
     saliences = [ep.salience for ep in memory.episodes]
@@ -655,6 +656,38 @@ def _format_top_episodes(memory, top_k: int, max_chars: int, step: Optional[int]
         lines.append(
             f"  {i:>2d} {ep.retrieval_count:>4d}  {ep.salience:>8.3f}  {age_str}  {text}"
         )
+    if last_weights is not None:
+        if torch.is_tensor(last_weights):
+            weights_list = last_weights.detach().float().cpu().tolist()
+        else:
+            weights_list = list(last_weights)
+        if len(weights_list) == len(memory.episodes):
+            weight_order = sorted(
+                range(len(weights_list)),
+                key=lambda idx: weights_list[idx],
+                reverse=True
+            )[:top_k]
+            lines.append("- most retrieved episodes (by weight):")
+            lines.append("  #  weight  salience  retr  age  text")
+            lines.append("  -- ------  --------  ----  ---  ----")
+            for i, idx in enumerate(weight_order, start=1):
+                ep = memory.episodes[idx]
+                weight = weights_list[idx]
+                text = ep.text or ""
+                if text:
+                    text = " ".join(text.split())
+                else:
+                    text = "(no text stored)"
+                if max_chars > 0 and len(text) > max_chars:
+                    text = text[: max_chars - 3] + "..."
+                if global_step is not None:
+                    age = max(0, global_step - ep.timestamp)
+                    age_str = f"{age:>3d}"
+                else:
+                    age_str = " --"
+                lines.append(
+                    f"  {i:>2d} {weight:>6.4f}  {ep.salience:>8.3f}  {ep.retrieval_count:>4d}  {age_str}  {text}"
+                )
     return "\n".join(lines)
 
 
