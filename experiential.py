@@ -686,7 +686,12 @@ class EpisodicMemory(nn.Module):
         benefit: float,
         scale: float
     ) -> None:
-        """Adjust salience based on retrieval benefit."""
+        """Adjust salience based on retrieval benefit.
+
+        Scales by number of memories to compensate for attention dilution.
+        With N memories, each gets ~1/N weight. Multiplying by N makes the
+        update independent of memory count: weight * N ≈ 1 for average attention.
+        """
         if not self.episodes or scale == 0.0:
             return
         if weights is None or weights.numel() == 0:
@@ -694,10 +699,12 @@ class EpisodicMemory(nn.Module):
         if weights.dim() == 2:
             weights = weights.mean(dim=0)
         weights = weights.detach().float().cpu()
-        delta = scale * benefit
+        n_memories = len(self.episodes)
+        # Scale by n_memories to compensate for soft attention dilution
+        delta = scale * benefit * n_memories
         if delta == 0.0:
             return
-        max_count = min(len(self.episodes), weights.numel())
+        max_count = min(n_memories, weights.numel())
         for i in range(max_count):
             w = weights[i].item()
             if w <= 0.0:
