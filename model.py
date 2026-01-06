@@ -274,8 +274,10 @@ class MemoryAugmentedAttention(nn.Module):
                 v = v_cache[:, :curr_pos]
 
         # 4. Project memory to K, V (no RoPE - memory is "outside" position)
-        mem_k = self.mem_k_proj(memory_kv.to(target_dtype))  # [B, M, n_kv_head * head_dim]
-        mem_v = self.mem_v_proj(memory_kv.to(target_dtype))  # [B, M, n_kv_head * head_dim]
+        # Move to same device and dtype as input (memory may be stored on CPU)
+        memory_kv = memory_kv.to(device=x.device, dtype=target_dtype)
+        mem_k = self.mem_k_proj(memory_kv)  # [B, M, n_kv_head * head_dim]
+        mem_v = self.mem_v_proj(memory_kv)  # [B, M, n_kv_head * head_dim]
         # Ensure output dtype matches target (projection weights may be fp32)
         mem_k = mem_k.to(target_dtype).view(B, M, self.n_kv_head, self.head_dim)
         mem_v = mem_v.to(target_dtype).view(B, M, self.n_kv_head, self.head_dim)
