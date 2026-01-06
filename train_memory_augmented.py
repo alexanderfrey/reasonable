@@ -350,9 +350,8 @@ def train_epoch(
 ) -> Dict[str, List[float]]:
     """Train for one epoch."""
     memory_gpt.train()
-    # Keep GPT backbone frozen initially
-    for param in memory_gpt.gpt.parameters():
-        param.requires_grad = False
+    # Note: Parameter freezing is handled by setup_memory_training() in main()
+    # which correctly preserves trainable params for kv_injection mode
 
     history = {
         'loss': [],
