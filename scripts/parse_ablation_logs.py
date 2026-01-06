@@ -5,21 +5,21 @@ from pathlib import Path
 
 EVAL_PATTERNS = {
     "eval": re.compile(
-        r"Eval \\(eval split\\): lm_loss=(?P<lm_loss>[0-9.]+), "
+        r"Eval \(eval split\): lm_loss=(?P<lm_loss>[0-9.]+), "
         r"ret_benefit=(?P<ret_benefit>[+-]?[0-9.]+), "
         r"ret_rate=(?P<ret_rate>[0-9.]+)%?, "
         r"acc=(?P<acc>[0-9.]+), "
         r"memory=(?P<memory>[0-9]+)"
     ),
     "train": re.compile(
-        r"Eval \\(train split\\): lm_loss=(?P<lm_loss>[0-9.]+), "
+        r"Eval \(train split\): lm_loss=(?P<lm_loss>[0-9.]+), "
         r"ret_benefit=(?P<ret_benefit>[+-]?[0-9.]+), "
         r"ret_rate=(?P<ret_rate>[0-9.]+)%?, "
         r"acc=(?P<acc>[0-9.]+), "
         r"memory=(?P<memory>[0-9]+)"
     ),
     "fresh": re.compile(
-        r"Eval \\(fresh memory\\): lm_loss=(?P<lm_loss>[0-9.]+), "
+        r"Eval \(fresh memory\): lm_loss=(?P<lm_loss>[0-9.]+), "
         r"ret_benefit=(?P<ret_benefit>[+-]?[0-9.]+), "
         r"ret_rate=(?P<ret_rate>[0-9.]+)%?, "
         r"acc=(?P<acc>[0-9.]+), "
@@ -32,7 +32,7 @@ SPLIT_ORDER = ["eval", "train", "fresh"]
 
 def parse_condition_seed(log_path: Path):
     parent = log_path.parent.name
-    match = re.match(r"(?P<cond>.+)_seed(?P<seed>\\d+)$", parent)
+    match = re.match(r"(?P<cond>.+)_seed(?P<seed>\d+)$", parent)
     if match:
         return match.group("cond"), match.group("seed")
     return parent, ""
