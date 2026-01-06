@@ -344,6 +344,7 @@ def train_epoch(
     affect_weight: float = 0.1,
     retrieval_weight: float = 0.1,
     retrieval_benefit_weight: float = 0.1,
+    retrieval_gate_weight: float = 0.0,
     contrastive_weight: float = 0.1,
     accumulation_steps: int = 1,
     sequential: bool = False,
@@ -413,7 +414,7 @@ def train_epoch(
             crystallize=True,
             use_memory=True,
             prev_memory_query=prev_memory_query,
-            return_memory_weights=(retrieval_benefit_salience_weight > 0)
+            return_memory_weights=(retrieval_benefit_salience_weight > 0 or retrieval_gate_weight > 0)
         )
         if sequential and mem_out.get('next_memory_query') is not None:
             prev_memory_query = mem_out['next_memory_query'].detach()
@@ -428,6 +429,7 @@ def train_epoch(
             affect_weight=affect_weight,
             retrieval_weight=retrieval_weight,
             retrieval_benefit_weight=retrieval_benefit_weight,
+            retrieval_gate_weight=retrieval_gate_weight,
             contrastive_weight=contrastive_weight,
         )
 
@@ -782,6 +784,8 @@ def main():
     # Retrieval benefit loss - trains memory to actually help prediction
     parser.add_argument("--retrieval_benefit_weight", type=float, default=0.1,
                         help="Weight for retrieval benefit loss (penalize when memory hurts)")
+    parser.add_argument("--retrieval_gate_weight", type=float, default=0.1,
+                        help="Weight for benefit-guided retrieval gate loss (default: 0.1)")
     # Contrastive learning for memory relevance
     parser.add_argument("--contrastive_weight", type=float, default=0.1,
                         help="Weight for contrastive memory loss (teach which memories are relevant)")
@@ -839,6 +843,7 @@ def main():
     logger.info(f"  Meta-surprise salience weight: {args.meta_surprise_salience_weight}")
     logger.info(f"  Retrieval temperature: {args.retrieval_temperature}, Retrieval salience weight: {args.retrieval_salience_weight}")
     logger.info(f"  Retrieval benefit salience weight: {args.retrieval_benefit_salience_weight}")
+    logger.info(f"  Retrieval gate weight: {args.retrieval_gate_weight}")
     logger.info(f"  Batch size: {args.batch_size} x {args.accumulation_steps} accumulation")
     logger.info(f"  Sequential training: {args.sequential}")
     logger.info(f"  Loss weights: lm={args.lm_weight}, exp={args.exp_weight}, "
@@ -873,6 +878,7 @@ def main():
         meta_surprise_salience_weight=args.meta_surprise_salience_weight,
         retrieval_temperature=args.retrieval_temperature,
         retrieval_salience_weight=args.retrieval_salience_weight,
+        retrieval_gate_weight=args.retrieval_gate_weight,
         decay_rate=args.decay_rate,
         min_salience=args.min_salience,
         dedup_threshold=args.dedup_threshold,
@@ -979,11 +985,12 @@ def main():
             lm_weight=args.lm_weight,
             exp_weight=args.exp_weight,
             affect_weight=args.affect_weight,
-            retrieval_weight=args.retrieval_weight,
-            retrieval_benefit_weight=args.retrieval_benefit_weight,
-            contrastive_weight=args.contrastive_weight,
-            accumulation_steps=args.accumulation_steps,
-            sequential=args.sequential,
+        retrieval_weight=args.retrieval_weight,
+        retrieval_benefit_weight=args.retrieval_benefit_weight,
+        retrieval_gate_weight=args.retrieval_gate_weight,
+        contrastive_weight=args.contrastive_weight,
+        accumulation_steps=args.accumulation_steps,
+        sequential=args.sequential,
             retrieval_benefit_salience_weight=args.retrieval_benefit_salience_weight,
         )
         all_history.append(history)

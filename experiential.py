@@ -1931,6 +1931,7 @@ class MemoryAugmentedGPT(nn.Module):
         pad_token_id: Optional[int] = None,
         meta_surprise_salience_weight: float = 1.0,  # How much meta-surprise boosts salience
         retrieval_salience_weight: float = 0.0,  # Bias retrieval toward high-salience memories
+        retrieval_gate_weight: float = 0.1,  # Train retrieval gate with benefit signal
         tokenizer: Optional[Any] = None,
         max_text_tokens: Optional[int] = None,
         decay_rate: float = 0.01,  # Salience decay rate per step
@@ -1963,6 +1964,7 @@ class MemoryAugmentedGPT(nn.Module):
             pad_token_id: Token ID for padding (excluded from surprise computation)
             meta_surprise_salience_weight: How much meta-surprise boosts salience (default 1.0, was 3.0)
             retrieval_salience_weight: Salience bias for episodic retrieval (0 = similarity only)
+            retrieval_gate_weight: Train retrieval gate using benefit signal (0 = disable)
             tokenizer: Optional tokenizer with a .decode method for episode text
             max_text_tokens: Optional max number of tokens to decode/store per episode
             decay_rate: Salience decay rate per step (default 0.01)
@@ -1978,6 +1980,7 @@ class MemoryAugmentedGPT(nn.Module):
         self.retrieval_temperature = retrieval_temperature
         self.semantic_weight = semantic_weight
         self.retrieval_salience_weight = retrieval_salience_weight
+        self.retrieval_gate_weight = retrieval_gate_weight
         self.consolidation_interval = consolidation_interval
         self._step_counter = 0
         if tokenizer is not None:
@@ -2000,6 +2003,16 @@ class MemoryAugmentedGPT(nn.Module):
             min_salience=min_salience,
             dedup_threshold=dedup_threshold,
         )
+
+        # Optional retrieval gate (benefit-guided).
+        self.retrieval_gate = None
+        if retrieval_gate_weight > 0:
+            hidden = max(64, self.d_model // 8)
+            self.retrieval_gate = nn.Sequential(
+                nn.Linear(2 * self.d_model, hidden),
+                nn.ReLU(),
+                nn.Linear(hidden, 1)
+            )
 
         # Semantic memory (abstracted knowledge)
         if use_semantic:
@@ -2166,6 +2179,7 @@ class MemoryAugmentedGPT(nn.Module):
             'semantic_proj', 'semantic_gate',  # Semantic integration
             'semantic_attention', 'semantic_norm',  # Semantic attention
             'query_proj',  # Query projection for retrieval
+            'retrieval_gate',  # Benefit-guided retrieval gate
         ]
 
         for name, param in self.named_parameters():
@@ -2304,6 +2318,8 @@ class MemoryAugmentedGPT(nn.Module):
         semantic_retrieved = None
         episodic_weights = None
         semantic_weights = None
+        episodic_weights_raw = None
+        episodic_gate = None
         memory_kv = None  # For kv_injection mode
 
         if prev_memory_query is not None:
@@ -2317,6 +2333,37 @@ class MemoryAugmentedGPT(nn.Module):
                     temperature=self.retrieval_temperature,
                     salience_weight=self.retrieval_salience_weight
                 )
+                episodic_weights_raw = episodic_weights
+                episodic_gate = None
+
+                # Optional benefit-guided retrieval gate.
+                if self.retrieval_gate is not None and episodic_weights is not None:
+                    memory_contents = self.memory.get_content_matrix(device=device)
+                    if memory_contents.numel() > 0:
+                        squeeze_weights = False
+                        if episodic_weights.dim() == 1:
+                            episodic_weights = episodic_weights.unsqueeze(0)
+                            squeeze_weights = True
+                        if query.dim() == 1:
+                            query = query.unsqueeze(0)
+                        batch_size = episodic_weights.size(0)
+                        n_mem = memory_contents.size(0)
+                        gate_dtype = next(self.retrieval_gate.parameters()).dtype
+                        query_gate = query.to(dtype=gate_dtype)
+                        memory_gate = memory_contents.to(dtype=gate_dtype)
+                        q = query_gate.unsqueeze(1).expand(batch_size, n_mem, -1)
+                        m = memory_gate.unsqueeze(0).expand(batch_size, -1, -1)
+                        gate_logits = self.retrieval_gate(torch.cat([q, m], dim=-1)).squeeze(-1)
+                        episodic_gate = torch.sigmoid(gate_logits)
+                        gated_weights = episodic_weights * episodic_gate
+                        denom = gated_weights.sum(dim=-1, keepdim=True)
+                        gated_weights = gated_weights / (denom + 1e-8)
+                        episodic_weights = gated_weights
+                        episodic_retrieved = torch.matmul(episodic_weights, memory_contents)
+                        if squeeze_weights:
+                            episodic_weights = episodic_weights.squeeze(0)
+                            episodic_retrieved = episodic_retrieved.squeeze(0)
+                            episodic_gate = episodic_gate.squeeze(0)
 
                 # For kv_injection: get memory sequences for top-k memories
                 if self.memory_integration == 'kv_injection' and episodic_weights is not None:
@@ -2413,6 +2460,8 @@ class MemoryAugmentedGPT(nn.Module):
             'retrieved_episodic': episodic_retrieved,
             'retrieved_semantic': semantic_retrieved,
             'episodic_weights': episodic_weights if return_memory_weights else None,
+            'episodic_weights_raw': episodic_weights_raw if return_memory_weights else None,
+            'episodic_gate': episodic_gate if return_memory_weights else None,
             'semantic_weights': semantic_weights if return_memory_weights else None,
             'crystallized': False,
             'consolidated': False,
@@ -3027,6 +3076,7 @@ def memory_augmented_loss(
     retrieval_weight: float = 0.01,
     retrieval_benefit_weight: float = 0.1,
     retrieval_benefit_margin: float = 0.0,
+    retrieval_gate_weight: float = 0.0,
     contrastive_weight: float = 0.1,
     contrastive_temperature: float = 0.1
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
@@ -3045,6 +3095,7 @@ def memory_augmented_loss(
         retrieval_weight: weight for meta-retrieval loss (extended self-awareness)
         retrieval_benefit_weight: weight for retrieval benefit loss (trains retrieval to help)
         retrieval_benefit_margin: margin for hinge loss (only penalize if memory hurts by > margin)
+        retrieval_gate_weight: weight for benefit-guided retrieval gate loss
 
     Returns:
         total_loss: combined scalar loss
@@ -3093,7 +3144,8 @@ def memory_augmented_loss(
 
     # Retrieval benefit loss - trains the model to USE retrieved memories effectively
     # If memory retrieval hurts prediction, add a penalty
-    if retrieval_benefit_weight > 0 and 'logits_without_memory' in memory_output:
+    retrieval_benefit_tensor = None
+    if (retrieval_benefit_weight > 0 or retrieval_gate_weight > 0) and 'logits_without_memory' in memory_output:
         logits_without_memory = memory_output['logits_without_memory']
         if logits_without_memory is not None:
             # Compute loss WITHOUT memory integration
@@ -3108,12 +3160,28 @@ def memory_augmented_loss(
             # Hinge loss: penalize when memory hurts by more than margin
             retrieval_harm = lm_loss - lm_loss_without_memory + retrieval_benefit_margin
             retrieval_benefit_loss = F.relu(retrieval_harm)  # Only penalize harm
+            retrieval_benefit_tensor = (lm_loss_without_memory - lm_loss)
 
             loss_dict['lm_loss_without_memory'] = lm_loss_without_memory.item()
-            loss_dict['retrieval_benefit'] = (lm_loss_without_memory - lm_loss).item()  # positive = good
+            loss_dict['retrieval_benefit'] = retrieval_benefit_tensor.item()  # positive = good
             loss_dict['retrieval_benefit_loss'] = retrieval_benefit_loss.item()
 
-            total_loss = total_loss + retrieval_benefit_weight * retrieval_benefit_loss
+            if retrieval_benefit_weight > 0:
+                total_loss = total_loss + retrieval_benefit_weight * retrieval_benefit_loss
+
+    # Benefit-guided retrieval gate loss
+    if retrieval_gate_weight > 0 and retrieval_benefit_tensor is not None:
+        gate = memory_output.get('episodic_gate')
+        weights_raw = memory_output.get('episodic_weights_raw')
+        if gate is not None and weights_raw is not None and gate.numel() > 0:
+            if gate.dim() == 1:
+                gate = gate.unsqueeze(0)
+            if weights_raw.dim() == 1:
+                weights_raw = weights_raw.unsqueeze(0)
+            gate_score = (weights_raw * gate).mean()
+            gate_loss = -retrieval_benefit_tensor.detach() * gate_score
+            loss_dict['retrieval_gate_loss'] = gate_loss.item()
+            total_loss = total_loss + retrieval_gate_weight * gate_loss
 
     # Contrastive memory loss - teaches which memories are relevant for which queries
     # This helps the model learn meaningful memory-query relationships
