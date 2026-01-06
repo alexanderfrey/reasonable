@@ -320,9 +320,24 @@ class EpisodicMemory(nn.Module):
                 else:
                     # No valid memories - use a small learned-like placeholder
                     # Using small random values instead of zeros to avoid attention issues
-                    batch_seq = torch.randn(1, self.d_model) * 0.01
+                    # Device/dtype will be set later when we know other batch entries
+                    batch_seq = None
 
                 batch_seqs.append(batch_seq)
+
+            # Determine device/dtype from non-None entries for any None placeholders
+            ref_seq = next((s for s in batch_seqs if s is not None), None)
+            if ref_seq is not None:
+                ref_device = ref_seq.device
+                ref_dtype = ref_seq.dtype
+            else:
+                ref_device = device if device is not None else torch.device('cpu')
+                ref_dtype = torch.float32
+
+            # Replace None entries with properly typed placeholders
+            for i, seq in enumerate(batch_seqs):
+                if seq is None:
+                    batch_seqs[i] = torch.randn(1, self.d_model, device=ref_device, dtype=ref_dtype) * 0.01
 
             # Pad to same length across batch (using mean padding, not zeros)
             max_len = max(s.size(0) for s in batch_seqs)
@@ -450,6 +465,7 @@ class EpisodicMemory(nn.Module):
         if not self.episodes:
             return []
 
+        # Move query to CPU for comparison (episodes may be on various devices)
         query_cpu = query.detach().cpu()
         query_norm = F.normalize(query_cpu, dim=-1)
 
@@ -458,7 +474,9 @@ class EpisodicMemory(nn.Module):
         for ep in self.episodes:
             if ep.salience < min_salience:
                 continue
-            content_norm = F.normalize(ep.get_content_vector(), dim=-1)
+            # Move content to CPU to match query device
+            content_vec = ep.get_content_vector().detach().cpu()
+            content_norm = F.normalize(content_vec, dim=-1)
             sim = torch.dot(query_norm, content_norm).item()
             scores.append((ep, sim))
 

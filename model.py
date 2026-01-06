@@ -276,8 +276,9 @@ class MemoryAugmentedAttention(nn.Module):
         # 4. Project memory to K, V (no RoPE - memory is "outside" position)
         mem_k = self.mem_k_proj(memory_kv.to(target_dtype))  # [B, M, n_kv_head * head_dim]
         mem_v = self.mem_v_proj(memory_kv.to(target_dtype))  # [B, M, n_kv_head * head_dim]
-        mem_k = mem_k.view(B, M, self.n_kv_head, self.head_dim)  # [B, M, n_kv_head, head_dim]
-        mem_v = mem_v.view(B, M, self.n_kv_head, self.head_dim)  # [B, M, n_kv_head, head_dim]
+        # Ensure output dtype matches target (projection weights may be fp32)
+        mem_k = mem_k.to(target_dtype).view(B, M, self.n_kv_head, self.head_dim)
+        mem_v = mem_v.to(target_dtype).view(B, M, self.n_kv_head, self.head_dim)
 
         # 5. Compute attention in two parts to handle masking correctly:
         #    - Context self-attention: causal mask (Q[i] sees K[0..i])
