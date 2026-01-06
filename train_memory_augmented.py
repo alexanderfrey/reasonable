@@ -960,11 +960,11 @@ def main():
         logger.info(f"\n--- Epoch {epoch + 1}/{args.n_epochs} ---")
 
         # Train
-    history = train_epoch(
-        memory_gpt,
-        train_loader,
-        optimizer,
-        device,
+        history = train_epoch(
+            memory_gpt,
+            train_loader,
+            optimizer,
+            device,
             log_interval=args.log_interval,
             memory_log_interval=args.memory_log_interval,
             memory_log_top_k=args.memory_log_top_k,
@@ -973,13 +973,13 @@ def main():
             lm_weight=args.lm_weight,
             exp_weight=args.exp_weight,
             affect_weight=args.affect_weight,
-        retrieval_weight=args.retrieval_weight,
-        retrieval_benefit_weight=args.retrieval_benefit_weight,
-        contrastive_weight=args.contrastive_weight,
-        accumulation_steps=args.accumulation_steps,
-        sequential=args.sequential,
-        retrieval_benefit_salience_weight=args.retrieval_benefit_salience_weight,
-    )
+            retrieval_weight=args.retrieval_weight,
+            retrieval_benefit_weight=args.retrieval_benefit_weight,
+            contrastive_weight=args.contrastive_weight,
+            accumulation_steps=args.accumulation_steps,
+            sequential=args.sequential,
+            retrieval_benefit_salience_weight=args.retrieval_benefit_salience_weight,
+        )
         all_history.append(history)
 
         # Evaluate on eval split
