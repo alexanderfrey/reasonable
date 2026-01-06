@@ -2016,8 +2016,9 @@ class MemoryAugmentedGPT(nn.Module):
                 nn.ReLU(),
                 nn.Linear(hidden, 1)
             )
-            # Bias toward a closed gate initially.
-            nn.init.constant_(self.retrieval_gate[-1].bias, -2.0)
+            # Bias toward an open gate initially (sigmoid(2) ≈ 0.88).
+            # This prevents gate collapse during early training when benefit may be negative.
+            nn.init.constant_(self.retrieval_gate[-1].bias, 2.0)
 
         # Semantic memory (abstracted knowledge)
         if use_semantic:
