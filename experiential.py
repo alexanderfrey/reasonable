@@ -580,7 +580,7 @@ class EpisodicMemory(nn.Module):
             # Increment counts proportionally to attention
             avg_weights = weights.mean(dim=0)  # [n_episodes]
             for i, ep in enumerate(self.episodes):
-                ep.retrieval_count += int(avg_weights[i].item() > 0.1)
+                ep.retrieval_count += int(avg_weights[i].item() > 0.01)
 
         if squeeze_output:
             values = values.squeeze(0)
@@ -678,6 +678,31 @@ class EpisodicMemory(nn.Module):
 
         # Prune memories that have faded below threshold
         self.episodes = [ep for ep in self.episodes if ep.salience >= self.min_salience]
+
+    def apply_retrieval_benefit(
+        self,
+        weights: torch.Tensor,
+        benefit: float,
+        scale: float
+    ) -> None:
+        """Adjust salience based on retrieval benefit."""
+        if not self.episodes or scale == 0.0:
+            return
+        if weights is None or weights.numel() == 0:
+            return
+        if weights.dim() == 2:
+            weights = weights.mean(dim=0)
+        weights = weights.detach().float().cpu()
+        delta = scale * benefit
+        if delta == 0.0:
+            return
+        max_count = min(len(self.episodes), weights.numel())
+        for i in range(max_count):
+            w = weights[i].item()
+            if w <= 0.0:
+                continue
+            salience = self.episodes[i].salience + delta * w
+            self.episodes[i].salience = max(0.0, min(1.0, salience))
 
     def clear(self):
         """Clear all episodes."""

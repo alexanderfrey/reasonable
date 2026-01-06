@@ -347,6 +347,7 @@ def train_epoch(
     contrastive_weight: float = 0.1,
     accumulation_steps: int = 1,
     sequential: bool = False,
+    retrieval_benefit_salience_weight: float = 0.0,
 ) -> Dict[str, List[float]]:
     """Train for one epoch."""
     memory_gpt.train()
@@ -411,7 +412,8 @@ def train_epoch(
             input_ids,
             crystallize=True,
             use_memory=True,
-            prev_memory_query=prev_memory_query
+            prev_memory_query=prev_memory_query,
+            return_memory_weights=(retrieval_benefit_salience_weight > 0)
         )
         if sequential and mem_out.get('next_memory_query') is not None:
             prev_memory_query = mem_out['next_memory_query'].detach()
@@ -428,6 +430,16 @@ def train_epoch(
             retrieval_benefit_weight=retrieval_benefit_weight,
             contrastive_weight=contrastive_weight,
         )
+
+        if retrieval_benefit_salience_weight > 0:
+            benefit = loss_dict.get('retrieval_benefit')
+            weights = mem_out.get('episodic_weights')
+            if benefit is not None and weights is not None and weights.numel() > 0:
+                memory_gpt.memory.apply_retrieval_benefit(
+                    weights,
+                    benefit,
+                    retrieval_benefit_salience_weight
+                )
 
         # Scale for gradient accumulation
         loss = loss / accumulation_steps
@@ -522,16 +534,37 @@ def _format_top_episodes(memory, top_k: int, max_chars: int, step: Optional[int]
     episodes = sorted(memory.episodes, key=lambda e: e.salience, reverse=True)[:top_k]
     most_retrieved = sorted(memory.episodes, key=lambda e: e.retrieval_count, reverse=True)[:top_k]
     global_step = getattr(memory, "_global_step", None)
+    # Salience histogram (0.1-wide bins, clamped to [0.0, 1.0])
+    saliences = [ep.salience for ep in memory.episodes]
+    bin_counts = [0] * 10
+    for s in saliences:
+        idx = int(s * 10)
+        if idx < 0:
+            idx = 0
+        elif idx > 9:
+            idx = 9
+        bin_counts[idx] += 1
+    max_count = max(bin_counts) if bin_counts else 1
+    bar_width = 20
     header = "Episodic memory snapshot"
     if step is not None:
         header += f" (step {step})"
     lines = [
         header,
         f"- memory size: {memory.size}",
+    ]
+    lines.append("- salience histogram (bin=0.1):")
+    for i, count in enumerate(bin_counts):
+        low = i / 10
+        high = (i + 1) / 10
+        bar_len = int(round(bar_width * (count / max_count))) if max_count > 0 else 0
+        bar = "#" * bar_len
+        lines.append(f"  {low:>3.1f}-{high:>3.1f} | {bar} {count}")
+    lines.extend([
         "- top episodes (by salience):",
         "  #  salience  retr  age  text",
         "  -- --------  ----  ---  ----",
-    ]
+    ])
     for i, ep in enumerate(episodes, start=1):
         text = ep.text or ""
         if text:
@@ -760,6 +793,8 @@ def main():
                         help="Soft retrieval temperature (higher = less peaky)")
     parser.add_argument("--retrieval_salience_weight", type=float, default=0.0,
                         help="Salience bias for episodic retrieval (0 = similarity only)")
+    parser.add_argument("--retrieval_benefit_salience_weight", type=float, default=0.0,
+                        help="Adjust salience by retrieval benefit (0 = disable)")
     parser.add_argument("--memory_log_interval", type=int, default=0,
                         help="Steps between logging top episodic memories (0 = disable)")
     parser.add_argument("--memory_log_top_k", type=int, default=5,
@@ -797,6 +832,7 @@ def main():
     logger.info(f"  Decay rate: {args.decay_rate}, Min salience: {args.min_salience}, Dedup: {args.dedup_threshold}")
     logger.info(f"  Meta-surprise salience weight: {args.meta_surprise_salience_weight}")
     logger.info(f"  Retrieval temperature: {args.retrieval_temperature}, Retrieval salience weight: {args.retrieval_salience_weight}")
+    logger.info(f"  Retrieval benefit salience weight: {args.retrieval_benefit_salience_weight}")
     logger.info(f"  Batch size: {args.batch_size} x {args.accumulation_steps} accumulation")
     logger.info(f"  Sequential training: {args.sequential}")
     logger.info(f"  Loss weights: lm={args.lm_weight}, exp={args.exp_weight}, "
@@ -924,11 +960,11 @@ def main():
         logger.info(f"\n--- Epoch {epoch + 1}/{args.n_epochs} ---")
 
         # Train
-        history = train_epoch(
-            memory_gpt,
-            train_loader,
-            optimizer,
-            device,
+    history = train_epoch(
+        memory_gpt,
+        train_loader,
+        optimizer,
+        device,
             log_interval=args.log_interval,
             memory_log_interval=args.memory_log_interval,
             memory_log_top_k=args.memory_log_top_k,
@@ -937,12 +973,13 @@ def main():
             lm_weight=args.lm_weight,
             exp_weight=args.exp_weight,
             affect_weight=args.affect_weight,
-            retrieval_weight=args.retrieval_weight,
-            retrieval_benefit_weight=args.retrieval_benefit_weight,
-            contrastive_weight=args.contrastive_weight,
-            accumulation_steps=args.accumulation_steps,
-            sequential=args.sequential,
-        )
+        retrieval_weight=args.retrieval_weight,
+        retrieval_benefit_weight=args.retrieval_benefit_weight,
+        contrastive_weight=args.contrastive_weight,
+        accumulation_steps=args.accumulation_steps,
+        sequential=args.sequential,
+        retrieval_benefit_salience_weight=args.retrieval_benefit_salience_weight,
+    )
         all_history.append(history)
 
         # Evaluate on eval split
