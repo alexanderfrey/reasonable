@@ -562,7 +562,8 @@ def evaluate(
     dataloader: DataLoader,
     device: torch.device,
     max_steps: int = 100,
-    sequential: bool = False
+    sequential: bool = False,
+    crystallize: bool = False
 ) -> Dict[str, float]:
     """
     Evaluate the model.
@@ -573,6 +574,7 @@ def evaluate(
         device: Device to run on
         max_steps: Maximum evaluation steps
         sequential: If True, chain queries across batches and handle doc boundaries
+        crystallize: If True, store new memories during eval (for testing memory on fresh docs)
 
     Returns:
         Dict with evaluation metrics including retrieval benefit
@@ -616,7 +618,7 @@ def evaluate(
             # Forward WITH memory
             logits, hidden, mem_out = memory_gpt(
                 input_ids,
-                crystallize=False,  # Don't modify memory during eval
+                crystallize=crystallize,  # Optionally store new memories during eval
                 use_memory=True,
                 prev_memory_query=prev_memory_query,
                 return_memory_weights=True
@@ -695,9 +697,27 @@ def main():
                         help="Max tokens to decode/store per episode (default: no limit)")
 
     # Memory params
-    parser.add_argument("--integration", choices=['residual', 'gated', 'attention', 'cross_attention'], default='gated')
+    parser.add_argument("--integration", choices=['residual', 'gated', 'attention', 'cross_attention', 'kv_injection'], default='gated')
     parser.add_argument("--memory_capacity", type=int, default=1000)
     parser.add_argument("--crystallization_threshold", type=float, default=0.2)
+    parser.add_argument("--decay_rate", type=float, default=0.01,
+                        help="Salience decay rate per step (default 0.01, use 0 to disable)")
+    parser.add_argument("--min_salience", type=float, default=0.05,
+                        help="Memories below this salience get pruned (default 0.05)")
+    parser.add_argument("--dedup_threshold", type=float, default=0.95,
+                        help="Reject memories with cosine sim > this to existing (default 0.95)")
+
+    # KV injection params (only used when --integration=kv_injection)
+    parser.add_argument("--kv_injection_layers", type=str, default=None,
+                        help="Comma-separated layer indices for memory injection (default: n/4,n/2,3n/4)")
+    parser.add_argument("--kv_injection_max_tokens", type=int, default=16,
+                        help="Max tokens per memory for K/V injection (default: 16)")
+    parser.add_argument("--kv_injection_store_sequences", action="store_true", default=True,
+                        help="Store full sequences instead of single vectors (default: True)")
+    parser.add_argument("--no_kv_injection_store_sequences", dest="kv_injection_store_sequences", action="store_false",
+                        help="Store single vectors instead of sequences")
+    parser.add_argument("--cross_attention_top_k", type=int, default=8,
+                        help="Top-k memories for cross_attention/kv_injection modes (default: 8)")
 
     # Loss weights
     parser.add_argument("--lm_weight", type=float, default=1.0)
@@ -740,11 +760,24 @@ def main():
         logger.warning("Sequential training requires batch_size=1; overriding.")
         args.batch_size = 1
 
+    # Parse kv_injection_layers if provided
+    kv_injection_layers = None
+    if args.kv_injection_layers:
+        kv_injection_layers = [int(x.strip()) for x in args.kv_injection_layers.split(',')]
+
     logger.info("=" * 60)
     logger.info("Memory-Augmented GPT Training")
     logger.info(f"  Integration: {args.integration}")
+    if args.integration == 'kv_injection':
+        logger.info(f"    KV injection layers: {kv_injection_layers or 'auto (n/4, n/2, 3n/4)'}")
+        logger.info(f"    KV injection max tokens: {args.kv_injection_max_tokens}")
+        logger.info(f"    KV injection store sequences: {args.kv_injection_store_sequences}")
+        logger.info(f"    Top-k memories: {args.cross_attention_top_k}")
+    elif args.integration == 'cross_attention':
+        logger.info(f"    Top-k memories: {args.cross_attention_top_k}")
     logger.info(f"  Memory capacity: {args.memory_capacity}")
     logger.info(f"  Crystallization threshold: {args.crystallization_threshold}")
+    logger.info(f"  Decay rate: {args.decay_rate}, Min salience: {args.min_salience}, Dedup: {args.dedup_threshold}")
     logger.info(f"  Meta-surprise salience weight: {args.meta_surprise_salience_weight}")
     logger.info(f"  Batch size: {args.batch_size} x {args.accumulation_steps} accumulation")
     logger.info(f"  Sequential training: {args.sequential}")
@@ -775,8 +808,16 @@ def main():
         memory_capacity=args.memory_capacity,
         crystallization_threshold=args.crystallization_threshold,
         memory_integration=args.integration,
+        cross_attention_top_k=args.cross_attention_top_k,
         use_experiential=True,
         meta_surprise_salience_weight=args.meta_surprise_salience_weight,
+        decay_rate=args.decay_rate,
+        min_salience=args.min_salience,
+        dedup_threshold=args.dedup_threshold,
+        # KV injection specific params
+        kv_injection_layers=kv_injection_layers,
+        kv_injection_max_tokens=args.kv_injection_max_tokens,
+        kv_injection_store_sequences=args.kv_injection_store_sequences,
     ).to(device)
 
     tokenizer_name = args.tokenizer_name
@@ -801,9 +842,6 @@ def main():
     else:
         logger.info("Tokenizer not set; episode text will not be stored.")
 
-    n_params = sum(p.numel() for p in memory_gpt.parameters() if p.requires_grad)
-    logger.info(f"Trainable parameters: {n_params:,}")
-
     # Data
     train_loader = create_dataloader(
         args.data_dir,
@@ -822,12 +860,21 @@ def main():
         doc_metadata_path=args.doc_metadata
     )
 
-    # Optimizer - only train memory components
-    memory_params = [p for n, p in memory_gpt.named_parameters()
-                     if 'gpt.' not in n and p.requires_grad]
-    optimizer = torch.optim.AdamW(memory_params, lr=args.lr, weight_decay=0.01)
+    # Setup training: freeze GPT backbone, train only memory components
+    # This uses the new setup_memory_training() method which properly handles
+    # kv_injection mode (memory params are inside GPT layers)
+    param_stats = memory_gpt.setup_memory_training(
+        freeze_gpt=True,
+        unfreeze_gpt_output_proj=False,
+        unfreeze_experiential=True,
+        verbose=True
+    )
 
-    logger.info(f"Optimizing {len(memory_params)} parameter groups")
+    # Collect trainable parameters for optimizer
+    trainable_params = [p for p in memory_gpt.parameters() if p.requires_grad]
+    optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=0.01)
+
+    logger.info(f"Optimizing {len(trainable_params)} parameter tensors ({param_stats['trainable']:,} params)")
 
     # Pre-populate memory bank (avoids cold-start for cross-attention)
     if args.prepopulate and args.prepopulate_steps > 0:
@@ -872,7 +919,7 @@ def main():
         )
         all_history.append(history)
 
-        # Evaluate
+        # Evaluate on eval split
         eval_metrics = evaluate(
             memory_gpt, eval_loader, device,
             max_steps=100,
@@ -880,11 +927,44 @@ def main():
         )
         ret_ben = eval_metrics.get('retrieval_benefit', 0.0)
         ret_rate = eval_metrics.get('retrieval_rate', 0.0)
-        logger.info(f"Eval: lm_loss={eval_metrics['lm_loss']:.4f}, "
+        logger.info(f"Eval (eval split): lm_loss={eval_metrics['lm_loss']:.4f}, "
                     f"ret_benefit={ret_ben:+.4f}, "
                     f"ret_rate={ret_rate:.2%}, "
                     f"acc={eval_metrics['accuracy']:.4f}, "
                     f"memory={eval_metrics['memory_size']}")
+
+        # Evaluate on training split (to test if memories help on same documents)
+        train_eval_metrics = evaluate(
+            memory_gpt, train_loader, device,
+            max_steps=100,
+            sequential=args.sequential
+        )
+        train_ret_ben = train_eval_metrics.get('retrieval_benefit', 0.0)
+        train_ret_rate = train_eval_metrics.get('retrieval_rate', 0.0)
+        logger.info(f"Eval (train split): lm_loss={train_eval_metrics['lm_loss']:.4f}, "
+                    f"ret_benefit={train_ret_ben:+.4f}, "
+                    f"ret_rate={train_ret_rate:.2%}, "
+                    f"acc={train_eval_metrics['accuracy']:.4f}, "
+                    f"memory={train_eval_metrics['memory_size']}")
+
+        # Evaluate on eval split with fresh memory (clear old, crystallize new)
+        memory_snapshot = memory_gpt.memory.snapshot()  # Save current memories
+        memory_gpt.memory.clear()  # Clear all memories
+        fresh_eval_metrics = evaluate(
+            memory_gpt, eval_loader, device,
+            max_steps=100,
+            sequential=args.sequential,
+            crystallize=True  # Build fresh memories during eval
+        )
+        fresh_ret_ben = fresh_eval_metrics.get('retrieval_benefit', 0.0)
+        fresh_ret_rate = fresh_eval_metrics.get('retrieval_rate', 0.0)
+        logger.info(f"Eval (fresh memory): lm_loss={fresh_eval_metrics['lm_loss']:.4f}, "
+                    f"ret_benefit={fresh_ret_ben:+.4f}, "
+                    f"ret_rate={fresh_ret_rate:.2%}, "
+                    f"acc={fresh_eval_metrics['accuracy']:.4f}, "
+                    f"memory={fresh_eval_metrics['memory_size']}")
+        # Restore original memories for next epoch (move back to GPU)
+        memory_gpt.memory.restore(memory_snapshot, device=device)
 
         # Save checkpoint
         save_path = os.path.join(args.output_dir, f"memory_gpt_epoch_{epoch+1}.pt")
