@@ -71,6 +71,13 @@ class Episode:
     token_surprises: Optional[List[float]] = None  # per-token surprise scores
     top_surprise_indices: Optional[List[int]] = None  # indices of most surprising tokens
     top_surprise_scores: Optional[List[float]] = None  # scores of most surprising tokens
+    # Modification tracking for content refinement/correction
+    harm_count: int = 0              # Times retrieval hurt (benefit < 0)
+    benefit_count: int = 0           # Times retrieval helped (benefit > 0)
+    cumulative_benefit: float = 0.0  # Sum of (weight * benefit) over lifetime
+    modification_count: int = 0      # Times content was modified
+    episode_id: int = 0              # Unique ID for merge tracking
+    source_episode_ids: Optional[List[int]] = None  # IDs of episodes merged into this
 
     @property
     def is_sequence(self) -> bool:
@@ -126,6 +133,12 @@ class Episode:
             token_surprises=list(self.token_surprises) if self.token_surprises is not None else None,
             top_surprise_indices=list(self.top_surprise_indices) if self.top_surprise_indices is not None else None,
             top_surprise_scores=list(self.top_surprise_scores) if self.top_surprise_scores is not None else None,
+            harm_count=self.harm_count,
+            benefit_count=self.benefit_count,
+            cumulative_benefit=self.cumulative_benefit,
+            modification_count=self.modification_count,
+            episode_id=self.episode_id,
+            source_episode_ids=list(self.source_episode_ids) if self.source_episode_ids is not None else None,
         )
 
     def get_surprising_tokens(self, tokenizer=None, top_k: int = 5) -> List[Dict[str, Any]]:
@@ -193,6 +206,17 @@ class EpisodicMemory(nn.Module):
         min_salience: float = 0.05,
         dedup_threshold: float = 0.95,  # Reject memories with cosine sim > this to existing
         retrieval_count_top_k: int = 8,
+        # Content modification parameters
+        enable_content_refinement: bool = False,
+        content_refinement_rate: float = 0.1,
+        content_refinement_min_benefit: float = 0.1,
+        enable_content_correction: bool = False,
+        content_correction_rate: float = 0.05,
+        content_correction_harm_threshold: int = 3,
+        enable_episodic_consolidation: bool = False,
+        consolidation_similarity_threshold: float = 0.85,
+        consolidation_min_retrievals: int = 5,
+        consolidation_check_interval: int = 100,
     ):
         super().__init__()
         self.d_model = d_model
@@ -204,11 +228,26 @@ class EpisodicMemory(nn.Module):
         self.dedup_threshold = dedup_threshold  # Skip storing near-duplicates
         self.retrieval_count_top_k = retrieval_count_top_k
 
+        # Content modification config
+        self.enable_content_refinement = enable_content_refinement
+        self.content_refinement_rate = content_refinement_rate
+        self.content_refinement_min_benefit = content_refinement_min_benefit
+        self.enable_content_correction = enable_content_correction
+        self.content_correction_rate = content_correction_rate
+        self.content_correction_harm_threshold = content_correction_harm_threshold
+        self.enable_episodic_consolidation = enable_episodic_consolidation
+        self.consolidation_similarity_threshold = consolidation_similarity_threshold
+        self.consolidation_min_retrievals = consolidation_min_retrievals
+        self.consolidation_check_interval = consolidation_check_interval
+
         # Episode storage
         self.episodes: List[Episode] = []
 
         # Global timestamp counter
         self._global_step = 0
+
+        # Episode ID counter for merge tracking
+        self._next_episode_id = 0
 
     @property
     def size(self) -> int:
@@ -420,6 +459,9 @@ class EpisodicMemory(nn.Module):
 
         # Keep tensors on their original device (GPU) to avoid device mismatches
         # during backward pass. The .detach() prevents gradients from flowing back.
+        episode_id = self._next_episode_id
+        self._next_episode_id += 1
+
         episode = Episode(
             timestamp=timestamp,
             content=content.detach().clone(),
@@ -433,6 +475,7 @@ class EpisodicMemory(nn.Module):
             token_surprises=list(token_surprises) if token_surprises is not None else None,
             top_surprise_indices=top_surprise_indices,
             top_surprise_scores=top_surprise_scores,
+            episode_id=episode_id,
         )
 
         # Apply decay to existing memories before adding new one
@@ -684,33 +727,357 @@ class EpisodicMemory(nn.Module):
         self,
         weights: torch.Tensor,
         benefit: float,
-        scale: float
-    ) -> None:
-        """Adjust salience based on retrieval benefit.
+        scale: float,
+        query: Optional[torch.Tensor] = None
+    ) -> Dict[str, int]:
+        """Adjust salience and optionally modify content based on retrieval benefit.
 
         Scales by number of memories to compensate for attention dilution.
         With N memories, each gets ~1/N weight. Multiplying by N makes the
         update independent of memory count: weight * N ≈ 1 for average attention.
+
+        If query is provided and content modification is enabled:
+        - Refines content when benefit > 0
+        - Corrects content when benefit < 0
+        - Periodically consolidates similar episodes
+
+        Args:
+            weights: attention weights from retrieve_soft
+            benefit: scalar benefit signal
+            scale: scaling factor for salience updates
+            query: optional query vector for content modification
+
+        Returns:
+            Dict with modification counts
         """
+        result = {
+            'salience_updated': 0,
+            'content_refined': 0,
+            'content_corrected': 0,
+            'episodes_deleted': 0,
+            'episodes_merged': 0,
+        }
+
         if not self.episodes or scale == 0.0:
-            return
+            return result
         if weights is None or weights.numel() == 0:
-            return
-        if weights.dim() == 2:
-            weights = weights.mean(dim=0)
-        weights = weights.detach().float().cpu()
+            return result
+
+        # Salience update
+        weights_for_salience = weights
+        if weights_for_salience.dim() == 2:
+            weights_for_salience = weights_for_salience.mean(dim=0)
+        weights_for_salience = weights_for_salience.detach().float().cpu()
         n_memories = len(self.episodes)
         # Scale by n_memories to compensate for soft attention dilution
         delta = scale * benefit * n_memories
-        if delta == 0.0:
-            return
-        max_count = min(n_memories, weights.numel())
-        for i in range(max_count):
+
+        if delta != 0.0:
+            max_count = min(n_memories, weights_for_salience.numel())
+            for i in range(max_count):
+                w = weights_for_salience[i].item()
+                if w <= 0.0:
+                    continue
+                salience = self.episodes[i].salience + delta * w
+                self.episodes[i].salience = max(0.0, min(1.0, salience))
+                result['salience_updated'] += 1
+
+        # Content modification (requires query)
+        if query is not None:
+            if benefit > 0:
+                result['content_refined'] = self.apply_content_refinement(
+                    weights, benefit, query
+                )
+            elif benefit < 0:
+                corrected, deleted = self.apply_content_correction(
+                    weights, benefit, query
+                )
+                result['content_corrected'] = corrected
+                result['episodes_deleted'] = deleted
+
+        # Periodic consolidation
+        result['episodes_merged'] = self.consolidate_similar_episodes()
+
+        return result
+
+    def apply_content_refinement(
+        self,
+        weights: torch.Tensor,
+        benefit: float,
+        query: torch.Tensor,
+        min_weight: float = 0.01
+    ) -> int:
+        """Nudge episode content toward query when retrieval was beneficial.
+
+        Uses full EMA (direction + magnitude):
+            new_content = (1 - alpha * w) * old_content + (alpha * w) * query
+
+        For sequence content: apply EMA to mean, then shift all tokens uniformly.
+
+        Args:
+            weights: [n_episodes] attention weights from retrieve_soft
+            benefit: scalar benefit signal (positive = helpful)
+            query: [d_model] the query that triggered beneficial retrieval
+            min_weight: ignore episodes with weight below this
+
+        Returns:
+            Number of episodes refined
+        """
+        if not self.enable_content_refinement:
+            return 0
+        if benefit < self.content_refinement_min_benefit:
+            return 0
+        if not self.episodes or weights is None:
+            return 0
+
+        # Flatten weights if batched
+        if weights.dim() == 2:
+            weights = weights.mean(dim=0)
+        weights = weights.detach().float().cpu()
+        query = query.detach().cpu()
+
+        refined_count = 0
+        for i, ep in enumerate(self.episodes):
+            if i >= weights.numel():
+                break
             w = weights[i].item()
-            if w <= 0.0:
+            if w < min_weight:
                 continue
-            salience = self.episodes[i].salience + delta * w
-            self.episodes[i].salience = max(0.0, min(1.0, salience))
+
+            # Compute effective refinement rate (scaled by weight and benefit)
+            alpha = self.content_refinement_rate * w * benefit
+            alpha = min(alpha, 0.5)  # Cap to prevent drastic changes
+
+            if ep.is_sequence:
+                # For sequences: compute shift, apply to all tokens
+                old_mean = ep.content.mean(dim=0)  # [d_model]
+                # Target mean after EMA
+                new_mean = (1 - alpha) * old_mean + alpha * query.to(ep.content.device)
+                shift = new_mean - old_mean
+                # Apply shift uniformly to all tokens
+                ep.content = ep.content + shift.unsqueeze(0)
+            else:
+                # For single vector: direct EMA
+                ep.content = (1 - alpha) * ep.content + alpha * query.to(ep.content.device)
+
+            # Update tracking
+            ep.benefit_count += 1
+            ep.cumulative_benefit += w * benefit
+            ep.modification_count += 1
+            refined_count += 1
+
+        return refined_count
+
+    def apply_content_correction(
+        self,
+        weights: torch.Tensor,
+        benefit: float,
+        query: torch.Tensor,
+        min_weight: float = 0.01
+    ) -> Tuple[int, int]:
+        """Correct episode content when retrieval hurt performance.
+
+        Pushes content away from the harmful query. Marks for deletion
+        if consistently harmful.
+
+        Args:
+            weights: [n_episodes] attention weights from retrieve_soft
+            benefit: scalar benefit signal (negative = harmful)
+            query: [d_model] the query that triggered harmful retrieval
+            min_weight: ignore episodes with weight below this
+
+        Returns:
+            (corrected_count, deleted_count)
+        """
+        if not self.enable_content_correction:
+            return 0, 0
+        if benefit >= 0:  # Only correct on negative benefit
+            return 0, 0
+        if not self.episodes or weights is None:
+            return 0, 0
+
+        # Flatten weights if batched
+        if weights.dim() == 2:
+            weights = weights.mean(dim=0)
+        weights = weights.detach().float().cpu()
+        query = query.detach().cpu()
+
+        corrected_count = 0
+        to_delete = []
+
+        for i, ep in enumerate(self.episodes):
+            if i >= weights.numel():
+                break
+            w = weights[i].item()
+            if w < min_weight:
+                continue
+
+            # Update harm tracking
+            ep.harm_count += 1
+            ep.cumulative_benefit += w * benefit  # benefit is negative
+
+            # Check for deletion candidate
+            if ep.harm_count >= self.content_correction_harm_threshold:
+                # Only delete if harm significantly outweighs benefit
+                if ep.harm_count > ep.benefit_count * 2:
+                    to_delete.append(i)
+                    continue
+
+            # Compute correction rate (scaled by weight and harm magnitude)
+            alpha = self.content_correction_rate * w * abs(benefit)
+            alpha = min(alpha, 0.3)  # More conservative than refinement
+
+            if ep.is_sequence:
+                # Push sequence mean away from query
+                old_mean = ep.content.mean(dim=0)
+                query_on_device = query.to(ep.content.device)
+                # Direction away from query
+                shift = alpha * (old_mean - query_on_device)
+                ep.content = ep.content + shift.unsqueeze(0)
+            else:
+                # Push single vector away from query
+                query_on_device = query.to(ep.content.device)
+                correction = alpha * (ep.content - query_on_device)
+                ep.content = ep.content + correction
+
+            ep.modification_count += 1
+            corrected_count += 1
+
+        # Delete consistently harmful episodes (in reverse order)
+        for i in reversed(to_delete):
+            del self.episodes[i]
+
+        return corrected_count, len(to_delete)
+
+    def consolidate_similar_episodes(self, force: bool = False) -> int:
+        """Merge similar, frequently-retrieved episodes into single stronger episodes.
+
+        Trigger conditions (all must be met):
+        - Cosine similarity > consolidation_similarity_threshold
+        - Both episodes have retrieval_count >= consolidation_min_retrievals
+        - Periodic check (every consolidation_check_interval steps) unless force=True
+
+        Merged episodes collapse to single vector [d_model].
+
+        Args:
+            force: If True, run regardless of interval
+
+        Returns:
+            Number of merges performed
+        """
+        if not self.enable_episodic_consolidation:
+            return 0
+        if len(self.episodes) < 2:
+            return 0
+
+        # Check interval (unless forced)
+        if not force and self._global_step % self.consolidation_check_interval != 0:
+            return 0
+
+        # Get content matrix for similarity computation
+        contents = self.get_keys()  # [n, d_model]
+        if contents is None:
+            return 0
+        contents_norm = F.normalize(contents, dim=-1)
+
+        # Compute pairwise similarities
+        sims = torch.mm(contents_norm, contents_norm.t())  # [n, n]
+
+        # Find merge candidates
+        merge_candidates = []
+        n = len(self.episodes)
+
+        for i in range(n):
+            for j in range(i + 1, n):
+                ep_i, ep_j = self.episodes[i], self.episodes[j]
+
+                # Check retrieval count threshold
+                if (ep_i.retrieval_count < self.consolidation_min_retrievals or
+                    ep_j.retrieval_count < self.consolidation_min_retrievals):
+                    continue
+
+                # Check similarity threshold
+                if sims[i, j].item() < self.consolidation_similarity_threshold:
+                    continue
+
+                # Compute merge score (higher = better candidate)
+                score = (sims[i, j].item() *
+                        (ep_i.retrieval_count + ep_j.retrieval_count) *
+                        (ep_i.salience + ep_j.salience))
+                merge_candidates.append((i, j, score))
+
+        if not merge_candidates:
+            return 0
+
+        # Sort by score (best candidates first)
+        merge_candidates.sort(key=lambda x: x[2], reverse=True)
+
+        # Perform merges (track which indices are consumed)
+        merged_indices = set()
+        merges_performed = 0
+        new_episodes = []
+
+        for i, j, score in merge_candidates:
+            if i in merged_indices or j in merged_indices:
+                continue
+
+            ep_i, ep_j = self.episodes[i], self.episodes[j]
+            merged_episode = self._merge_episodes(ep_i, ep_j)
+            new_episodes.append(merged_episode)
+
+            merged_indices.add(i)
+            merged_indices.add(j)
+            merges_performed += 1
+
+        # Rebuild episode list: keep non-merged, add merged
+        self.episodes = [
+            ep for idx, ep in enumerate(self.episodes)
+            if idx not in merged_indices
+        ] + new_episodes
+
+        return merges_performed
+
+    def _merge_episodes(self, ep1: Episode, ep2: Episode) -> Episode:
+        """Merge two episodes into one (collapsed to single vector)."""
+        w1 = ep1.salience * (ep1.retrieval_count + 1)
+        w2 = ep2.salience * (ep2.retrieval_count + 1)
+        total_w = w1 + w2
+
+        # Merge content to single vector (weighted average of means)
+        v1 = ep1.get_content_vector()
+        v2 = ep2.get_content_vector()
+        merged_content = (w1 * v1 + w2 * v2) / total_w  # [d_model]
+
+        # Merge context (weighted average)
+        merged_context = (w1 * ep1.context + w2 * ep2.context) / total_w
+
+        # Take metadata from higher-salience episode
+        primary = ep1 if ep1.salience >= ep2.salience else ep2
+
+        # Generate new episode ID
+        new_id = self._next_episode_id
+        self._next_episode_id += 1
+
+        return Episode(
+            timestamp=max(ep1.timestamp, ep2.timestamp),
+            content=merged_content.detach().clone(),
+            context=merged_context.detach().clone(),
+            salience=max(ep1.salience, ep2.salience),
+            valence=(w1 * ep1.valence + w2 * ep2.valence) / total_w,
+            arousal=(w1 * ep1.arousal + w2 * ep2.arousal) / total_w,
+            retrieval_count=ep1.retrieval_count + ep2.retrieval_count,
+            text=primary.text,
+            token_ids=primary.token_ids,
+            token_surprises=primary.token_surprises,
+            top_surprise_indices=primary.top_surprise_indices,
+            top_surprise_scores=primary.top_surprise_scores,
+            harm_count=ep1.harm_count + ep2.harm_count,
+            benefit_count=ep1.benefit_count + ep2.benefit_count,
+            cumulative_benefit=ep1.cumulative_benefit + ep2.cumulative_benefit,
+            modification_count=ep1.modification_count + ep2.modification_count + 1,
+            episode_id=new_id,
+            source_episode_ids=[ep1.episode_id, ep2.episode_id],
+        )
 
     def clear(self):
         """Clear all episodes."""
@@ -1946,6 +2313,17 @@ class MemoryAugmentedGPT(nn.Module):
         decay_rate: float = 0.01,  # Salience decay rate per step
         min_salience: float = 0.05,  # Memories below this get pruned
         dedup_threshold: float = 0.95,  # Reject memories with cosine sim > this
+        # Content modification parameters
+        enable_content_refinement: bool = False,
+        content_refinement_rate: float = 0.1,
+        content_refinement_min_benefit: float = 0.1,
+        enable_content_correction: bool = False,
+        content_correction_rate: float = 0.05,
+        content_correction_harm_threshold: int = 3,
+        enable_episodic_consolidation: bool = False,
+        consolidation_similarity_threshold: float = 0.85,
+        consolidation_min_retrievals: int = 5,
+        consolidation_check_interval: int = 100,
         # K/V injection parameters (for memory_integration='kv_injection')
         kv_injection_layers: Optional[List[int]] = None,  # GPT layers for memory injection
         kv_injection_max_tokens: int = 16,  # Max tokens per memory
@@ -2014,6 +2392,16 @@ class MemoryAugmentedGPT(nn.Module):
             min_salience=min_salience,
             dedup_threshold=dedup_threshold,
             retrieval_count_top_k=cross_attention_top_k,
+            enable_content_refinement=enable_content_refinement,
+            content_refinement_rate=content_refinement_rate,
+            content_refinement_min_benefit=content_refinement_min_benefit,
+            enable_content_correction=enable_content_correction,
+            content_correction_rate=content_correction_rate,
+            content_correction_harm_threshold=content_correction_harm_threshold,
+            enable_episodic_consolidation=enable_episodic_consolidation,
+            consolidation_similarity_threshold=consolidation_similarity_threshold,
+            consolidation_min_retrievals=consolidation_min_retrievals,
+            consolidation_check_interval=consolidation_check_interval,
         )
 
         # Optional retrieval gate (benefit-guided).

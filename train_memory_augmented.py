@@ -519,16 +519,23 @@ def train_epoch(
                 benefit = loss_dict.get('retrieval_benefit')
                 weights = mem_out.get('episodic_weights')
                 if benefit is not None and weights is not None and weights.numel() > 0:
-                    memory_gpt.memory.apply_retrieval_benefit(
+                    # Pass query for content modification if available
+                    query = prev_memory_query
+                    mod_result = memory_gpt.memory.apply_retrieval_benefit(
                         weights,
                         benefit,
-                        retrieval_benefit_salience_weight
+                        retrieval_benefit_salience_weight,
+                        query=query
                     )
                     if step % log_interval == 0 and not live_enabled:
                         logger.info(
-                            "Retrieval-benefit salience update: benefit=%.4f, weight=%.4f",
+                            "Retrieval-benefit update: benefit=%.4f, salience=%d, refined=%d, corrected=%d, deleted=%d, merged=%d",
                             benefit,
-                            retrieval_benefit_salience_weight
+                            mod_result.get('salience_updated', 0),
+                            mod_result.get('content_refined', 0),
+                            mod_result.get('content_corrected', 0),
+                            mod_result.get('episodes_deleted', 0),
+                            mod_result.get('episodes_merged', 0)
                         )
 
             # Scale for gradient accumulation
@@ -984,6 +991,27 @@ def main():
                         help="Memories below this salience get pruned (default 0.05)")
     parser.add_argument("--dedup_threshold", type=float, default=0.95,
                         help="Reject memories with cosine sim > this to existing (default 0.95)")
+    # Content modification parameters
+    parser.add_argument("--enable_content_refinement", action="store_true",
+                        help="Enable content refinement on positive retrieval benefit")
+    parser.add_argument("--content_refinement_rate", type=float, default=0.1,
+                        help="EMA rate for content refinement (default 0.1)")
+    parser.add_argument("--content_refinement_min_benefit", type=float, default=0.1,
+                        help="Min benefit to trigger refinement (default 0.1)")
+    parser.add_argument("--enable_content_correction", action="store_true",
+                        help="Enable content correction on negative retrieval benefit")
+    parser.add_argument("--content_correction_rate", type=float, default=0.05,
+                        help="Rate for pushing content away from harmful queries (default 0.05)")
+    parser.add_argument("--content_correction_harm_threshold", type=int, default=3,
+                        help="Harm count before episode becomes deletion candidate (default 3)")
+    parser.add_argument("--enable_episodic_consolidation", action="store_true",
+                        help="Enable merging of similar, frequently-retrieved episodes")
+    parser.add_argument("--consolidation_similarity_threshold", type=float, default=0.85,
+                        help="Cosine similarity threshold for episode merging (default 0.85)")
+    parser.add_argument("--consolidation_min_retrievals", type=int, default=5,
+                        help="Min retrieval count for both episodes to merge (default 5)")
+    parser.add_argument("--consolidation_check_interval", type=int, default=100,
+                        help="Steps between consolidation checks (default 100)")
 
     # KV injection params (only used when --integration=kv_injection)
     parser.add_argument("--kv_injection_layers", type=str, default=None,
@@ -1128,6 +1156,17 @@ def main():
         decay_rate=args.decay_rate,
         min_salience=args.min_salience,
         dedup_threshold=args.dedup_threshold,
+        # Content modification params
+        enable_content_refinement=args.enable_content_refinement,
+        content_refinement_rate=args.content_refinement_rate,
+        content_refinement_min_benefit=args.content_refinement_min_benefit,
+        enable_content_correction=args.enable_content_correction,
+        content_correction_rate=args.content_correction_rate,
+        content_correction_harm_threshold=args.content_correction_harm_threshold,
+        enable_episodic_consolidation=args.enable_episodic_consolidation,
+        consolidation_similarity_threshold=args.consolidation_similarity_threshold,
+        consolidation_min_retrievals=args.consolidation_min_retrievals,
+        consolidation_check_interval=args.consolidation_check_interval,
         # KV injection specific params
         kv_injection_layers=kv_injection_layers,
         kv_injection_max_tokens=args.kv_injection_max_tokens,
