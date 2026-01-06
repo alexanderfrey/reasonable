@@ -57,22 +57,48 @@ Query (from prev step) → retrieve_soft() → attention weights over all episod
                                 ↓
                         Top-k episodes selected
                                 ↓
-                        Episode content → K/V projection
+                        Episode content → K/V projection (mem_k_proj, mem_v_proj)
                                 ↓
                         Injected into GPT attention layers (e.g., layers n/4, n/2, 3n/4)
-                                ↓
-                        GPT attends to memory K/V alongside context K/V
 ```
 
-**The injection happens DURING the forward pass**, not after. Memory K/V is concatenated with context K/V in selected transformer layers.
+**The injection happens DURING the forward pass** via two parallel attention computations:
+
+```
+                    Q, K, V from input
+                           │
+           ┌───────────────┴───────────────┐
+           ▼                               ▼
+    Self-Attention                  Cross-Attention
+    (context K/V)                   (memory K/V)
+    causal mask                     no causal mask
+           │                               │
+           ▼                               ▼
+    attn_context                    attn_memory
+           │                               │
+           └───────────┬───────────────────┘
+                       ▼
+              Gated Blend (mem_gate)
+              output = (1-g)·context + g·memory
+                       │
+                       ▼
+                 Final output
+```
+
+**Key insight**: Memory K/V are NOT concatenated with context K/V. The attention runs two
+separate passes (context self-attn + memory cross-attn) and blends them with a learned
+gate (`mem_gate`). This avoids shifting causal positions when prepending memory.
+
+See `model.py:214-314` for implementation.
 
 ### Retrieval Mechanism
 
 1. **Query projection**: Current hidden state → query vector
 2. **Soft retrieval**: Cosine similarity + salience weighting → attention weights
-3. **Gating**: Optional learned gate suppresses unhelpful retrievals
+3. **Retrieval gating**: Optional learned gate suppresses unhelpful retrievals
 4. **Selection**: Top-k memories by attention weight
-5. **Injection**: Memory content projected to K/V, concatenated in attention
+5. **Injection**: Memory content projected to K/V via `mem_k_proj`, `mem_v_proj`
+6. **Blending**: `output = (1 - sigmoid(mem_gate)) * attn_context + sigmoid(mem_gate) * attn_memory`
 
 ## 3. Modifying During Run
 
@@ -150,7 +176,8 @@ Periodically merge similar, frequently-retrieved episodes:
 | Episode dataclass | `experiential.py` | line ~51 |
 | Episode storage | `EpisodicMemory.store()` | line ~460 |
 | Soft retrieval | `EpisodicMemory.retrieve_soft()` | line ~550 |
-| K/V injection | `MemoryAugmentedGPT._inject_memory_kv()` | line ~2600 |
+| **K/V injection (attention)** | `model.py` | line 214-314 |
+| K/V injection (orchestration) | `MemoryAugmentedGPT._inject_memory_kv()` | line ~2600 |
 | Content refinement | `EpisodicMemory.apply_content_refinement()` | line ~803 |
 | Content correction | `EpisodicMemory.apply_content_correction()` | line ~868 |
 | Consolidation | `EpisodicMemory.consolidate_similar_episodes()` | line ~950 |
