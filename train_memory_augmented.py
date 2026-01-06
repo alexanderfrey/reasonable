@@ -729,10 +729,10 @@ def evaluate(
             if sequential and mem_out.get('next_memory_query') is not None:
                 prev_memory_query = mem_out['next_memory_query']
 
-            # Track if retrieval happened
+            # Track if retrieval happened (threshold lowered for large memory banks)
             if mem_out.get('episodic_weights') is not None:
                 weights = mem_out['episodic_weights']
-                if weights.numel() > 0 and weights.max().item() > 0.01:
+                if weights.numel() > 0 and weights.max().item() > 0.001:
                     n_retrievals += 1
 
             # Compute loss with memory
