@@ -46,6 +46,13 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
+try:
+    from rich.console import Console
+    from rich.live import Live
+    from rich.panel import Panel
+    _RICH_AVAILABLE = True
+except Exception:
+    _RICH_AVAILABLE = False
 
 
 def load_model(checkpoint_path: str, device: torch.device):
@@ -351,6 +358,9 @@ def train_epoch(
     accumulation_steps: int = 1,
     sequential: bool = False,
     retrieval_benefit_salience_weight: float = 0.0,
+    live_memory_hist: bool = False,
+    live_memory_interval: int = 1,
+    live_memory_top_k: int = 0,
 ) -> Dict[str, List[float]]:
     """Train for one epoch."""
     memory_gpt.train()
@@ -383,204 +393,337 @@ def train_epoch(
     prev_doc_id = None
     logged_grad_norms = False
 
-    pbar = tqdm(dataloader, desc="Training")
-    for step, batch in enumerate(pbar):
-        input_ids = batch["input_ids"].to(device)
-        # Target is shifted input (next token prediction)
-        targets = input_ids[:, 1:].contiguous()
-        input_ids = input_ids[:, :-1].contiguous()
-
-        if sequential:
-            doc_ids = batch.get("doc_id")
-            if doc_ids is None:
-                raise ValueError("Sequential training requires doc_id in batch")
-            if (doc_ids != doc_ids[0]).any():
-                logger.warning("Batch spans multiple documents; resetting sequence state")
-            batch_doc_id = int(doc_ids[0])
-            if prev_doc_id is None or batch_doc_id != prev_doc_id:
-                memory_gpt.reset_hidden_state()
-                prev_memory_query = None
-                prev_doc_id = batch_doc_id
-        else:
-            # Reset experiential state for each batch (shuffled data, not sequential)
-            # This prevents state from leaking across unrelated documents
-            if memory_gpt.experiential is not None:
-                memory_gpt.experiential.reset_state(batch_size=input_ids.size(0))
-
-        # Forward pass with causal memory retrieval
-        # For shuffled data, prev_memory_query=None means no memory retrieval
-        # (each batch is an independent sequence, no previous context to query from)
-        # Memories are still crystallized and available for sequential evaluation
-        logits, hidden, mem_out = memory_gpt(
-            input_ids,
-            crystallize=True,
-            use_memory=True,
-            prev_memory_query=prev_memory_query,
-            return_memory_weights=(
-                retrieval_benefit_salience_weight > 0
-                or retrieval_gate_weight > 0
-                or retrieval_gate_sparsity_weight > 0
-            )
+    live = None
+    live_enabled = live_memory_hist and _RICH_AVAILABLE
+    if live_memory_hist and not _RICH_AVAILABLE:
+        logger.warning("Live histogram requested but rich is unavailable; continuing without live output.")
+    if live_enabled:
+        live_top_k = live_memory_top_k if live_memory_top_k > 0 else memory_log_top_k
+        console = Console()
+        live = Live(
+            Panel(
+                _format_live_snapshot(
+                    memory_gpt.memory,
+                    metrics=None,
+                    step=0,
+                    top_k=live_top_k,
+                    max_chars=memory_log_max_chars,
+                ),
+                title="Memory Snapshot",
+            ),
+            console=console,
+            refresh_per_second=4,
+            transient=True,
         )
-        if sequential and mem_out.get('next_memory_query') is not None:
-            prev_memory_query = mem_out['next_memory_query'].detach()
-        elif not sequential:
-            prev_memory_query = None
+        live.start()
 
-        if step % log_interval == 0:
-            raw_weights = mem_out.get('episodic_weights_raw')
-            gated_weights = mem_out.get('episodic_weights')
-            gate_vals = mem_out.get('episodic_gate')
-            if raw_weights is not None and raw_weights.numel() > 0:
-                if raw_weights.dim() > 1:
-                    raw_view = raw_weights.mean(dim=0)
-                else:
-                    raw_view = raw_weights
-                raw_view = raw_view.detach().float()
-                raw_max = raw_view.max().item()
-                raw_mean = raw_view.mean().item()
-                if gated_weights is not None and gated_weights.numel() > 0:
-                    if gated_weights.dim() > 1:
-                        gated_view = gated_weights.mean(dim=0)
-                    else:
-                        gated_view = gated_weights
-                    gated_view = gated_view.detach().float()
-                    gated_max = gated_view.max().item()
-                    gated_mean = gated_view.mean().item()
-                    gate_mean = None
-                    if gate_vals is not None and gate_vals.numel() > 0:
-                        gate_mean = gate_vals.detach().float().mean().item()
-                    if gate_mean is not None:
-                        logger.info(
-                            "Retrieval weights: raw max=%.4f mean=%.4f | gated max=%.4f mean=%.4f | gate mean=%.4f",
-                            raw_max, raw_mean, gated_max, gated_mean, gate_mean
-                        )
-                    else:
-                        logger.info(
-                            "Retrieval weights: raw max=%.4f mean=%.4f | gated max=%.4f mean=%.4f",
-                            raw_max, raw_mean, gated_max, gated_mean
-                        )
-                else:
-                    logger.info(
-                        "Retrieval weights: raw max=%.4f mean=%.4f",
-                        raw_max, raw_mean
-                    )
+    pbar = tqdm(dataloader, desc="Training", disable=live_enabled)
+    try:
+        for step, batch in enumerate(pbar):
+            input_ids = batch["input_ids"].to(device)
+            # Target is shifted input (next token prediction)
+            targets = input_ids[:, 1:].contiguous()
+            input_ids = input_ids[:, :-1].contiguous()
 
-        # Compute loss (includes extended self-awareness losses)
-        loss, loss_dict = memory_augmented_loss(
-            logits, targets, mem_out,
-            lm_weight=lm_weight,
-            exp_weight=exp_weight,
-            affect_weight=affect_weight,
-            retrieval_weight=retrieval_weight,
-            retrieval_benefit_weight=retrieval_benefit_weight,
-            retrieval_gate_weight=retrieval_gate_weight,
-            retrieval_gate_sparsity_weight=retrieval_gate_sparsity_weight,
-            retrieval_gate_entropy_weight=retrieval_gate_entropy_weight,
-            contrastive_weight=contrastive_weight,
-        )
+            if sequential:
+                doc_ids = batch.get("doc_id")
+                if doc_ids is None:
+                    raise ValueError("Sequential training requires doc_id in batch")
+                if (doc_ids != doc_ids[0]).any():
+                    logger.warning("Batch spans multiple documents; resetting sequence state")
+                batch_doc_id = int(doc_ids[0])
+                if prev_doc_id is None or batch_doc_id != prev_doc_id:
+                    memory_gpt.reset_hidden_state()
+                    prev_memory_query = None
+                    prev_doc_id = batch_doc_id
+            else:
+                # Reset experiential state for each batch (shuffled data, not sequential)
+                # This prevents state from leaking across unrelated documents
+                if memory_gpt.experiential is not None:
+                    memory_gpt.experiential.reset_state(batch_size=input_ids.size(0))
 
-        if retrieval_benefit_salience_weight > 0:
-            benefit = loss_dict.get('retrieval_benefit')
-            weights = mem_out.get('episodic_weights')
-            if benefit is not None and weights is not None and weights.numel() > 0:
-                memory_gpt.memory.apply_retrieval_benefit(
-                    weights,
-                    benefit,
-                    retrieval_benefit_salience_weight
+            # Forward pass with causal memory retrieval
+            # For shuffled data, prev_memory_query=None means no memory retrieval
+            # (each batch is an independent sequence, no previous context to query from)
+            # Memories are still crystallized and available for sequential evaluation
+            logits, hidden, mem_out = memory_gpt(
+                input_ids,
+                crystallize=True,
+                use_memory=True,
+                prev_memory_query=prev_memory_query,
+                return_memory_weights=(
+                    retrieval_benefit_salience_weight > 0
+                    or retrieval_gate_weight > 0
+                    or retrieval_gate_sparsity_weight > 0
                 )
-                if step % log_interval == 0:
-                    logger.info(
-                        "Retrieval-benefit salience update: benefit=%.4f, weight=%.4f",
+            )
+            if sequential and mem_out.get('next_memory_query') is not None:
+                prev_memory_query = mem_out['next_memory_query'].detach()
+            elif not sequential:
+                prev_memory_query = None
+
+            if step % log_interval == 0 and not live_enabled:
+                raw_weights = mem_out.get('episodic_weights_raw')
+                gated_weights = mem_out.get('episodic_weights')
+                gate_vals = mem_out.get('episodic_gate')
+                if raw_weights is not None and raw_weights.numel() > 0:
+                    if raw_weights.dim() > 1:
+                        raw_view = raw_weights.mean(dim=0)
+                    else:
+                        raw_view = raw_weights
+                    raw_view = raw_view.detach().float()
+                    raw_max = raw_view.max().item()
+                    raw_mean = raw_view.mean().item()
+                    if gated_weights is not None and gated_weights.numel() > 0:
+                        if gated_weights.dim() > 1:
+                            gated_view = gated_weights.mean(dim=0)
+                        else:
+                            gated_view = gated_weights
+                        gated_view = gated_view.detach().float()
+                        gated_max = gated_view.max().item()
+                        gated_mean = gated_view.mean().item()
+                        gate_mean = None
+                        if gate_vals is not None and gate_vals.numel() > 0:
+                            gate_mean = gate_vals.detach().float().mean().item()
+                        if gate_mean is not None:
+                            logger.info(
+                                "Retrieval weights: raw max=%.4f mean=%.4f | gated max=%.4f mean=%.4f | gate mean=%.4f",
+                                raw_max, raw_mean, gated_max, gated_mean, gate_mean
+                            )
+                        else:
+                            logger.info(
+                                "Retrieval weights: raw max=%.4f mean=%.4f | gated max=%.4f mean=%.4f",
+                                raw_max, raw_mean, gated_max, gated_mean
+                            )
+                    else:
+                        logger.info(
+                            "Retrieval weights: raw max=%.4f mean=%.4f",
+                            raw_max, raw_mean
+                        )
+
+            # Compute loss (includes extended self-awareness losses)
+            loss, loss_dict = memory_augmented_loss(
+                logits, targets, mem_out,
+                lm_weight=lm_weight,
+                exp_weight=exp_weight,
+                affect_weight=affect_weight,
+                retrieval_weight=retrieval_weight,
+                retrieval_benefit_weight=retrieval_benefit_weight,
+                retrieval_gate_weight=retrieval_gate_weight,
+                retrieval_gate_sparsity_weight=retrieval_gate_sparsity_weight,
+                retrieval_gate_entropy_weight=retrieval_gate_entropy_weight,
+                contrastive_weight=contrastive_weight,
+            )
+
+            if retrieval_benefit_salience_weight > 0:
+                benefit = loss_dict.get('retrieval_benefit')
+                weights = mem_out.get('episodic_weights')
+                if benefit is not None and weights is not None and weights.numel() > 0:
+                    memory_gpt.memory.apply_retrieval_benefit(
+                        weights,
                         benefit,
                         retrieval_benefit_salience_weight
                     )
+                    if step % log_interval == 0 and not live_enabled:
+                        logger.info(
+                            "Retrieval-benefit salience update: benefit=%.4f, weight=%.4f",
+                            benefit,
+                            retrieval_benefit_salience_weight
+                        )
 
-        # Scale for gradient accumulation
-        loss = loss / accumulation_steps
+            # Scale for gradient accumulation
+            loss = loss / accumulation_steps
 
-        # Verify loss tensor is on a CUDA device if training on GPU
-        # (comparing device types rather than exact device IDs)
-        if device.type == 'cuda' and loss.device.type != 'cuda':
-            logger.warning(f"Step {step}: loss tensor on {loss.device}, expected {device}")
-            loss = loss.to(device)
+            # Verify loss tensor is on a CUDA device if training on GPU
+            # (comparing device types rather than exact device IDs)
+            if device.type == 'cuda' and loss.device.type != 'cuda':
+                logger.warning(f"Step {step}: loss tensor on {loss.device}, expected {device}")
+                loss = loss.to(device)
 
-        loss.backward()
+            loss.backward()
 
-        # One-time gradient norm check for memory injection params.
-        if step == 0 and not logged_grad_norms:
-            patterns = ('mem_k_proj', 'mem_v_proj', 'mem_gate')
-            logger.info("Grad norms (step 0):")
-            for name, param in memory_gpt.named_parameters():
-                if any(p in name for p in patterns):
-                    if param.grad is None:
-                        logger.info("  %s: grad=None", name)
-                    else:
-                        grad_norm = param.grad.detach().float().norm().item()
-                        logger.info("  %s: %.6f", name, grad_norm)
-            logged_grad_norms = True
+            # One-time gradient norm check for memory injection params.
+            if step == 0 and not logged_grad_norms:
+                patterns = ('mem_k_proj', 'mem_v_proj', 'mem_gate')
+                logger.info("Grad norms (step 0):")
+                for name, param in memory_gpt.named_parameters():
+                    if any(p in name for p in patterns):
+                        if param.grad is None:
+                            logger.info("  %s: grad=None", name)
+                        else:
+                            grad_norm = param.grad.detach().float().norm().item()
+                            logger.info("  %s: %.6f", name, grad_norm)
+                logged_grad_norms = True
 
-        total_loss += loss.item() * accumulation_steps
+            total_loss += loss.item() * accumulation_steps
 
-        # Optimizer step
-        if (step + 1) % accumulation_steps == 0:
-            torch.nn.utils.clip_grad_norm_(memory_gpt.parameters(), max_norm=1.0)
-            optimizer.step()
-            optimizer.zero_grad()
+            # Optimizer step
+            if (step + 1) % accumulation_steps == 0:
+                torch.nn.utils.clip_grad_norm_(memory_gpt.parameters(), max_norm=1.0)
+                optimizer.step()
+                optimizer.zero_grad()
 
-        # Metrics
-        if mem_out.get('prediction') is not None:
-            acc = prediction_accuracy(mem_out['prediction'], mem_out['target'])
-            surprise = mem_out['surprise'].mean().item()
-        else:
-            acc = 0.0
-            surprise = 0.0
+            # Metrics
+            if mem_out.get('prediction') is not None:
+                acc = prediction_accuracy(mem_out['prediction'], mem_out['target'])
+                surprise = mem_out['surprise'].mean().item()
+            else:
+                acc = 0.0
+                surprise = 0.0
 
-        history['loss'].append(loss_dict['total_loss'])
-        history['lm_loss'].append(loss_dict['lm_loss'])
-        history['exp_loss'].append(loss_dict.get('exp_loss', 0.0))
-        history['accuracy'].append(acc)
-        history['memory_size'].append(mem_out['episodic_size'])
-        history['surprise'].append(surprise)
-        # Extended self-awareness metrics
-        history['affect_loss'].append(loss_dict.get('affect_loss', 0.0))
-        history['retrieval_loss'].append(loss_dict.get('retrieval_loss', 0.0))
-        history['meta_affect_surprise'].append(loss_dict.get('mean_meta_affect_surprise', 0.0))
-        history['meta_retrieval_surprise'].append(loss_dict.get('mean_meta_retrieval_surprise', 0.0))
-        # Retrieval benefit metrics
-        history['retrieval_benefit'].append(loss_dict.get('retrieval_benefit', 0.0))
-        history['retrieval_benefit_loss'].append(loss_dict.get('retrieval_benefit_loss', 0.0))
-        # Contrastive loss
-        history['contrastive_loss'].append(loss_dict.get('contrastive_loss', 0.0))
+            history['loss'].append(loss_dict['total_loss'])
+            history['lm_loss'].append(loss_dict['lm_loss'])
+            history['exp_loss'].append(loss_dict.get('exp_loss', 0.0))
+            history['accuracy'].append(acc)
+            history['memory_size'].append(mem_out['episodic_size'])
+            history['surprise'].append(surprise)
+            # Extended self-awareness metrics
+            history['affect_loss'].append(loss_dict.get('affect_loss', 0.0))
+            history['retrieval_loss'].append(loss_dict.get('retrieval_loss', 0.0))
+            history['meta_affect_surprise'].append(loss_dict.get('mean_meta_affect_surprise', 0.0))
+            history['meta_retrieval_surprise'].append(loss_dict.get('mean_meta_retrieval_surprise', 0.0))
+            # Retrieval benefit metrics
+            history['retrieval_benefit'].append(loss_dict.get('retrieval_benefit', 0.0))
+            history['retrieval_benefit_loss'].append(loss_dict.get('retrieval_benefit_loss', 0.0))
+            # Contrastive loss
+            history['contrastive_loss'].append(loss_dict.get('contrastive_loss', 0.0))
 
-        if memory_log_interval and step % memory_log_interval == 0:
-            memory_report = _format_top_episodes(
-                memory_gpt.memory,
-                top_k=memory_log_top_k,
-                max_chars=memory_log_max_chars,
-                step=step,
-            )
-            logger.info("%s", memory_report)
+            if memory_log_interval and step % memory_log_interval == 0 and not live_enabled:
+                memory_report = _format_top_episodes(
+                    memory_gpt.memory,
+                    top_k=memory_log_top_k,
+                    max_chars=memory_log_max_chars,
+                    step=step,
+                )
+                logger.info("%s", memory_report)
 
-        # Log
-        if step % log_interval == 0:
-            avg_loss = total_loss / (step + 1)
-            retrieval_benefit = loss_dict.get('retrieval_benefit', 0.0)
-            pbar.set_postfix({
-                'loss': f'{avg_loss:.4f}',
-                'lm': f'{loss_dict["lm_loss"]:.3f}',
-                'mem': mem_out['episodic_size'],
-                'acc': f'{acc:.3f}',
-                'ret_ben': f'{retrieval_benefit:.3f}',  # positive = memory helps
-            })
+            if live and live_memory_interval > 0 and step % live_memory_interval == 0:
+                avg_loss = total_loss / (step + 1)
+                retrieval_benefit = loss_dict.get('retrieval_benefit', 0.0)
+                live_metrics = {
+                    "loss": avg_loss,
+                    "lm": loss_dict.get("lm_loss", 0.0),
+                    "exp": loss_dict.get("exp_loss", 0.0),
+                    "aff": loss_dict.get("affect_loss", 0.0),
+                    "ret": loss_dict.get("retrieval_loss", 0.0),
+                    "mem": mem_out.get("episodic_size", 0),
+                    "acc": acc,
+                    "ret_ben": retrieval_benefit,
+                    "surprise": surprise,
+                }
+                live.update(
+                    Panel(
+                        _format_live_snapshot(
+                            memory_gpt.memory,
+                            metrics=live_metrics,
+                            step=step,
+                            top_k=live_top_k,
+                            max_chars=memory_log_max_chars,
+                        ),
+                        title="Memory Snapshot",
+                    )
+                )
 
-        if max_steps and step >= max_steps:
-            break
+            # Log
+            if step % log_interval == 0 and not live_enabled:
+                avg_loss = total_loss / (step + 1)
+                retrieval_benefit = loss_dict.get('retrieval_benefit', 0.0)
+                pbar.set_postfix({
+                    'loss': f'{avg_loss:.4f}',
+                    'lm': f'{loss_dict["lm_loss"]:.3f}',
+                    'mem': mem_out['episodic_size'],
+                    'acc': f'{acc:.3f}',
+                    'ret_ben': f'{retrieval_benefit:.3f}',  # positive = memory helps
+                })
+
+            if max_steps and step >= max_steps:
+                break
+    finally:
+        if live is not None:
+            live.stop()
 
     return history
 
 
-def _format_top_episodes(memory, top_k: int, max_chars: int, step: Optional[int] = None) -> str:
+def _format_salience_histogram(memory, step: Optional[int] = None) -> str:
+    if memory.size == 0:
+        header = "Episodic memory histogram"
+        if step is not None:
+            header += f" (step {step})"
+        return f"{header}\n- memory empty"
+    saliences = [ep.salience for ep in memory.episodes]
+    bin_counts = [0] * 10
+    for s in saliences:
+        idx = int(s * 10)
+        if idx < 0:
+            idx = 0
+        elif idx > 9:
+            idx = 9
+        bin_counts[idx] += 1
+    max_count = max(bin_counts) if bin_counts else 1
+    bar_width = 20
+    header = "Episodic memory histogram"
+    if step is not None:
+        header += f" (step {step})"
+    lines = [
+        header,
+        f"- memory size: {memory.size}",
+        "- salience histogram (bin=0.1):",
+    ]
+    for i, count in enumerate(bin_counts):
+        low = i / 10
+        high = (i + 1) / 10
+        bar_len = int(round(bar_width * (count / max_count))) if max_count > 0 else 0
+        bar = "#" * bar_len
+        lines.append(f"  {low:>3.1f}-{high:>3.1f} | {bar} {count}")
+    return "\n".join(lines)
+
+
+def _format_live_snapshot(
+    memory,
+    metrics: Optional[Dict[str, float]],
+    step: Optional[int],
+    top_k: int,
+    max_chars: int,
+) -> str:
+    lines = []
+    if metrics:
+        lines.append(
+            "Metrics: loss={loss:.4f} lm={lm:.3f} exp={exp:.3f} aff={aff:.3f} ret={ret:.3f}".format(
+                loss=metrics.get("loss", 0.0),
+                lm=metrics.get("lm", 0.0),
+                exp=metrics.get("exp", 0.0),
+                aff=metrics.get("aff", 0.0),
+                ret=metrics.get("ret", 0.0),
+            )
+        )
+        lines.append(
+            "         mem={mem:d} acc={acc:.3f} ret_ben={ret_ben:.3f} surprise={surprise:.3f}".format(
+                mem=int(metrics.get("mem", 0)),
+                acc=metrics.get("acc", 0.0),
+                ret_ben=metrics.get("ret_ben", 0.0),
+                surprise=metrics.get("surprise", 0.0),
+            )
+        )
+    lines.append(
+        _format_top_episodes(
+            memory,
+            top_k=top_k,
+            max_chars=max_chars,
+            step=step,
+            pad_to_top_k=True,
+        )
+    )
+    return "\n".join(lines)
+
+
+def _format_top_episodes(
+    memory,
+    top_k: int,
+    max_chars: int,
+    step: Optional[int] = None,
+    pad_to_top_k: bool = False,
+) -> str:
     if memory.size == 0:
         header = "Episodic memory snapshot"
         if step is not None:
@@ -616,52 +759,41 @@ def _format_top_episodes(memory, top_k: int, max_chars: int, step: Optional[int]
         bar_len = int(round(bar_width * (count / max_count))) if max_count > 0 else 0
         bar = "#" * bar_len
         lines.append(f"  {low:>3.1f}-{high:>3.1f} | {bar} {count}")
-    lines.extend([
-        "- top episodes (by salience):",
-        "  #  salience  retr  age  text",
-        "  -- --------  ----  ---  ----",
-    ])
-    for i, ep in enumerate(episodes, start=1):
-        text = ep.text or ""
-        if text:
-            text = " ".join(text.split())
-        else:
-            text = "(no text stored)"
-        if max_chars > 0 and len(text) > max_chars:
-            text = text[: max_chars - 3] + "..."
-        if global_step is not None:
-            age = max(0, global_step - ep.timestamp)
-            age_str = f"{age:>3d}"
-        else:
-            age_str = " --"
-        lines.append(
-            f"  {i:>2d} {ep.salience:>8.3f}  {ep.retrieval_count:>4d}  {age_str}  {text}"
-        )
     lines.append("- most retrieved episodes:")
     lines.append("  #  retr  salience  age  text")
     lines.append("  -- ----  --------  ---  ----")
-    for i, ep in enumerate(most_retrieved, start=1):
-        text = ep.text or ""
-        if text:
-            text = " ".join(text.split())
-        else:
-            text = "(no text stored)"
-        if max_chars > 0 and len(text) > max_chars:
-            text = text[: max_chars - 3] + "..."
-        if global_step is not None:
-            age = max(0, global_step - ep.timestamp)
-            age_str = f"{age:>3d}"
-        else:
-            age_str = " --"
-        lines.append(
-            f"  {i:>2d} {ep.retrieval_count:>4d}  {ep.salience:>8.3f}  {age_str}  {text}"
-        )
+    for i in range(1, top_k + 1):
+        if i <= len(most_retrieved):
+            ep = most_retrieved[i - 1]
+            text = ep.text or ""
+            if text:
+                text = " ".join(text.split())
+            else:
+                text = "(no text stored)"
+            if max_chars > 0 and len(text) > max_chars:
+                text = text[: max_chars - 3] + "..."
+            if global_step is not None:
+                age = max(0, global_step - ep.timestamp)
+                age_str = f"{age:>3d}"
+            else:
+                age_str = " --"
+            lines.append(
+                f"  {i:>2d} {ep.retrieval_count:>4d}  {ep.salience:>8.3f}  {age_str}  {text}"
+            )
+        elif pad_to_top_k:
+            lines.append(f"  {i:>2d} {'--':>4}  {'--':>8}   --  (empty)")
     if last_weights is not None:
         if torch.is_tensor(last_weights):
             weights_list = last_weights.detach().float().cpu().tolist()
         else:
             weights_list = list(last_weights)
-        if len(weights_list) == len(memory.episodes):
+        if weights_list:
+            n_eps = len(memory.episodes)
+            mismatch = len(weights_list) != n_eps
+            if len(weights_list) < n_eps:
+                weights_list = weights_list + [0.0] * (n_eps - len(weights_list))
+            elif len(weights_list) > n_eps:
+                weights_list = weights_list[:n_eps]
             weight_order = sorted(
                 range(len(weights_list)),
                 key=lambda idx: weights_list[idx],
@@ -670,24 +802,36 @@ def _format_top_episodes(memory, top_k: int, max_chars: int, step: Optional[int]
             lines.append("- most retrieved episodes (by weight):")
             lines.append("  #  weight  salience  retr  age  text")
             lines.append("  -- ------  --------  ----  ---  ----")
-            for i, idx in enumerate(weight_order, start=1):
-                ep = memory.episodes[idx]
-                weight = weights_list[idx]
-                text = ep.text or ""
-                if text:
-                    text = " ".join(text.split())
-                else:
-                    text = "(no text stored)"
-                if max_chars > 0 and len(text) > max_chars:
-                    text = text[: max_chars - 3] + "..."
-                if global_step is not None:
-                    age = max(0, global_step - ep.timestamp)
-                    age_str = f"{age:>3d}"
-                else:
-                    age_str = " --"
-                lines.append(
-                    f"  {i:>2d} {weight:>6.4f}  {ep.salience:>8.3f}  {ep.retrieval_count:>4d}  {age_str}  {text}"
-                )
+            weight_max_chars = min(max_chars, 80) if max_chars > 0 else max_chars
+
+            for i in range(1, top_k + 1):
+                if i <= len(weight_order):
+                    idx = weight_order[i - 1]
+                    ep = memory.episodes[idx]
+                    weight = weights_list[idx]
+                    text = ep.text or ""
+                    if text:
+                        text = " ".join(text.split())
+                    else:
+                        text = "(no text stored)"
+                    if weight_max_chars > 0 and len(text) > weight_max_chars:
+                        text = text[: weight_max_chars - 3] + "..."
+                    if global_step is not None:
+                        age = max(0, global_step - ep.timestamp)
+                        age_str = f"{age:>3d}"
+                    else:
+                        age_str = " --"
+                    lines.append(
+                        f"  {i:>2d} {weight:>6.4f}  {ep.salience:>8.3f}  {ep.retrieval_count:>4d}  {age_str}  {text}"
+                    )
+                elif pad_to_top_k:
+                    lines.append(f"  {i:>2d} {'--':>6}  {'--':>8}  {'--':>4}   --  (empty)")
+        elif pad_to_top_k:
+            lines.append("- most retrieved episodes (by weight):")
+            lines.append("  #  weight  salience  retr  age  text")
+            lines.append("  -- ------  --------  ----  ---  ----")
+            for i in range(1, top_k + 1):
+                lines.append(f"  {i:>2d} {'--':>6}  {'--':>8}  {'--':>4}   --  (empty)")
     return "\n".join(lines)
 
 
@@ -895,6 +1039,12 @@ def main():
                         help="How many top episodic memories to show")
     parser.add_argument("--memory_log_max_chars", type=int, default=200,
                         help="Max chars per episodic text snippet")
+    parser.add_argument("--live_memory_hist", action="store_true",
+                        help="Show a live-updating salience histogram (requires rich)")
+    parser.add_argument("--live_memory_interval", type=int, default=1,
+                        help="Steps between live histogram refreshes (default: 1)")
+    parser.add_argument("--live_memory_top_k", type=int, default=0,
+                        help="Top-k slots in live view (0 = use memory_log_top_k)")
 
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--log_interval", type=int, default=50)
@@ -946,6 +1096,15 @@ def main():
         args.memory_log_top_k,
         args.memory_log_max_chars,
     )
+    if args.live_memory_hist:
+        logger.info(
+            "  Live histogram: enabled (interval=%s)",
+            args.live_memory_interval,
+        )
+        logger.info(
+            "  Live top-k: %s",
+            args.live_memory_top_k if args.live_memory_top_k > 0 else args.memory_log_top_k,
+        )
     logger.info("=" * 60)
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -1081,6 +1240,9 @@ def main():
             accumulation_steps=args.accumulation_steps,
             sequential=args.sequential,
             retrieval_benefit_salience_weight=args.retrieval_benefit_salience_weight,
+            live_memory_hist=args.live_memory_hist,
+            live_memory_interval=args.live_memory_interval,
+            live_memory_top_k=args.live_memory_top_k,
         )
         all_history.append(history)
 
