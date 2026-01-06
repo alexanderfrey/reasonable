@@ -756,6 +756,10 @@ def main():
     # Salience calibration
     parser.add_argument("--meta_surprise_salience_weight", type=float, default=1.0,
                         help="How much meta-surprise boosts salience (default 1.0)")
+    parser.add_argument("--retrieval_temperature", type=float, default=0.1,
+                        help="Soft retrieval temperature (higher = less peaky)")
+    parser.add_argument("--retrieval_salience_weight", type=float, default=0.0,
+                        help="Salience bias for episodic retrieval (0 = similarity only)")
     parser.add_argument("--memory_log_interval", type=int, default=0,
                         help="Steps between logging top episodic memories (0 = disable)")
     parser.add_argument("--memory_log_top_k", type=int, default=5,
@@ -792,6 +796,7 @@ def main():
     logger.info(f"  Crystallization threshold: {args.crystallization_threshold}")
     logger.info(f"  Decay rate: {args.decay_rate}, Min salience: {args.min_salience}, Dedup: {args.dedup_threshold}")
     logger.info(f"  Meta-surprise salience weight: {args.meta_surprise_salience_weight}")
+    logger.info(f"  Retrieval temperature: {args.retrieval_temperature}, Retrieval salience weight: {args.retrieval_salience_weight}")
     logger.info(f"  Batch size: {args.batch_size} x {args.accumulation_steps} accumulation")
     logger.info(f"  Sequential training: {args.sequential}")
     logger.info(f"  Loss weights: lm={args.lm_weight}, exp={args.exp_weight}, "
@@ -824,6 +829,8 @@ def main():
         cross_attention_top_k=args.cross_attention_top_k,
         use_experiential=True,
         meta_surprise_salience_weight=args.meta_surprise_salience_weight,
+        retrieval_temperature=args.retrieval_temperature,
+        retrieval_salience_weight=args.retrieval_salience_weight,
         decay_rate=args.decay_rate,
         min_salience=args.min_salience,
         dedup_threshold=args.dedup_threshold,
