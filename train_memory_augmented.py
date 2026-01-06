@@ -19,6 +19,7 @@ import json
 import logging
 import math
 import os
+import random
 import time
 from typing import Optional, Dict, List
 
@@ -53,6 +54,17 @@ try:
     _RICH_AVAILABLE = True
 except Exception:
     _RICH_AVAILABLE = False
+
+
+def set_seed(seed: int) -> None:
+    """Set RNG seeds for reproducible training runs."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 
 def load_model(checkpoint_path: str, device: torch.device):
@@ -361,6 +373,10 @@ def train_epoch(
     live_memory_hist: bool = False,
     live_memory_interval: int = 1,
     live_memory_top_k: int = 0,
+    memory_snapshot_interval: int = 0,
+    memory_snapshot_dir: Optional[str] = None,
+    memory_snapshot_min_size: int = 1,
+    epoch: int = 0,
 ) -> Dict[str, List[float]]:
     """Train for one epoch."""
     memory_gpt.train()
@@ -612,6 +628,27 @@ def train_epoch(
                     step=step,
                 )
                 logger.info("%s", memory_report)
+
+            if (
+                memory_snapshot_interval
+                and memory_snapshot_dir
+                and step % memory_snapshot_interval == 0
+                and memory_gpt.memory.size >= memory_snapshot_min_size
+            ):
+                snapshot_path = os.path.join(
+                    memory_snapshot_dir,
+                    f"episodic_memory_epoch_{epoch + 1}_step_{step}.pt",
+                )
+                torch.save(
+                    {
+                        'episodic_memory': memory_gpt.memory.snapshot(),
+                        'epoch': epoch,
+                        'step': step,
+                    },
+                    snapshot_path,
+                )
+                if step % log_interval == 0 and not live_enabled:
+                    logger.info("Saved episodic memory snapshot to %s", snapshot_path)
 
             if live and live_memory_interval > 0 and step % live_memory_interval == 0:
                 avg_loss = total_loss / (step + 1)
@@ -979,6 +1016,8 @@ def main():
     parser.add_argument("--n_epochs", type=int, default=1)
     parser.add_argument("--max_steps", type=int, default=None)
     parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Random seed for reproducibility (default: 42)")
     parser.add_argument("--accumulation_steps", type=int, default=4)
     parser.add_argument("--no-sequential", dest="sequential", action="store_false",
                         help="Disable sequential training (shuffle batches and reset state)")
@@ -1076,6 +1115,12 @@ def main():
                         help="How many top episodic memories to show")
     parser.add_argument("--memory_log_max_chars", type=int, default=200,
                         help="Max chars per episodic text snippet")
+    parser.add_argument("--memory_snapshot_interval", type=int, default=0,
+                        help="Save episodic memory snapshot every N steps (0 = disable)")
+    parser.add_argument("--memory_snapshot_dir", default=None,
+                        help="Directory for episodic memory snapshots (default: <output_dir>/memory_snapshots)")
+    parser.add_argument("--memory_snapshot_min_size", type=int, default=1,
+                        help="Minimum memory size to write snapshot (default: 1)")
     parser.add_argument("--live_memory_hist", action="store_true",
                         help="Show a live-updating salience histogram (requires rich)")
     parser.add_argument("--live_memory_interval", type=int, default=1,
@@ -1088,6 +1133,7 @@ def main():
 
     args = parser.parse_args()
     device = torch.device(args.device)
+    set_seed(args.seed)
 
     if args.sequential and args.batch_size != 1:
         logger.warning("Sequential training requires batch_size=1; overriding.")
@@ -1119,6 +1165,7 @@ def main():
     logger.info(f"  Retrieval gate entropy weight: {args.retrieval_gate_entropy_weight}")
     logger.info(f"  Batch size: {args.batch_size} x {args.accumulation_steps} accumulation")
     logger.info(f"  Sequential training: {args.sequential}")
+    logger.info(f"  Seed: {args.seed}")
     logger.info(f"  Loss weights: lm={args.lm_weight}, exp={args.exp_weight}, "
                 f"affect={args.affect_weight}, retrieval={args.retrieval_weight}, "
                 f"retrieval_benefit={args.retrieval_benefit_weight}, "
@@ -1133,6 +1180,14 @@ def main():
         args.memory_log_top_k,
         args.memory_log_max_chars,
     )
+    if args.memory_snapshot_interval:
+        snapshot_dir = args.memory_snapshot_dir or os.path.join(args.output_dir, "memory_snapshots")
+        logger.info(
+            "  Memory snapshots: every %s steps, dir=%s, min_size=%s",
+            args.memory_snapshot_interval,
+            snapshot_dir,
+            args.memory_snapshot_min_size,
+        )
     if args.live_memory_hist:
         logger.info(
             "  Live histogram: enabled (interval=%s)",
@@ -1145,6 +1200,10 @@ def main():
     logger.info("=" * 60)
 
     os.makedirs(args.output_dir, exist_ok=True)
+    snapshot_dir = None
+    if args.memory_snapshot_interval:
+        snapshot_dir = args.memory_snapshot_dir or os.path.join(args.output_dir, "memory_snapshots")
+        os.makedirs(snapshot_dir, exist_ok=True)
 
     # Load model
     gpt, config, saved_args = load_model(args.checkpoint, device)
@@ -1291,6 +1350,10 @@ def main():
             live_memory_hist=args.live_memory_hist,
             live_memory_interval=args.live_memory_interval,
             live_memory_top_k=args.live_memory_top_k,
+            memory_snapshot_interval=args.memory_snapshot_interval,
+            memory_snapshot_dir=snapshot_dir,
+            memory_snapshot_min_size=args.memory_snapshot_min_size,
+            epoch=epoch,
         )
         all_history.append(history)
 

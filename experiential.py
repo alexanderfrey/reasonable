@@ -3004,9 +3004,45 @@ class MemoryAugmentedGPT(nn.Module):
                         # For kv_injection: store sequence of hidden states
                         # For other modes: store single modulated vector
                         if store_sequences:
-                            # Store last N tokens of hidden states
                             max_tokens = getattr(self, 'kv_injection_max_tokens', 16)
-                            content_seq = hidden_states[i, -max_tokens:, :]  # [max_tokens, d_model]
+                            # Prefer span around the most surprising token, fall back to tail.
+                            if surprise_t is not None and surprise_t.size(1) > 0:
+                                # Align to per-token CE: hidden_states[:, :-1, :]
+                                seq_source = hidden_states[i, :-1, :] if hidden_states.size(1) > 1 else hidden_states[i]
+                                seq_len = seq_source.size(0)
+                                k = min(self.surprise_topk, surprise_t.size(1))
+                                if k <= 0:
+                                    content_seq = hidden_states[i, -max_tokens:, :]  # [max_tokens, d_model]
+                                else:
+                                    topk_vals, topk_idx = torch.topk(surprise_t[i], k=k)
+                                    topk_pairs = list(zip(topk_idx.tolist(), topk_vals.tolist()))
+                                    min_idx = min(idx for idx, _ in topk_pairs)
+                                    max_idx = max(idx for idx, _ in topk_pairs)
+                                    span_len = max_idx - min_idx + 1
+                                    if span_len <= max_tokens:
+                                        start = min_idx
+                                        end = max_idx + 1
+                                    else:
+                                        # Choose window covering as many top-k indices as possible.
+                                        best_start = 0
+                                        best_count = -1
+                                        best_score = None
+                                        for start in range(0, max(1, seq_len - max_tokens + 1)):
+                                            end = start + max_tokens
+                                            count = sum(1 for idx, _ in topk_pairs if start <= idx < end)
+                                            if count < best_count:
+                                                continue
+                                            score = sum(val for idx, val in topk_pairs if start <= idx < end)
+                                            if count > best_count or best_score is None or score > best_score:
+                                                best_start = start
+                                                best_count = count
+                                                best_score = score
+                                        start = best_start
+                                        end = min(seq_len, start + max_tokens)
+                                    content_seq = seq_source[start:end, :]
+                            else:
+                                # Store last N tokens of hidden states
+                                content_seq = hidden_states[i, -max_tokens:, :]  # [max_tokens, d_model]
                             content = content_seq
                         else:
                             content = modulated[i]  # [d_model]
