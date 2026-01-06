@@ -697,7 +697,7 @@ def main():
                         help="Max tokens to decode/store per episode (default: no limit)")
 
     # Memory params
-    parser.add_argument("--integration", choices=['residual', 'gated', 'attention', 'cross_attention', 'kv_injection'], default='gated')
+    parser.add_argument("--integration", choices=['residual', 'gated', 'attention', 'cross_attention', 'kv_injection'], default='cross_attention')
     parser.add_argument("--memory_capacity", type=int, default=1000)
     parser.add_argument("--crystallization_threshold", type=float, default=0.2)
     parser.add_argument("--decay_rate", type=float, default=0.01,
