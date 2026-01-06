@@ -253,6 +253,10 @@ class EpisodicMemory(nn.Module):
         This method retrieves the full token sequences stored in memories,
         suitable for use as K/V in attention mechanisms.
 
+        Padding strategy: Instead of zero-padding (which can soak attention),
+        we pad with the sequence mean. This ensures padded positions have
+        similar representations to real tokens, avoiding attention dilution.
+
         Args:
             indices: Optional [batch, k] tensor of memory indices to retrieve.
                     If None, returns all memories.
@@ -267,6 +271,16 @@ class EpisodicMemory(nn.Module):
         if not self.episodes:
             return None
 
+        def pad_sequence_with_mean(seq: torch.Tensor, target_len: int) -> torch.Tensor:
+            """Pad sequence to target_len using sequence mean (not zeros)."""
+            if seq.size(0) >= target_len:
+                return seq[:target_len]
+            # Pad with mean of sequence to avoid attention dilution
+            seq_mean = seq.mean(dim=0, keepdim=True)  # [1, d_model]
+            pad_len = target_len - seq.size(0)
+            padding = seq_mean.expand(pad_len, -1)  # [pad_len, d_model]
+            return torch.cat([seq, padding], dim=0)
+
         if indices is None:
             # Return all memories concatenated
             all_seqs = []
@@ -274,14 +288,9 @@ class EpisodicMemory(nn.Module):
                 seq = ep.get_content_sequence(max_tokens=max_tokens_per_memory)
                 all_seqs.append(seq)
 
-            # Pad to same length and stack
+            # Pad to same length and stack (using mean padding, not zeros)
             max_len = max(s.size(0) for s in all_seqs)
-            padded = []
-            for seq in all_seqs:
-                if seq.size(0) < max_len:
-                    pad = torch.zeros(max_len - seq.size(0), self.d_model, device=seq.device, dtype=seq.dtype)
-                    seq = torch.cat([seq, pad], dim=0)
-                padded.append(seq)
+            padded = [pad_sequence_with_mean(seq, max_len) for seq in all_seqs]
 
             result = torch.stack(padded, dim=0)  # [num_memories, max_len, d_model]
             # Flatten to [num_memories * max_len, d_model] for simpler attention
@@ -309,18 +318,15 @@ class EpisodicMemory(nn.Module):
                     # Concatenate all sequences for this batch element
                     batch_seq = torch.cat(mem_seqs, dim=0)  # [total_tokens, d_model]
                 else:
-                    batch_seq = torch.zeros(1, self.d_model)
+                    # No valid memories - use a small learned-like placeholder
+                    # Using small random values instead of zeros to avoid attention issues
+                    batch_seq = torch.randn(1, self.d_model) * 0.01
 
                 batch_seqs.append(batch_seq)
 
-            # Pad to same length across batch
+            # Pad to same length across batch (using mean padding, not zeros)
             max_len = max(s.size(0) for s in batch_seqs)
-            padded = []
-            for seq in batch_seqs:
-                if seq.size(0) < max_len:
-                    pad = torch.zeros(max_len - seq.size(0), self.d_model, device=seq.device, dtype=seq.dtype)
-                    seq = torch.cat([seq, pad], dim=0)
-                padded.append(seq)
+            padded = [pad_sequence_with_mean(seq, max_len) for seq in batch_seqs]
 
             result = torch.stack(padded, dim=0)  # [batch, max_len, d_model]
 
@@ -452,7 +458,7 @@ class EpisodicMemory(nn.Module):
         for ep in self.episodes:
             if ep.salience < min_salience:
                 continue
-            content_norm = F.normalize(ep.content, dim=-1)
+            content_norm = F.normalize(ep.get_content_vector(), dim=-1)
             sim = torch.dot(query_norm, content_norm).item()
             scores.append((ep, sim))
 
@@ -521,7 +527,8 @@ class EpisodicMemory(nn.Module):
 
         # Stack episode contents: [n_episodes, d_model]
         # Keep on same device as query for gradient flow
-        episode_contents = torch.stack([ep.content.to(device) for ep in self.episodes])
+        # Use get_content_vector() to handle both single-vector and sequence storage
+        episode_contents = torch.stack([ep.get_content_vector().to(device) for ep in self.episodes])
         n_episodes = episode_contents.size(0)
 
         # Normalize for cosine similarity
@@ -574,7 +581,8 @@ class EpisodicMemory(nn.Module):
         """
         if not self.episodes:
             return torch.zeros(0, self.d_model, device=device)
-        contents = torch.stack([ep.content for ep in self.episodes])
+        # Use get_content_vector() to handle both single-vector and sequence storage
+        contents = torch.stack([ep.get_content_vector() for ep in self.episodes])
         if device is not None:
             contents = contents.to(device)
         return contents
@@ -2305,8 +2313,22 @@ class MemoryAugmentedGPT(nn.Module):
             )
 
         # Save original logits/hidden for retrieval benefit loss
-        logits_without_memory = logits
         hidden_states_original = hidden_states
+
+        # For kv_injection: logits already have memory, need separate forward for baseline
+        # For other modes: save logits before integration as baseline
+        if self.memory_integration == 'kv_injection' and memory_kv is not None:
+            # Run separate forward WITHOUT memory to get true baseline
+            # This is needed because kv_injection integrates memory during forward
+            with torch.no_grad():
+                logits_without_memory, _ = self.gpt(
+                    input_ids,
+                    input_pos=input_pos,
+                    return_hidden_states=False,
+                    memory_kv=None  # No memory injection
+                )
+        else:
+            logits_without_memory = logits
 
         # 3. Integrate memory with hidden states (memory was retrieved causally)
         # Skip for kv_injection mode - memory was integrated during forward pass
@@ -2674,7 +2696,8 @@ class MemoryAugmentedGPT(nn.Module):
             return None
 
         # Stack all memory contents into a single tensor
-        memory_contents = [ep.content for ep in self.memory.episodes]
+        # Use get_content_vector() to handle both single-vector and sequence storage
+        memory_contents = [ep.get_content_vector() for ep in self.memory.episodes]
         memory_bank = torch.stack(memory_contents, dim=0)  # [num_memories, d_model]
 
         # Move to specified device if needed
@@ -3337,8 +3360,9 @@ class SemanticStream(nn.Module):
             return None
 
         # Stack episode embeddings
-        device = episodes[0].content.device
-        episode_embeddings = torch.stack([ep.content.to(device) for ep in episodes])
+        # Use get_content_vector() to handle both single-vector and sequence storage
+        device = episodes[0].get_content_vector().device
+        episode_embeddings = torch.stack([ep.get_content_vector().to(device) for ep in episodes])
 
         # Ensure all SemanticStream modules are on the same device
         self.pattern_extractor = self.pattern_extractor.to(device)

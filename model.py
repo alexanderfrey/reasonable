@@ -259,46 +259,52 @@ class MemoryAugmentedAttention(nn.Module):
         q = apply_rotary_emb(q, cos, sin, interleaved=False)
         k = apply_rotary_emb(k, cos, sin, interleaved=False)
 
-        # 3. Project memory to K, V (no RoPE - memory is "outside" position)
+        # 3. KV Cache Management (same as base attention)
+        if kv_cache is not None:
+            k_cache, v_cache = kv_cache
+
+            # Write current K, V to cache at input_pos
+            k_cache.index_copy_(1, input_pos, k)
+            v_cache.index_copy_(1, input_pos, v)
+
+            # For decoding (S=1), retrieve history from cache
+            if S == 1:
+                curr_pos = input_pos[-1].item() + 1
+                k = k_cache[:, :curr_pos]
+                v = v_cache[:, :curr_pos]
+
+        # 4. Project memory to K, V (no RoPE - memory is "outside" position)
         mem_k = self.mem_k_proj(memory_kv.to(target_dtype))  # [B, M, n_kv_head * head_dim]
         mem_v = self.mem_v_proj(memory_kv.to(target_dtype))  # [B, M, n_kv_head * head_dim]
         mem_k = mem_k.view(B, M, self.n_kv_head, self.head_dim)  # [B, M, n_kv_head, head_dim]
         mem_v = mem_v.view(B, M, self.n_kv_head, self.head_dim)  # [B, M, n_kv_head, head_dim]
 
-        # 4. Concatenate memory K/V with context K/V
-        # Memory comes first (always attendable), then context (causal)
-        k_aug = torch.cat([mem_k, k], dim=1)  # [B, M+S, n_kv_head, head_dim]
-        v_aug = torch.cat([mem_v, v], dim=1)  # [B, M+S, n_kv_head, head_dim]
-
-        # 5. Attention with augmented K/V
-        # Note: We need custom masking - memory positions are always visible,
-        # context positions follow causal mask
-        # For simplicity, we use flash_attn with causal=False and apply our own mask
-        # OR we can use the fact that prepending memory effectively makes it "past"
-
-        # Since memory tokens are prepended, they appear as "earlier" positions
-        # The causal mask will naturally allow attending to them
+        # 5. Compute attention in two parts to handle masking correctly:
+        #    - Context self-attention: causal mask (Q[i] sees K[0..i])
+        #    - Memory cross-attention: no causal mask (all Q see all memory)
+        #    This avoids the bug where prepending memory would shift causal positions.
         is_causal = (S > 1)  # Only apply causal during prefill
         attn_dropout = self.base_attn.dropout if self.base_attn.training else 0.0
 
-        output_aug = flash_attn_func(
-            q, k_aug, v_aug,
-            dropout_p=attn_dropout,
-            causal=is_causal,
-            window_size=(-1, -1)
-        )
-
-        # Also compute base attention without memory for gating
-        output_base = flash_attn_func(
+        # 5a. Self-attention to context (with causal mask)
+        attn_context = flash_attn_func(
             q, k, v,
             dropout_p=attn_dropout,
             causal=is_causal,
             window_size=(-1, -1)
         )
 
-        # 6. Blend with gating
+        # 5b. Cross-attention to memory (no causal mask - all positions see all memory)
+        attn_memory = flash_attn_func(
+            q, mem_k, mem_v,
+            dropout_p=attn_dropout,
+            causal=False,  # All query positions can attend to all memory
+            window_size=(-1, -1)
+        )
+
+        # 6. Blend context and memory attention with learned gate
         gate = torch.sigmoid(self.mem_gate)
-        output = gate * output_aug + (1 - gate) * output_base
+        output = (1 - gate) * attn_context + gate * attn_memory
 
         # 7. Reshape and output projection
         output = output.reshape(B, S, self.n_head * self.head_dim)
