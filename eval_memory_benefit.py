@@ -154,6 +154,8 @@ def snapshot_memory(model: MemoryAugmentedGPT) -> Dict[str, object]:
             retrieval_count=ep.retrieval_count,
             text=ep.text,
             token_ids=list(ep.token_ids) if ep.token_ids is not None else None,
+            hint_text=ep.hint_text,
+            hint_token_ids=list(ep.hint_token_ids) if ep.hint_token_ids is not None else None,
         ))
     return {
         'episodes': episodes,

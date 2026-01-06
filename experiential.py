@@ -67,6 +67,8 @@ class Episode:
     retrieval_count: int = 0    # how often accessed (for consolidation)
     text: Optional[str] = None  # human-readable text for this episode
     token_ids: Optional[List[int]] = None  # raw token ids for later decoding
+    hint_text: Optional[str] = None  # decoded span of top-surprise tokens
+    hint_token_ids: Optional[List[int]] = None  # raw token ids for hint span
     # Per-token surprise data
     token_surprises: Optional[List[float]] = None  # per-token surprise scores
     top_surprise_indices: Optional[List[int]] = None  # indices of most surprising tokens
@@ -130,6 +132,8 @@ class Episode:
             retrieval_count=self.retrieval_count,
             text=self.text,
             token_ids=list(self.token_ids) if self.token_ids is not None else None,
+            hint_text=self.hint_text,
+            hint_token_ids=list(self.hint_token_ids) if self.hint_token_ids is not None else None,
             token_surprises=list(self.token_surprises) if self.token_surprises is not None else None,
             top_surprise_indices=list(self.top_surprise_indices) if self.top_surprise_indices is not None else None,
             top_surprise_scores=list(self.top_surprise_scores) if self.top_surprise_scores is not None else None,
@@ -402,6 +406,8 @@ class EpisodicMemory(nn.Module):
         timestamp: Optional[int] = None,
         text: Optional[str] = None,
         token_ids: Optional[List[int]] = None,
+        hint_text: Optional[str] = None,
+        hint_token_ids: Optional[List[int]] = None,
         token_surprises: Optional[List[float]] = None,
         top_k_surprises: int = 10,
     ) -> Episode:
@@ -419,6 +425,8 @@ class EpisodicMemory(nn.Module):
             timestamp: optional explicit timestamp
             text: optional human-readable text for this episode
             token_ids: optional raw token ids for later decoding
+            hint_text: optional decoded span around the most surprising tokens
+            hint_token_ids: optional raw token ids for the hint span
             token_surprises: optional per-token surprise scores
             top_k_surprises: number of top surprising tokens to pre-compute
 
@@ -473,6 +481,8 @@ class EpisodicMemory(nn.Module):
             retrieval_count=0,
             text=text,
             token_ids=list(token_ids) if token_ids is not None else None,
+            hint_text=hint_text,
+            hint_token_ids=list(hint_token_ids) if hint_token_ids is not None else None,
             token_surprises=list(token_surprises) if token_surprises is not None else None,
             top_surprise_indices=top_surprise_indices,
             top_surprise_scores=top_surprise_scores,
@@ -1077,6 +1087,8 @@ class EpisodicMemory(nn.Module):
             retrieval_count=ep1.retrieval_count + ep2.retrieval_count,
             text=primary.text,
             token_ids=primary.token_ids,
+            hint_text=primary.hint_text,
+            hint_token_ids=primary.hint_token_ids,
             token_surprises=primary.token_surprises,
             top_surprise_indices=primary.top_surprise_indices,
             top_surprise_scores=primary.top_surprise_scores,
@@ -1134,6 +1146,8 @@ class EpisodicMemory(nn.Module):
                 retrieval_count=ep.retrieval_count,
                 text=ep.text,
                 token_ids=list(ep.token_ids) if ep.token_ids is not None else None,
+                hint_text=ep.hint_text,
+                hint_token_ids=list(ep.hint_token_ids) if ep.hint_token_ids is not None else None,
                 token_surprises=list(ep.token_surprises) if ep.token_surprises is not None else None,
                 top_surprise_indices=list(ep.top_surprise_indices) if ep.top_surprise_indices is not None else None,
                 top_surprise_scores=list(ep.top_surprise_scores) if ep.top_surprise_scores is not None else None,
@@ -2697,6 +2711,58 @@ class MemoryAugmentedGPT(nn.Module):
 
         return text, token_ids
 
+    def _decode_tokens(self, token_ids: List[int]) -> Optional[str]:
+        """Decode a list of token IDs using the attached tokenizer."""
+        if not token_ids:
+            return None
+        if self.tokenizer is None or not hasattr(self.tokenizer, "decode"):
+            return None
+        try:
+            return self.tokenizer.decode(token_ids, skip_special_tokens=True)
+        except TypeError:
+            return self.tokenizer.decode(token_ids)
+
+    def _select_surprise_span(
+        self,
+        surprise_scores: Optional[torch.Tensor],
+        max_tokens: int,
+        top_k: int
+    ) -> Optional[Tuple[int, int]]:
+        """Pick a token span that covers top-k surprise while staying within max_tokens."""
+        if surprise_scores is None or surprise_scores.numel() == 0:
+            return None
+        if max_tokens <= 0:
+            return None
+        seq_len = surprise_scores.numel()
+        k = min(top_k, seq_len)
+        if k <= 0:
+            return None
+
+        topk_vals, topk_idx = torch.topk(surprise_scores, k=k)
+        topk_pairs = list(zip(topk_idx.tolist(), topk_vals.tolist()))
+        min_idx = min(idx for idx, _ in topk_pairs)
+        max_idx = max(idx for idx, _ in topk_pairs)
+        span_len = max_idx - min_idx + 1
+
+        if span_len <= max_tokens:
+            return min_idx, max_idx + 1
+
+        best_start = 0
+        best_count = -1
+        best_score = None
+        max_start = max(1, seq_len - max_tokens + 1)
+        for start in range(0, max_start):
+            end = start + max_tokens
+            count = sum(1 for idx, _ in topk_pairs if start <= idx < end)
+            if count < best_count:
+                continue
+            score = sum(val for idx, val in topk_pairs if start <= idx < end)
+            if count > best_count or best_score is None or score > best_score:
+                best_start = start
+                best_count = count
+                best_score = score
+        return best_start, min(seq_len, best_start + max_tokens)
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -3001,6 +3067,28 @@ class MemoryAugmentedGPT(nn.Module):
                         if surprise_t is not None:
                             token_surprises = surprise_t[i].tolist()
 
+                        hint_text = None
+                        hint_token_ids = None
+                        if surprise_t is not None and surprise_t.size(1) > 0:
+                            hint_max_tokens = getattr(self, "kv_injection_max_tokens", 16)
+                            if self.max_text_tokens is not None:
+                                hint_max_tokens = min(hint_max_tokens, self.max_text_tokens)
+                            top_k = self.experiential.surprise_topk if self.experiential is not None else 0
+                            span = self._select_surprise_span(
+                                surprise_t[i],
+                                hint_max_tokens,
+                                top_k,
+                            )
+                            if span is not None:
+                                start, end = span
+                                pred_tokens = input_ids[i, 1:1 + surprise_t.size(1)]
+                                hint_ids = pred_tokens[start:end].detach().cpu().tolist()
+                                if self.pad_token_id is not None:
+                                    hint_ids = [tok for tok in hint_ids if tok != self.pad_token_id]
+                                if hint_ids:
+                                    hint_token_ids = hint_ids
+                                    hint_text = self._decode_tokens(hint_token_ids)
+
                         # For kv_injection: store sequence of hidden states
                         # For other modes: store single modulated vector
                         if store_sequences:
@@ -3009,37 +3097,17 @@ class MemoryAugmentedGPT(nn.Module):
                             if surprise_t is not None and surprise_t.size(1) > 0:
                                 # Align to per-token CE: hidden_states[:, :-1, :]
                                 seq_source = hidden_states[i, :-1, :] if hidden_states.size(1) > 1 else hidden_states[i]
-                                seq_len = seq_source.size(0)
-                                k = min(self.surprise_topk, surprise_t.size(1))
-                                if k <= 0:
-                                    content_seq = hidden_states[i, -max_tokens:, :]  # [max_tokens, d_model]
-                                else:
-                                    topk_vals, topk_idx = torch.topk(surprise_t[i], k=k)
-                                    topk_pairs = list(zip(topk_idx.tolist(), topk_vals.tolist()))
-                                    min_idx = min(idx for idx, _ in topk_pairs)
-                                    max_idx = max(idx for idx, _ in topk_pairs)
-                                    span_len = max_idx - min_idx + 1
-                                    if span_len <= max_tokens:
-                                        start = min_idx
-                                        end = max_idx + 1
-                                    else:
-                                        # Choose window covering as many top-k indices as possible.
-                                        best_start = 0
-                                        best_count = -1
-                                        best_score = None
-                                        for start in range(0, max(1, seq_len - max_tokens + 1)):
-                                            end = start + max_tokens
-                                            count = sum(1 for idx, _ in topk_pairs if start <= idx < end)
-                                            if count < best_count:
-                                                continue
-                                            score = sum(val for idx, val in topk_pairs if start <= idx < end)
-                                            if count > best_count or best_score is None or score > best_score:
-                                                best_start = start
-                                                best_count = count
-                                                best_score = score
-                                        start = best_start
-                                        end = min(seq_len, start + max_tokens)
+                                top_k = self.experiential.surprise_topk if self.experiential is not None else 0
+                                span = self._select_surprise_span(
+                                    surprise_t[i],
+                                    max_tokens,
+                                    top_k,
+                                )
+                                if span is not None:
+                                    start, end = span
                                     content_seq = seq_source[start:end, :]
+                                else:
+                                    content_seq = hidden_states[i, -max_tokens:, :]  # [max_tokens, d_model]
                             else:
                                 # Store last N tokens of hidden states
                                 content_seq = hidden_states[i, -max_tokens:, :]  # [max_tokens, d_model]
@@ -3055,6 +3123,8 @@ class MemoryAugmentedGPT(nn.Module):
                             arousal=exp_output['arousal'][i].item(),
                             text=text,
                             token_ids=token_ids,
+                            hint_text=hint_text,
+                            hint_token_ids=hint_token_ids,
                             token_surprises=token_surprises,
                         )
                         memory_output['crystallized'] = True
