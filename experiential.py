@@ -335,9 +335,10 @@ class EpisodicMemory(nn.Module):
                 ref_dtype = torch.float32
 
             # Replace None entries with properly typed placeholders
+            # Use zeros instead of randn for deterministic behavior
             for i, seq in enumerate(batch_seqs):
                 if seq is None:
-                    batch_seqs[i] = torch.randn(1, self.d_model, device=ref_device, dtype=ref_dtype) * 0.01
+                    batch_seqs[i] = torch.zeros(1, self.d_model, device=ref_device, dtype=ref_dtype)
 
             # Pad to same length across batch (using mean padding, not zeros)
             max_len = max(s.size(0) for s in batch_seqs)
@@ -2338,6 +2339,9 @@ class MemoryAugmentedGPT(nn.Module):
         if self.memory_integration == 'kv_injection' and memory_kv is not None:
             # Run separate forward WITHOUT memory to get true baseline
             # This is needed because kv_injection integrates memory during forward
+            # Use eval mode to disable dropout for fair comparison
+            was_training = self.gpt.training
+            self.gpt.eval()
             with torch.no_grad():
                 logits_without_memory, _ = self.gpt(
                     input_ids,
@@ -2345,6 +2349,8 @@ class MemoryAugmentedGPT(nn.Module):
                     return_hidden_states=False,
                     memory_kv=None  # No memory injection
                 )
+            if was_training:
+                self.gpt.train()
         else:
             logits_without_memory = logits
 
