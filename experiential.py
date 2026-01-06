@@ -248,6 +248,7 @@ class EpisodicMemory(nn.Module):
 
         # Episode ID counter for merge tracking
         self._next_episode_id = 0
+        self._last_consolidation_step = -1
 
     @property
     def size(self) -> int:
@@ -758,7 +759,7 @@ class EpisodicMemory(nn.Module):
             'episodes_merged': 0,
         }
 
-        if not self.episodes or scale == 0.0:
+        if not self.episodes:
             return result
         if weights is None or weights.numel() == 0:
             return result
@@ -834,6 +835,8 @@ class EpisodicMemory(nn.Module):
         if weights.dim() == 2:
             weights = weights.mean(dim=0)
         weights = weights.detach().float().cpu()
+        if query.dim() > 1:
+            query = query.mean(dim=0)
         query = query.detach().cpu()
 
         refined_count = 0
@@ -900,6 +903,8 @@ class EpisodicMemory(nn.Module):
         if weights.dim() == 2:
             weights = weights.mean(dim=0)
         weights = weights.detach().float().cpu()
+        if query.dim() > 1:
+            query = query.mean(dim=0)
         query = query.detach().cpu()
 
         corrected_count = 0
@@ -971,8 +976,12 @@ class EpisodicMemory(nn.Module):
             return 0
 
         # Check interval (unless forced)
-        if not force and self._global_step % self.consolidation_check_interval != 0:
-            return 0
+        if not force:
+            if self._global_step == self._last_consolidation_step:
+                return 0
+            if self._global_step % self.consolidation_check_interval != 0:
+                return 0
+        self._last_consolidation_step = self._global_step
 
         # Get content matrix for similarity computation
         contents = self.get_keys()  # [n, d_model]
@@ -1128,10 +1137,18 @@ class EpisodicMemory(nn.Module):
                 token_surprises=list(ep.token_surprises) if ep.token_surprises is not None else None,
                 top_surprise_indices=list(ep.top_surprise_indices) if ep.top_surprise_indices is not None else None,
                 top_surprise_scores=list(ep.top_surprise_scores) if ep.top_surprise_scores is not None else None,
+                harm_count=ep.harm_count,
+                benefit_count=ep.benefit_count,
+                cumulative_benefit=ep.cumulative_benefit,
+                modification_count=ep.modification_count,
+                episode_id=ep.episode_id,
+                source_episode_ids=list(ep.source_episode_ids) if ep.source_episode_ids is not None else None,
             ))
         return {
             'episodes': episodes,
             'global_step': self._global_step,
+            'next_episode_id': self._next_episode_id,
+            'last_consolidation_step': self._last_consolidation_step,
         }
 
     def restore(self, snapshot: Dict[str, object], device: Optional[torch.device] = None) -> None:
@@ -1148,6 +1165,13 @@ class EpisodicMemory(nn.Module):
         else:
             self.episodes = episodes
         self._global_step = snapshot.get('global_step', 0)
+        self._last_consolidation_step = snapshot.get('last_consolidation_step', -1)
+        next_episode_id = snapshot.get('next_episode_id')
+        if next_episode_id is None:
+            max_id = max((ep.episode_id for ep in self.episodes), default=-1)
+            self._next_episode_id = max_id + 1
+        else:
+            self._next_episode_id = next_episode_id
 
 
 class ExperientialStream(nn.Module):

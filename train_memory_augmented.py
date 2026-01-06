@@ -366,6 +366,18 @@ def train_epoch(
     memory_gpt.train()
     # Note: Parameter freezing is handled by setup_memory_training() in main()
     # which correctly preserves trainable params for kv_injection mode
+    apply_retrieval_updates = (
+        retrieval_benefit_salience_weight > 0
+        or memory_gpt.memory.enable_content_refinement
+        or memory_gpt.memory.enable_content_correction
+        or memory_gpt.memory.enable_episodic_consolidation
+    )
+    needs_memory_weights = (
+        apply_retrieval_updates
+        or retrieval_gate_weight > 0
+        or retrieval_gate_sparsity_weight > 0
+        or retrieval_gate_entropy_weight > 0
+    )
 
     history = {
         'loss': [],
@@ -446,16 +458,13 @@ def train_epoch(
             # For shuffled data, prev_memory_query=None means no memory retrieval
             # (each batch is an independent sequence, no previous context to query from)
             # Memories are still crystallized and available for sequential evaluation
+            retrieval_query = prev_memory_query
             logits, hidden, mem_out = memory_gpt(
                 input_ids,
                 crystallize=True,
                 use_memory=True,
                 prev_memory_query=prev_memory_query,
-                return_memory_weights=(
-                    retrieval_benefit_salience_weight > 0
-                    or retrieval_gate_weight > 0
-                    or retrieval_gate_sparsity_weight > 0
-                )
+                return_memory_weights=needs_memory_weights
             )
             if sequential and mem_out.get('next_memory_query') is not None:
                 prev_memory_query = mem_out['next_memory_query'].detach()
@@ -515,12 +524,12 @@ def train_epoch(
                 contrastive_weight=contrastive_weight,
             )
 
-            if retrieval_benefit_salience_weight > 0:
+            if apply_retrieval_updates:
                 benefit = loss_dict.get('retrieval_benefit')
                 weights = mem_out.get('episodic_weights')
                 if benefit is not None and weights is not None and weights.numel() > 0:
                     # Pass query for content modification if available
-                    query = prev_memory_query
+                    query = retrieval_query
                     mod_result = memory_gpt.memory.apply_retrieval_benefit(
                         weights,
                         benefit,
