@@ -49,9 +49,17 @@ class ExperientialConfig:
 
 @dataclass
 class Episode:
-    """A discrete memory of something that happened."""
+    """A discrete memory of something that happened.
+
+    Memory storage modes:
+    - Single vector: content is [d_model] - compressed summary (legacy)
+    - Sequence: content is [n_tokens, d_model] - richer token-level detail
+
+    The sequence mode enables attention layers to attend to specific tokens
+    within the memory, rather than a single compressed representation.
+    """
     timestamp: int              # when (global step / position)
-    content: torch.Tensor       # what (embedding of the event) [d_model]
+    content: torch.Tensor       # what: [d_model] (legacy) or [n_tokens, d_model] (sequence)
     context: torch.Tensor       # surrounding state when it happened [d_model]
     salience: float             # how important (surprise × affect)
     valence: float = 0.0        # emotional valence at the time
@@ -63,6 +71,45 @@ class Episode:
     token_surprises: Optional[List[float]] = None  # per-token surprise scores
     top_surprise_indices: Optional[List[int]] = None  # indices of most surprising tokens
     top_surprise_scores: Optional[List[float]] = None  # scores of most surprising tokens
+
+    @property
+    def is_sequence(self) -> bool:
+        """Check if this episode stores a sequence (vs single vector)."""
+        return self.content.dim() == 2
+
+    @property
+    def n_tokens(self) -> int:
+        """Number of tokens stored (1 for single vector, n for sequence)."""
+        return self.content.size(0) if self.is_sequence else 1
+
+    @property
+    def d_model(self) -> int:
+        """Model dimension."""
+        return self.content.size(-1)
+
+    def get_content_vector(self) -> torch.Tensor:
+        """Get single-vector representation for retrieval queries.
+
+        For sequence storage, returns mean-pooled representation.
+        For single vector storage, returns the vector directly.
+        """
+        if self.is_sequence:
+            return self.content.mean(dim=0)  # [d_model]
+        return self.content  # [d_model]
+
+    def get_content_sequence(self, max_tokens: Optional[int] = None) -> torch.Tensor:
+        """Get sequence representation for K/V injection.
+
+        For single vector storage, returns unsqueezed [1, d_model].
+        For sequence storage, returns [n_tokens, d_model], optionally truncated.
+        """
+        if self.is_sequence:
+            seq = self.content
+            if max_tokens is not None and seq.size(0) > max_tokens:
+                # Keep most recent tokens (end of sequence)
+                seq = seq[-max_tokens:]
+            return seq  # [n_tokens, d_model]
+        return self.content.unsqueeze(0)  # [1, d_model]
 
     def to(self, device: torch.device) -> 'Episode':
         """Move episode tensors to device."""
@@ -143,7 +190,8 @@ class EpisodicMemory(nn.Module):
         crystallization_threshold: float = 0.3,
         decay_rate: float = 0.01,
         decay_on_store: bool = True,
-        min_salience: float = 0.05
+        min_salience: float = 0.05,
+        dedup_threshold: float = 0.95,  # Reject memories with cosine sim > this to existing
     ):
         super().__init__()
         self.d_model = d_model
@@ -152,6 +200,7 @@ class EpisodicMemory(nn.Module):
         self.decay_rate = decay_rate
         self.decay_on_store = decay_on_store
         self.min_salience = min_salience  # Memories below this salience are pruned
+        self.dedup_threshold = dedup_threshold  # Skip storing near-duplicates
 
         # Episode storage
         self.episodes: List[Episode] = []
@@ -175,6 +224,8 @@ class EpisodicMemory(nn.Module):
         Used for novelty computation: comparing current hidden states
         against all stored memories to avoid redundant storage.
 
+        For sequence-based memories, returns mean-pooled representations.
+
         Args:
             device: target device for the tensor
 
@@ -184,10 +235,98 @@ class EpisodicMemory(nn.Module):
         if not self.episodes:
             return None
 
-        keys = torch.stack([ep.content for ep in self.episodes])  # [num_memories, d_model]
+        # Use get_content_vector() which handles both single-vector and sequence storage
+        keys = torch.stack([ep.get_content_vector() for ep in self.episodes])  # [num_memories, d_model]
         if device is not None:
             keys = keys.to(device)
         return keys
+
+    def get_memory_sequences(
+        self,
+        indices: Optional[torch.Tensor] = None,
+        max_tokens_per_memory: int = 16,
+        device: Optional[torch.device] = None
+    ) -> Optional[torch.Tensor]:
+        """
+        Get memory sequences for K/V injection into attention layers.
+
+        This method retrieves the full token sequences stored in memories,
+        suitable for use as K/V in attention mechanisms.
+
+        Args:
+            indices: Optional [batch, k] tensor of memory indices to retrieve.
+                    If None, returns all memories.
+            max_tokens_per_memory: Maximum tokens per memory (truncates longer)
+            device: Target device for the output tensor
+
+        Returns:
+            memory_tokens: [batch, total_tokens, d_model] if indices provided,
+                          [num_memories * max_tokens, d_model] if indices=None,
+                          or None if no memories exist
+        """
+        if not self.episodes:
+            return None
+
+        if indices is None:
+            # Return all memories concatenated
+            all_seqs = []
+            for ep in self.episodes:
+                seq = ep.get_content_sequence(max_tokens=max_tokens_per_memory)
+                all_seqs.append(seq)
+
+            # Pad to same length and stack
+            max_len = max(s.size(0) for s in all_seqs)
+            padded = []
+            for seq in all_seqs:
+                if seq.size(0) < max_len:
+                    pad = torch.zeros(max_len - seq.size(0), self.d_model, device=seq.device, dtype=seq.dtype)
+                    seq = torch.cat([seq, pad], dim=0)
+                padded.append(seq)
+
+            result = torch.stack(padded, dim=0)  # [num_memories, max_len, d_model]
+            # Flatten to [num_memories * max_len, d_model] for simpler attention
+            result = result.view(-1, self.d_model)
+
+            if device is not None:
+                result = result.to(device)
+            return result
+
+        else:
+            # indices: [batch, k] - retrieve specific memories for each batch element
+            batch_size, k = indices.shape
+
+            # Collect sequences for each batch element
+            batch_seqs = []
+            for b in range(batch_size):
+                mem_seqs = []
+                for i in range(k):
+                    idx = indices[b, i].item()
+                    if 0 <= idx < len(self.episodes):
+                        seq = self.episodes[idx].get_content_sequence(max_tokens=max_tokens_per_memory)
+                        mem_seqs.append(seq)
+
+                if mem_seqs:
+                    # Concatenate all sequences for this batch element
+                    batch_seq = torch.cat(mem_seqs, dim=0)  # [total_tokens, d_model]
+                else:
+                    batch_seq = torch.zeros(1, self.d_model)
+
+                batch_seqs.append(batch_seq)
+
+            # Pad to same length across batch
+            max_len = max(s.size(0) for s in batch_seqs)
+            padded = []
+            for seq in batch_seqs:
+                if seq.size(0) < max_len:
+                    pad = torch.zeros(max_len - seq.size(0), self.d_model, device=seq.device, dtype=seq.dtype)
+                    seq = torch.cat([seq, pad], dim=0)
+                padded.append(seq)
+
+            result = torch.stack(padded, dim=0)  # [batch, max_len, d_model]
+
+            if device is not None:
+                result = result.to(device)
+            return result
 
     def store(
         self,
@@ -206,7 +345,9 @@ class EpisodicMemory(nn.Module):
         Store a new episode in memory.
 
         Args:
-            content: the state embedding to store [d_model]
+            content: the state embedding to store - either:
+                     [d_model] for single-vector storage (legacy)
+                     [n_tokens, d_model] for sequence storage (richer)
             context: the context/prediction at the time [d_model]
             salience: importance score
             valence: emotional valence
@@ -232,6 +373,26 @@ class EpisodicMemory(nn.Module):
                            key=lambda i: token_surprises[i], reverse=True)[:k]
             top_surprise_indices = indices
             top_surprise_scores = [token_surprises[i] for i in indices]
+
+        # Get vector representation for deduplication
+        # For sequences, use mean pooling to get a single vector
+        if content.dim() == 2:
+            content_vec = content.mean(dim=0)  # [d_model]
+        else:
+            content_vec = content  # [d_model]
+
+        # Deduplication: skip if too similar to existing memory
+        if self.episodes and self.dedup_threshold < 1.0:
+            content_norm = F.normalize(content_vec.detach(), dim=-1)
+            for ep in self.episodes:
+                # Use get_content_vector() which handles both single-vector and sequence
+                ep_vec = ep.get_content_vector()
+                ep_norm = F.normalize(ep_vec, dim=-1)
+                sim = torch.dot(content_norm, ep_norm.to(content.device)).item()
+                if sim > self.dedup_threshold:
+                    # Near-duplicate found - boost existing memory's salience instead
+                    ep.salience = max(ep.salience, salience)
+                    return ep  # Skip storing
 
         # Keep tensors on their original device (GPU) to avoid device mismatches
         # during backward pass. The .detach() prevents gradients from flowing back.
@@ -1706,7 +1867,7 @@ class MemoryAugmentedGPT(nn.Module):
         gpt_model: nn.Module,
         memory_capacity: int = 1000,
         crystallization_threshold: float = 0.3,
-        memory_integration: str = 'gated',  # 'residual', 'gated', 'attention', or 'cross_attention'
+        memory_integration: str = 'gated',  # 'residual', 'gated', 'attention', 'cross_attention', 'kv_injection'
         cross_attention_top_k: int = 8,
         memory_weight: float = 0.1,
         use_experiential: bool = True,
@@ -1720,14 +1881,26 @@ class MemoryAugmentedGPT(nn.Module):
         retrieval_salience_weight: float = 0.0,  # Bias retrieval toward high-salience memories
         tokenizer: Optional[Any] = None,
         max_text_tokens: Optional[int] = None,
+        decay_rate: float = 0.01,  # Salience decay rate per step
+        min_salience: float = 0.05,  # Memories below this get pruned
+        dedup_threshold: float = 0.95,  # Reject memories with cosine sim > this
+        # K/V injection parameters (for memory_integration='kv_injection')
+        kv_injection_layers: Optional[List[int]] = None,  # GPT layers for memory injection
+        kv_injection_max_tokens: int = 16,  # Max tokens per memory
+        kv_injection_store_sequences: bool = True,  # Store sequences vs single vectors
     ):
         """
         Args:
             gpt_model: Pre-existing GPT model to wrap
             memory_capacity: Maximum episodes to store
             crystallization_threshold: Salience threshold for storing memories
-            memory_integration: How to integrate memories ('residual', 'gated', 'attention', 'cross_attention')
-            cross_attention_top_k: Top-k episodic memories to attend in cross-attention
+            memory_integration: How to integrate memories:
+                - 'residual': Simple additive integration (post-hoc)
+                - 'gated': Learned gating for memory vs hidden states (post-hoc)
+                - 'attention': Cross-attention to aggregated memory (post-hoc)
+                - 'cross_attention': Cross-attention to top-k memories (post-hoc)
+                - 'kv_injection': Inject memory K/V into GPT attention layers (during forward)
+            cross_attention_top_k: Top-k episodic memories for cross_attention/kv_injection
             memory_weight: Base weight for memory contribution (for residual mode)
             use_experiential: Whether to use experiential stream for surprise/salience
             use_semantic: Whether to use semantic memory for abstracted knowledge
@@ -1740,6 +1913,9 @@ class MemoryAugmentedGPT(nn.Module):
             retrieval_salience_weight: Salience bias for episodic retrieval (0 = similarity only)
             tokenizer: Optional tokenizer with a .decode method for episode text
             max_text_tokens: Optional max number of tokens to decode/store per episode
+            decay_rate: Salience decay rate per step (default 0.01)
+            min_salience: Memories below this salience get pruned (default 0.05)
+            dedup_threshold: Reject new memories with cosine sim > this to existing (default 0.95)
         """
         super().__init__()
         self.gpt = gpt_model
@@ -1767,7 +1943,10 @@ class MemoryAugmentedGPT(nn.Module):
         self.memory = EpisodicMemory(
             d_model=self.d_model,
             capacity=memory_capacity,
-            crystallization_threshold=crystallization_threshold
+            crystallization_threshold=crystallization_threshold,
+            decay_rate=decay_rate,
+            min_salience=min_salience,
+            dedup_threshold=dedup_threshold,
         )
 
         # Semantic memory (abstracted knowledge)
@@ -1851,6 +2030,18 @@ class MemoryAugmentedGPT(nn.Module):
                 nn.Sigmoid()
             )
 
+        elif memory_integration == 'kv_injection':
+            # K/V injection into GPT attention layers
+            # Memory tokens are added to K/V in selected GPT layers
+            # This is the most powerful mode - GPT can attend to memory naturally
+            self.kv_injection_top_k = cross_attention_top_k  # Reuse param for top-k memories
+            self.kv_injection_max_tokens = kv_injection_max_tokens
+            self.kv_injection_store_sequences = kv_injection_store_sequences
+            self.kv_injection_layers = kv_injection_layers
+
+            # Enable memory layers in GPT (done lazily on first forward if not already done)
+            self._kv_injection_layers_enabled = False
+
         # Query projection for retrieval
         self.query_proj = nn.Linear(self.d_model, self.d_model)
 
@@ -1873,6 +2064,114 @@ class MemoryAugmentedGPT(nn.Module):
 
         nn.init.xavier_uniform_(self.query_proj.weight)
         nn.init.zeros_(self.query_proj.bias)
+
+    def setup_memory_training(
+        self,
+        freeze_gpt: bool = True,
+        unfreeze_gpt_output_proj: bool = False,
+        unfreeze_experiential: bool = True,
+        verbose: bool = True
+    ) -> Dict[str, int]:
+        """
+        Configure which parameters to train for memory-augmented learning.
+
+        This method sets up selective parameter freezing for efficient memory training:
+        - Freezes the base GPT model (keeps pretrained knowledge)
+        - Unfreezes memory-related parameters (K/V projections, gates)
+        - Optionally unfreezes experiential stream for salience learning
+
+        Args:
+            freeze_gpt: Whether to freeze the base GPT model (default True)
+            unfreeze_gpt_output_proj: Whether to unfreeze GPT output projections
+                                      for adaptation (default False)
+            unfreeze_experiential: Whether to train the experiential stream
+                                   (default True)
+            verbose: Print parameter counts (default True)
+
+        Returns:
+            Dict with counts of frozen/unfrozen parameters
+        """
+        frozen_count = 0
+        trainable_count = 0
+
+        # 1. Freeze all parameters first
+        for param in self.parameters():
+            param.requires_grad = False
+            frozen_count += param.numel()
+
+        # 2. Unfreeze memory-related parameters
+        memory_patterns = [
+            'mem_k_proj', 'mem_v_proj', 'mem_gate',  # MemoryAugmentedAttention
+            'memory_gate', 'memory_proj',  # Gated integration
+            'memory_attention', 'memory_norm',  # Attention integration
+            'memory_cross_attn', 'memory_cross_norm',  # Cross-attention
+            'memory_ffn', 'memory_ffn_norm', 'memory_influence_gate',  # Cross-attention FFN
+            'semantic_proj', 'semantic_gate',  # Semantic integration
+            'semantic_attention', 'semantic_norm',  # Semantic attention
+            'query_proj',  # Query projection for retrieval
+        ]
+
+        for name, param in self.named_parameters():
+            if any(pattern in name for pattern in memory_patterns):
+                param.requires_grad = True
+                frozen_count -= param.numel()
+                trainable_count += param.numel()
+
+        # 3. Optionally unfreeze experiential stream
+        if unfreeze_experiential and self.experiential is not None:
+            for name, param in self.experiential.named_parameters():
+                param.requires_grad = True
+                frozen_count -= param.numel()
+                trainable_count += param.numel()
+
+        # 4. Optionally unfreeze GPT output projections (o_proj) for adaptation
+        if unfreeze_gpt_output_proj:
+            for name, param in self.gpt.named_parameters():
+                if 'o_proj' in name:
+                    param.requires_grad = True
+                    frozen_count -= param.numel()
+                    trainable_count += param.numel()
+
+        if verbose:
+            total = frozen_count + trainable_count
+            print(f"Memory training setup:")
+            print(f"  Total parameters: {total:,}")
+            print(f"  Frozen: {frozen_count:,} ({100*frozen_count/total:.1f}%)")
+            print(f"  Trainable: {trainable_count:,} ({100*trainable_count/total:.1f}%)")
+
+        return {
+            'frozen': frozen_count,
+            'trainable': trainable_count,
+            'total': frozen_count + trainable_count
+        }
+
+    def get_memory_parameters(self) -> List[nn.Parameter]:
+        """
+        Get list of memory-related parameters for optimizer.
+
+        Useful for creating separate parameter groups with different
+        learning rates for memory vs other parameters.
+
+        Returns:
+            List of trainable memory-related parameters
+        """
+        memory_patterns = [
+            'mem_k_proj', 'mem_v_proj', 'mem_gate',
+            'memory_gate', 'memory_proj',
+            'memory_attention', 'memory_norm',
+            'memory_cross_attn', 'memory_cross_norm',
+            'memory_ffn', 'memory_ffn_norm', 'memory_influence_gate',
+            'semantic_proj', 'semantic_gate',
+            'semantic_attention', 'semantic_norm',
+            'query_proj',
+        ]
+
+        memory_params = []
+        for name, param in self.named_parameters():
+            if any(pattern in name for pattern in memory_patterns):
+                memory_params.append(param)
+
+        return memory_params
 
     def set_tokenizer(self, tokenizer: Any, max_text_tokens: Optional[int] = None) -> None:
         """Attach a tokenizer for decoding episode text."""
@@ -1948,6 +2247,7 @@ class MemoryAugmentedGPT(nn.Module):
         semantic_retrieved = None
         episodic_weights = None
         semantic_weights = None
+        memory_kv = None  # For kv_injection mode
 
         if prev_memory_query is not None:
             # Use previous step's query for causal memory retrieval
@@ -1961,6 +2261,21 @@ class MemoryAugmentedGPT(nn.Module):
                     salience_weight=self.retrieval_salience_weight
                 )
 
+                # For kv_injection: get memory sequences for top-k memories
+                if self.memory_integration == 'kv_injection' and episodic_weights is not None:
+                    # Get top-k memory indices
+                    top_k = min(self.kv_injection_top_k, self.memory.size)
+                    if episodic_weights.dim() == 1:
+                        episodic_weights = episodic_weights.unsqueeze(0)
+                    topk_indices = episodic_weights.topk(top_k, dim=-1).indices  # [batch, k]
+
+                    # Get memory sequences for these indices
+                    memory_kv = self.memory.get_memory_sequences(
+                        indices=topk_indices,
+                        max_tokens_per_memory=self.kv_injection_max_tokens,
+                        device=device
+                    )  # [batch, total_tokens, d_model]
+
             # 1b. Semantic retrieval (causal: query is from before this sequence)
             if use_semantic and self.semantic is not None and self.semantic.size > 0:
                 semantic_retrieved, semantic_weights = self.semantic.query_soft(
@@ -1969,27 +2284,43 @@ class MemoryAugmentedGPT(nn.Module):
                 )
 
         # 2. Get hidden states from GPT
-        logits, hidden_states = self.gpt(
-            input_ids,
-            input_pos=input_pos,
-            return_hidden_states=True
-        )
+        # For kv_injection mode: enable memory layers lazily on first use
+        if self.memory_integration == 'kv_injection' and not self._kv_injection_layers_enabled:
+            self.gpt.enable_memory_layers(self.kv_injection_layers)
+            self._kv_injection_layers_enabled = True
+
+        # Pass memory_kv to GPT for kv_injection mode
+        if self.memory_integration == 'kv_injection':
+            logits, hidden_states = self.gpt(
+                input_ids,
+                input_pos=input_pos,
+                return_hidden_states=True,
+                memory_kv=memory_kv  # Injected into GPT attention layers
+            )
+        else:
+            logits, hidden_states = self.gpt(
+                input_ids,
+                input_pos=input_pos,
+                return_hidden_states=True
+            )
 
         # Save original logits/hidden for retrieval benefit loss
         logits_without_memory = logits
         hidden_states_original = hidden_states
 
         # 3. Integrate memory with hidden states (memory was retrieved causally)
-        if episodic_retrieved is not None or semantic_retrieved is not None:
-            hidden_states = self._integrate_memory(
-                hidden_states,
-                episodic_retrieved,
-                semantic_retrieved,
-                episodic_weights=episodic_weights,
-                semantic_weights=semantic_weights
-            )
-            # Recompute logits with memory-augmented hidden states
-            logits = self.gpt.lm_head(self.gpt.final_norm(hidden_states))
+        # Skip for kv_injection mode - memory was integrated during forward pass
+        if self.memory_integration != 'kv_injection':
+            if episodic_retrieved is not None or semantic_retrieved is not None:
+                hidden_states = self._integrate_memory(
+                    hidden_states,
+                    episodic_retrieved,
+                    semantic_retrieved,
+                    episodic_weights=episodic_weights,
+                    semantic_weights=semantic_weights
+                )
+                # Recompute logits with memory-augmented hidden states
+                logits = self.gpt.lm_head(self.gpt.final_norm(hidden_states))
 
         # 4. Prepare query for NEXT step (causal: computed after processing current)
         # This query will be used by the next step to retrieve relevant memories
@@ -2099,6 +2430,12 @@ class MemoryAugmentedGPT(nn.Module):
                 # Get per-token surprise if available
                 surprise_t = exp_output.get('surprise_t')  # [B, seq_len]
 
+                # Determine whether to store sequences (for kv_injection mode)
+                store_sequences = (
+                    self.memory_integration == 'kv_injection' and
+                    getattr(self, 'kv_injection_store_sequences', False)
+                )
+
                 for i in range(batch_size):
                     salience = exp_output['salience'][i].item()
                     if self.memory.should_crystallize(salience):
@@ -2109,8 +2446,18 @@ class MemoryAugmentedGPT(nn.Module):
                         if surprise_t is not None:
                             token_surprises = surprise_t[i].tolist()
 
+                        # For kv_injection: store sequence of hidden states
+                        # For other modes: store single modulated vector
+                        if store_sequences:
+                            # Store last N tokens of hidden states
+                            max_tokens = getattr(self, 'kv_injection_max_tokens', 16)
+                            content_seq = hidden_states[i, -max_tokens:, :]  # [max_tokens, d_model]
+                            content = content_seq
+                        else:
+                            content = modulated[i]  # [d_model]
+
                         self.memory.store(
-                            content=modulated[i],
+                            content=content,
                             context=exp_output['prediction'][i],
                             salience=salience,
                             valence=exp_output['valence'][i].item(),

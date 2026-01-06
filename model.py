@@ -166,6 +166,146 @@ class OptimizedAttention(nn.Module):
         return self.o_proj(output)
 
 
+class MemoryAugmentedAttention(nn.Module):
+    """
+    Attention layer that can attend to both current context and memory K/V pairs.
+
+    This enables GPT layers to naturally attend to retrieved memories during
+    forward pass, rather than post-hoc blending. Memory tokens are prepended
+    to the K/V sequence, allowing each query position to attend to relevant
+    memory content.
+
+    Key design choices:
+    - Memory K/V projections are separate (trainable) from frozen base projections
+    - Gating controls how much memory influences output (initialized small)
+    - Memory positions are always attendable (no causal mask applied to them)
+    """
+
+    def __init__(self, config, base_attn: OptimizedAttention):
+        super().__init__()
+        self.base_attn = base_attn  # Original attention (can be frozen)
+        self.d_model = config.d_model
+        self.n_head = config.n_head
+        self.n_kv_head = config.n_kv_head if config.n_kv_head is not None else config.n_head
+        self.head_dim = self.d_model // self.n_head
+
+        # Memory K/V projections (trainable even if base is frozen)
+        self.mem_k_proj = nn.Linear(self.d_model, self.n_kv_head * self.head_dim, bias=False)
+        self.mem_v_proj = nn.Linear(self.d_model, self.n_kv_head * self.head_dim, bias=False)
+
+        # Gate to control memory influence (initialized to ~0.12)
+        self.mem_gate = nn.Parameter(torch.tensor(-2.0))
+
+        # Initialize memory projections
+        nn.init.normal_(self.mem_k_proj.weight, mean=0.0, std=0.02)
+        nn.init.normal_(self.mem_v_proj.weight, mean=0.0, std=0.02)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        kv_cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        input_pos: Optional[torch.Tensor] = None,
+        memory_kv: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """
+        Forward pass with optional memory K/V injection.
+
+        Args:
+            x: [B, S, d_model] input hidden states
+            cos, sin: RoPE embeddings
+            kv_cache: Optional KV cache for generation
+            input_pos: Position indices
+            memory_kv: [B, M, d_model] memory tokens to attend to, or None
+
+        Returns:
+            output: [B, S, d_model] attention output
+        """
+        if memory_kv is None:
+            # No memory - use base attention directly
+            return self.base_attn(x, cos, sin, kv_cache, input_pos)
+
+        B, S, _ = x.shape
+        M = memory_kv.size(1)  # Number of memory tokens
+
+        # 1. Get Q, K, V from base attention's fused projection
+        qkv = self.base_attn.qkv_proj(x)
+        qkv = qkv.view(B, S, self.n_head + 2 * self.n_kv_head, self.head_dim)
+        q, k, v = qkv.split([self.n_head, self.n_kv_head, self.n_kv_head], dim=2)
+
+        # Ensure flash-attn compatible dtype
+        target_dtype = q.dtype
+        if target_dtype not in (torch.float16, torch.bfloat16):
+            if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+                target_dtype = torch.bfloat16
+            else:
+                target_dtype = torch.float16
+        if q.dtype != target_dtype:
+            q = q.to(dtype=target_dtype)
+            k = k.to(dtype=target_dtype)
+            v = v.to(dtype=target_dtype)
+
+        # 2. Apply RoPE to Q and K (not to memory - memory has no position)
+        rotary_dim = cos.shape[-1] * 2
+        head_dim = q.shape[-1]
+        if rotary_dim > head_dim:
+            trim = head_dim // 2
+            cos = cos[..., :trim]
+            sin = sin[..., :trim]
+        if cos.dtype != target_dtype:
+            cos = cos.to(dtype=target_dtype)
+            sin = sin.to(dtype=target_dtype)
+        q = apply_rotary_emb(q, cos, sin, interleaved=False)
+        k = apply_rotary_emb(k, cos, sin, interleaved=False)
+
+        # 3. Project memory to K, V (no RoPE - memory is "outside" position)
+        mem_k = self.mem_k_proj(memory_kv.to(target_dtype))  # [B, M, n_kv_head * head_dim]
+        mem_v = self.mem_v_proj(memory_kv.to(target_dtype))  # [B, M, n_kv_head * head_dim]
+        mem_k = mem_k.view(B, M, self.n_kv_head, self.head_dim)  # [B, M, n_kv_head, head_dim]
+        mem_v = mem_v.view(B, M, self.n_kv_head, self.head_dim)  # [B, M, n_kv_head, head_dim]
+
+        # 4. Concatenate memory K/V with context K/V
+        # Memory comes first (always attendable), then context (causal)
+        k_aug = torch.cat([mem_k, k], dim=1)  # [B, M+S, n_kv_head, head_dim]
+        v_aug = torch.cat([mem_v, v], dim=1)  # [B, M+S, n_kv_head, head_dim]
+
+        # 5. Attention with augmented K/V
+        # Note: We need custom masking - memory positions are always visible,
+        # context positions follow causal mask
+        # For simplicity, we use flash_attn with causal=False and apply our own mask
+        # OR we can use the fact that prepending memory effectively makes it "past"
+
+        # Since memory tokens are prepended, they appear as "earlier" positions
+        # The causal mask will naturally allow attending to them
+        is_causal = (S > 1)  # Only apply causal during prefill
+        attn_dropout = self.base_attn.dropout if self.base_attn.training else 0.0
+
+        output_aug = flash_attn_func(
+            q, k_aug, v_aug,
+            dropout_p=attn_dropout,
+            causal=is_causal,
+            window_size=(-1, -1)
+        )
+
+        # Also compute base attention without memory for gating
+        output_base = flash_attn_func(
+            q, k, v,
+            dropout_p=attn_dropout,
+            causal=is_causal,
+            window_size=(-1, -1)
+        )
+
+        # 6. Blend with gating
+        gate = torch.sigmoid(self.mem_gate)
+        output = gate * output_aug + (1 - gate) * output_base
+
+        # 7. Reshape and output projection
+        output = output.reshape(B, S, self.n_head * self.head_dim)
+        output = output.to(self.base_attn.o_proj.weight.dtype)
+        return self.base_attn.o_proj(output)
+
+
 class TransformerBlock(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -176,11 +316,35 @@ class TransformerBlock(nn.Module):
         # Residual dropout (applied after attention and FFN)
         dropout = getattr(config, 'dropout', 0.0)
         self.resid_dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+        # Flag for memory-augmented attention
+        self._has_memory_attn = False
 
-    def forward(self, x, cos, sin, kv_cache=None, input_pos=None):
+    def upgrade_to_memory_attention(self, config):
+        """Replace standard attention with memory-augmented attention."""
+        if not self._has_memory_attn:
+            self.attn = MemoryAugmentedAttention(config, self.attn)
+            self._has_memory_attn = True
+
+    def forward(self, x, cos, sin, kv_cache=None, input_pos=None, memory_kv=None):
+        """
+        Forward pass through transformer block.
+
+        Args:
+            x: [B, S, d_model] input hidden states
+            cos, sin: RoPE embeddings
+            kv_cache: Optional KV cache tuple for generation
+            input_pos: Position indices
+            memory_kv: [B, M, d_model] memory tokens for memory-augmented attention
+
+        Returns:
+            x: [B, S, d_model] output hidden states
+        """
         # Attention Block
         h = self.norm_attn(x)
-        attn_out = self.attn(h, cos, sin, kv_cache, input_pos)
+        if self._has_memory_attn and memory_kv is not None:
+            attn_out = self.attn(h, cos, sin, kv_cache, input_pos, memory_kv=memory_kv)
+        else:
+            attn_out = self.attn(h, cos, sin, kv_cache, input_pos)
         x = x + self.resid_dropout(attn_out)
 
         # MLP Block
@@ -245,8 +409,43 @@ class GPT(nn.Module):
 
         self.kv_caches = None # Placeholder
 
+        # Memory injection layer indices (empty = no memory injection)
+        self._memory_layers: List[int] = []
+
         # Apply SOTA weight initialization
         self._init_weights()
+
+    def enable_memory_layers(self, layer_indices: Optional[List[int]] = None):
+        """
+        Enable memory K/V injection at specific layers.
+
+        Args:
+            layer_indices: List of layer indices to inject memory at.
+                          If None, uses default [n_layer//4, n_layer//2, 3*n_layer//4]
+                          (1/4, 1/2, 3/4 depth)
+
+        Returns:
+            List of actual layer indices enabled
+        """
+        if layer_indices is None:
+            # Default: inject at 1/4, 1/2, 3/4 depth
+            n = self.config.n_layer
+            layer_indices = [n // 4, n // 2, 3 * n // 4]
+
+        # Validate indices
+        layer_indices = [i for i in layer_indices if 0 <= i < self.config.n_layer]
+
+        # Upgrade selected layers to memory-augmented attention
+        for idx in layer_indices:
+            self.layers[idx].upgrade_to_memory_attention(self.config)
+
+        self._memory_layers = layer_indices
+        logger.info(f"Enabled memory injection at layers: {layer_indices}")
+        return layer_indices
+
+    def get_memory_layer_indices(self) -> List[int]:
+        """Get list of layer indices with memory injection enabled."""
+        return self._memory_layers.copy()
 
     def _init_weights(self):
         """
@@ -323,11 +522,13 @@ class GPT(nn.Module):
         self,
         input_ids: torch.Tensor,
         input_pos: Optional[torch.Tensor] = None,
-        return_hidden_states: bool = False
+        return_hidden_states: bool = False,
+        memory_kv: Optional[torch.Tensor] = None
     ):
         # input_ids: [B, S]
         # input_pos: [S] (integers indicating position in sequence)
         # return_hidden_states: if True, returns (logits, hidden_states) instead of (logits, None)
+        # memory_kv: [B, M, d_model] memory tokens to inject at memory layers (optional)
 
         if input_pos is None:
             # Default to 0..S if not provided (assume prompt w/o cache)
@@ -361,10 +562,18 @@ class GPT(nn.Module):
         for i, layer in enumerate(self.layers):
             # Retrieve layer-specific cache tuple (K, V)
             layer_cache = self.kv_caches[i] if use_cache else None
+
+            # Pass memory_kv only to memory-enabled layers
+            layer_memory = memory_kv if i in self._memory_layers else None
+
             if use_checkpointing:
-                x = gradient_checkpoint(layer, x, cos, sin, layer_cache, input_pos, use_reentrant=False)
+                # Note: gradient_checkpoint doesn't support kwargs well, so we pass memory_kv positionally
+                x = gradient_checkpoint(
+                    layer, x, cos, sin, layer_cache, input_pos, layer_memory,
+                    use_reentrant=False
+                )
             else:
-                x = layer(x, cos, sin, kv_cache=layer_cache, input_pos=input_pos)
+                x = layer(x, cos, sin, kv_cache=layer_cache, input_pos=input_pos, memory_kv=layer_memory)
 
         hidden_states = self.final_norm(x)
         logits = self.lm_head(hidden_states)
