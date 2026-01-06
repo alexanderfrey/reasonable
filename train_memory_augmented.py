@@ -377,6 +377,7 @@ def train_epoch(
 
     prev_memory_query = None
     prev_doc_id = None
+    logged_grad_norms = False
 
     pbar = tqdm(dataloader, desc="Training")
     for step, batch in enumerate(pbar):
@@ -438,6 +439,19 @@ def train_epoch(
             loss = loss.to(device)
 
         loss.backward()
+
+        # One-time gradient norm check for memory injection params.
+        if step == 0 and not logged_grad_norms:
+            patterns = ('mem_k_proj', 'mem_v_proj', 'mem_gate')
+            logger.info("Grad norms (step 0):")
+            for name, param in memory_gpt.named_parameters():
+                if any(p in name for p in patterns):
+                    if param.grad is None:
+                        logger.info("  %s: grad=None", name)
+                    else:
+                        grad_norm = param.grad.detach().float().norm().item()
+                        logger.info("  %s: %.6f", name, grad_norm)
+            logged_grad_norms = True
 
         total_loss += loss.item() * accumulation_steps
 
@@ -869,8 +883,14 @@ def main():
         verbose=True
     )
 
+    # Log trainable parameter names once for verification.
+    trainable_named_params = [(name, param) for name, param in memory_gpt.named_parameters() if param.requires_grad]
+    logger.info("Trainable parameters (%d):", len(trainable_named_params))
+    for name, _ in trainable_named_params:
+        logger.info("  %s", name)
+
     # Collect trainable parameters for optimizer
-    trainable_params = [p for p in memory_gpt.parameters() if p.requires_grad]
+    trainable_params = [param for _, param in trainable_named_params]
     optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=0.01)
 
     logger.info(f"Optimizing {len(trainable_params)} parameter tensors ({param_stats['trainable']:,} params)")

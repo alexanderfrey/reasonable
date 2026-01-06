@@ -2118,6 +2118,11 @@ class MemoryAugmentedGPT(nn.Module):
         Returns:
             Dict with counts of frozen/unfrozen parameters
         """
+        # Ensure kv_injection layers exist before freezing/unfreezing or optimizer setup.
+        if self.memory_integration == 'kv_injection' and not self._kv_injection_layers_enabled:
+            self.gpt.enable_memory_layers(self.kv_injection_layers)
+            self._kv_injection_layers_enabled = True
+
         frozen_count = 0
         trainable_count = 0
 
@@ -2292,16 +2297,19 @@ class MemoryAugmentedGPT(nn.Module):
                 if self.memory_integration == 'kv_injection' and episodic_weights is not None:
                     # Get top-k memory indices
                     top_k = min(self.kv_injection_top_k, self.memory.size)
-                    if episodic_weights.dim() == 1:
-                        episodic_weights = episodic_weights.unsqueeze(0)
-                    topk_indices = episodic_weights.topk(top_k, dim=-1).indices  # [batch, k]
+                    if top_k <= 0:
+                        memory_kv = None
+                    else:
+                        if episodic_weights.dim() == 1:
+                            episodic_weights = episodic_weights.unsqueeze(0)
+                        topk_indices = episodic_weights.topk(top_k, dim=-1).indices  # [batch, k]
 
-                    # Get memory sequences for these indices
-                    memory_kv = self.memory.get_memory_sequences(
-                        indices=topk_indices,
-                        max_tokens_per_memory=self.kv_injection_max_tokens,
-                        device=device
-                    )  # [batch, total_tokens, d_model]
+                        # Get memory sequences for these indices
+                        memory_kv = self.memory.get_memory_sequences(
+                            indices=topk_indices,
+                            max_tokens_per_memory=self.kv_injection_max_tokens,
+                            device=device
+                        )  # [batch, total_tokens, d_model]
 
             # 1b. Semantic retrieval (causal: query is from before this sequence)
             if use_semantic and self.semantic is not None and self.semantic.size > 0:

@@ -274,11 +274,11 @@ class MemoryAugmentedAttention(nn.Module):
                 v = v_cache[:, :curr_pos]
 
         # 4. Project memory to K, V (no RoPE - memory is "outside" position)
-        # Move to same device and dtype as input (memory may be stored on CPU)
-        memory_kv = memory_kv.to(device=x.device, dtype=target_dtype)
+        # Match projection dtype to avoid fp32/bf16 mismatches, then cast for flash-attn.
+        proj_dtype = self.mem_k_proj.weight.dtype
+        memory_kv = memory_kv.to(device=x.device, dtype=proj_dtype)
         mem_k = self.mem_k_proj(memory_kv)  # [B, M, n_kv_head * head_dim]
         mem_v = self.mem_v_proj(memory_kv)  # [B, M, n_kv_head * head_dim]
-        # Ensure output dtype matches target (projection weights may be fp32)
         mem_k = mem_k.to(target_dtype).view(B, M, self.n_kv_head, self.head_dim)
         mem_v = mem_v.to(target_dtype).view(B, M, self.n_kv_head, self.head_dim)
 
@@ -331,7 +331,13 @@ class TransformerBlock(nn.Module):
     def upgrade_to_memory_attention(self, config):
         """Replace standard attention with memory-augmented attention."""
         if not self._has_memory_attn:
-            self.attn = MemoryAugmentedAttention(config, self.attn)
+            base_attn = self.attn
+            memory_attn = MemoryAugmentedAttention(config, base_attn)
+            # Keep new memory params on the same device/dtype as the base attention.
+            ref_param = next(base_attn.parameters(), None)
+            if ref_param is not None:
+                memory_attn.to(device=ref_param.device, dtype=ref_param.dtype)
+            self.attn = memory_attn
             self._has_memory_attn = True
 
     def forward(self, x, cos, sin, kv_cache=None, input_pos=None, memory_kv=None):
