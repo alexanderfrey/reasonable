@@ -440,6 +440,12 @@ def train_epoch(
                     benefit,
                     retrieval_benefit_salience_weight
                 )
+                if step % log_interval == 0:
+                    logger.info(
+                        "Retrieval-benefit salience update: benefit=%.4f, weight=%.4f",
+                        benefit,
+                        retrieval_benefit_salience_weight
+                    )
 
         # Scale for gradient accumulation
         loss = loss / accumulation_steps
