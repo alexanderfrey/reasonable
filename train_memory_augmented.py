@@ -346,6 +346,7 @@ def train_epoch(
     retrieval_benefit_weight: float = 0.1,
     retrieval_gate_weight: float = 0.0,
     retrieval_gate_sparsity_weight: float = 0.0,
+    retrieval_gate_entropy_weight: float = 0.01,
     contrastive_weight: float = 0.1,
     accumulation_steps: int = 1,
     sequential: bool = False,
@@ -475,6 +476,7 @@ def train_epoch(
             retrieval_benefit_weight=retrieval_benefit_weight,
             retrieval_gate_weight=retrieval_gate_weight,
             retrieval_gate_sparsity_weight=retrieval_gate_sparsity_weight,
+            retrieval_gate_entropy_weight=retrieval_gate_entropy_weight,
             contrastive_weight=contrastive_weight,
         )
 
@@ -829,10 +831,12 @@ def main():
     # Retrieval benefit loss - trains memory to actually help prediction
     parser.add_argument("--retrieval_benefit_weight", type=float, default=0.1,
                         help="Weight for retrieval benefit loss (penalize when memory hurts)")
-    parser.add_argument("--retrieval_gate_weight", type=float, default=0.05,
+    parser.add_argument("--retrieval_gate_weight", type=float, default=0.01,
                         help="Weight for benefit-guided retrieval gate loss (default: 0.1)")
     parser.add_argument("--retrieval_gate_sparsity_weight", type=float, default=0.002,
                         help="Weight for retrieval gate sparsity regularizer (default: 0.002)")
+    parser.add_argument("--retrieval_gate_entropy_weight", type=float, default=0.01,
+                        help="Weight for gate entropy regularizer to prevent collapse (default: 0.01)")
     # Contrastive learning for memory relevance
     parser.add_argument("--contrastive_weight", type=float, default=0.1,
                         help="Weight for contrastive memory loss (teach which memories are relevant)")
@@ -892,6 +896,7 @@ def main():
     logger.info(f"  Retrieval benefit salience weight: {args.retrieval_benefit_salience_weight}")
     logger.info(f"  Retrieval gate weight: {args.retrieval_gate_weight}")
     logger.info(f"  Retrieval gate sparsity weight: {args.retrieval_gate_sparsity_weight}")
+    logger.info(f"  Retrieval gate entropy weight: {args.retrieval_gate_entropy_weight}")
     logger.info(f"  Batch size: {args.batch_size} x {args.accumulation_steps} accumulation")
     logger.info(f"  Sequential training: {args.sequential}")
     logger.info(f"  Loss weights: lm={args.lm_weight}, exp={args.exp_weight}, "
@@ -1038,6 +1043,7 @@ def main():
             retrieval_benefit_weight=args.retrieval_benefit_weight,
             retrieval_gate_weight=args.retrieval_gate_weight,
             retrieval_gate_sparsity_weight=args.retrieval_gate_sparsity_weight,
+            retrieval_gate_entropy_weight=args.retrieval_gate_entropy_weight,
             contrastive_weight=args.contrastive_weight,
             accumulation_steps=args.accumulation_steps,
             sequential=args.sequential,

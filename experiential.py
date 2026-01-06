@@ -3084,6 +3084,7 @@ def memory_augmented_loss(
     retrieval_benefit_margin: float = 0.0,
     retrieval_gate_weight: float = 0.0,
     retrieval_gate_sparsity_weight: float = 0.0,
+    retrieval_gate_entropy_weight: float = 0.01,
     contrastive_weight: float = 0.1,
     contrastive_temperature: float = 0.1
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
@@ -3104,6 +3105,7 @@ def memory_augmented_loss(
         retrieval_benefit_margin: margin for hinge loss (only penalize if memory hurts by > margin)
         retrieval_gate_weight: weight for benefit-guided retrieval gate loss
         retrieval_gate_sparsity_weight: weight for sparsity regularizer on gate outputs
+        retrieval_gate_entropy_weight: weight for entropy regularizer (prevents gate collapse)
 
     Returns:
         total_loss: combined scalar loss
@@ -3194,6 +3196,17 @@ def memory_augmented_loss(
             gate_sparsity_loss = gate.mean()
             loss_dict['retrieval_gate_sparsity_loss'] = gate_sparsity_loss.item()
             total_loss = total_loss + retrieval_gate_sparsity_weight * gate_sparsity_loss
+        # Entropy regularization: prevents gate collapse by penalizing values near 0 or 1
+        # Binary entropy is maximized at gate=0.5, minimized at gate=0 or 1
+        if retrieval_gate_entropy_weight > 0:
+            eps = 1e-6
+            gate_clamped = gate.clamp(eps, 1 - eps)
+            gate_entropy = -(gate_clamped * torch.log(gate_clamped) +
+                             (1 - gate_clamped) * torch.log(1 - gate_clamped))
+            # Maximize entropy (subtract from loss since we minimize)
+            entropy_loss = -gate_entropy.mean()
+            loss_dict['retrieval_gate_entropy'] = gate_entropy.mean().item()
+            total_loss = total_loss + retrieval_gate_entropy_weight * entropy_loss
 
     # Contrastive memory loss - teaches which memories are relevant for which queries
     # This helps the model learn meaningful memory-query relationships
