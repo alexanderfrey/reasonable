@@ -1932,7 +1932,7 @@ class MemoryAugmentedGPT(nn.Module):
         meta_surprise_salience_weight: float = 1.0,  # How much meta-surprise boosts salience
         retrieval_salience_weight: float = 0.0,  # Bias retrieval toward high-salience memories
         retrieval_gate_weight: float = 0.1,  # Train retrieval gate with benefit signal
-        retrieval_gate_sparsity_weight: float = 0.01,  # Encourage sparse retrieval gate
+        retrieval_gate_sparsity_weight: float = 0.002,  # Encourage sparse retrieval gate
         tokenizer: Optional[Any] = None,
         max_text_tokens: Optional[int] = None,
         decay_rate: float = 0.01,  # Salience decay rate per step

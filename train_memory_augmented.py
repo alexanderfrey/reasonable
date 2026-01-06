@@ -829,10 +829,10 @@ def main():
     # Retrieval benefit loss - trains memory to actually help prediction
     parser.add_argument("--retrieval_benefit_weight", type=float, default=0.1,
                         help="Weight for retrieval benefit loss (penalize when memory hurts)")
-    parser.add_argument("--retrieval_gate_weight", type=float, default=0.1,
+    parser.add_argument("--retrieval_gate_weight", type=float, default=0.05,
                         help="Weight for benefit-guided retrieval gate loss (default: 0.1)")
-    parser.add_argument("--retrieval_gate_sparsity_weight", type=float, default=0.01,
-                        help="Weight for retrieval gate sparsity regularizer (default: 0.01)")
+    parser.add_argument("--retrieval_gate_sparsity_weight", type=float, default=0.002,
+                        help="Weight for retrieval gate sparsity regularizer (default: 0.002)")
     # Contrastive learning for memory relevance
     parser.add_argument("--contrastive_weight", type=float, default=0.1,
                         help="Weight for contrastive memory loss (teach which memories are relevant)")
