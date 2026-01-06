@@ -1932,6 +1932,7 @@ class MemoryAugmentedGPT(nn.Module):
         meta_surprise_salience_weight: float = 1.0,  # How much meta-surprise boosts salience
         retrieval_salience_weight: float = 0.0,  # Bias retrieval toward high-salience memories
         retrieval_gate_weight: float = 0.1,  # Train retrieval gate with benefit signal
+        retrieval_gate_sparsity_weight: float = 0.01,  # Encourage sparse retrieval gate
         tokenizer: Optional[Any] = None,
         max_text_tokens: Optional[int] = None,
         decay_rate: float = 0.01,  # Salience decay rate per step
@@ -1965,6 +1966,7 @@ class MemoryAugmentedGPT(nn.Module):
             meta_surprise_salience_weight: How much meta-surprise boosts salience (default 1.0, was 3.0)
             retrieval_salience_weight: Salience bias for episodic retrieval (0 = similarity only)
             retrieval_gate_weight: Train retrieval gate using benefit signal (0 = disable)
+            retrieval_gate_sparsity_weight: Encourage sparse retrieval gate (0 = disable)
             tokenizer: Optional tokenizer with a .decode method for episode text
             max_text_tokens: Optional max number of tokens to decode/store per episode
             decay_rate: Salience decay rate per step (default 0.01)
@@ -1981,6 +1983,7 @@ class MemoryAugmentedGPT(nn.Module):
         self.semantic_weight = semantic_weight
         self.retrieval_salience_weight = retrieval_salience_weight
         self.retrieval_gate_weight = retrieval_gate_weight
+        self.retrieval_gate_sparsity_weight = retrieval_gate_sparsity_weight
         self.consolidation_interval = consolidation_interval
         self._step_counter = 0
         if tokenizer is not None:
@@ -2013,6 +2016,8 @@ class MemoryAugmentedGPT(nn.Module):
                 nn.ReLU(),
                 nn.Linear(hidden, 1)
             )
+            # Bias toward a closed gate initially.
+            nn.init.constant_(self.retrieval_gate[-1].bias, -2.0)
 
         # Semantic memory (abstracted knowledge)
         if use_semantic:
@@ -3077,6 +3082,7 @@ def memory_augmented_loss(
     retrieval_benefit_weight: float = 0.1,
     retrieval_benefit_margin: float = 0.0,
     retrieval_gate_weight: float = 0.0,
+    retrieval_gate_sparsity_weight: float = 0.0,
     contrastive_weight: float = 0.1,
     contrastive_temperature: float = 0.1
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
@@ -3096,6 +3102,7 @@ def memory_augmented_loss(
         retrieval_benefit_weight: weight for retrieval benefit loss (trains retrieval to help)
         retrieval_benefit_margin: margin for hinge loss (only penalize if memory hurts by > margin)
         retrieval_gate_weight: weight for benefit-guided retrieval gate loss
+        retrieval_gate_sparsity_weight: weight for sparsity regularizer on gate outputs
 
     Returns:
         total_loss: combined scalar loss
@@ -3169,19 +3176,23 @@ def memory_augmented_loss(
             if retrieval_benefit_weight > 0:
                 total_loss = total_loss + retrieval_benefit_weight * retrieval_benefit_loss
 
-    # Benefit-guided retrieval gate loss
-    if retrieval_gate_weight > 0 and retrieval_benefit_tensor is not None:
-        gate = memory_output.get('episodic_gate')
-        weights_raw = memory_output.get('episodic_weights_raw')
-        if gate is not None and weights_raw is not None and gate.numel() > 0:
-            if gate.dim() == 1:
-                gate = gate.unsqueeze(0)
+    # Benefit-guided retrieval gate loss and sparsity regularizer
+    gate = memory_output.get('episodic_gate')
+    weights_raw = memory_output.get('episodic_weights_raw')
+    if gate is not None and gate.numel() > 0:
+        if gate.dim() == 1:
+            gate = gate.unsqueeze(0)
+        if retrieval_gate_weight > 0 and retrieval_benefit_tensor is not None and weights_raw is not None:
             if weights_raw.dim() == 1:
                 weights_raw = weights_raw.unsqueeze(0)
             gate_score = (weights_raw * gate).mean()
             gate_loss = -retrieval_benefit_tensor.detach() * gate_score
             loss_dict['retrieval_gate_loss'] = gate_loss.item()
             total_loss = total_loss + retrieval_gate_weight * gate_loss
+        if retrieval_gate_sparsity_weight > 0:
+            gate_sparsity_loss = gate.mean()
+            loss_dict['retrieval_gate_sparsity_loss'] = gate_sparsity_loss.item()
+            total_loss = total_loss + retrieval_gate_sparsity_weight * gate_sparsity_loss
 
     # Contrastive memory loss - teaches which memories are relevant for which queries
     # This helps the model learn meaningful memory-query relationships

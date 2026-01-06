@@ -345,6 +345,7 @@ def train_epoch(
     retrieval_weight: float = 0.1,
     retrieval_benefit_weight: float = 0.1,
     retrieval_gate_weight: float = 0.0,
+    retrieval_gate_sparsity_weight: float = 0.0,
     contrastive_weight: float = 0.1,
     accumulation_steps: int = 1,
     sequential: bool = False,
@@ -414,12 +415,55 @@ def train_epoch(
             crystallize=True,
             use_memory=True,
             prev_memory_query=prev_memory_query,
-            return_memory_weights=(retrieval_benefit_salience_weight > 0 or retrieval_gate_weight > 0)
+            return_memory_weights=(
+                retrieval_benefit_salience_weight > 0
+                or retrieval_gate_weight > 0
+                or retrieval_gate_sparsity_weight > 0
+            )
         )
         if sequential and mem_out.get('next_memory_query') is not None:
             prev_memory_query = mem_out['next_memory_query'].detach()
         elif not sequential:
             prev_memory_query = None
+
+        if step % log_interval == 0:
+            raw_weights = mem_out.get('episodic_weights_raw')
+            gated_weights = mem_out.get('episodic_weights')
+            gate_vals = mem_out.get('episodic_gate')
+            if raw_weights is not None and raw_weights.numel() > 0:
+                if raw_weights.dim() > 1:
+                    raw_view = raw_weights.mean(dim=0)
+                else:
+                    raw_view = raw_weights
+                raw_view = raw_view.detach().float()
+                raw_max = raw_view.max().item()
+                raw_mean = raw_view.mean().item()
+                if gated_weights is not None and gated_weights.numel() > 0:
+                    if gated_weights.dim() > 1:
+                        gated_view = gated_weights.mean(dim=0)
+                    else:
+                        gated_view = gated_weights
+                    gated_view = gated_view.detach().float()
+                    gated_max = gated_view.max().item()
+                    gated_mean = gated_view.mean().item()
+                    gate_mean = None
+                    if gate_vals is not None and gate_vals.numel() > 0:
+                        gate_mean = gate_vals.detach().float().mean().item()
+                    if gate_mean is not None:
+                        logger.info(
+                            "Retrieval weights: raw max=%.4f mean=%.4f | gated max=%.4f mean=%.4f | gate mean=%.4f",
+                            raw_max, raw_mean, gated_max, gated_mean, gate_mean
+                        )
+                    else:
+                        logger.info(
+                            "Retrieval weights: raw max=%.4f mean=%.4f | gated max=%.4f mean=%.4f",
+                            raw_max, raw_mean, gated_max, gated_mean
+                        )
+                else:
+                    logger.info(
+                        "Retrieval weights: raw max=%.4f mean=%.4f",
+                        raw_max, raw_mean
+                    )
 
         # Compute loss (includes extended self-awareness losses)
         loss, loss_dict = memory_augmented_loss(
@@ -430,6 +474,7 @@ def train_epoch(
             retrieval_weight=retrieval_weight,
             retrieval_benefit_weight=retrieval_benefit_weight,
             retrieval_gate_weight=retrieval_gate_weight,
+            retrieval_gate_sparsity_weight=retrieval_gate_sparsity_weight,
             contrastive_weight=contrastive_weight,
         )
 
@@ -786,6 +831,8 @@ def main():
                         help="Weight for retrieval benefit loss (penalize when memory hurts)")
     parser.add_argument("--retrieval_gate_weight", type=float, default=0.1,
                         help="Weight for benefit-guided retrieval gate loss (default: 0.1)")
+    parser.add_argument("--retrieval_gate_sparsity_weight", type=float, default=0.01,
+                        help="Weight for retrieval gate sparsity regularizer (default: 0.01)")
     # Contrastive learning for memory relevance
     parser.add_argument("--contrastive_weight", type=float, default=0.1,
                         help="Weight for contrastive memory loss (teach which memories are relevant)")
@@ -844,6 +891,7 @@ def main():
     logger.info(f"  Retrieval temperature: {args.retrieval_temperature}, Retrieval salience weight: {args.retrieval_salience_weight}")
     logger.info(f"  Retrieval benefit salience weight: {args.retrieval_benefit_salience_weight}")
     logger.info(f"  Retrieval gate weight: {args.retrieval_gate_weight}")
+    logger.info(f"  Retrieval gate sparsity weight: {args.retrieval_gate_sparsity_weight}")
     logger.info(f"  Batch size: {args.batch_size} x {args.accumulation_steps} accumulation")
     logger.info(f"  Sequential training: {args.sequential}")
     logger.info(f"  Loss weights: lm={args.lm_weight}, exp={args.exp_weight}, "
@@ -879,6 +927,7 @@ def main():
         retrieval_temperature=args.retrieval_temperature,
         retrieval_salience_weight=args.retrieval_salience_weight,
         retrieval_gate_weight=args.retrieval_gate_weight,
+        retrieval_gate_sparsity_weight=args.retrieval_gate_sparsity_weight,
         decay_rate=args.decay_rate,
         min_salience=args.min_salience,
         dedup_threshold=args.dedup_threshold,
@@ -985,12 +1034,13 @@ def main():
             lm_weight=args.lm_weight,
             exp_weight=args.exp_weight,
             affect_weight=args.affect_weight,
-        retrieval_weight=args.retrieval_weight,
-        retrieval_benefit_weight=args.retrieval_benefit_weight,
-        retrieval_gate_weight=args.retrieval_gate_weight,
-        contrastive_weight=args.contrastive_weight,
-        accumulation_steps=args.accumulation_steps,
-        sequential=args.sequential,
+            retrieval_weight=args.retrieval_weight,
+            retrieval_benefit_weight=args.retrieval_benefit_weight,
+            retrieval_gate_weight=args.retrieval_gate_weight,
+            retrieval_gate_sparsity_weight=args.retrieval_gate_sparsity_weight,
+            contrastive_weight=args.contrastive_weight,
+            accumulation_steps=args.accumulation_steps,
+            sequential=args.sequential,
             retrieval_benefit_salience_weight=args.retrieval_benefit_salience_weight,
         )
         all_history.append(history)
