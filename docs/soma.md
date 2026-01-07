@@ -16,8 +16,8 @@
 - [x] Self-state losses in `memory_augmented_loss()`
 - [x] Soma outputs in `memory_output` dict
 - [x] Hidden state gating by soma
+- [x] Attention Q bias from soma (`self_state_to_attention=True`)
 - [ ] Full narrative loop during forward pass (currently manual)
-- [ ] Attention bias from soma (implemented but not wired)
 - [ ] Logit bias from soma (implemented but not wired)
 
 ### Training

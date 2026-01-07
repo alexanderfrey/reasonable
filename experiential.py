@@ -2377,6 +2377,8 @@ class MemoryAugmentedGPT(nn.Module):
         self_state_narrative_gain: float = 0.1,  # How much self-interpretation affects soma
         self_state_use_ideal_self: bool = True,  # Enable ideal self with discrepancy
         self_state_gate_hidden: bool = True,  # Soma modulates hidden states
+        self_state_to_attention: bool = False,  # Soma modulates attention Q vectors
+        self_state_attention_scale: float = 0.1,  # Scale for Q bias (small = subtle)
     ):
         """
         Args:
@@ -2497,8 +2499,10 @@ class MemoryAugmentedGPT(nn.Module):
         # - Tracks temperament (slow-moving personality baseline)
         self.use_self_state = use_self_state
         if use_self_state:
-            # Get vocab size from GPT model
+            # Get model config for self-state
             vocab_size = gpt_model.config.vocab_size
+            n_head = gpt_model.config.n_head
+            head_dim = gpt_model.config.d_model // n_head
             self_state_config = SelfStateConfig(
                 d_model=self.d_model,
                 d_soma=self_state_d_soma,
@@ -2508,6 +2512,11 @@ class MemoryAugmentedGPT(nn.Module):
                 narrative_gain=self_state_narrative_gain,
                 use_ideal_self=self_state_use_ideal_self,
                 soma_gate_hidden=self_state_gate_hidden,
+                # Attention modulation
+                soma_to_attention=self_state_to_attention,
+                n_head=n_head,
+                head_dim=head_dim,
+                soma_attention_scale=self_state_attention_scale,
             )
             self.self_state = SelfState(self_state_config)
         else:
@@ -2926,19 +2935,37 @@ class MemoryAugmentedGPT(nn.Module):
             self.gpt.enable_memory_layers(self.kv_injection_layers)
             self._kv_injection_layers_enabled = True
 
-        # Pass memory_kv to GPT for kv_injection mode
+        # 2a. Compute soma Q bias BEFORE forward pass (uses previous soma state)
+        # The soma modulates attention by biasing Q vectors, affecting what tokens
+        # are attended to based on internal state
+        soma_q_bias = None
+        if self.self_state is not None and self.self_state.config.soma_to_attention:
+            # Get current soma (from previous step)
+            current_soma = self.self_state.get_soma()
+            if current_soma is not None:
+                # Compute q_bias from current soma
+                # We use a dummy hidden_states here since we only need q_bias
+                feedback_out = self.self_state.feedback(
+                    torch.zeros(batch_size, 1, self.d_model, device=device),
+                    current_soma
+                )
+                soma_q_bias = feedback_out.get('q_bias')  # [B, n_head, head_dim]
+
+        # Pass memory_kv and soma_q_bias to GPT
         if self.memory_integration == 'kv_injection':
             logits, hidden_states = self.gpt(
                 input_ids,
                 input_pos=input_pos,
                 return_hidden_states=True,
-                memory_kv=memory_kv  # Injected into GPT attention layers
+                memory_kv=memory_kv,  # Injected into GPT attention layers
+                soma_q_bias=soma_q_bias,  # Soma modulates attention Q vectors
             )
         else:
             logits, hidden_states = self.gpt(
                 input_ids,
                 input_pos=input_pos,
-                return_hidden_states=True
+                return_hidden_states=True,
+                soma_q_bias=soma_q_bias,  # Soma modulates attention Q vectors
             )
 
         # Save original logits/hidden for retrieval benefit loss
@@ -3117,6 +3144,9 @@ class MemoryAugmentedGPT(nn.Module):
                     # Ideal self (if enabled)
                     'ideal_discrepancy': self_state_output.get('ideal_discrepancy_magnitude'),
                     'regulation_signal': self_state_output.get('regulation_signal'),
+                    # Attention modulation (if enabled)
+                    'soma_q_bias': soma_q_bias,
+                    'soma_attention_active': soma_q_bias is not None,
                 })
 
             # 5b. Crystallize high-salience moments into episodic memory

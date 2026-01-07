@@ -75,22 +75,28 @@ class OptimizedAttention(nn.Module):
         self.o_proj = nn.Linear(self.d_model, self.d_model, bias=False)
 
     def forward(
-        self, 
-        x: torch.Tensor, 
-        cos: torch.Tensor, 
-        sin: torch.Tensor, 
+        self,
+        x: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
         kv_cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-        input_pos: Optional[torch.Tensor] = None
+        input_pos: Optional[torch.Tensor] = None,
+        q_bias: Optional[torch.Tensor] = None,  # [B, n_head, head_dim] soma-derived Q modulation
     ) -> torch.Tensor:
-        
+
         B, S, _ = x.shape
-        
+
         # 1. Fused QKV Projection
         qkv = self.qkv_proj(x)
         qkv = qkv.view(B, S, self.n_head + 2 * self.n_kv_head, self.head_dim)
-        
+
         # 2. Split Q, K, V
         q, k, v = qkv.split([self.n_head, self.n_kv_head, self.n_kv_head], dim=2)
+
+        # 2a. Apply soma Q bias (shifts what each head "looks for")
+        # q_bias: [B, n_head, head_dim] -> [B, 1, n_head, head_dim] for broadcast
+        if q_bias is not None:
+            q = q + q_bias.unsqueeze(1)  # Broadcast across sequence length
 
         # Ensure flash-attn sees a supported dtype
         target_dtype = q.dtype
@@ -207,7 +213,8 @@ class MemoryAugmentedAttention(nn.Module):
         sin: torch.Tensor,
         kv_cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         input_pos: Optional[torch.Tensor] = None,
-        memory_kv: Optional[torch.Tensor] = None
+        memory_kv: Optional[torch.Tensor] = None,
+        q_bias: Optional[torch.Tensor] = None,  # [B, n_head, head_dim] soma-derived Q modulation
     ) -> torch.Tensor:
         """
         Forward pass with optional memory K/V injection.
@@ -218,13 +225,14 @@ class MemoryAugmentedAttention(nn.Module):
             kv_cache: Optional KV cache for generation
             input_pos: Position indices
             memory_kv: [B, M, d_model] memory tokens to attend to, or None
+            q_bias: [B, n_head, head_dim] soma-derived Q modulation, or None
 
         Returns:
             output: [B, S, d_model] attention output
         """
         if memory_kv is None:
             # No memory - use base attention directly
-            return self.base_attn(x, cos, sin, kv_cache, input_pos)
+            return self.base_attn(x, cos, sin, kv_cache, input_pos, q_bias=q_bias)
 
         B, S, _ = x.shape
         M = memory_kv.size(1)  # Number of memory tokens
@@ -233,6 +241,10 @@ class MemoryAugmentedAttention(nn.Module):
         qkv = self.base_attn.qkv_proj(x)
         qkv = qkv.view(B, S, self.n_head + 2 * self.n_kv_head, self.head_dim)
         q, k, v = qkv.split([self.n_head, self.n_kv_head, self.n_kv_head], dim=2)
+
+        # 1a. Apply soma Q bias before RoPE (shifts what each head "looks for")
+        if q_bias is not None:
+            q = q + q_bias.unsqueeze(1)  # [B, 1, n_head, head_dim] broadcast
 
         # Ensure flash-attn compatible dtype
         target_dtype = q.dtype
@@ -340,7 +352,7 @@ class TransformerBlock(nn.Module):
             self.attn = memory_attn
             self._has_memory_attn = True
 
-    def forward(self, x, cos, sin, kv_cache=None, input_pos=None, memory_kv=None):
+    def forward(self, x, cos, sin, kv_cache=None, input_pos=None, memory_kv=None, q_bias=None):
         """
         Forward pass through transformer block.
 
@@ -350,6 +362,7 @@ class TransformerBlock(nn.Module):
             kv_cache: Optional KV cache tuple for generation
             input_pos: Position indices
             memory_kv: [B, M, d_model] memory tokens for memory-augmented attention
+            q_bias: [B, n_head, head_dim] soma-derived Q modulation
 
         Returns:
             x: [B, S, d_model] output hidden states
@@ -357,9 +370,9 @@ class TransformerBlock(nn.Module):
         # Attention Block
         h = self.norm_attn(x)
         if self._has_memory_attn and memory_kv is not None:
-            attn_out = self.attn(h, cos, sin, kv_cache, input_pos, memory_kv=memory_kv)
+            attn_out = self.attn(h, cos, sin, kv_cache, input_pos, memory_kv=memory_kv, q_bias=q_bias)
         else:
-            attn_out = self.attn(h, cos, sin, kv_cache, input_pos)
+            attn_out = self.attn(h, cos, sin, kv_cache, input_pos, q_bias=q_bias)
         x = x + self.resid_dropout(attn_out)
 
         # MLP Block
@@ -538,12 +551,16 @@ class GPT(nn.Module):
         input_ids: torch.Tensor,
         input_pos: Optional[torch.Tensor] = None,
         return_hidden_states: bool = False,
-        memory_kv: Optional[torch.Tensor] = None
+        memory_kv: Optional[torch.Tensor] = None,
+        soma_q_bias: Optional[torch.Tensor] = None,  # [B, n_head, head_dim] or [B, n_layer, n_head, head_dim]
     ):
         # input_ids: [B, S]
         # input_pos: [S] (integers indicating position in sequence)
         # return_hidden_states: if True, returns (logits, hidden_states) instead of (logits, None)
         # memory_kv: [B, M, d_model] memory tokens to inject at memory layers (optional)
+        # soma_q_bias: Soma-derived Q modulation. Can be:
+        #   - [B, n_head, head_dim]: same bias for all layers
+        #   - [B, n_layer, n_head, head_dim]: per-layer biases
 
         if input_pos is None:
             # Default to 0..S if not provided (assume prompt w/o cache)
@@ -572,6 +589,13 @@ class GPT(nn.Module):
                 self.kv_caches = None
                 use_cache = False
 
+        # Determine if soma_q_bias is per-layer or shared
+        per_layer_q_bias = (
+            soma_q_bias is not None and
+            soma_q_bias.dim() == 4 and
+            soma_q_bias.size(1) == len(self.layers)
+        )
+
         # 3. Transformer Layers
         use_checkpointing = self.config.use_gradient_checkpointing and self.training and not use_cache
         for i, layer in enumerate(self.layers):
@@ -581,14 +605,21 @@ class GPT(nn.Module):
             # Pass memory_kv only to memory-enabled layers
             layer_memory = memory_kv if i in self._memory_layers else None
 
+            # Get Q bias for this layer
+            if per_layer_q_bias:
+                layer_q_bias = soma_q_bias[:, i, :, :]  # [B, n_head, head_dim]
+            else:
+                layer_q_bias = soma_q_bias  # Same for all layers, or None
+
             if use_checkpointing:
-                # Note: gradient_checkpoint doesn't support kwargs well, so we pass memory_kv positionally
+                # Note: gradient_checkpoint doesn't support kwargs well, so we pass positionally
                 x = gradient_checkpoint(
-                    layer, x, cos, sin, layer_cache, input_pos, layer_memory,
+                    layer, x, cos, sin, layer_cache, input_pos, layer_memory, layer_q_bias,
                     use_reentrant=False
                 )
             else:
-                x = layer(x, cos, sin, kv_cache=layer_cache, input_pos=input_pos, memory_kv=layer_memory)
+                x = layer(x, cos, sin, kv_cache=layer_cache, input_pos=input_pos,
+                         memory_kv=layer_memory, q_bias=layer_q_bias)
 
         hidden_states = self.final_norm(x)
         logits = self.lm_head(hidden_states)

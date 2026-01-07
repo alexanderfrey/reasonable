@@ -70,7 +70,10 @@ class SelfStateConfig:
     self_discrepancy_weight: float = 0.5  # Weight for actual-ideal discrepancy
 
     # Feedback modulation
-    soma_to_attention_dim: int = 0  # If >0, soma modulates attention (per-head bias)
+    soma_to_attention: bool = False  # Whether soma modulates attention Q vectors
+    n_head: int = 8  # Number of attention heads (for Q bias shape)
+    head_dim: int = 64  # Dimension per head (for Q bias shape)
+    soma_attention_scale: float = 0.1  # Scale factor for Q bias (small = subtle)
     soma_to_logits: bool = False  # Whether soma biases output logits
     soma_gate_hidden: bool = True  # Gate hidden states by soma
 
@@ -560,8 +563,8 @@ class SomaFeedback(nn.Module):
     Feeds soma state back into the model's processing.
 
     The soma modulates:
-    - Hidden states (gating)
-    - Attention (per-head bias) — optional
+    - Hidden states (gating) — post-attention
+    - Attention Q vectors (per-head bias) — shifts what each head "looks for"
     - Output logits (prediction bias) — optional
 
     This creates the feedback loop where internal state shapes perception.
@@ -583,12 +586,23 @@ class SomaFeedback(nn.Module):
                 nn.Tanh()
             )
 
-        # Soma → attention bias (optional)
-        if config.soma_to_attention_dim > 0:
-            self.attention_bias = nn.Sequential(
-                nn.Linear(config.d_soma, config.soma_to_attention_dim),
-                nn.Tanh()
+        # Soma → attention Q bias (shifts what each head "looks for")
+        # Output shape: [B, n_head, head_dim]
+        if config.soma_to_attention:
+            q_bias_dim = config.n_head * config.head_dim
+            self.q_bias_proj = nn.Sequential(
+                nn.Linear(config.d_soma, config.d_soma * 2),
+                nn.GELU(),
+                nn.Linear(config.d_soma * 2, q_bias_dim),
+                nn.Tanh()  # Bound the bias
             )
+            self.n_head = config.n_head
+            self.head_dim = config.head_dim
+            self.attention_scale = config.soma_attention_scale
+
+            # Initialize to produce near-zero bias initially
+            nn.init.zeros_(self.q_bias_proj[-2].weight)
+            nn.init.zeros_(self.q_bias_proj[-2].bias)
 
         # Soma → logit bias (optional)
         if config.soma_to_logits:
@@ -609,7 +623,7 @@ class SomaFeedback(nn.Module):
         Returns:
             dict with:
                 - modulated_hidden: [B, seq_len, d_model]
-                - attention_bias: [B, n_heads] if enabled
+                - q_bias: [B, n_head, head_dim] if soma_to_attention enabled
                 - logit_bias: [B, vocab_size] if enabled
         """
         result = {}
@@ -624,9 +638,14 @@ class SomaFeedback(nn.Module):
         else:
             result['modulated_hidden'] = hidden_states
 
-        # Attention bias
-        if self.config.soma_to_attention_dim > 0:
-            result['attention_bias'] = self.attention_bias(soma)
+        # Attention Q bias
+        if self.config.soma_to_attention:
+            # Project soma to Q bias shape
+            q_bias_flat = self.q_bias_proj(soma)  # [B, n_head * head_dim]
+            q_bias = q_bias_flat.view(-1, self.n_head, self.head_dim)  # [B, n_head, head_dim]
+            # Apply scale factor (small = subtle modulation)
+            q_bias = self.attention_scale * q_bias
+            result['q_bias'] = q_bias
 
         # Logit bias
         if self.config.soma_to_logits:

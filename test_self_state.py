@@ -201,7 +201,10 @@ def test_soma_feedback():
         d_model=256,
         d_soma=32,
         soma_gate_hidden=True,
-        soma_to_attention_dim=8,
+        soma_to_attention=True,
+        n_head=8,
+        head_dim=32,  # 256 / 8
+        soma_attention_scale=0.1,
         soma_to_logits=True,
         vocab_size=50257,
     )
@@ -216,9 +219,10 @@ def test_soma_feedback():
     output = feedback(hidden_states, soma)
 
     assert output['modulated_hidden'].shape == (batch_size, seq_len, config.d_model)
-    if 'attention_bias' in output:
-        assert output['attention_bias'].shape == (batch_size, config.soma_to_attention_dim)
-        print(f"  Attention bias shape: {output['attention_bias'].shape}")
+    if 'q_bias' in output:
+        assert output['q_bias'].shape == (batch_size, config.n_head, config.head_dim)
+        print(f"  Q bias shape: {output['q_bias'].shape}")
+        print(f"  Q bias magnitude: {output['q_bias'].abs().mean().item():.4f}")
     if 'logit_bias' in output:
         assert output['logit_bias'].shape == (batch_size, config.vocab_size)
         print(f"  Logit bias shape: {output['logit_bias'].shape}")
