@@ -367,6 +367,7 @@ def train_epoch(
     retrieval_gate_sparsity_weight: float = 0.0,
     retrieval_gate_entropy_weight: float = 0.01,
     contrastive_weight: float = 0.1,
+    certainty_weight: float = 0.1,
     accumulation_steps: int = 1,
     sequential: bool = False,
     retrieval_benefit_salience_weight: float = 0.0,
@@ -412,6 +413,9 @@ def train_epoch(
         'retrieval_benefit_loss': [],
         # Contrastive loss
         'contrastive_loss': [],
+        # Certainty calibration metrics
+        'certainty': [],
+        'certainty_calibration_loss': [],
     }
 
     total_loss = 0.0
@@ -538,6 +542,7 @@ def train_epoch(
                 retrieval_gate_sparsity_weight=retrieval_gate_sparsity_weight,
                 retrieval_gate_entropy_weight=retrieval_gate_entropy_weight,
                 contrastive_weight=contrastive_weight,
+                certainty_calibration_weight=certainty_weight,
             )
 
             if apply_retrieval_updates:
@@ -619,6 +624,9 @@ def train_epoch(
             history['retrieval_benefit_loss'].append(loss_dict.get('retrieval_benefit_loss', 0.0))
             # Contrastive loss
             history['contrastive_loss'].append(loss_dict.get('contrastive_loss', 0.0))
+            # Certainty calibration metrics
+            history['certainty'].append(loss_dict.get('mean_certainty', 0.0))
+            history['certainty_calibration_loss'].append(loss_dict.get('certainty_calibration_loss', 0.0))
 
             if memory_log_interval and step % memory_log_interval == 0 and not live_enabled:
                 memory_report = _format_top_episodes(
@@ -661,6 +669,8 @@ def train_epoch(
                     "ret": loss_dict.get("retrieval_loss", 0.0),
                     "mem": mem_out.get("episodic_size", 0),
                     "acc": acc,
+                    "cert": loss_dict.get("mean_certainty", 0.0),
+                    "cert_loss": loss_dict.get("certainty_calibration_loss", 0.0),
                     "ret_ben": retrieval_benefit,
                     "surprise": surprise,
                 }
@@ -681,11 +691,13 @@ def train_epoch(
             if step % log_interval == 0 and not live_enabled:
                 avg_loss = total_loss / (step + 1)
                 retrieval_benefit = loss_dict.get('retrieval_benefit', 0.0)
+                certainty_val = loss_dict.get('mean_certainty', 0.0)
                 pbar.set_postfix({
                     'loss': f'{avg_loss:.4f}',
                     'lm': f'{loss_dict["lm_loss"]:.3f}',
                     'mem': mem_out['episodic_size'],
                     'acc': f'{acc:.3f}',
+                    'cert': f'{certainty_val:.3f}',  # certainty calibration
                     'ret_ben': f'{retrieval_benefit:.3f}',  # positive = memory helps
                 })
 
@@ -777,6 +789,16 @@ def _format_top_episodes(
     step: Optional[int] = None,
     pad_to_top_k: bool = False,
 ) -> str:
+    def _format_episode_text(ep, limit: int) -> str:
+        text = ep.hint_text or ep.text or ""
+        if text:
+            text = " ".join(text.split())
+        else:
+            text = "(no text stored)"
+        if limit > 0 and len(text) > limit:
+            text = text[: limit - 3] + "..."
+        return text
+
     if memory.size == 0:
         header = "Episodic memory snapshot"
         if step is not None:
@@ -813,18 +835,12 @@ def _format_top_episodes(
         bar = "#" * bar_len
         lines.append(f"  {low:>3.1f}-{high:>3.1f} | {bar} {count}")
     lines.append("- most retrieved episodes:")
-    lines.append("  #  retr  salience  age  text")
+    lines.append("  #  retr  salience  age  hint")
     lines.append("  -- ----  --------  ---  ----")
     for i in range(1, top_k + 1):
         if i <= len(most_retrieved):
             ep = most_retrieved[i - 1]
-            text = ep.text or ""
-            if text:
-                text = " ".join(text.split())
-            else:
-                text = "(no text stored)"
-            if max_chars > 0 and len(text) > max_chars:
-                text = text[: max_chars - 3] + "..."
+            text = _format_episode_text(ep, max_chars)
             if global_step is not None:
                 age = max(0, global_step - ep.timestamp)
                 age_str = f"{age:>3d}"
@@ -853,7 +869,7 @@ def _format_top_episodes(
                 reverse=True
             )[:top_k]
             lines.append("- most retrieved episodes (by weight):")
-            lines.append("  #  weight  salience  retr  age  text")
+            lines.append("  #  weight  salience  retr  age  hint")
             lines.append("  -- ------  --------  ----  ---  ----")
             weight_max_chars = min(max_chars, 80) if max_chars > 0 else max_chars
 
@@ -862,13 +878,7 @@ def _format_top_episodes(
                     idx = weight_order[i - 1]
                     ep = memory.episodes[idx]
                     weight = weights_list[idx]
-                    text = ep.text or ""
-                    if text:
-                        text = " ".join(text.split())
-                    else:
-                        text = "(no text stored)"
-                    if weight_max_chars > 0 and len(text) > weight_max_chars:
-                        text = text[: weight_max_chars - 3] + "..."
+                    text = _format_episode_text(ep, weight_max_chars)
                     if global_step is not None:
                         age = max(0, global_step - ep.timestamp)
                         age_str = f"{age:>3d}"
@@ -881,7 +891,7 @@ def _format_top_episodes(
                     lines.append(f"  {i:>2d} {'--':>6}  {'--':>8}  {'--':>4}   --  (empty)")
         elif pad_to_top_k:
             lines.append("- most retrieved episodes (by weight):")
-            lines.append("  #  weight  salience  retr  age  text")
+            lines.append("  #  weight  salience  retr  age  hint")
             lines.append("  -- ------  --------  ----  ---  ----")
             for i in range(1, top_k + 1):
                 lines.append(f"  {i:>2d} {'--':>6}  {'--':>8}  {'--':>4}   --  (empty)")
@@ -1093,6 +1103,9 @@ def main():
     # Contrastive learning for memory relevance
     parser.add_argument("--contrastive_weight", type=float, default=0.1,
                         help="Weight for contrastive memory loss (teach which memories are relevant)")
+    # Certainty calibration
+    parser.add_argument("--certainty_weight", type=float, default=0.1,
+                        help="Weight for certainty calibration loss (default: 0.1)")
     # Memory pre-population (for cross-attention cold start)
     parser.add_argument("--prepopulate", action="store_true",
                         help="Enable memory pre-population before training (default: off)")
@@ -1344,6 +1357,7 @@ def main():
             retrieval_gate_sparsity_weight=args.retrieval_gate_sparsity_weight,
             retrieval_gate_entropy_weight=args.retrieval_gate_entropy_weight,
             contrastive_weight=args.contrastive_weight,
+            certainty_weight=args.certainty_weight,
             accumulation_steps=args.accumulation_steps,
             sequential=args.sequential,
             retrieval_benefit_salience_weight=args.retrieval_benefit_salience_weight,
