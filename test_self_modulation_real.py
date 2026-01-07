@@ -89,7 +89,6 @@ def train_with_self_modulation(
 
         input_ids = batch["input_ids"].to(device)
         batch_size = input_ids.size(0)
-        seq_len = input_ids.size(1)
 
         # Reset state for each batch
         experiential.reset_state(batch_size=batch_size)
@@ -98,18 +97,17 @@ def train_with_self_modulation(
         with torch.no_grad():
             _, hidden_states = extractor(input_ids)
 
-            # Compute logits to determine was_correct
-            # Use lm_head on last position hidden state
-            last_hidden = hidden_states[:, -1, :]  # [B, d_model]
-            logits = extractor.model.lm_head(last_hidden)  # [B, vocab]
-            predictions = logits.argmax(dim=-1)  # [B]
+            # Compute was_correct using proper next-token prediction alignment
+            # hidden[:, i] predicts token[i+1], so use hidden[:, :-1] vs input[:, 1:]
+            # Also apply final_norm before lm_head (matching real model path)
+            normed_hidden = extractor.model.final_norm(hidden_states[:, :-1, :])  # [B, seq-1, d_model]
+            logits = extractor.model.lm_head(normed_hidden)  # [B, seq-1, vocab]
+            predictions = logits.argmax(dim=-1)  # [B, seq-1]
+            targets = input_ids[:, 1:]  # [B, seq-1] - next tokens
 
-            # Target is what would come after the sequence
-            # Since we don't have it, use a proxy: check if top prediction
-            # matches the actual last token (shifted by 1)
-            # Or use top-k accuracy as soft correctness
-            targets = input_ids[:, -1]  # Last token as proxy target
-            was_correct = (predictions == targets).float()  # [B]
+            # Per-position correctness, then aggregate per batch item
+            correct = (predictions == targets).float()  # [B, seq-1]
+            was_correct = correct.mean(dim=-1)  # [B] - mean accuracy per sequence
 
         # Forward through experiential module
         exp_output = experiential(hidden_states)

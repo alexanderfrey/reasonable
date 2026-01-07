@@ -1352,14 +1352,10 @@ class ExperientialStream(nn.Module):
                 nn.Linear(meta_hidden, 2)  # [valence, arousal]
             )
 
-        # Unified certainty estimation (combines multiple uncertainty signals)
-        # This integrates surprise, meta_surprise, confidence_gate into calibrated certainty
-        from certainty import CertaintyHead
-        self.certainty_head = CertaintyHead(
-            d_model=d_model,
-            d_soma=64,  # Default, will be overridden if SelfState provides soma
-            use_soma=False,  # Soma integration happens in SelfState, not here
-        )
+        # Note: CertaintyHead is NOT instantiated here anymore.
+        # The authoritative certainty is computed in MemoryAugmentedGPT after self_state,
+        # where it has access to soma and self_confidence for proper calibration.
+        # SelfState uses a fallback certainty (1 - surprise) when certainty is not provided.
 
         # Persistent state buffer (not a parameter, just a buffer)
         self.register_buffer('_persistent_state', None)
@@ -1890,16 +1886,13 @@ class ExperientialStream(nn.Module):
             # Blend: confident → use h_end, uncertain → use fallback
             modulated_output = confidence_gate * h_end + (1 - confidence_gate) * fallback
 
-        # Compute unified certainty (combines all uncertainty signals)
-        certainty_output = self.certainty_head(
-            hidden_states=modulated_output,
-            surprise=surprise,  # Uses either per_token_ce based or fallback surprise
-            meta_surprise=meta_surprise,
-            confidence_gate=confidence_gate,
-            self_confidence=None,  # Will be added when SelfState is integrated
-            soma=None,  # Will be passed when available
-        )
-        certainty = certainty_output.certainty  # [B] in [0, 1]
+        # Note: Certainty is NOT computed here anymore.
+        # The authoritative certainty is computed in MemoryAugmentedGPT.forward() after self_state,
+        # where it has access to soma and self_confidence for proper calibration.
+        # For standalone ExperientialStream use, certainty will be None and consumers
+        # should use a fallback (e.g., 1 - surprise).
+        certainty = None
+        certainty_sources = None
 
         # Update persistent state with MODULATED output (closes the feedback loop)
         # This means: what the system commits to → becomes input to next prediction
@@ -1955,9 +1948,9 @@ class ExperientialStream(nn.Module):
             'h_end': h_end.detach(),               # raw world state (for analysis)
             'modulated_output': modulated_output,  # h_end adjusted by self-knowledge (= target)
             'confidence_gate': confidence_gate,    # how much we trusted h_end
-            # Unified certainty (combines surprise, meta_surprise, confidence_gate)
-            'certainty': certainty,                # [B] calibrated certainty in [0, 1]
-            'certainty_sources': certainty_output.uncertainty_sources,  # [B, n_sources]
+            # Certainty is computed in MemoryAugmentedGPT, not here
+            'certainty': certainty,                # None here, set by MemoryAugmentedGPT
+            'certainty_sources': certainty_sources,  # None here, set by MemoryAugmentedGPT
             'mid_idx': mid_idx,
             'end_idx': end_idx if end_idx != -1 else seq_len - 1,
             'persistent_state': self._persistent_state,

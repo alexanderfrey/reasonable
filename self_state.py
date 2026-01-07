@@ -829,8 +829,14 @@ class SelfState(nn.Module):
         # 1. Extract signals from experiential output
         signals = self.extract_signals(exp_output)
 
-        # Extract certainty for modulation (unified certainty from CertaintyHead)
+        # Extract certainty for modulation
+        # If authoritative certainty not available (computed later in MemoryAugmentedGPT),
+        # use fallback based on surprise: low surprise = high certainty
         certainty = exp_output.get('certainty', None)
+        if certainty is None:
+            surprise = exp_output.get('surprise')
+            if surprise is not None:
+                certainty = 1.0 - torch.clamp(surprise, 0, 1)  # Fallback certainty
 
         # 2. Integrate signals into soma (with certainty modulation)
         integrator_out = self.integrator(signals, update_state=update_state, certainty=certainty)
