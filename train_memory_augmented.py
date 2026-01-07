@@ -1106,6 +1106,11 @@ def main():
     # Certainty calibration
     parser.add_argument("--certainty_weight", type=float, default=0.1,
                         help="Weight for certainty calibration loss (default: 0.1)")
+    # Self-state (internal soma with certainty integration)
+    parser.add_argument("--use_self_state", action="store_true",
+                        help="Enable internal state (soma) system for certainty calibration")
+    parser.add_argument("--self_state_d_soma", type=int, default=64,
+                        help="Soma (internal state) dimension (default: 64)")
     # Memory pre-population (for cross-attention cold start)
     parser.add_argument("--prepopulate", action="store_true",
                         help="Enable memory pre-population before training (default: off)")
@@ -1182,7 +1187,9 @@ def main():
     logger.info(f"  Loss weights: lm={args.lm_weight}, exp={args.exp_weight}, "
                 f"affect={args.affect_weight}, retrieval={args.retrieval_weight}, "
                 f"retrieval_benefit={args.retrieval_benefit_weight}, "
-                f"contrastive={args.contrastive_weight}")
+                f"contrastive={args.contrastive_weight}, certainty={args.certainty_weight}")
+    logger.info(f"  Self-state (soma): {'enabled' if args.use_self_state else 'disabled'}"
+                + (f", d_soma={args.self_state_d_soma}" if args.use_self_state else ""))
     if args.prepopulate:
         logger.info(f"  Pre-population: {args.prepopulate_steps} steps, min {args.min_memories} memories")
     else:
@@ -1252,6 +1259,9 @@ def main():
         kv_injection_layers=kv_injection_layers,
         kv_injection_max_tokens=args.kv_injection_max_tokens,
         kv_injection_store_sequences=args.kv_injection_store_sequences,
+        # Self-state (soma) for certainty calibration
+        use_self_state=args.use_self_state,
+        self_state_d_soma=args.self_state_d_soma,
     ).to(device)
 
     tokenizer_name = args.tokenizer_name
