@@ -763,11 +763,12 @@ def _format_live_snapshot(
             )
         )
         lines.append(
-            "         mem={mem:d} acc={acc:.3f} ret_ben={ret_ben:.3f} surprise={surprise:.3f}".format(
+            "         mem={mem:d} acc={acc:.3f} ret_ben={ret_ben:.3f} surprise={surprise:.3f} cert={cert:.3f}".format(
                 mem=int(metrics.get("mem", 0)),
                 acc=metrics.get("acc", 0.0),
                 ret_ben=metrics.get("ret_ben", 0.0),
                 surprise=metrics.get("surprise", 0.0),
+                cert=metrics.get("cert", 0.0),
             )
         )
     lines.append(
