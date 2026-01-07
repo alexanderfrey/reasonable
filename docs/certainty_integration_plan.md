@@ -101,6 +101,12 @@ def compute_certainty(
 ### Phase 2: Certainty Head (Dedicated Module)
 **Goal**: Add dedicated certainty estimation with calibration loss
 
+> **Note on Estimation vs Training Strategy**:
+> The CertaintyHead is an **estimation module** - it outputs a certainty score in a single forward pass.
+> Simple calibration loss (BCE against correctness) is used here.
+> **Dual-tick selection** (CTM-style min-loss + max-certainty) is a **training strategy** that
+> requires multiple forward passes at different ticks - this belongs in Phase 4's CertaintyDrivenLoss.
+
 **Files to create/modify**:
 - Create `certainty.py` (new file)
 - Modify `experiential.py` to use CertaintyHead
@@ -462,6 +468,83 @@ thinking_max_ticks: int = 3,
 thinking_certainty_threshold: float = 0.8,
 ```
 
+#### Dual-Tick Selection Loss (CTM-Style Training)
+
+This is where CTM's dual-tick selection strategy belongs. Unlike Phase 2's simple calibration loss
+(which trains certainty at a single point), this loss operates across the tick trajectory.
+
+```python
+class CertaintyDrivenLoss(nn.Module):
+    """
+    CTM-inspired loss that selects two ticks per sample:
+    - t_min_loss: tick with minimum task loss (best prediction)
+    - t_max_certainty: tick with maximum certainty
+
+    This trains the model to:
+    1. Find good answers at some tick (correctness)
+    2. Be confident when correct (calibration)
+    3. Support adaptive compute at inference (efficiency)
+    """
+
+    def __init__(self, task_weight: float = 0.5, certainty_weight: float = 0.5):
+        super().__init__()
+        self.task_weight = task_weight
+        self.certainty_weight = certainty_weight
+
+    def forward(
+        self,
+        tick_losses: torch.Tensor,        # [B, T] task loss at each tick
+        tick_certainties: torch.Tensor,   # [B, T] certainty at each tick
+        was_correct: torch.Tensor,        # [B, T] whether prediction was correct
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Compute CTM-style dual-tick loss.
+
+        For each sample:
+        1. Find t_min_loss = argmin(tick_losses[b, :])
+        2. Find t_max_certainty = argmax(tick_certainties[b, :])
+        3. Loss = 0.5 * loss[t_min_loss] + 0.5 * loss[t_max_certainty]
+        """
+        B, T = tick_losses.shape
+
+        # Find best ticks per sample
+        t_min_loss = tick_losses.argmin(dim=1)      # [B]
+        t_max_certainty = tick_certainties.argmax(dim=1)  # [B]
+
+        # Gather losses at selected ticks
+        batch_idx = torch.arange(B, device=tick_losses.device)
+        loss_at_min = tick_losses[batch_idx, t_min_loss]
+        loss_at_max_cert = tick_losses[batch_idx, t_max_certainty]
+
+        # Task loss: average of losses at both selected ticks
+        task_loss = self.task_weight * loss_at_min + self.certainty_weight * loss_at_max_cert
+
+        # Calibration at max-certainty tick: certainty should match correctness
+        cert_at_max = tick_certainties[batch_idx, t_max_certainty]
+        correct_at_max = was_correct[batch_idx, t_max_certainty]
+        calibration_loss = F.binary_cross_entropy(cert_at_max, correct_at_max.float())
+
+        return {
+            'loss': task_loss.mean() + 0.1 * calibration_loss,
+            'task_loss': task_loss.mean(),
+            'calibration_loss': calibration_loss,
+            't_min_loss': t_min_loss,
+            't_max_certainty': t_max_certainty,
+        }
+```
+
+**Why dual-tick selection lives here, not in CertaintyHead**:
+
+| Component | Purpose | Requires |
+|-----------|---------|----------|
+| **CertaintyHead** (Phase 2) | Estimate certainty at a single state | Single forward pass |
+| **CertaintyDrivenLoss** (Phase 4) | Train across tick trajectory | Multiple ticks from ThinkingLoop |
+
+The CertaintyHead is called at each tick to produce `tick_certainties`. The CertaintyDrivenLoss
+then selects which ticks to optimize against. This separation allows:
+- Phase 2: Works without thinking loop (simple calibration)
+- Phase 4: Full CTM-style adaptive compute training
+
 ---
 
 ### Phase 5: Certainty-Driven Question Triggering
@@ -522,11 +605,12 @@ Phase 1: Enhanced Certainty Signal
     ├── Test: certainty distribution, correlation with accuracy
     │
     ▼
-Phase 2: Certainty Head
+Phase 2: Certainty Head (Estimation Module)
     │
-    ├── Create certainty.py
+    ├── Create certainty.py with CertaintyHead
     ├── Add CertaintyHead to MemoryAugmentedGPT
-    ├── Add calibration loss to training
+    ├── Add SIMPLE calibration loss (BCE against correctness)
+    ├── Note: No tick selection here - single forward pass only
     ├── Test: calibration curve
     │
     ▼
@@ -537,12 +621,14 @@ Phase 3: Certainty in Soma
     ├── Test: behavior under high vs low certainty
     │
     ▼
-Phase 4: Thinking Steps
+Phase 4: Thinking Steps + Dual-Tick Loss
     │
-    ├── Create thinking.py
+    ├── Create thinking.py with ThinkStep, ThinkingLoop
     ├── Add ThinkingLoop to MemoryAugmentedGPT
+    ├── Add CertaintyDrivenLoss (CTM-style dual-tick selection)
+    ├── Dual-tick selects: t_min_loss + t_max_certainty
     ├── Add config flags
-    ├── Test: certainty increases with ticks
+    ├── Test: certainty increases with ticks, dual-tick selection works
     │
     ▼
 Phase 5: Question Triggering
@@ -574,6 +660,9 @@ certainty_modulates_feedback: bool = True
 use_thinking_loop: bool = False  # Off by default initially
 thinking_max_ticks: int = 3
 thinking_certainty_threshold: float = 0.8
+use_dual_tick_loss: bool = True  # CTM-style training when thinking_loop enabled
+dual_tick_task_weight: float = 0.5
+dual_tick_certainty_weight: float = 0.5
 
 # Phase 5
 question_certainty_threshold: float = 0.3
@@ -584,19 +673,22 @@ question_certainty_threshold: float = 0.3
 ## Testing Strategy
 
 ### Unit Tests
-1. `test_certainty_head.py` - CertaintyHead forward, calibration loss
+1. `test_certainty_head.py` - CertaintyHead forward, simple calibration loss
 2. `test_thinking_loop.py` - ThinkingLoop halting, certainty trajectory
 3. `test_certainty_soma.py` - Certainty modulation of soma
+4. `test_dual_tick_loss.py` - CertaintyDrivenLoss tick selection, gradient flow
 
 ### Integration Tests
 1. Run training with enhanced certainty, verify no regression
 2. Add certainty calibration loss, verify calibration improves
 3. Enable thinking loop, verify ticks adapt to difficulty
+4. Enable dual-tick loss, verify t_min_loss and t_max_certainty are sensibly selected
 
 ### Metrics to Track
 1. **Certainty calibration**: Plot certainty vs accuracy buckets
 2. **Thinking efficiency**: Average ticks used vs accuracy
 3. **Question rate**: % of samples with certainty < threshold
+4. **Tick divergence**: How often t_min_loss ≠ t_max_certainty (measures calibration gap)
 
 ---
 
@@ -628,6 +720,8 @@ question_certainty_threshold: float = 0.3
 ### Phase 4
 - [ ] Certainty increases with ticks on hard examples
 - [ ] Easy examples halt early (fewer ticks)
+- [ ] Dual-tick selection: t_min_loss ≠ t_max_certainty on some samples (learning is non-trivial)
+- [ ] CertaintyDrivenLoss converges
 
 ### Phase 5
 - [ ] Questions generated for low-certainty samples
