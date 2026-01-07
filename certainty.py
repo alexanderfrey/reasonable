@@ -39,11 +39,14 @@ class CertaintyHead(nn.Module):
     The output is trained to match actual prediction correctness (calibration).
     """
 
+    # Fixed number of certainty sources (hardcoded, not configurable)
+    # Sources: surprise, meta_surprise, confidence_gate, self_confidence, hidden
+    N_SOURCES = 5
+
     def __init__(
         self,
         d_model: int,
         d_soma: int = 64,
-        n_sources: int = 5,  # surprise, meta, confidence, self_conf, hidden
         use_soma: bool = True,
         dropout: float = 0.1,
     ):
@@ -51,8 +54,8 @@ class CertaintyHead(nn.Module):
 
         self.d_model = d_model
         self.d_soma = d_soma
-        self.n_sources = n_sources
         self.use_soma = use_soma
+        n_sources = self.N_SOURCES  # Use class constant
 
         # Source-specific processors
         # Each source gets its own small network to extract certainty contribution

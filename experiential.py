@@ -2562,6 +2562,15 @@ class MemoryAugmentedGPT(nn.Module):
         else:
             self.self_state = None
 
+        # Unified certainty estimation (computed after self_state to use all signals)
+        # This is the authoritative certainty computation; ExperientialStream's is bypassed
+        from certainty import CertaintyHead
+        self.certainty_head = CertaintyHead(
+            d_model=self.d_model,
+            d_soma=self_state_d_soma if use_self_state else 64,
+            use_soma=use_self_state,  # Only use soma if self_state is enabled
+        )
+
         # Memory integration components
         if memory_integration == 'gated':
             # Learned gate: how much to use memory vs original hidden state
@@ -3131,6 +3140,9 @@ class MemoryAugmentedGPT(nn.Module):
                 'modulated_output': exp_output.get('modulated_output'),
                 'confidence_gate': exp_output.get('confidence_gate'),
                 'meta_surprise': exp_output.get('meta_surprise'),
+                # Certainty estimation
+                'certainty': exp_output.get('certainty'),
+                'certainty_sources': exp_output.get('certainty_sources'),
                 # Extended self-awareness: affect prediction
                 'predicted_valence': exp_output.get('predicted_valence'),
                 'predicted_arousal': exp_output.get('predicted_arousal'),
@@ -3188,6 +3200,26 @@ class MemoryAugmentedGPT(nn.Module):
                     'soma_q_bias': soma_q_bias,
                     'soma_attention_active': soma_q_bias is not None,
                 })
+
+            # 5c. Compute unified certainty (after self_state, using all signals)
+            # This uses soma-modulated hidden states and self_confidence from self_state
+            self_confidence_for_certainty = None
+            soma_for_certainty = None
+            if self.self_state is not None:
+                self_confidence_for_certainty = self_state_output['self_confidence'].squeeze(-1)
+                soma_for_certainty = self_state_output['soma']
+
+            certainty_output = self.certainty_head(
+                hidden_states=hidden_states,  # Potentially soma-modulated
+                surprise=exp_output.get('surprise'),
+                meta_surprise=exp_output.get('meta_surprise'),
+                confidence_gate=exp_output.get('confidence_gate'),
+                self_confidence=self_confidence_for_certainty,
+                soma=soma_for_certainty,
+            )
+            # Update memory_output with authoritative certainty (overrides ExperientialStream's)
+            memory_output['certainty'] = certainty_output.certainty
+            memory_output['certainty_sources'] = certainty_output.uncertainty_sources
 
             # 5b. Crystallize high-salience moments into episodic memory
             # Store the MODULATED output (post-self-regulation), not raw target
@@ -3831,6 +3863,8 @@ def memory_augmented_loss(
     retrieval_gate_entropy_weight: float = 0.01,
     contrastive_weight: float = 0.1,
     contrastive_temperature: float = 0.1,
+    # Certainty calibration
+    certainty_calibration_weight: float = 0.1,  # Weight for certainty calibration loss
     # Self-state loss weights
     self_state_weight: float = 0.01,  # Weight for self-state losses
     self_state_config: Optional['SelfStateConfig'] = None,  # Config for computing losses
@@ -3853,6 +3887,7 @@ def memory_augmented_loss(
         retrieval_gate_weight: weight for benefit-guided retrieval gate loss
         retrieval_gate_sparsity_weight: weight for sparsity regularizer on gate outputs
         retrieval_gate_entropy_weight: weight for entropy regularizer (prevents gate collapse)
+        certainty_calibration_weight: weight for certainty calibration loss
 
     Returns:
         total_loss: combined scalar loss
@@ -3876,6 +3911,21 @@ def memory_augmented_loss(
 
     total_loss = lm_weight * lm_loss
 
+    # Compute was_correct for certainty calibration
+    # Use per-token top-1 accuracy as correctness signal
+    was_correct = None
+    if certainty_calibration_weight > 0 and memory_output.get('certainty') is not None:
+        with torch.no_grad():
+            # Get predictions and check correctness
+            # lm_logits: [B, seq_len, vocab], targets: [B, seq_len]
+            predictions = lm_logits.argmax(dim=-1)  # [B, seq_len]
+            # Create mask for valid positions (not padding)
+            valid_mask = (targets != -100)
+            # Per-position correctness
+            correct = (predictions == targets) & valid_mask  # [B, seq_len]
+            # Average correctness per batch item (as soft correctness score)
+            was_correct = correct.float().sum(dim=-1) / (valid_mask.float().sum(dim=-1) + 1e-8)  # [B]
+
     # Experiential prediction loss (now uses combined_experiential_loss for full training)
     # This trains: predictor, surprise_predictor, self_modulator, affect_predictor, retrieval_predictor
     if 'prediction' in memory_output and memory_output['prediction'] is not None:
@@ -3886,12 +3936,17 @@ def memory_augmented_loss(
             self_mod_weight=self_mod_weight / exp_weight if exp_weight > 0 else 0.0,
             affect_weight=affect_weight / exp_weight if exp_weight > 0 else 0.0,
             retrieval_weight=retrieval_weight / exp_weight if exp_weight > 0 else 0.0,
+            certainty_calibration_weight=certainty_calibration_weight / exp_weight if exp_weight > 0 else 0.0,
+            was_correct=was_correct,
         )
         loss_dict['exp_loss'] = exp_dict.get('exp_loss', 0.0)
         loss_dict['meta_loss'] = exp_dict.get('meta_loss', 0.0)
         loss_dict['self_mod_loss'] = exp_dict.get('self_mod_loss', 0.0)
         loss_dict['mean_meta_surprise'] = exp_dict.get('mean_meta_surprise', 0.0)
         loss_dict['mean_confidence'] = exp_dict.get('mean_confidence', 0.0)
+        # Certainty calibration metrics
+        loss_dict['certainty_calibration_loss'] = exp_dict.get('certainty_calibration_loss', 0.0)
+        loss_dict['mean_certainty'] = exp_dict.get('mean_certainty', 0.0)
         # Extended self-awareness metrics
         loss_dict['affect_loss'] = exp_dict.get('affect_loss', 0.0)
         loss_dict['retrieval_loss'] = exp_dict.get('retrieval_loss', 0.0)

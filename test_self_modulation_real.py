@@ -1,8 +1,9 @@
 """
-Test self-modulation on real training data.
+Test self-modulation and certainty calibration on real training data.
 
 Analyzes how the confidence gate varies with meta-surprise and
 whether the system learns to modulate its outputs appropriately.
+Also tests the new certainty calibration system (Phase 1-2).
 
 Usage:
     python test_self_modulation_real.py --max_steps 1000
@@ -23,6 +24,7 @@ from experiential import (
     ExperientialStream,
     combined_experiential_loss,
 )
+from certainty import expected_calibration_error
 from train_experiential import (
     HiddenStateExtractor,
     load_model,
@@ -47,9 +49,10 @@ def train_with_self_modulation(
     log_interval: int = 50,
     meta_weight: float = 0.5,
     self_mod_weight: float = 0.1,
+    certainty_weight: float = 0.1,
 ):
     """
-    Train experiential module tracking self-modulation metrics.
+    Train experiential module tracking self-modulation and certainty metrics.
     """
     extractor.model.eval()
     for param in extractor.model.parameters():
@@ -61,12 +64,19 @@ def train_with_self_modulation(
         'exp_loss': [],
         'meta_loss': [],
         'self_mod_loss': [],
+        'certainty_loss': [],
         'meta_surprise': [],
         'confidence_mean': [],
         'confidence_std': [],
         'modulation_magnitude': [],  # How much modulated_output differs from h_end
         'surprise': [],
+        'certainty': [],
+        'accuracy': [],  # For ECE computation
     }
+
+    # For ECE computation at end
+    all_certainties = []
+    all_was_correct = []
 
     start_time = time.time()
     step = 0
@@ -79,6 +89,7 @@ def train_with_self_modulation(
 
         input_ids = batch["input_ids"].to(device)
         batch_size = input_ids.size(0)
+        seq_len = input_ids.size(1)
 
         # Reset state for each batch
         experiential.reset_state(batch_size=batch_size)
@@ -87,15 +98,30 @@ def train_with_self_modulation(
         with torch.no_grad():
             _, hidden_states = extractor(input_ids)
 
+            # Compute logits to determine was_correct
+            # Use lm_head on last position hidden state
+            last_hidden = hidden_states[:, -1, :]  # [B, d_model]
+            logits = extractor.model.lm_head(last_hidden)  # [B, vocab]
+            predictions = logits.argmax(dim=-1)  # [B]
+
+            # Target is what would come after the sequence
+            # Since we don't have it, use a proxy: check if top prediction
+            # matches the actual last token (shifted by 1)
+            # Or use top-k accuracy as soft correctness
+            targets = input_ids[:, -1]  # Last token as proxy target
+            was_correct = (predictions == targets).float()  # [B]
+
         # Forward through experiential module
         exp_output = experiential(hidden_states)
 
-        # Combined loss (includes self-modulation loss)
+        # Combined loss (includes self-modulation and certainty calibration loss)
         loss, loss_dict = combined_experiential_loss(
             exp_output,
             exp_weight=1.0,
             meta_weight=meta_weight,
-            self_mod_weight=self_mod_weight
+            self_mod_weight=self_mod_weight,
+            certainty_calibration_weight=certainty_weight,
+            was_correct=was_correct,
         )
 
         # Backward and optimize
@@ -104,36 +130,51 @@ def train_with_self_modulation(
         torch.nn.utils.clip_grad_norm_(experiential.parameters(), max_norm=1.0)
         optimizer.step()
 
-        # Track self-modulation metrics
+        # Track self-modulation and certainty metrics
         with torch.no_grad():
             conf_gate = exp_output['confidence_gate']  # [B, d_model]
             modulated = exp_output['modulated_output']  # [B, d_model]
-            target = exp_output['target']  # [B, d_model]
+            h_end = exp_output['h_end']  # [B, d_model] - raw world state
 
             # Mean confidence across dimensions
             conf_mean = conf_gate.mean().item()
             conf_std = conf_gate.std().item()
 
             # How much did modulation change the output?
-            # Normalized difference between modulated and target
-            mod_diff = (modulated - target).norm(dim=-1) / target.norm(dim=-1)
+            # Compare modulated_output to h_end (raw world state)
+            # This shows how much self-knowledge adjusted the committed output
+            mod_diff = (modulated - h_end).norm(dim=-1) / (h_end.norm(dim=-1) + 1e-8)
             mod_magnitude = mod_diff.mean().item()
+
+            # Certainty metrics
+            certainty = exp_output.get('certainty')
+            if certainty is not None:
+                certainty_mean = certainty.mean().item()
+                # Collect for ECE computation
+                all_certainties.append(certainty.detach().cpu())
+                all_was_correct.append(was_correct.detach().cpu())
+            else:
+                certainty_mean = 0.5
 
         history['exp_loss'].append(loss_dict['exp_loss'])
         history['meta_loss'].append(loss_dict.get('meta_loss', 0))
         history['self_mod_loss'].append(loss_dict.get('self_mod_loss', 0))
+        history['certainty_loss'].append(loss_dict.get('certainty_calibration_loss', 0))
         history['meta_surprise'].append(loss_dict.get('mean_meta_surprise', 0))
         history['confidence_mean'].append(loss_dict.get('mean_confidence', conf_mean))
         history['confidence_std'].append(conf_std)
         history['modulation_magnitude'].append(mod_magnitude)
         history['surprise'].append(exp_output['surprise'].mean().item())
+        history['certainty'].append(certainty_mean)
+        history['accuracy'].append(was_correct.mean().item())
 
         # Log
         if step % log_interval == 0:
             pbar.set_postfix({
                 'ms': f"{loss_dict.get('mean_meta_surprise', 0):.3f}",
                 'conf': f"{loss_dict.get('mean_confidence', conf_mean):.3f}",
-                'sm_loss': f"{loss_dict.get('self_mod_loss', 0):.4f}",
+                'cert': f"{certainty_mean:.3f}",
+                'cert_loss': f"{loss_dict.get('certainty_calibration_loss', 0):.4f}",
             })
 
         pbar.update(1)
@@ -143,7 +184,16 @@ def train_with_self_modulation(
     elapsed = time.time() - start_time
     logger.info(f"Training complete: {step} steps in {elapsed:.1f}s")
 
-    return history
+    # Compute final ECE
+    ece_value = None
+    ece_details = None
+    if all_certainties:
+        all_cert = torch.cat(all_certainties)
+        all_corr = torch.cat(all_was_correct)
+        ece_value, ece_details = expected_calibration_error(all_cert, all_corr)
+        logger.info(f"Final ECE: {ece_value.item():.4f}")
+
+    return history, ece_value, ece_details
 
 
 def analyze_self_modulation(history: dict):
@@ -252,6 +302,122 @@ def analyze_self_modulation(history: dict):
     }
 
 
+def analyze_certainty_calibration(history: dict, ece_value, ece_details):
+    """Analyze certainty calibration patterns."""
+    print("\n" + "=" * 80)
+    print("CERTAINTY CALIBRATION ANALYSIS")
+    print("=" * 80)
+
+    n = len(history.get('certainty', []))
+    if n == 0:
+        print("\nNo certainty data recorded.")
+        return {}
+
+    # Split into phases
+    phase_size = n // 4
+    phases = {
+        'early': (0, phase_size),
+        'mid-early': (phase_size, 2 * phase_size),
+        'mid-late': (2 * phase_size, 3 * phase_size),
+        'late': (3 * phase_size, n),
+    }
+
+    print(f"\n{'Phase':<12} {'Certainty':>12} {'Accuracy':>12} {'Cert Loss':>12} {'Gap':>12}")
+    print("-" * 80)
+
+    phase_data = {}
+    for phase_name, (start, end) in phases.items():
+        cert = sum(history['certainty'][start:end]) / (end - start)
+        acc = sum(history['accuracy'][start:end]) / (end - start)
+        cert_loss = sum(history['certainty_loss'][start:end]) / (end - start)
+        gap = abs(cert - acc)  # Calibration gap
+
+        phase_data[phase_name] = {'cert': cert, 'acc': acc, 'cert_loss': cert_loss, 'gap': gap}
+        print(f"{phase_name:<12} {cert:>12.4f} {acc:>12.4f} {cert_loss:>12.4f} {gap:>12.4f}")
+
+    # Correlation analysis
+    print("\n" + "=" * 70)
+    print("CERTAINTY-ACCURACY CORRELATION")
+    print("=" * 70)
+
+    cert_tensor = torch.tensor(history['certainty'])
+    acc_tensor = torch.tensor(history['accuracy'])
+    surp_tensor = torch.tensor(history['surprise'])
+
+    cert_centered = cert_tensor - cert_tensor.mean()
+    acc_centered = acc_tensor - acc_tensor.mean()
+    surp_centered = surp_tensor - surp_tensor.mean()
+
+    cert_acc_corr = (cert_centered * acc_centered).sum() / (cert_centered.norm() * acc_centered.norm() + 1e-8)
+    cert_surp_corr = (cert_centered * surp_centered).sum() / (cert_centered.norm() * surp_centered.norm() + 1e-8)
+
+    print(f"\nCorrelation(certainty, accuracy): {cert_acc_corr:.4f}")
+    print(f"Correlation(certainty, surprise): {cert_surp_corr:.4f}")
+
+    # ECE analysis
+    if ece_value is not None:
+        print(f"\nExpected Calibration Error (ECE): {ece_value.item():.4f}")
+        if ece_details is not None:
+            print("\nPer-bin calibration:")
+            bin_acc = ece_details['bin_accuracies']
+            bin_conf = ece_details['bin_confidences']
+            bin_counts = ece_details['bin_counts']
+            for i, (acc, conf, count) in enumerate(zip(bin_acc, bin_conf, bin_counts)):
+                if count > 0:
+                    print(f"  Bin {i}: conf={conf:.3f}, acc={acc:.3f}, gap={abs(conf-acc):.3f}, n={count}")
+
+    # Interpretation
+    print("\n" + "=" * 70)
+    print("INTERPRETATION")
+    print("=" * 70)
+
+    early_cert = phase_data['early']['cert']
+    late_cert = phase_data['late']['cert']
+    early_gap = phase_data['early']['gap']
+    late_gap = phase_data['late']['gap']
+
+    if late_gap < early_gap:
+        reduction = (early_gap - late_gap) / (early_gap + 1e-8) * 100
+        print(f"\n✓ Calibration gap DECREASED by {reduction:.1f}%")
+        print("  → Certainty is becoming better calibrated to accuracy")
+    else:
+        print("\n✗ Calibration gap did not decrease")
+
+    if cert_acc_corr > 0.3:
+        print(f"\n✓ Strong positive correlation between certainty and accuracy")
+        print("  → Model is more certain when it's more likely to be correct")
+    elif cert_acc_corr > 0:
+        print(f"\n~ Weak positive correlation between certainty and accuracy")
+        print("  → Certainty calibration is emerging")
+    else:
+        print(f"\n✗ Negative/zero correlation between certainty and accuracy")
+        print("  → Certainty needs more training")
+
+    if cert_surp_corr < -0.3:
+        print(f"\n✓ Strong negative correlation between certainty and surprise")
+        print("  → Low surprise → high certainty (expected behavior)")
+
+    if ece_value is not None:
+        if ece_value.item() < 0.1:
+            print(f"\n✓ ECE is low ({ece_value.item():.4f}) - well calibrated")
+        elif ece_value.item() < 0.2:
+            print(f"\n~ ECE is moderate ({ece_value.item():.4f}) - reasonably calibrated")
+        else:
+            print(f"\n✗ ECE is high ({ece_value.item():.4f}) - needs more calibration training")
+
+    print("\n" + "=" * 70)
+
+    return {
+        'early_cert': early_cert,
+        'late_cert': late_cert,
+        'early_gap': early_gap,
+        'late_gap': late_gap,
+        'cert_acc_corr': cert_acc_corr.item(),
+        'cert_surp_corr': cert_surp_corr.item(),
+        'ece': ece_value.item() if ece_value is not None else None,
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description="Test self-modulation on real data")
     parser.add_argument("--checkpoint", type=str, default=DEFAULT_CHECKPOINT)
@@ -263,6 +429,8 @@ def main():
     parser.add_argument("--meta_weight", type=float, default=0.5)
     parser.add_argument("--self_mod_weight", type=float, default=0.1,
                         help="Weight for self-modulation loss")
+    parser.add_argument("--certainty_weight", type=float, default=0.1,
+                        help="Weight for certainty calibration loss")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
 
     args = parser.parse_args()
@@ -320,8 +488,8 @@ def main():
     )
 
     # Train
-    logger.info(f"\nTraining with self-modulation enabled (weight={args.self_mod_weight})...")
-    history = train_with_self_modulation(
+    logger.info(f"\nTraining with self-modulation (weight={args.self_mod_weight}) and certainty (weight={args.certainty_weight})...")
+    history, ece_value, ece_details = train_with_self_modulation(
         extractor=extractor,
         experiential=experiential,
         dataloader=dataloader,
@@ -331,16 +499,23 @@ def main():
         log_interval=50,
         meta_weight=args.meta_weight,
         self_mod_weight=args.self_mod_weight,
+        certainty_weight=args.certainty_weight,
     )
 
-    # Analyze
-    results = analyze_self_modulation(history)
+    # Analyze self-modulation
+    sm_results = analyze_self_modulation(history)
+
+    # Analyze certainty calibration
+    cert_results = analyze_certainty_calibration(history, ece_value, ece_details)
 
     # Save
     output_path = "self_modulation_results.pt"
     torch.save({
         'history': history,
-        'results': results,
+        'self_modulation_results': sm_results,
+        'certainty_results': cert_results,
+        'ece_value': ece_value.item() if ece_value is not None else None,
+        'ece_details': {k: v.cpu() for k, v in ece_details.items()} if ece_details else None,
         'args': vars(args),
     }, output_path)
     logger.info(f"\nSaved results to {output_path}")
