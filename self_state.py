@@ -141,7 +141,8 @@ class SomaIntegrator(nn.Module):
     def forward(
         self,
         signals: torch.Tensor,  # [B, n_signals]
-        update_state: bool = True
+        update_state: bool = True,
+        certainty: Optional[torch.Tensor] = None,  # [B] for certainty-modulated updates
     ) -> Dict[str, torch.Tensor]:
         """
         Integrate signals into soma state.
@@ -150,6 +151,8 @@ class SomaIntegrator(nn.Module):
             signals: [B, n_signals] raw sub-signals
                      (surprise, arousal, valence, novelty, certainty, engagement)
             update_state: whether to update persistent state
+            certainty: [B] optional certainty for modulating update strength.
+                       When uncertain, be more conservative in state updates.
 
         Returns:
             dict with:
@@ -173,6 +176,13 @@ class SomaIntegrator(nn.Module):
 
         # Project to soma space
         signal_contribution = self.signal_proj(weighted_signals)  # [B, d_soma]
+
+        # Certainty-modulated integration: when uncertain, be more conservative
+        # This prevents uncertain signals from causing large state changes
+        if certainty is not None:
+            # certainty_gate ∈ [0.3, 1.0] - never fully stop updates
+            certainty_gate = 0.3 + 0.7 * certainty.unsqueeze(-1)  # [B, 1]
+            signal_contribution = signal_contribution * certainty_gate
 
         # Integrate with decay (EMA-style)
         new_soma = self.decay * prev_soma + (1 - self.decay) * signal_contribution
@@ -616,9 +626,16 @@ class SomaFeedback(nn.Module):
         self,
         hidden_states: torch.Tensor,  # [B, seq_len, d_model]
         soma: torch.Tensor,  # [B, d_soma]
+        certainty: Optional[torch.Tensor] = None,  # [B] for certainty-scaled feedback
     ) -> Dict[str, torch.Tensor]:
         """
         Modulate hidden states by soma.
+
+        Args:
+            hidden_states: [B, seq_len, d_model] model hidden states
+            soma: [B, d_soma] internal state
+            certainty: [B] optional certainty for scaling feedback strength.
+                       When uncertain, reduce soma's influence on processing.
 
         Returns:
             dict with:
@@ -632,6 +649,17 @@ class SomaFeedback(nn.Module):
         if self.config.soma_gate_hidden:
             gate = self.hidden_gate(soma).unsqueeze(1)  # [B, 1, d_model]
             add = self.hidden_add(soma).unsqueeze(1)  # [B, 1, d_model]
+
+            # Certainty-scaled feedback: when uncertain, let hidden states flow more freely
+            # This prevents uncertain internal state from corrupting processing
+            if certainty is not None:
+                # feedback_strength ∈ [0.2, 1.0]
+                feedback_strength = 0.2 + 0.8 * certainty.unsqueeze(-1).unsqueeze(-1)  # [B, 1, 1]
+
+                # Blend gate toward 1 (no gating) when uncertain
+                gate = 1 - feedback_strength * (1 - gate)
+                # Reduce additive bias when uncertain
+                add = add * feedback_strength
 
             modulated = hidden_states * gate + 0.1 * add
             result['modulated_hidden'] = modulated
@@ -744,8 +772,15 @@ class SelfState(nn.Module):
             novelty = torch.zeros(batch_size, device=device)
         signals.append(novelty.unsqueeze(-1))
 
-        # Certainty (inverse of surprise, normalized)
-        certainty = 1.0 - torch.clamp(surprise, 0, 1)
+        # Certainty: use unified certainty from CertaintyHead if available,
+        # otherwise fall back to simple inverse of surprise
+        if 'certainty' in exp_output and exp_output['certainty'] is not None:
+            certainty = exp_output['certainty']
+            if certainty.dim() == 0:
+                certainty = certainty.unsqueeze(0).expand(batch_size)
+        else:
+            # Fallback: simple inverse of surprise
+            certainty = 1.0 - torch.clamp(surprise, 0, 1)
         signals.append(certainty.unsqueeze(-1))
 
         # Engagement (could be attention entropy, for now proxy from arousal)
@@ -794,8 +829,11 @@ class SelfState(nn.Module):
         # 1. Extract signals from experiential output
         signals = self.extract_signals(exp_output)
 
-        # 2. Integrate signals into soma
-        integrator_out = self.integrator(signals, update_state=update_state)
+        # Extract certainty for modulation (unified certainty from CertaintyHead)
+        certainty = exp_output.get('certainty', None)
+
+        # 2. Integrate signals into soma (with certainty modulation)
+        integrator_out = self.integrator(signals, update_state=update_state, certainty=certainty)
         soma = integrator_out['soma']
         soma_delta = integrator_out['soma_delta']
 
@@ -836,8 +874,8 @@ class SelfState(nn.Module):
             context = hidden_states[:, -1, :]
             ideal_out = self.ideal_self(soma, context)
 
-        # 6. Feedback modulation of hidden states
-        feedback_out = self.feedback(hidden_states, soma)
+        # 6. Feedback modulation of hidden states (with certainty scaling)
+        feedback_out = self.feedback(hidden_states, soma, certainty=certainty)
         modulated_hidden = feedback_out['modulated_hidden']
 
         # 7. Generate description (if requested)

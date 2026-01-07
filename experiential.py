@@ -1352,6 +1352,15 @@ class ExperientialStream(nn.Module):
                 nn.Linear(meta_hidden, 2)  # [valence, arousal]
             )
 
+        # Unified certainty estimation (combines multiple uncertainty signals)
+        # This integrates surprise, meta_surprise, confidence_gate into calibrated certainty
+        from certainty import CertaintyHead
+        self.certainty_head = CertaintyHead(
+            d_model=d_model,
+            d_soma=64,  # Default, will be overridden if SelfState provides soma
+            use_soma=False,  # Soma integration happens in SelfState, not here
+        )
+
         # Persistent state buffer (not a parameter, just a buffer)
         self.register_buffer('_persistent_state', None)
         self._batch_size = None
@@ -1881,6 +1890,17 @@ class ExperientialStream(nn.Module):
             # Blend: confident → use h_end, uncertain → use fallback
             modulated_output = confidence_gate * h_end + (1 - confidence_gate) * fallback
 
+        # Compute unified certainty (combines all uncertainty signals)
+        certainty_output = self.certainty_head(
+            hidden_states=modulated_output,
+            surprise=surprise,  # Uses either per_token_ce based or fallback surprise
+            meta_surprise=meta_surprise,
+            confidence_gate=confidence_gate,
+            self_confidence=None,  # Will be added when SelfState is integrated
+            soma=None,  # Will be passed when available
+        )
+        certainty = certainty_output.certainty  # [B] in [0, 1]
+
         # Update persistent state with MODULATED output (closes the feedback loop)
         # This means: what the system commits to → becomes input to next prediction
         gate_values = None
@@ -1935,6 +1955,9 @@ class ExperientialStream(nn.Module):
             'h_end': h_end.detach(),               # raw world state (for analysis)
             'modulated_output': modulated_output,  # h_end adjusted by self-knowledge (= target)
             'confidence_gate': confidence_gate,    # how much we trusted h_end
+            # Unified certainty (combines surprise, meta_surprise, confidence_gate)
+            'certainty': certainty,                # [B] calibrated certainty in [0, 1]
+            'certainty_sources': certainty_output.uncertainty_sources,  # [B, n_sources]
             'mid_idx': mid_idx,
             'end_idx': end_idx if end_idx != -1 else seq_len - 1,
             'persistent_state': self._persistent_state,
@@ -2152,11 +2175,14 @@ def combined_experiential_loss(
     self_mod_weight: float = 0.1,
     affect_weight: float = 0.1,
     retrieval_weight: float = 0.1,
-    temperature: float = 0.1
+    certainty_calibration_weight: float = 0.1,
+    temperature: float = 0.1,
+    was_correct: Optional[torch.Tensor] = None,  # [B] correctness for calibration
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """
     Combined loss for experiential prediction, meta-surprise, self-modulation,
-    and extended self-awareness (affect prediction, retrieval prediction).
+    extended self-awareness (affect prediction, retrieval prediction),
+    and certainty calibration.
 
     Args:
         output: dict from ExperientialStream.forward()
@@ -2165,7 +2191,9 @@ def combined_experiential_loss(
         self_mod_weight: weight for self-modulation loss
         affect_weight: weight for meta-affect loss (extended self-awareness)
         retrieval_weight: weight for meta-retrieval loss (extended self-awareness)
+        certainty_calibration_weight: weight for certainty calibration loss
         temperature: temperature for contrastive loss
+        was_correct: [B] optional correctness scores for calibration loss
 
     Returns:
         total_loss: combined scalar loss
@@ -2232,6 +2260,18 @@ def combined_experiential_loss(
         if output.get('meta_retrieval_surprise') is not None:
             loss_dict['mean_meta_retrieval_surprise'] = output['meta_retrieval_surprise'].mean().item()
         total_loss = total_loss + retrieval_weight * retrieval_loss
+
+    # Certainty calibration loss: certainty should match actual correctness
+    # This trains the model to be well-calibrated (confident when right, uncertain when wrong)
+    if output.get('certainty') is not None and was_correct is not None:
+        from certainty import certainty_calibration_loss
+        cert_loss = certainty_calibration_loss(
+            output['certainty'],
+            was_correct,
+        )
+        loss_dict['certainty_calibration_loss'] = cert_loss.item()
+        loss_dict['mean_certainty'] = output['certainty'].mean().item()
+        total_loss = total_loss + certainty_calibration_weight * cert_loss
 
     loss_dict['total_loss'] = total_loss.item()
     return total_loss, loss_dict
