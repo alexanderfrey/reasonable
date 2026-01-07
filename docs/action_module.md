@@ -6,6 +6,8 @@ An action module that gives the model **agency** — the ability to take discret
 
 This extends the experiential architecture from passive (react to text) to active (choose to intervene).
 
+**Key Insight**: The most important action is **questioning** — when the model's predictions about the world fail, it can actively seek information to resolve the error rather than passively accepting confusion. See `questioning_system.md` for the deep treatment of questions as the cognitive response to prediction failure.
+
 ## Architecture Status
 
 ### Core Components
@@ -15,9 +17,16 @@ This extends the experiential architecture from passive (react to text) to activ
 - [ ] **UserContactInterface** — Generate messages to user
 - [ ] **ActionValue** — Estimate value/appropriateness of actions
 
+### Questioning Integration (see `questioning_system.md`)
+- [ ] **QuestionBuffer** — Accumulate questions from prediction failures
+- [ ] **QuestionAction** — Specialized action type for asking questions
+- [ ] **PredictionFailure → Question → Action** pipeline
+- [ ] **Question resolution** — Handle answers, update model
+
 ### Integration
 - [ ] Hook into MemoryAugmentedGPT forward pass
 - [ ] Action triggers based on soma thresholds
+- [ ] Action triggers based on prediction error
 - [ ] Interrupt mechanism for user contact
 - [ ] Action history tracking
 
@@ -62,25 +71,139 @@ Humans do all of these. An action module enables the model to be an **agent** ra
 | `forget` | Repeated harm from memory | Remove unhelpful memory |
 | `mark_important` | Ideal self alignment | Boost memory salience |
 
+### Question Actions (Cross-Tier)
+
+Questions are a special category of actions that arise from **prediction failure**. They span tiers because a question can be asked externally (user) or internally (self-reasoning).
+
+| Action | Source | Resolution |
+|--------|--------|------------|
+| `ask_clarification` | Semantic prediction failure | User provides meaning |
+| `ask_identification` | Visual prediction failure (unrecognized) | User identifies object |
+| `ask_confirmation` | Hypothesis formed | User confirms/denies |
+| `ask_elaboration` | Incomplete understanding | User provides details |
+| `reason_internally` | Any prediction failure | Self-resolution through inference |
+| `consult_memory` | Prediction failure | Check if seen before |
+
+```python
+@dataclass
+class QuestionAction(Action):
+    """
+    Action specifically for asking questions arising from prediction failure.
+
+    This is the bridge between:
+    - Experiential system (prediction error detected)
+    - Questioning system (question generated)
+    - Action system (question asked/resolved)
+    """
+    name: str = 'ask_question'
+    tier: int = 1  # Default to user-facing, but can be internal
+
+    # The question being asked
+    question: 'Question'  # From questioning_system
+
+    # Action-specific properties
+    urgency: float                  # How urgent? (from cost_of_not_knowing)
+    interruptibility: str           # 'immediate', 'next_pause', 'batch', 'internal'
+    fallback_strategy: str          # If user doesn't respond
+
+    # Source tracking
+    prediction_failure: 'PredictionFailure'  # What triggered this
+    failure_magnitude: float        # How large was the error?
+
+    def is_internal(self) -> bool:
+        """Is this an internal reasoning action (no user contact)?"""
+        return self.interruptibility == 'internal'
+
+    def to_user_message(self) -> str:
+        """Convert to human-readable question."""
+        return self.question.to_natural_language()
+
+    def execute(self, context: Dict) -> Dict:
+        if self.is_internal():
+            # Attempt self-resolution
+            return self._execute_internal(context)
+        else:
+            # Ask user
+            return self._execute_external(context)
+
+    def _execute_internal(self, context: Dict) -> Dict:
+        """Try to resolve question through reasoning."""
+        reasoner = context.get('reasoner')
+        if reasoner:
+            result = reasoner.attempt_resolution(self.question)
+            return {
+                'interrupt': False,
+                'resolved': result['resolved'],
+                'answer': result.get('answer'),
+                'confidence': result.get('confidence', 0.0),
+            }
+        return {'interrupt': False, 'resolved': False}
+
+    def _execute_external(self, context: Dict) -> Dict:
+        """Ask user the question."""
+        return {
+            'interrupt': self.interruptibility == 'immediate',
+            'message': self.to_user_message(),
+            'expects_response': True,
+            'question_id': self.question.id,
+            'urgency': self.urgency,
+            'source': f"prediction_failure:{self.prediction_failure.source_type}",
+        }
+```
+
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                        ACTION MODULE                             │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│  ┌─────────────┐     ┌──────────────┐     ┌─────────────────┐  │
-│  │    SOMA     │────▶│ ACTION POLICY │────▶│ ACTION EXECUTOR │  │
-│  │  + context  │     │  π(a|s,c)     │     │                 │  │
-│  └─────────────┘     └──────────────┘     └────────┬────────┘  │
-│                              │                      │           │
-│                              ▼                      ▼           │
-│                      ┌──────────────┐      ┌───────────────┐   │
-│                      │ ACTION VALUE │      │ USER CONTACT  │   │
-│                      │   V(s,a)     │      │  INTERFACE    │   │
-│                      └──────────────┘      └───────────────┘   │
-│                                                                  │
-└─────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                              ACTION MODULE                                   │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │                    PREDICTION FAILURE PATHWAY                        │   │
+│  │                                                                      │   │
+│  │  ┌────────────┐    ┌────────────────┐    ┌───────────────────────┐  │   │
+│  │  │ PREDICTION │───▶│   QUESTION     │───▶│   QUESTION BUFFER     │  │   │
+│  │  │   ERROR    │    │   GENERATOR    │    │   (accumulate,        │  │   │
+│  │  │  (surprise)│    │                │    │    prioritize)        │  │   │
+│  │  └────────────┘    └────────────────┘    └───────────┬───────────┘  │   │
+│  │                                                      │               │   │
+│  └──────────────────────────────────────────────────────┼───────────────┘   │
+│                                                         │                    │
+│                                                         ▼                    │
+│  ┌─────────────┐     ┌──────────────────────────────────────────────┐      │
+│  │    SOMA     │────▶│            ACTION POLICY                      │      │
+│  │  + context  │     │            π(a|s,c,q)                         │      │
+│  └─────────────┘     │                                               │      │
+│                      │  Inputs:                                      │      │
+│                      │  - Soma state (internal feelings)             │      │
+│                      │  - Context (what's happening)                 │      │
+│                      │  - Question buffer (pending questions)        │      │
+│                      └──────────────────┬───────────────────────────┘      │
+│                                         │                                    │
+│                    ┌────────────────────┼────────────────────┐              │
+│                    ▼                    ▼                    ▼              │
+│           ┌──────────────┐     ┌──────────────┐     ┌──────────────┐       │
+│           │  QUESTION    │     │   OTHER      │     │   NO         │       │
+│           │  ACTION      │     │   ACTION     │     │   ACTION     │       │
+│           │  (ask/reason)│     │   (internal) │     │   (continue) │       │
+│           └──────┬───────┘     └──────────────┘     └──────────────┘       │
+│                  │                                                          │
+│      ┌───────────┼───────────┐                                             │
+│      ▼           ▼           ▼                                             │
+│  ┌────────┐ ┌────────┐ ┌─────────┐                                        │
+│  │  ASK   │ │ REASON │ │ DEFER   │                                        │
+│  │  USER  │ │ SELF   │ │ (wait)  │                                        │
+│  └───┬────┘ └───┬────┘ └─────────┘                                        │
+│      │          │                                                          │
+│      ▼          ▼                                                          │
+│  ┌──────────────────────────────────────────────────────────────────┐     │
+│  │                    ANSWER INTEGRATION                             │     │
+│  │  - Update model (reduce future prediction error)                  │     │
+│  │  - Update soma (satisfaction from resolution)                     │     │
+│  │  - Store in memory (Q&A pair)                                     │     │
+│  └──────────────────────────────────────────────────────────────────┘     │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ## Components
@@ -262,6 +385,60 @@ class ActionExecutor:
 
 When should the model consider taking an action?
 
+### The Core Trigger: Prediction Failure
+
+**The fundamental trigger for action is prediction failure.** When the model's predictions don't match reality, this creates a signal that can lead to action:
+
+```
+Prediction Failure (surprise) → Question Generation → Action Decision
+```
+
+```python
+def prediction_failure_to_action(
+    predicted: torch.Tensor,
+    observed: torch.Tensor,
+    context: torch.Tensor,
+    soma: torch.Tensor,
+    question_buffer: QuestionBuffer,
+    action_policy: ActionPolicy,
+) -> Optional[Action]:
+    """
+    The pipeline from prediction failure to potential action.
+    """
+    # 1. Compute prediction error
+    error = compute_prediction_error(predicted, observed)
+
+    if error < MIN_ERROR_THRESHOLD:
+        return None  # Small errors don't trigger action
+
+    # 2. Generate question from failure (see questioning_system.md)
+    question = question_generator(
+        predicted=predicted,
+        observed=observed,
+        context=context,
+        soma=soma,
+        error_magnitude=error,
+    )
+
+    # 3. Add to question buffer for potential batching/prioritization
+    question_buffer.add(question)
+
+    # 4. Decide if we should act NOW
+    if question.should_ask_user():
+        # Convert question to action
+        return QuestionAction(
+            question=question,
+            urgency=question.cost_of_not_knowing,
+            interruptibility=_compute_interruptibility(error, soma),
+        )
+    elif question.can_self_resolve():
+        # Try internal resolution first
+        return InternalReasoningAction(question=question)
+    else:
+        # Defer - question stays in buffer
+        return None
+```
+
 ### Soma-Based Triggers
 
 ```python
@@ -288,19 +465,25 @@ def should_consider_action(soma_output: Dict) -> bool:
     return False
 ```
 
-### Context-Based Triggers
+### Context-Based Triggers (Prediction Error)
 
 ```python
-def context_triggers_action(exp_output: Dict) -> bool:
-    """Check context-based triggers."""
+def context_triggers_action(exp_output: Dict, question_buffer: QuestionBuffer) -> bool:
+    """Check context-based triggers from prediction failures."""
 
-    # Very high surprise in text
+    # Very high surprise in text → strong prediction failure
     if exp_output['surprise'].max() > SURPRISE_THRESHOLD:
         return True
 
-    # Ambiguity detected (entropy of predictions)
+    # Ambiguity detected (entropy of predictions) → uncertain predictions
     if exp_output.get('prediction_entropy', 0) > ENTROPY_THRESHOLD:
         return True
+
+    # Accumulated questions in buffer → batched questioning
+    if len(question_buffer.get_top_questions(k=1)) > 0:
+        top_question = question_buffer.get_top_questions(k=1)[0]
+        if top_question.urgency > URGENCY_THRESHOLD:
+            return True
 
     return False
 ```

@@ -77,9 +77,13 @@ Unlike passive image encoding, this module implements **active visual understand
 ### Understanding-Driven Components
 - [ ] **ComprehensionChecker** — Assess understanding of each region
 - [ ] **UncertaintyResolver** — Decide how to resolve confusion
-- [ ] **QuestionGenerator** — Generate questions about uncertain elements
 - [ ] **VisualReasoner** — Multi-step reasoning to figure things out
 - [ ] **VisualUnderstandingLoop** — Iterate until comprehension achieved
+
+### Questioning Integration (see `questioning_system.md`)
+- [ ] **VisualPredictionFailure** — Visual prediction error as question source
+- [ ] **Visual Question Generation** — Convert visual uncertainty to questions
+- [ ] **Grounded Questions** — Questions that point to specific image regions
 
 ### Integration
 - [ ] Hook visual embeddings into transformer attention
@@ -941,65 +945,158 @@ class UncertaintyResolver(nn.Module):
         }
 ```
 
-### QuestionGenerator
+### Visual Prediction Failure → Question
 
-Generates specific questions about what isn't understood:
+Visual questions arise from visual prediction failures. This connects to the unified questioning system (see `questioning_system.md`):
 
 ```python
-class QuestionGenerator(nn.Module):
+class VisualPredictionFailure(PredictionFailure):
     """
-    Generate questions to ask the user about uncertain visual elements.
+    Visual prediction failure: expected to see X, actually see Y.
 
-    Questions should be:
-    1. Specific - point to the region in question
-    2. Contextual - incorporate what IS understood
-    3. Useful - answer would actually help understanding
+    This is the visual instantiation of the general prediction failure concept.
+    """
+    predicted_visual: torch.Tensor    # What was expected
+    observed_visual: torch.Tensor     # What was seen
+    region: Tuple[int, int]           # Where in the image (row, col)
+    patch_indices: List[int]          # Which patches
+    recognizable: bool                # Can the observed content be identified?
+    confidence: float                 # How confident in what we see?
+
+    def to_question(self) -> 'Question':
+        """
+        Convert visual prediction failure to question.
+
+        The question type depends on the nature of the failure:
+        - Unrecognizable → "What is this?"
+        - Unexpected → "Why is X here instead of Y?"
+        - Ambiguous → "Is this A or B?"
+        """
+        from questioning_system import Question, QuestionType
+
+        if not self.recognizable:
+            return Question(
+                source_type='visual',
+                source_failure=self,
+                type='visual_identification',
+                focus=self.observed_visual,
+                uncertainty_type='novel',
+                information_need='identity',
+                # Visual-specific: can point to region
+                visual_region=self.region,
+                can_highlight=True,
+            )
+        elif self.confidence < 0.5:
+            return Question(
+                source_type='visual',
+                source_failure=self,
+                type='visual_confirmation',
+                focus=self.observed_visual,
+                uncertainty_type='ambiguous',
+                information_need='confirmation',
+                visual_region=self.region,
+                can_highlight=True,
+            )
+        else:
+            return Question(
+                source_type='visual',
+                source_failure=self,
+                type='visual_explanation',
+                focus=self.observed_visual,
+                uncertainty_type='unexpected',
+                information_need='explanation',
+                visual_region=self.region,
+                expected=self.predicted_visual,
+                can_highlight=True,
+            )
+
+
+class VisualQuestionGenerator(nn.Module):
+    """
+    Generate questions from visual prediction failures.
+
+    Extends the base QuestionGenerator with visual-specific capabilities:
+    - Region grounding (point to where in image)
+    - Visual context (what else is in the scene)
+    - Spatial relationships (relative to other objects)
     """
 
     def __init__(self, config):
         self.d_model = config.d_model
 
-        # Question type selector
-        self.question_type = nn.Linear(config.d_model, 6)
-        # Types: [what_is, what_doing, why_here, what_relation, what_means, is_this]
+        # Question type selector (visual-specific types)
+        self.question_type = nn.Linear(config.d_model, 7)
+        # Types: [what_is, what_doing, why_here, what_relation, what_means, is_this, describe]
 
-        # Template-based generation with learned slot filling
+        # Visual grounding for question
+        self.region_descriptor = nn.Sequential(
+            nn.Linear(config.d_model, config.d_model // 2),
+            nn.GELU(),
+            nn.Linear(config.d_model // 2, config.d_model),
+        )
+
+        # Spatial location encoding
+        self.location_encoder = nn.Embedding(9, config.d_model // 4)  # 3x3 grid
+
+        # Templates with visual grounding
         self.templates = {
-            'what_is': "What is the {DESCRIPTION} in the {LOCATION}?",
-            'what_doing': "What is the {SUBJECT} doing?",
-            'why_here': "Why is there a {OBJECT} in this scene?",
+            'what_is': "What is {VISUAL_DESCRIPTION} in the {LOCATION} of the image?",
+            'what_doing': "What is {SUBJECT} doing in this image?",
+            'why_here': "Why is there {OBJECT} {SPATIAL_RELATION}?",
             'what_relation': "What is the relationship between {A} and {B}?",
-            'what_means': "What does {SYMBOL} mean in this context?",
-            'is_this': "Is this a {HYPOTHESIS}?",
+            'what_means': "What does {SYMBOL} signify here?",
+            'is_this': "Is {REGION_DESCRIPTION} a {HYPOTHESIS}?",
+            'describe': "Can you describe what you see {LOCATION}?",
         }
-
-        # Slot fillers
-        self.description_head = nn.Linear(config.d_model, config.vocab_size)
-        self.location_head = nn.Linear(config.d_model, 9)  # grid positions
 
     def forward(
         self,
-        uncertain_region: torch.Tensor,  # [d_model]
-        uncertainty_type: int,
-        scene_context: torch.Tensor,     # [d_model]
-    ) -> str:
-        """Generate a question about the uncertain region."""
+        visual_failure: VisualPredictionFailure,
+        scene_context: torch.Tensor,
+        all_visual_tokens: torch.Tensor,
+    ) -> 'Question':
+        """Generate a grounded visual question."""
 
-        # Select question type based on uncertainty
-        q_type_logits = self.question_type(uncertain_region)
-        q_type = q_type_logits.argmax().item()
+        # Get region embedding
+        region_embed = self.region_descriptor(visual_failure.observed_visual)
 
-        template = list(self.templates.values())[q_type]
+        # Encode spatial location
+        location_idx = self._region_to_location_idx(visual_failure.region)
+        location_embed = self.location_encoder(torch.tensor(location_idx))
 
-        # Fill slots (simplified - in practice would use generation)
-        # This would generate actual words for DESCRIPTION, LOCATION, etc.
+        # Combine for question type selection
+        combined = torch.cat([region_embed, location_embed, scene_context], dim=-1)
+        q_type_logits = self.question_type(combined)
+        q_type_idx = q_type_logits.argmax().item()
+        q_type = list(self.templates.keys())[q_type_idx]
 
-        return {
-            'template': template,
-            'question_type': list(self.templates.keys())[q_type],
-            'region_embedding': uncertain_region,
-            # In practice: filled_question = fill_template(template, slots)
+        # Create Question object (from questioning_system.md)
+        question = visual_failure.to_question()
+        question.type = q_type
+        question.template = self.templates[q_type]
+        question.grounding = {
+            'region': visual_failure.region,
+            'location_description': self._idx_to_location_name(location_idx),
+            'visual_context': scene_context,
         }
+
+        return question
+
+    def _region_to_location_idx(self, region: Tuple[int, int]) -> int:
+        """Convert region coordinates to 3x3 grid index."""
+        # Simplified: map to 9 positions
+        row, col = region
+        # Normalize and bin
+        return min(2, row // 3) * 3 + min(2, col // 3)
+
+    def _idx_to_location_name(self, idx: int) -> str:
+        """Convert grid index to natural language."""
+        names = [
+            'top-left', 'top-center', 'top-right',
+            'middle-left', 'center', 'middle-right',
+            'bottom-left', 'bottom-center', 'bottom-right',
+        ]
+        return names[idx]
 ```
 
 ### VisualReasoner
