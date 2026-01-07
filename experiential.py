@@ -37,6 +37,9 @@ import torch.nn.functional as F
 from typing import Dict, Optional, List, Tuple, Any
 from dataclasses import dataclass, field
 
+# Self-state module (latent soma with bidirectional text interface)
+from self_state import SelfState, SelfStateConfig, compute_self_state_losses
+
 
 @dataclass
 class ExperientialConfig:
@@ -2366,6 +2369,14 @@ class MemoryAugmentedGPT(nn.Module):
         kv_injection_layers: Optional[List[int]] = None,  # GPT layers for memory injection
         kv_injection_max_tokens: int = 16,  # Max tokens per memory
         kv_injection_store_sequences: bool = True,  # Store sequences vs single vectors
+        # Self-state parameters (internal soma with bidirectional text interface)
+        use_self_state: bool = False,  # Enable internal state system
+        self_state_d_soma: int = 64,  # Soma (internal state) dimension
+        self_state_soma_decay: float = 0.9,  # Mood inertia
+        self_state_temperament_decay: float = 0.999,  # Personality drift
+        self_state_narrative_gain: float = 0.1,  # How much self-interpretation affects soma
+        self_state_use_ideal_self: bool = True,  # Enable ideal self with discrepancy
+        self_state_gate_hidden: bool = True,  # Soma modulates hidden states
     ):
         """
         Args:
@@ -2475,6 +2486,32 @@ class MemoryAugmentedGPT(nn.Module):
             )
         else:
             self.experiential = None
+
+        # Self-state system (internal soma with bidirectional text interface)
+        # This creates an "inner state" that:
+        # - Accumulates from sub-signals (surprise, arousal, valence)
+        # - Has a self-model that predicts own reactions
+        # - Can describe itself in text (lossy projection)
+        # - Can read its own description to modify state (narrative loop)
+        # - Maintains actual vs ideal self with discrepancy signal
+        # - Tracks temperament (slow-moving personality baseline)
+        self.use_self_state = use_self_state
+        if use_self_state:
+            # Get vocab size from GPT model
+            vocab_size = gpt_model.config.vocab_size
+            self_state_config = SelfStateConfig(
+                d_model=self.d_model,
+                d_soma=self_state_d_soma,
+                vocab_size=vocab_size,
+                soma_decay=self_state_soma_decay,
+                temperament_decay=self_state_temperament_decay,
+                narrative_gain=self_state_narrative_gain,
+                use_ideal_self=self_state_use_ideal_self,
+                soma_gate_hidden=self_state_gate_hidden,
+            )
+            self.self_state = SelfState(self_state_config)
+        else:
+            self.self_state = None
 
         # Memory integration components
         if memory_integration == 'gated':
@@ -3043,7 +3080,46 @@ class MemoryAugmentedGPT(nn.Module):
                 'ema_sigma': exp_output.get('ema_sigma'),
             })
 
-            # 5. Crystallize high-salience moments into episodic memory
+            # 5a. Self-state processing (if enabled)
+            # Integrates experiential signals into persistent soma,
+            # predicts own reactions (self-model), and optionally
+            # modulates hidden states via soma feedback
+            if self.self_state is not None:
+                # Use endpoint hidden state as input embedding for self-model
+                input_embedding = hidden_states[:, -1, :]  # [B, d_model]
+
+                self_state_output = self.self_state(
+                    exp_output=exp_output,
+                    hidden_states=hidden_states,
+                    input_embedding=input_embedding,
+                    self_description_embedding=None,  # TODO: Enable narrative loop
+                    update_state=self.training,
+                    compute_description=False,  # Only compute on demand
+                )
+
+                # Apply soma feedback to hidden states if configured
+                if self.self_state.config.soma_gate_hidden:
+                    hidden_states = self_state_output['modulated_hidden']
+                    # Recompute logits with soma-modulated hidden states
+                    logits = self.gpt.lm_head(self.gpt.final_norm(hidden_states))
+
+                # Add self-state outputs to memory_output
+                memory_output.update({
+                    # Core soma state
+                    'soma': self_state_output['soma'],
+                    'soma_delta': self_state_output['soma_delta'],
+                    'soma_relative': self_state_output['soma_relative'],
+                    'temperament': self_state_output['temperament'],
+                    # Self-model predictions
+                    'self_predicted_delta': self_state_output['predicted_delta'],
+                    'self_surprise': self_state_output['self_surprise'],
+                    'self_confidence': self_state_output['self_confidence'],
+                    # Ideal self (if enabled)
+                    'ideal_discrepancy': self_state_output.get('ideal_discrepancy_magnitude'),
+                    'regulation_signal': self_state_output.get('regulation_signal'),
+                })
+
+            # 5b. Crystallize high-salience moments into episodic memory
             # Store the MODULATED output (post-self-regulation), not raw target
             # This means memories contain what the system "committed to" after reflection
             if crystallize:
@@ -3542,6 +3618,77 @@ class MemoryAugmentedGPT(nn.Module):
 
         return result
 
+    # --- Self-State Methods ---
+
+    def get_soma(self) -> Optional[torch.Tensor]:
+        """Get current soma (internal state) if self-state is enabled."""
+        if self.self_state is not None:
+            return self.self_state.get_soma()
+        return None
+
+    def get_temperament(self) -> Optional[torch.Tensor]:
+        """Get current temperament (personality baseline) if self-state is enabled."""
+        if self.self_state is not None:
+            return self.self_state.get_temperament()
+        return None
+
+    def reset_soma(self):
+        """Reset soma to neutral (e.g., between documents)."""
+        if self.self_state is not None:
+            self.self_state.reset_soma()
+
+    def describe_self(self, include_template: bool = True) -> Optional[Dict[str, Any]]:
+        """
+        Generate a textual description of current internal state.
+
+        Returns:
+            dict with:
+                - logits: [vocab_size] next-token logits for description
+                - template_values: [5] structured values (intensity, valence, arousal, certainty, engagement)
+                - hidden_seed: [d_model] seed for autoregressive generation
+        """
+        if self.self_state is None:
+            return None
+
+        soma = self.self_state.get_soma()
+        if soma is None:
+            return None
+
+        return self.self_state.describer(soma)
+
+    def interpret_self_description(
+        self,
+        description_embedding: torch.Tensor,
+    ) -> Optional[Dict[str, torch.Tensor]]:
+        """
+        Process a self-description and update soma (narrative self-modification).
+
+        Args:
+            description_embedding: [B, d_model] embedding of self-description text
+
+        Returns:
+            dict with soma_delta, interpretation_valence, updated_soma
+        """
+        if self.self_state is None:
+            return None
+
+        soma = self.self_state.get_soma()
+        if soma is None:
+            return None
+
+        return self.self_state.interpreter(description_embedding, soma)
+
+    def self_state_snapshot(self) -> Optional[Dict[str, Any]]:
+        """Capture self-state for checkpointing."""
+        if self.self_state is not None:
+            return self.self_state.snapshot()
+        return None
+
+    def self_state_restore(self, snapshot: Dict[str, Any], device: Optional[torch.device] = None):
+        """Restore self-state from checkpoint."""
+        if self.self_state is not None and snapshot is not None:
+            self.self_state.restore(snapshot, device)
+
 
 def contrastive_memory_loss(
     query: torch.Tensor,
@@ -3613,7 +3760,10 @@ def memory_augmented_loss(
     retrieval_gate_sparsity_weight: float = 0.0,
     retrieval_gate_entropy_weight: float = 0.01,
     contrastive_weight: float = 0.1,
-    contrastive_temperature: float = 0.1
+    contrastive_temperature: float = 0.1,
+    # Self-state loss weights
+    self_state_weight: float = 0.01,  # Weight for self-state losses
+    self_state_config: Optional['SelfStateConfig'] = None,  # Config for computing losses
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """
     Combined loss for memory-augmented generation.
@@ -3754,6 +3904,47 @@ def memory_augmented_loss(
             total_loss = total_loss + contrastive_weight * contrastive_loss
         else:
             loss_dict['contrastive_loss'] = 0.0
+
+    # Self-state losses (if self-state is enabled)
+    # Trains: self-model (predict own reactions), ideal self (move toward desired state)
+    if self_state_weight > 0 and 'soma' in memory_output and memory_output['soma'] is not None:
+        # Build self-state output dict for loss computation
+        self_state_output = {
+            'soma': memory_output.get('soma'),
+            'soma_delta': memory_output.get('soma_delta'),
+            'self_surprise': memory_output.get('self_surprise'),
+            'self_confidence': memory_output.get('self_confidence'),
+            'ideal_discrepancy_magnitude': memory_output.get('ideal_discrepancy'),
+            'regulation_signal': memory_output.get('regulation_signal'),
+        }
+
+        # Use default config if not provided
+        if self_state_config is None:
+            self_state_config = SelfStateConfig(d_model=lm_logits.size(-1))
+
+        self_state_losses = compute_self_state_losses(self_state_output, self_state_config)
+
+        if self_state_losses['total'] > 0:
+            self_state_loss = self_state_losses['total']
+            loss_dict['self_state_loss'] = self_state_loss.item()
+            total_loss = total_loss + self_state_weight * self_state_loss
+
+            # Individual loss components
+            if 'self_model' in self_state_losses:
+                loss_dict['self_model_loss'] = self_state_losses['self_model'].item()
+            if 'ideal_discrepancy' in self_state_losses:
+                loss_dict['ideal_discrepancy_loss'] = self_state_losses['ideal_discrepancy'].item()
+            if 'regulation_alignment' in self_state_losses:
+                loss_dict['regulation_alignment_loss'] = self_state_losses['regulation_alignment'].item()
+
+        # Log soma statistics
+        if memory_output.get('soma') is not None:
+            loss_dict['soma_mean'] = memory_output['soma'].mean().item()
+            loss_dict['soma_std'] = memory_output['soma'].std().item()
+        if memory_output.get('self_surprise') is not None:
+            loss_dict['self_surprise_mean'] = memory_output['self_surprise'].mean().item()
+        if memory_output.get('ideal_discrepancy') is not None:
+            loss_dict['ideal_discrepancy_mean'] = memory_output['ideal_discrepancy'].mean().item()
 
     # Memory statistics (for logging)
     loss_dict['episodic_size'] = memory_output.get('episodic_size', 0)
