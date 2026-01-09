@@ -532,40 +532,52 @@ class CTMLayer(nn.Module):
         sin: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Forward pass with per-layer temporal processing.
+        Forward pass with NLM as the PRIMARY driver of neural dynamics.
+
+        Per the CTM paper, NLM IS the thinking mechanism:
+            - NLM processes temporal history to produce the next state
+            - Observation from data informs but doesn't dominate
+            - Self-attention allows token communication
 
         Flow:
-            1. Self-attention: tokens reason about each other
-            2. Cross-attention: sync determines WHERE, retrieves WHAT
-            3. Synapse: integrates observation with state
-            4. NLM: temporal processing from layer history
-            5. FFN: final transformation
+            1. NLM: PRIMARY state from temporal history (THE thinking)
+            2. Cross-attention: sync → WHERE, retrieves observation
+            3. Synapse: integrates NLM state with observation
+            4. Self-attention: tokens communicate (for language modeling)
 
         Returns:
             state: (B, S, D) updated state
             post_act: (B, S, D) post-activation for history
         """
-        # 1. Self-attention: tokens communicate within tick
+        # 1. NLM: THE PRIMARY driver of neural dynamics
+        # NLM processes this layer's temporal history to produce next state
+        if layer_history is not None and layer_history.size(2) > 0:
+            # NLM output IS the new state (not a residual!)
+            nlm_state = self.nlm(layer_history)
+            nlm_state = self.norm_nlm(nlm_state)
+        else:
+            # Tick 0: no history yet, use incoming state
+            nlm_state = self.norm_nlm(state)
+
+        # 2. Cross-attention: get observation from data
+        # Sync modulates WHERE to look, attention retrieves WHAT
+        obs = self.cross_attn(nlm_state, static_k, static_v, cos, sin, sync)
+
+        # 3. Synapse: integrate NLM-driven state with observation
+        # NLM state + observation → combined understanding
+        state = self.synapse(nlm_state, obs)
+        state = self.resid_dropout(state)
+
+        # 4. Self-attention: tokens communicate (needed for language modeling)
+        # This is an addition to pure CTM for sequential reasoning
         self_attn_out = self.self_attn(self.norm_self(state), cos, sin)
         state = state + self.resid_dropout(self_attn_out)
 
-        # 2. Cross-attention: sync modulates query (WHERE), retrieves observation (WHAT)
-        obs = self.cross_attn(self.norm_cross(state), static_k, static_v, cos, sin, sync)
-
-        # 3. Synapse integration (state + observation)
-        synapse_out = self.synapse(state, obs)
-        state = state + self.resid_dropout(synapse_out)
-
-        # 4. Temporal NLM: process layer history (depth in time)
-        if layer_history is not None and layer_history.size(2) > 0:
-            nlm_out = self.nlm(layer_history)
-            state = state + self.resid_dropout(self.norm_nlm(nlm_out))
-
-        # 5. FFN
+        # 5. FFN for expressiveness
         ffn_out = self.ffn(self.norm_ffn(state))
         state = state + self.resid_dropout(ffn_out)
 
-        # Post-activation for history
+        # Post-activation for history (this feeds into next tick's NLM)
         post_act = self.norm_post(state)
 
         return state, post_act
