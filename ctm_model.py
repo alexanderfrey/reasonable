@@ -285,6 +285,90 @@ class SynapseModel(nn.Module):
         return out
 
 
+# --- CTM Self-Attention ---
+
+class CTMSelfAttention(nn.Module):
+    """
+    Self-attention for CTM state during iterative processing.
+
+    Allows tokens to communicate with each other during thinking,
+    enabling reasoning across positions within each tick.
+
+    Uses FlashAttention-2 with causal masking for autoregressive modeling.
+    Supports Grouped Query Attention (GQA).
+    """
+
+    def __init__(self, config: CTMConfig):
+        super().__init__()
+        self.d_model = config.d_model
+        self.n_head = config.n_head
+        self.n_kv_head = config.n_kv_head
+        self.head_dim = config.d_model // config.n_head
+        self.dropout = config.dropout
+
+        assert config.n_head % config.n_kv_head == 0
+        self.n_rep = config.n_head // config.n_kv_head
+
+        # QKV projections
+        self.q_proj = nn.Linear(config.d_model, config.n_head * self.head_dim, bias=False)
+        self.k_proj = nn.Linear(config.d_model, config.n_kv_head * self.head_dim, bias=False)
+        self.v_proj = nn.Linear(config.d_model, config.n_kv_head * self.head_dim, bias=False)
+
+        # Output projection
+        self.o_proj = nn.Linear(config.n_head * self.head_dim, config.d_model, bias=False)
+
+    def forward(
+        self,
+        x: torch.Tensor,          # (B, S, D) - CTM state
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+    ) -> torch.Tensor:
+        B, S, _ = x.shape
+
+        # Project Q, K, V
+        q = self.q_proj(x).view(B, S, self.n_head, self.head_dim)
+        k = self.k_proj(x).view(B, S, self.n_kv_head, self.head_dim)
+        v = self.v_proj(x).view(B, S, self.n_kv_head, self.head_dim)
+
+        # Ensure flash-attn compatible dtype
+        target_dtype = q.dtype
+        if target_dtype not in (torch.float16, torch.bfloat16):
+            target_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+
+        if q.dtype != target_dtype:
+            q = q.to(dtype=target_dtype)
+            k = k.to(dtype=target_dtype)
+            v = v.to(dtype=target_dtype)
+
+        # Apply RoPE to Q and K
+        rotary_dim = cos.shape[-1] * 2
+        if rotary_dim > self.head_dim:
+            trim = self.head_dim // 2
+            cos = cos[..., :trim]
+            sin = sin[..., :trim]
+        if cos.dtype != target_dtype:
+            cos = cos.to(dtype=target_dtype)
+            sin = sin.to(dtype=target_dtype)
+
+        q = apply_rotary_emb(q, cos, sin, interleaved=False)
+        k = apply_rotary_emb(k, cos, sin, interleaved=False)
+
+        # FlashAttention with causal mask
+        attn_dropout = self.dropout if self.training else 0.0
+        output = flash_attn_func(
+            q, k, v,
+            dropout_p=attn_dropout,
+            causal=True,
+            window_size=(-1, -1)
+        )
+
+        # Reshape and project output
+        output = output.reshape(B, S, self.n_head * self.head_dim)
+        output = output.to(self.o_proj.weight.dtype)
+
+        return self.o_proj(output)
+
+
 # --- CTM Cross-Attention ---
 
 class CTMCrossAttention(nn.Module):
@@ -385,118 +469,126 @@ class CTMCrossAttention(nn.Module):
 
 class CTMLayer(nn.Module):
     """
-    Single CTM layer performing one step within a tick.
+    Single CTM layer with per-layer temporal processing.
 
-    Per the CTM paper:
-        1. NLM: Process neuron history -> state update
-        2. Sync -> modulates attention query (WHERE to look)
-        3. CrossAttention: Query static KV -> observation (WHAT is there)
-        4. Synapse: Integrate state + observation -> update
+    Architecture per layer:
+        1. Self-Attention: Tokens communicate with each other
+        2. Cross-Attention: Query static KV (sync modulates WHERE to look)
+        3. Synapse: Integrate state + observation
+        4. Temporal NLM: Process layer's history (depth in time)
         5. FFN: Final transformation
+
+    Each layer maintains its own NLM for per-channel temporal processing,
+    enabling "depth in time" rather than just depth in layers.
     """
 
     def __init__(self, config: CTMConfig, layer_idx: int):
         super().__init__()
         self.layer_idx = layer_idx
+        self.d_model = config.d_model
+
+        # Self-attention (tokens communicate during thinking)
+        self.self_attn = CTMSelfAttention(config)
 
         # Cross-attention to static KV (sync modulates query inside)
         self.cross_attn = CTMCrossAttention(config)
 
-        # Synapse model (integrates state and observation only - sync already used in attention)
+        # Synapse model (integrates state and observation)
         self.synapse = SynapseModel(
             d_model=config.d_model,
             dropout=config.dropout
+        )
+
+        # Per-layer NLM: each layer has private temporal processors
+        # Each layer only sees its own history across ticks (num_ticks entries)
+        self.nlm = NeuronLevelModels(
+            d_model=config.d_model,
+            nlm_hidden=config.nlm_hidden,
+            nlm_depth=config.nlm_depth,
+            max_ticks=config.num_ticks
         )
 
         # FFN
         self.ffn = OptimizedMLP(config.d_model, config.d_ff)
 
         # Normalizations
+        self.norm_self = OptimizedRMSNorm(config.d_model)
+        self.norm_cross = OptimizedRMSNorm(config.d_model)
         self.norm_nlm = OptimizedRMSNorm(config.d_model)
-        self.norm_attn = OptimizedRMSNorm(config.d_model)
         self.norm_ffn = OptimizedRMSNorm(config.d_model)
         self.norm_post = OptimizedRMSNorm(config.d_model)
 
         # Residual dropout
         self.resid_dropout = nn.Dropout(config.dropout) if config.dropout > 0 else nn.Identity()
 
-    def forward_with_global_context(
+    def forward(
         self,
         state: torch.Tensor,           # (B, S, D) current state
-        global_sync: torch.Tensor,     # (B, S, sync_pairs) from global sync module
-        global_nlm_out: torch.Tensor,  # (B, S, D) from global NLM
+        sync: torch.Tensor,            # (B, S, sync_pairs) from global sync module
+        layer_history: Optional[torch.Tensor],  # (B, S, T, D) history for this layer's NLM
         static_k: torch.Tensor,        # (B, S, n_kv_head, head_dim)
         static_v: torch.Tensor,        # (B, S, n_kv_head, head_dim)
         cos: torch.Tensor,
         sin: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Forward pass receiving precomputed global sync and NLM outputs.
+        Forward pass with per-layer temporal processing.
 
-        Per the CTM paper:
-        - Sync determines WHERE to look (modulates attention query)
-        - Attention retrieves WHAT is there (observation)
-        - Synapse integrates observation with current state
+        Flow:
+            1. Self-attention: tokens reason about each other
+            2. Cross-attention: sync determines WHERE, retrieves WHAT
+            3. Synapse: integrates observation with state
+            4. NLM: temporal processing from layer history
+            5. FFN: final transformation
 
         Returns:
             state: (B, S, D) updated state
-            post_act: (B, S, D) post-activation for global history
+            post_act: (B, S, D) post-activation for history
         """
-        # 1. Integrate NLM output from global history
-        state = state + self.resid_dropout(self.norm_nlm(global_nlm_out))
+        # 1. Self-attention: tokens communicate within tick
+        self_attn_out = self.self_attn(self.norm_self(state), cos, sin)
+        state = state + self.resid_dropout(self_attn_out)
 
         # 2. Cross-attention: sync modulates query (WHERE), retrieves observation (WHAT)
-        obs = self.cross_attn(self.norm_attn(state), static_k, static_v, cos, sin, global_sync)
+        obs = self.cross_attn(self.norm_cross(state), static_k, static_v, cos, sin, sync)
 
-        # 3. Synapse integration (state + observation only, sync already used above)
+        # 3. Synapse integration (state + observation)
         synapse_out = self.synapse(state, obs)
         state = state + self.resid_dropout(synapse_out)
 
-        # 4. FFN
+        # 4. Temporal NLM: process layer history (depth in time)
+        if layer_history is not None and layer_history.size(2) > 0:
+            nlm_out = self.nlm(layer_history)
+            state = state + self.resid_dropout(self.norm_nlm(nlm_out))
+
+        # 5. FFN
         ffn_out = self.ffn(self.norm_ffn(state))
         state = state + self.resid_dropout(ffn_out)
 
-        # 5. Post-activation for global history
+        # Post-activation for history
         post_act = self.norm_post(state)
 
         return state, post_act
-
-    def forward(
-        self,
-        state: torch.Tensor,
-        history: torch.Tensor,
-        static_k: torch.Tensor,
-        static_v: torch.Tensor,
-        cos: torch.Tensor,
-        sin: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Legacy forward for compatibility. Use forward_with_global_context instead."""
-        # This path is deprecated - the CTMCore now handles global context
-        raise NotImplementedError(
-            "CTMLayer.forward() is deprecated. Use forward_with_global_context() "
-            "which receives precomputed global sync and NLM outputs."
-        )
 
 
 # --- CTM Core ---
 
 class CTMCore(nn.Module):
     """
-    The iterative core implementing continuous thought with GLOBAL sync history.
+    The iterative core implementing continuous thought with per-layer history.
 
     Key insight from the paper:
     - z^t evolution = the neural dynamics (thinking)
     - S^t (sync) = the representation of that thinking
 
-    The sync is computed from the FULL history spanning prior ticks,
-    preserving the continuous thought stream.
+    Architecture with per-layer temporal processing:
+        - History updated after EACH layer (not just per tick)
+        - Each layer has its own NLM for temporal processing
+        - Sync computed from full history up to current step
+        - Enables "depth in time" at each layer
 
-    Architecture (tick-major):
-        Tick 0: Layer 0 → Layer 1 → ... → Layer N (all post-acts → global history)
-        Tick 1: Layer 0 → Layer 1 → ... → Layer N (sync from full global history)
-        ...
-
-    This preserves a global history across ticks.
+    History shape: (B, S, num_ticks * n_layer, D)
+        - Entry [tick * n_layer + layer_idx] = post-activation of layer at tick
     """
 
     def __init__(self, config: CTMConfig):
@@ -506,25 +598,17 @@ class CTMCore(nn.Module):
         self.d_model = config.d_model
         self.use_gradient_checkpointing = config.use_gradient_checkpointing
 
-        # Total history length = num_ticks (one entry per full tick)
-        self.total_history_len = config.num_ticks
+        # Total history length = num_ticks * n_layer (one entry per layer-tick)
+        self.total_history_len = config.num_ticks * config.n_layer
 
         self.layers = nn.ModuleList([
             CTMLayer(config, i) for i in range(config.n_layer)
         ])
 
-        # Global sync module (shared across all layer-tick pairs)
+        # Global sync module (shared, computes sync from full history)
         self.global_sync = SynchronizationModule(
             d_model=config.d_model,
             sync_pairs=config.sync_pairs
-        )
-
-        # Global NLM (shared, processes the full history)
-        self.global_nlm = NeuronLevelModels(
-            d_model=config.d_model,
-            nlm_hidden=config.nlm_hidden,
-            nlm_depth=config.nlm_depth,
-            max_ticks=self.total_history_len
         )
 
     def forward(
@@ -547,43 +631,47 @@ class CTMCore(nn.Module):
         dtype = initial_state.dtype
 
         state = initial_state
-        all_states = []  # States at end of each full tick (after all layers)
+        all_states = []  # States at end of each full tick (for tick selection)
 
-        # Global history buffer spanning ticks
-        # Shape: (B, S, num_ticks, D)
-        history_dtype = torch.bfloat16 if dtype == torch.float32 else dtype
-        total_steps = num_ticks
-        global_history = torch.zeros(B, S, total_steps, D, device=device, dtype=history_dtype)
+        # History as list of tensors (preserves gradients for temporal credit assignment)
+        # Each entry is (B, S, D) post-activation from a layer-tick step
+        # Indexed as: history_list[tick * n_layer + layer_idx]
+        history_list: List[torch.Tensor] = []
 
         for tick in range(num_ticks):
-            # Get global history up to current tick
-            current_history = global_history[:, :, :tick] if tick > 0 else None
-
-            # Compute global sync from full history
-            if current_history is not None and current_history.size(2) > 0:
-                sync = self.global_sync(current_history)
-                nlm_out = self.global_nlm(current_history)
-            else:
-                sync = torch.zeros(B, S, self.global_sync.sync_pairs, device=device, dtype=dtype)
-                nlm_out = torch.zeros(B, S, D, device=device, dtype=dtype)
-
             for layer_idx, layer in enumerate(self.layers):
-                # Layer forward with global sync and NLM output
+                # Build GLOBAL history by stacking (for sync computation)
+                if len(history_list) > 0:
+                    # Stack maintains gradient flow through time
+                    global_hist = torch.stack(history_list, dim=2)  # (B, S, T, D)
+                    sync = self.global_sync(global_hist)
+                else:
+                    sync = torch.zeros(B, S, self.global_sync.sync_pairs, device=device, dtype=dtype)
+
+                # Build PER-LAYER history for this layer's NLM
+                # Layer L's entries are at indices: [L, n_layer+L, 2*n_layer+L, ...]
+                if tick > 0:
+                    layer_entries = [history_list[t * self.n_layer + layer_idx] for t in range(tick)]
+                    layer_history = torch.stack(layer_entries, dim=2)  # (B, S, tick, D)
+                else:
+                    layer_history = None
+
+                # Layer forward with per-layer NLM
                 if self.use_gradient_checkpointing and self.training:
                     state, post_act = gradient_checkpoint(
-                        layer.forward_with_global_context,
-                        state, sync, nlm_out, static_k, static_v, cos, sin,
+                        layer.forward,
+                        state, sync, layer_history, static_k, static_v, cos, sin,
                         use_reentrant=False
                     )
                 else:
-                    state, post_act = layer.forward_with_global_context(
-                        state, sync, nlm_out, static_k, static_v, cos, sin
+                    state, post_act = layer.forward(
+                        state, sync, layer_history, static_k, static_v, cos, sin
                     )
 
-            # Append to global history once per full tick
-            global_history[:, :, tick] = post_act.to(history_dtype)
+                # Append to history (preserves gradients)
+                history_list.append(post_act)
 
-            # Store state once per full tick for tick selection
+            # Store state at end of each tick (for tick selection in loss)
             all_states.append(state.clone())
 
         return state, all_states
