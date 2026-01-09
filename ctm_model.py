@@ -230,21 +230,24 @@ class SynchronizationModule(nn.Module):
 
 class SynapseModel(nn.Module):
     """
-    Integrates current state with observation (cross-attention output) and sync features.
+    Integrates current state with observation (cross-attention output).
 
     U-Net style MLP with skip connections for stable gradient flow.
+
+    Per the CTM paper, sync determines WHERE to look (via attention query),
+    and the synapse integrates WHAT was found (observation) with current state.
+    Sync does NOT enter the synapse directly.
 
     Inputs:
         state: (B, S, D) - current hidden state
         observation: (B, S, D) - cross-attention output
-        sync: (B, S, sync_pairs) - synchronization features
     Output: (B, S, D) - integrated update
     """
 
-    def __init__(self, d_model: int, sync_pairs: int, dropout: float = 0.0):
+    def __init__(self, d_model: int, dropout: float = 0.0):
         super().__init__()
 
-        input_dim = d_model + d_model + sync_pairs
+        input_dim = d_model + d_model  # state + observation only
 
         # Encoder path
         self.enc1 = nn.Linear(input_dim, d_model, bias=False)
@@ -263,10 +266,9 @@ class SynapseModel(nn.Module):
         self,
         state: torch.Tensor,
         observation: torch.Tensor,
-        sync: torch.Tensor
     ) -> torch.Tensor:
-        # Concatenate inputs
-        x = torch.cat([state, observation, sync], dim=-1)
+        # Concatenate inputs (no sync - it influenced the query instead)
+        x = torch.cat([state, observation], dim=-1)
 
         # Encoder
         h1 = F.gelu(self.enc1(x))
@@ -289,6 +291,10 @@ class CTMCrossAttention(nn.Module):
     """
     Cross-attention from CTM state to static input KV.
 
+    Per the CTM paper, sync determines WHERE to look by modulating the query.
+    The sync features influence query formation, steering attention to relevant
+    parts of the input based on the current synchronization pattern.
+
     Uses FlashAttention-2 with causal masking for autoregressive modeling.
     Supports Grouped Query Attention (GQA).
     """
@@ -300,11 +306,16 @@ class CTMCrossAttention(nn.Module):
         self.n_kv_head = config.n_kv_head
         self.head_dim = config.d_model // config.n_head
         self.dropout = config.dropout
+        self.sync_pairs = config.sync_pairs
 
         assert config.n_head % config.n_kv_head == 0
         self.n_rep = config.n_head // config.n_kv_head
 
-        # Query projection (from CTM state)
+        # Sync projection: maps sync features to query modulation
+        # This allows sync to steer WHERE the model looks
+        self.sync_proj = nn.Linear(config.sync_pairs, config.d_model, bias=False)
+
+        # Query projection (from CTM state + sync modulation)
         self.q_proj = nn.Linear(config.d_model, config.n_head * self.head_dim, bias=False)
 
         # Output projection
@@ -317,11 +328,17 @@ class CTMCrossAttention(nn.Module):
         value: torch.Tensor,      # (B, S, n_kv_head, head_dim) - static value
         cos: torch.Tensor,
         sin: torch.Tensor,
+        sync: torch.Tensor,       # (B, S, sync_pairs) - sync features to modulate query
     ) -> torch.Tensor:
         B, S, _ = query.shape
 
-        # Project query
-        q = self.q_proj(query)
+        # Sync modulates the query: determines WHERE to look
+        # Project sync to d_model and add to state before query projection
+        sync_modulation = self.sync_proj(sync)
+        query_input = query + sync_modulation
+
+        # Project query (now influenced by sync)
+        q = self.q_proj(query_input)
         q = q.view(B, S, self.n_head, self.head_dim)
 
         # Ensure flash-attn compatible dtype
@@ -368,28 +385,26 @@ class CTMCrossAttention(nn.Module):
 
 class CTMLayer(nn.Module):
     """
-    Single CTM layer performing one tick of processing.
+    Single CTM layer performing one step within a tick.
 
-    Components:
+    Per the CTM paper:
         1. NLM: Process neuron history -> state update
-        2. CrossAttention: Query static KV -> observation
-        3. Sync: Compute synchronization from history
-        4. Synapse: Integrate state, observation, sync -> update
+        2. Sync -> modulates attention query (WHERE to look)
+        3. CrossAttention: Query static KV -> observation (WHAT is there)
+        4. Synapse: Integrate state + observation -> update
         5. FFN: Final transformation
     """
 
     def __init__(self, config: CTMConfig, layer_idx: int):
         super().__init__()
         self.layer_idx = layer_idx
-        self.sync_pairs = config.sync_pairs
 
-        # Cross-attention to static KV
+        # Cross-attention to static KV (sync modulates query inside)
         self.cross_attn = CTMCrossAttention(config)
 
-        # Synapse model (integrates state, observation, and GLOBAL sync)
+        # Synapse model (integrates state and observation only - sync already used in attention)
         self.synapse = SynapseModel(
             d_model=config.d_model,
-            sync_pairs=config.sync_pairs,
             dropout=config.dropout
         )
 
@@ -418,8 +433,10 @@ class CTMLayer(nn.Module):
         """
         Forward pass receiving precomputed global sync and NLM outputs.
 
-        The sync and NLM are computed from the GLOBAL history spanning
-        all prior layers and ticks, preserving the continuous thought stream.
+        Per the CTM paper:
+        - Sync determines WHERE to look (modulates attention query)
+        - Attention retrieves WHAT is there (observation)
+        - Synapse integrates observation with current state
 
         Returns:
             state: (B, S, D) updated state
@@ -428,11 +445,11 @@ class CTMLayer(nn.Module):
         # 1. Integrate NLM output from global history
         state = state + self.resid_dropout(self.norm_nlm(global_nlm_out))
 
-        # 2. Cross-attention to static KV (query the data)
-        obs = self.cross_attn(self.norm_attn(state), static_k, static_v, cos, sin)
+        # 2. Cross-attention: sync modulates query (WHERE), retrieves observation (WHAT)
+        obs = self.cross_attn(self.norm_attn(state), static_k, static_v, cos, sin, global_sync)
 
-        # 3. Synapse integration with global sync
-        synapse_out = self.synapse(state, obs, global_sync)
+        # 3. Synapse integration (state + observation only, sync already used above)
+        synapse_out = self.synapse(state, obs)
         state = state + self.resid_dropout(synapse_out)
 
         # 4. FFN
@@ -471,15 +488,15 @@ class CTMCore(nn.Module):
     - z^t evolution = the neural dynamics (thinking)
     - S^t (sync) = the representation of that thinking
 
-    The sync is computed from the FULL history spanning all layers and ticks,
+    The sync is computed from the FULL history spanning prior ticks,
     preserving the continuous thought stream.
 
-    Architecture:
-        Layer 1: tick 0 → tick 1 → ... → tick T  (all post-acts → global history)
-        Layer 2: tick 0 → tick 1 → ... → tick T  (sync from full global history)
+    Architecture (tick-major):
+        Tick 0: Layer 0 → Layer 1 → ... → Layer N (all post-acts → global history)
+        Tick 1: Layer 0 → Layer 1 → ... → Layer N (sync from full global history)
         ...
 
-    This ensures sync in layer 2 has knowledge of how neurons correlated in layer 1.
+    This preserves a global history across ticks.
     """
 
     def __init__(self, config: CTMConfig):
@@ -489,8 +506,8 @@ class CTMCore(nn.Module):
         self.d_model = config.d_model
         self.use_gradient_checkpointing = config.use_gradient_checkpointing
 
-        # Total history length = n_layer * num_ticks
-        self.total_history_len = config.n_layer * config.num_ticks
+        # Total history length = num_ticks (one entry per full tick)
+        self.total_history_len = config.num_ticks
 
         self.layers = nn.ModuleList([
             CTMLayer(config, i) for i in range(config.n_layer)
@@ -522,7 +539,7 @@ class CTMCore(nn.Module):
         """
         Returns:
             final_state: (B, S, D)
-            all_states: List of (B, S, D) for each complete tick across all layers
+            all_states: List of (B, S, D) for each complete tick (after all layers)
         """
         B, S, D = initial_state.shape
         num_ticks = num_ticks or self.num_ticks
@@ -530,29 +547,27 @@ class CTMCore(nn.Module):
         dtype = initial_state.dtype
 
         state = initial_state
-        all_states = []  # States at end of each layer's tick sequence
+        all_states = []  # States at end of each full tick (after all layers)
 
-        # Global history buffer spanning all layers and ticks
-        # Shape: (B, S, n_layer * num_ticks, D)
+        # Global history buffer spanning ticks
+        # Shape: (B, S, num_ticks, D)
         history_dtype = torch.bfloat16 if dtype == torch.float32 else dtype
-        total_steps = self.n_layer * num_ticks
+        total_steps = num_ticks
         global_history = torch.zeros(B, S, total_steps, D, device=device, dtype=history_dtype)
 
-        global_step = 0  # Tracks position in global history
+        for tick in range(num_ticks):
+            # Get global history up to current tick
+            current_history = global_history[:, :, :tick] if tick > 0 else None
 
-        for layer_idx, layer in enumerate(self.layers):
-            for tick in range(num_ticks):
-                # Get global history up to current step
-                current_history = global_history[:, :, :global_step] if global_step > 0 else None
+            # Compute global sync from full history
+            if current_history is not None and current_history.size(2) > 0:
+                sync = self.global_sync(current_history)
+                nlm_out = self.global_nlm(current_history)
+            else:
+                sync = torch.zeros(B, S, self.global_sync.sync_pairs, device=device, dtype=dtype)
+                nlm_out = torch.zeros(B, S, D, device=device, dtype=dtype)
 
-                # Compute global sync from full history
-                if current_history is not None and current_history.size(2) > 0:
-                    sync = self.global_sync(current_history)
-                    nlm_out = self.global_nlm(current_history)
-                else:
-                    sync = torch.zeros(B, S, self.global_sync.sync_pairs, device=device, dtype=dtype)
-                    nlm_out = torch.zeros(B, S, D, device=device, dtype=dtype)
-
+            for layer_idx, layer in enumerate(self.layers):
                 # Layer forward with global sync and NLM output
                 if self.use_gradient_checkpointing and self.training:
                     state, post_act = gradient_checkpoint(
@@ -565,12 +580,11 @@ class CTMCore(nn.Module):
                         state, sync, nlm_out, static_k, static_v, cos, sin
                     )
 
-                # Append to global history
-                global_history[:, :, global_step] = post_act.to(history_dtype)
-                global_step += 1
+            # Append to global history once per full tick
+            global_history[:, :, tick] = post_act.to(history_dtype)
 
-                # Store state at every global step for tick selection
-                all_states.append(state.clone())
+            # Store state once per full tick for tick selection
+            all_states.append(state.clone())
 
         return state, all_states
 
