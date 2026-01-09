@@ -53,6 +53,11 @@ class CTMConfig:
     nlm_depth: int = 2
     sync_pairs: int = 512
 
+    # Enhanced sync parameters
+    n_sync_heads: int = 8           # Number of sync heads (like attention heads)
+    sync_local_window: int = 3      # Window for local (recent) sync patterns
+    use_enhanced_sync: bool = True  # Use enhanced sync vs original
+
     # Training
     dropout: float = 0.0
     rope_theta: float = 500000.0
@@ -65,6 +70,9 @@ class CTMConfig:
             # SwiGLU optimal sizing
             self.d_ff = int(2 * (4 * self.d_model) / 3)
             self.d_ff = 256 * ((self.d_ff + 256 - 1) // 256)
+        # Ensure sync_pairs is divisible by n_sync_heads
+        assert self.sync_pairs % self.n_sync_heads == 0, \
+            f"sync_pairs ({self.sync_pairs}) must be divisible by n_sync_heads ({self.n_sync_heads})"
 
 
 # --- Neuron-Level Models ---
@@ -222,6 +230,148 @@ class SynchronizationModule(nn.Module):
         # Weighted correlation: sum over time of (h1 * h2 * weight)
         # (B, S, T, P) * (T, P) summed over T -> (B, S, P)
         sync = (h1 * h2 * decay_weights.unsqueeze(0).unsqueeze(0)).sum(dim=2)
+
+        return sync
+
+
+class EnhancedSynchronizationModule(nn.Module):
+    """
+    Enhanced sync with learned projections and multi-scale temporal attention.
+
+    Key improvements over random pair sampling:
+    1. Learned projections: Instead of random pairs, learn A(h) and B(h) projections
+       where correlation(A, B) captures meaningful neural coordination patterns
+    2. Multi-head: Multiple projection pairs capture diverse correlation patterns
+       (analogous to multi-head attention)
+    3. Multi-scale temporal: Separate local (recent) and global (full history)
+       patterns with learned blending
+    4. Temporal attention: Learn which time steps matter for each sync head
+       (instead of fixed exponential decay)
+
+    Input: (B, S, T, D) - post-activation history
+    Output: (B, S, sync_pairs) - sync features
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        sync_pairs: int,
+        n_heads: int = 8,
+        local_window: int = 3,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        self.d_model = d_model
+        self.sync_pairs = sync_pairs
+        self.n_heads = n_heads
+        self.head_dim = sync_pairs // n_heads
+        self.local_window = local_window
+
+        # Learned projection pairs A and B (per head)
+        # Sync = sum_t attention_t * (A(h_t) ⊙ B(h_t))
+        # Using separate projections allows learning asymmetric correlations
+        self.proj_A = nn.Linear(d_model, sync_pairs, bias=False)
+        self.proj_B = nn.Linear(d_model, sync_pairs, bias=False)
+
+        # Temporal attention: learn which time steps matter
+        # Query is learned per head, Key is projected from history
+        self.temporal_query = nn.Parameter(torch.randn(n_heads, self.head_dim) * 0.02)
+        self.temporal_key = nn.Linear(d_model, sync_pairs, bias=False)
+
+        # Multi-scale: blend local (recent) and global (full history) patterns
+        # Local captures recent dynamics, global captures stable patterns
+        self.scale_gate = nn.Sequential(
+            nn.Linear(d_model, n_heads * 2),
+            nn.Sigmoid()
+        )
+
+        # Output projection to blend heads
+        self.out_proj = nn.Linear(sync_pairs, sync_pairs, bias=False)
+        self.norm = OptimizedRMSNorm(sync_pairs)
+
+        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+
+        self._init_weights()
+
+    def _init_weights(self):
+        nn.init.normal_(self.proj_A.weight, std=0.02)
+        nn.init.normal_(self.proj_B.weight, std=0.02)
+        nn.init.normal_(self.temporal_key.weight, std=0.02)
+        nn.init.normal_(self.out_proj.weight, std=0.02)
+
+    def forward(self, history: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            history: (B, S, T, D) post-activation history
+
+        Returns:
+            (B, S, sync_pairs) synchronization values
+        """
+        B, S, T, D = history.shape
+        H = self.n_heads
+        HD = self.head_dim
+
+        # Use float32 for stability
+        compute_dtype = self.proj_A.weight.dtype
+        h = history.to(compute_dtype)
+
+        # Project history to A and B spaces: (B, S, T, sync_pairs)
+        h_A = self.proj_A(h)
+        h_B = self.proj_B(h)
+
+        # Reshape to heads: (B, S, T, H, HD)
+        h_A = h_A.view(B, S, T, H, HD)
+        h_B = h_B.view(B, S, T, H, HD)
+
+        # Compute element-wise product (pairwise correlation proxy)
+        # (B, S, T, H, HD)
+        correlation = h_A * h_B
+
+        # Temporal attention: which time steps matter?
+        # Keys from history: (B, S, T, H, HD)
+        keys = self.temporal_key(h).view(B, S, T, H, HD)
+
+        # Query is learned: (H, HD)
+        # Attention scores: (B, S, T, H)
+        attn_scores = torch.einsum('bsthd,hd->bsth', keys, self.temporal_query)
+        attn_scores = attn_scores / math.sqrt(HD)
+
+        # === Multi-scale: separate local and global attention ===
+
+        # Global attention over full history
+        global_attn = F.softmax(attn_scores, dim=2)  # (B, S, T, H)
+
+        # Local attention: only attend to recent window
+        local_mask = torch.zeros(T, device=h.device, dtype=torch.bool)
+        local_start = max(0, T - self.local_window)
+        local_mask[local_start:] = True
+
+        local_scores = attn_scores.clone()
+        local_scores[:, :, ~local_mask, :] = float('-inf')
+        local_attn = F.softmax(local_scores, dim=2)  # (B, S, T, H)
+
+        # Compute scale gate from most recent state
+        # (B, S, D) -> (B, S, H*2)
+        most_recent = h[:, :, -1, :]
+        scale_weights = self.scale_gate(most_recent)  # (B, S, H*2)
+        local_weight = scale_weights[..., :H]  # (B, S, H)
+        global_weight = scale_weights[..., H:]  # (B, S, H)
+
+        # Blend local and global attention
+        # (B, S, T, H)
+        blended_attn = local_weight.unsqueeze(2) * local_attn + global_weight.unsqueeze(2) * global_attn
+
+        # Apply attention to correlations
+        # (B, S, T, H, HD) * (B, S, T, H, 1) -> sum over T -> (B, S, H, HD)
+        sync_heads = (correlation * blended_attn.unsqueeze(-1)).sum(dim=2)
+
+        # Flatten heads: (B, S, sync_pairs)
+        sync = sync_heads.view(B, S, self.sync_pairs)
+
+        # Output projection and normalization
+        sync = self.out_proj(sync)
+        sync = self.norm(sync)
+        sync = self.dropout(sync)
 
         return sync
 
@@ -618,10 +768,20 @@ class CTMCore(nn.Module):
         ])
 
         # Global sync module (shared, computes sync from full history)
-        self.global_sync = SynchronizationModule(
-            d_model=config.d_model,
-            sync_pairs=config.sync_pairs
-        )
+        # Use enhanced sync for learned projections + multi-scale attention
+        if config.use_enhanced_sync:
+            self.global_sync = EnhancedSynchronizationModule(
+                d_model=config.d_model,
+                sync_pairs=config.sync_pairs,
+                n_heads=config.n_sync_heads,
+                local_window=config.sync_local_window,
+                dropout=config.dropout,
+            )
+        else:
+            self.global_sync = SynchronizationModule(
+                d_model=config.d_model,
+                sync_pairs=config.sync_pairs
+            )
 
     def forward(
         self,
