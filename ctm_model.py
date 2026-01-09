@@ -619,11 +619,13 @@ class CTMCore(nn.Module):
         cos: torch.Tensor,
         sin: torch.Tensor,
         num_ticks: Optional[int] = None,  # Override for adaptive compute
-    ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+    ) -> Tuple[torch.Tensor, List[torch.Tensor], torch.Tensor, List[torch.Tensor]]:
         """
         Returns:
             final_state: (B, S, D)
-            all_states: List of (B, S, D) for each complete tick (after all layers)
+            all_states: List of (B, S, D) for each complete tick
+            final_sync: (B, S, sync_pairs) - sync at end (THE representation per CTM paper)
+            all_syncs: List of (B, S, sync_pairs) for each complete tick (for tick selection)
         """
         B, S, D = initial_state.shape
         num_ticks = num_ticks or self.num_ticks
@@ -631,7 +633,8 @@ class CTMCore(nn.Module):
         dtype = initial_state.dtype
 
         state = initial_state
-        all_states = []  # States at end of each full tick (for tick selection)
+        all_states = []  # States at end of each full tick
+        all_syncs = []   # Syncs at end of each full tick (for output/tick selection)
 
         # History as list of tensors (preserves gradients for temporal credit assignment)
         # Each entry is (B, S, D) post-activation from a layer-tick step
@@ -671,10 +674,17 @@ class CTMCore(nn.Module):
                 # Append to history (preserves gradients)
                 history_list.append(post_act)
 
-            # Store state at end of each tick (for tick selection in loss)
-            all_states.append(state.clone())
+            # Compute FINAL sync for this tick (after all layers processed)
+            # This is THE representation per the CTM paper
+            tick_global_hist = torch.stack(history_list, dim=2)
+            tick_sync = self.global_sync(tick_global_hist)
 
-        return state, all_states
+            # Store state and sync at end of each tick
+            all_states.append(state.clone())
+            all_syncs.append(tick_sync)
+
+        final_sync = all_syncs[-1] if all_syncs else torch.zeros(B, S, self.global_sync.sync_pairs, device=device, dtype=dtype)
+        return state, all_states, final_sync, all_syncs
 
 
 # --- Input Encoder ---
@@ -772,7 +782,10 @@ class CTMLanguageModel(nn.Module):
         1. Token embedding
         2. Input encoder (produces static KV)
         3. CTM iterative core (multiple ticks)
-        4. Output projection (logits)
+        4. Output projection from SYNC (per CTM paper)
+
+    Per the CTM paper, sync (neural correlation patterns) IS the representation.
+    Output is computed from sync, not from the hidden state directly.
 
     Returns logits for each tick to enable tick selection during training.
     """
@@ -790,12 +803,10 @@ class CTMLanguageModel(nn.Module):
         # CTM core
         self.ctm_core = CTMCore(config)
 
-        # Output head
-        self.final_norm = OptimizedRMSNorm(config.d_model)
-        self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
-
-        # Weight tying
-        self.lm_head.weight = self.token_embedding.weight
+        # Output head: sync → logits (per CTM paper, sync IS the representation)
+        # No weight tying since sync_pairs != d_model
+        self.sync_norm = OptimizedRMSNorm(config.sync_pairs)
+        self.sync_head = nn.Linear(config.sync_pairs, config.vocab_size, bias=False)
 
         # RoPE cache
         self.head_dim = config.d_model // config.n_head
@@ -866,20 +877,20 @@ class CTMLanguageModel(nn.Module):
         initial_state = encoded
 
         # 4. Run CTM iterations
-        final_state, all_states = self.ctm_core(
+        final_state, all_states, final_sync, all_syncs = self.ctm_core(
             initial_state, static_k, static_v, cos, sin, num_ticks=num_ticks
         )
 
-        # 5. Compute logits
+        # 5. Compute logits from SYNC (per CTM paper, sync IS the representation)
         if return_all_ticks:
             all_logits = []
-            for state in all_states:
-                logits = self.lm_head(self.final_norm(state))
+            for sync in all_syncs:
+                logits = self.sync_head(self.sync_norm(sync))
                 all_logits.append(logits)
-            final_logits = self.lm_head(self.final_norm(final_state))
+            final_logits = self.sync_head(self.sync_norm(final_sync))
             return final_logits, all_logits
         else:
-            logits = self.lm_head(self.final_norm(final_state))
+            logits = self.sync_head(self.sync_norm(final_sync))
             return logits, None
 
     @torch.no_grad()
