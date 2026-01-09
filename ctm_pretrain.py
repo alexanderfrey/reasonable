@@ -672,6 +672,16 @@ def train(args: Namespace):
                             per_tick = metrics["per_tick_loss"]
                             for t, tl in enumerate(per_tick):
                                 log_data[f"train/tick_{t}_loss"] = tl.item()
+
+                            # Log tick distribution as bar chart
+                            tick_dist = metrics.get("tick_distribution")
+                            if tick_dist is not None:
+                                dist_data = [[f"tick_{i}", v.item()] for i, v in enumerate(tick_dist)]
+                                dist_table = wandb.Table(data=dist_data, columns=["tick", "frequency"])
+                                log_data["train/tick_distribution"] = wandb.plot.bar(
+                                    dist_table, "tick", "frequency", title="Train Tick Distribution"
+                                )
+
                             wandb.log(log_data, step=global_step)
 
                     total_loss_accum = 0.0
@@ -702,9 +712,27 @@ def train(args: Namespace):
                                 "eval/loss": eval_loss,
                                 "eval/perplexity": eval_ppl,
                             }
+                            tick_dist = eval_metrics.get("tick_distribution")
+                            if tick_dist is not None:
+                                tick_idx = torch.arange(
+                                    tick_dist.numel(), device=tick_dist.device, dtype=tick_dist.dtype
+                                )
+                                eval_log["eval/avg_selected_tick"] = (tick_idx * tick_dist).sum().item()
+
+                                # Log tick distribution as bar chart
+                                dist_data = [[f"tick_{i}", v.item()] for i, v in enumerate(tick_dist)]
+                                dist_table = wandb.Table(data=dist_data, columns=["tick", "frequency"])
+                                eval_log["eval/tick_distribution"] = wandb.plot.bar(
+                                    dist_table, "tick", "frequency", title="Eval Tick Distribution"
+                                )
+
                             if "per_tick_loss" in eval_metrics:
                                 for t, tl in enumerate(eval_metrics["per_tick_loss"]):
-                                    eval_log[f"eval/tick_{t}_loss"] = tl.item()
+                                    tick_loss = tl.item()
+                                    eval_log[f"eval/tick_{t}_loss"] = tick_loss
+                                    eval_log[f"eval/tick_{t}_ppl"] = (
+                                        math.exp(tick_loss) if tick_loss < 700 else float("inf")
+                                    )
                             wandb.log(eval_log, step=global_step)
 
                         # Save best model
