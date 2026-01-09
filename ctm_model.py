@@ -24,10 +24,10 @@ logger = logging.getLogger(__name__)
 try:
     from flash_attn import flash_attn_func
     from flash_attn.layers.rotary import apply_rotary_emb
-    FLASH_AVAILABLE = True
 except ImportError:
-    FLASH_AVAILABLE = False
-    logger.warning("flash_attn not installed. CTM will fail or run slow.")
+    raise ImportError(
+        "flash_attn is required for CTM. Install with: pip install flash-attn --no-build-isolation"
+    )
 
 # Import shared components from model.py
 from model import OptimizedRMSNorm, OptimizedMLP
