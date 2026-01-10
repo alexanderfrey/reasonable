@@ -23,6 +23,7 @@ import math
 import numpy as np
 import time
 import logging
+import colorsys
 from typing import Optional, Dict, Any
 import wandb
 from tqdm import tqdm
@@ -77,6 +78,18 @@ def setup_environment(args: Namespace):
         logger.info("Using FP32 precision.")
 
     return device, use_amp, use_bf16
+
+
+def build_label_mask(
+    labels: torch.Tensor,
+    pad_token_id: int,
+    ignore_index: int,
+) -> torch.Tensor:
+    """Build float mask for valid tokens."""
+    mask_token = ignore_index if ignore_index != -100 else pad_token_id
+    if mask_token == -100:
+        return torch.ones_like(labels, dtype=torch.float32)
+    return (labels != mask_token).float()
 
 
 def prepare_dataloaders(args: Namespace, tokenizer, vocab_size, pad_token_id, eos_token_id):
@@ -178,6 +191,9 @@ def initialize_ctm_model(args: Namespace, vocab_size: int, device: torch.device)
         nlm_hidden=args.nlm_hidden,
         nlm_depth=args.nlm_depth,
         sync_pairs=args.sync_pairs,
+        sync_pred_hidden=getattr(args, "sync_pred_hidden", None),
+        sync_pred_dropout=getattr(args, "sync_pred_dropout", 0.0),
+        sync_order=args.sync_order,
         dropout=args.dropout,
         rope_theta=getattr(args, "rope_theta", 500000.0),
         use_gradient_checkpointing=getattr(args, "use_gradient_checkpointing", False),
@@ -197,6 +213,9 @@ def initialize_ctm_model(args: Namespace, vocab_size: int, device: torch.device)
     logger.info(f"  - num_ticks: {config.num_ticks}")
     logger.info(f"  - nlm_hidden: {config.nlm_hidden}")
     logger.info(f"  - sync_pairs: {config.sync_pairs}")
+    logger.info(f"  - sync_order: {config.sync_order}")
+    logger.info(f"  - sync_pred_hidden: {config.sync_pred_hidden}")
+    logger.info(f"  - sync_pred_dropout: {config.sync_pred_dropout}")
     logger.info(f"  - Total parameters: {total_params:,} ({total_params/1e6:.2f}M)")
     logger.info(f"  - Trainable parameters: {trainable_params:,}")
 
@@ -211,6 +230,7 @@ def ctm_train_step(
     use_amp: bool,
     use_bf16: bool,
     gradient_accumulation_steps: int,
+    sync_pred_weight: float = 0.0,
     num_ticks: Optional[int] = None,
 ):
     """
@@ -237,14 +257,33 @@ def ctm_train_step(
     from torch.amp import autocast
     with autocast("cuda", enabled=amp_enabled, dtype=amp_dtype):
         # Forward pass with all ticks
-        _, all_logits = model(input_ids, return_all_ticks=True, num_ticks=num_ticks)
+        if sync_pred_weight > 0:
+            _, all_logits, all_syncs = model(
+                input_ids, return_all_ticks=True, num_ticks=num_ticks, return_syncs=True
+            )
+        else:
+            _, all_logits = model(input_ids, return_all_ticks=True, num_ticks=num_ticks)
+            all_syncs = None
 
         # Compute loss with tick selection
-        loss, metrics = criterion(all_logits, labels)
+        lm_loss, metrics = criterion(all_logits, labels)
+
+        sync_pred_loss = torch.tensor(0.0, device=device)
+        sync_pred_cosine = torch.tensor(0.0, device=device)
+        if sync_pred_weight > 0 and all_syncs is not None:
+            mask = build_label_mask(labels, criterion.pad_token_id, criterion.ignore_index)
+            sync_pred_loss, sync_pred_cosine = model.sync_predictor(all_syncs, mask=mask)
+
+        loss = lm_loss + sync_pred_weight * sync_pred_loss
 
     # Scale loss for gradient accumulation
     loss_scaled = loss / gradient_accumulation_steps
     loss_scaled.backward()
+
+    metrics["lm_loss"] = lm_loss.detach()
+    metrics["sync_pred_loss"] = sync_pred_loss.detach()
+    metrics["sync_pred_cosine"] = sync_pred_cosine.detach()
+    metrics["total_loss"] = loss.detach()
 
     return loss.item(), metrics
 
@@ -266,6 +305,9 @@ def ctm_evaluate(
     total_tokens = 0
     per_tick_losses = None
     tick_counts = None
+    total_sync_pred_loss = 0.0
+    total_sync_pred_cosine = 0.0
+    sync_pred_weight = getattr(args, "sync_pred_weight", 0.0)
 
     if use_bf16:
         amp_dtype = torch.bfloat16
@@ -318,13 +360,29 @@ def ctm_evaluate(
         labels = batch["labels"].to(device, non_blocking=True)
 
         with autocast("cuda", enabled=amp_enabled, dtype=amp_dtype):
-            _, all_logits = model(input_ids, return_all_ticks=True, num_ticks=num_ticks)
+            if sync_pred_weight > 0:
+                _, all_logits, all_syncs = model(
+                    input_ids, return_all_ticks=True, num_ticks=num_ticks, return_syncs=True
+                )
+            else:
+                _, all_logits = model(input_ids, return_all_ticks=True, num_ticks=num_ticks)
+                all_syncs = None
+
             loss, metrics = criterion(all_logits, labels)
+
+            sync_pred_loss = torch.tensor(0.0, device=device)
+            sync_pred_cosine = torch.tensor(0.0, device=device)
+            if sync_pred_weight > 0 and all_syncs is not None:
+                mask = build_label_mask(labels, criterion.pad_token_id, criterion.ignore_index)
+                sync_pred_loss, sync_pred_cosine = model.sync_predictor(all_syncs, mask=mask)
 
         batch_tokens = metrics["num_valid_tokens"].item()
         total_loss += loss.item() * batch_tokens
         total_tokens += batch_tokens
         num_batches += 1
+        if sync_pred_weight > 0:
+            total_sync_pred_loss += sync_pred_loss.item() * batch_tokens
+            total_sync_pred_cosine += sync_pred_cosine.item() * batch_tokens
 
         # Accumulate per-tick losses
         if per_tick_losses is None:
@@ -343,10 +401,18 @@ def ctm_evaluate(
     perplexity = math.exp(avg_loss) if avg_loss < 700 else float("inf")
     avg_per_tick_loss = per_tick_losses / total_tokens
     avg_tick_dist = tick_counts / total_tokens
+    avg_sync_pred_loss = (
+        total_sync_pred_loss / total_tokens if sync_pred_weight > 0 else float("nan")
+    )
+    avg_sync_pred_cosine = (
+        total_sync_pred_cosine / total_tokens if sync_pred_weight > 0 else float("nan")
+    )
 
     return avg_loss, perplexity, {
         "per_tick_loss": avg_per_tick_loss,
         "tick_distribution": avg_tick_dist,
+        "sync_pred_loss": avg_sync_pred_loss,
+        "sync_pred_cosine": avg_sync_pred_cosine,
     }
 
 
@@ -402,6 +468,38 @@ def run_debug_generation(
     finally:
         if was_training:
             model.train()
+
+
+def _build_tick_palette(num_ticks: int) -> np.ndarray:
+    base_palette = [
+        (31, 119, 180),
+        (255, 127, 14),
+        (44, 160, 44),
+        (214, 39, 40),
+        (148, 103, 189),
+        (140, 86, 75),
+        (227, 119, 194),
+        (127, 127, 127),
+        (188, 189, 34),
+        (23, 190, 207),
+    ]
+    if num_ticks <= len(base_palette):
+        palette = base_palette[:num_ticks]
+    else:
+        palette = []
+        for i in range(num_ticks):
+            r, g, b = colorsys.hsv_to_rgb(i / num_ticks, 0.7, 0.9)
+            palette.append((int(r * 255), int(g * 255), int(b * 255)))
+    return np.array(palette, dtype=np.uint8)
+
+
+def _selected_ticks_to_rgb(selected_ticks: torch.Tensor, num_ticks: int, max_tokens: int) -> np.ndarray:
+    ticks = selected_ticks.detach().to("cpu").numpy()
+    if max_tokens > 0 and ticks.shape[1] > max_tokens:
+        ticks = ticks[:, :max_tokens]
+    palette = _build_tick_palette(num_ticks)
+    ticks = np.clip(ticks, 0, num_ticks - 1).astype(np.int64)
+    return palette[ticks]
 
 
 def save_checkpoint(
@@ -576,8 +674,12 @@ def train(args: Namespace):
     logger.info(f"\nStarting CTM training from epoch {start_epoch + 1}...")
     model.train()
     total_loss_accum = 0.0
+    lm_loss_accum = 0.0
+    sync_pred_loss_accum = 0.0
+    sync_pred_cos_accum = 0.0
     micro_steps_count = 0
     can_toggle_sync = hasattr(model, "require_backward_grad_sync")
+    sync_pred_weight = getattr(args, "sync_pred_weight", 0.0)
 
     # Tick budget warmup (optional)
     tick_warmup_steps = getattr(args, "tick_warmup_steps", 0)
@@ -617,10 +719,15 @@ def train(args: Namespace):
             # Training step
             step_loss, metrics = ctm_train_step(
                 model, batch, criterion, device, use_amp, use_bf16,
-                gradient_accumulation_steps, num_ticks=num_ticks
+                gradient_accumulation_steps, sync_pred_weight=sync_pred_weight,
+                num_ticks=num_ticks
             )
 
             total_loss_accum += step_loss
+            lm_loss_accum += metrics["lm_loss"].item()
+            if sync_pred_weight > 0:
+                sync_pred_loss_accum += metrics["sync_pred_loss"].item()
+                sync_pred_cos_accum += metrics["sync_pred_cosine"].item()
             micro_steps_count += 1
 
             # Optimizer step
@@ -644,17 +751,24 @@ def train(args: Namespace):
 
                 # --- Logging ---
                 if args.log_interval > 0 and global_step % args.log_interval == 0:
-                    avg_loss = total_loss_accum / micro_steps_count
-                    perplexity = math.exp(avg_loss) if avg_loss < 700 else float("inf")
+                    avg_total_loss = total_loss_accum / micro_steps_count
+                    avg_lm_loss = lm_loss_accum / micro_steps_count
+                    perplexity = math.exp(avg_lm_loss) if avg_lm_loss < 700 else float("inf")
                     avg_tick = metrics["avg_selected_tick"].item()
 
                     log_postfix = {
-                        "Loss": f"{avg_loss:.4f}",
+                        "Loss": f"{avg_total_loss:.4f}",
+                        "LM": f"{avg_lm_loss:.4f}",
                         "PPL": f"{perplexity:.2f}",
                         "AvgTick": f"{avg_tick:.2f}",
                         "Step": global_step,
                         "LR": f"{optimizer.param_groups[0]['lr']:.2e}",
                     }
+                    if sync_pred_weight > 0:
+                        avg_sync_pred_loss = sync_pred_loss_accum / micro_steps_count
+                        avg_sync_pred_cos = sync_pred_cos_accum / micro_steps_count
+                        log_postfix["SyncAux"] = f"{avg_sync_pred_loss:.4f}"
+                        log_postfix["SyncCos"] = f"{avg_sync_pred_cos:.3f}"
 
                     if args.is_main_process:
                         if hasattr(progress_bar, "set_postfix"):
@@ -662,16 +776,41 @@ def train(args: Namespace):
 
                         if not getattr(args, "disable_wandb", False) and wandb.run:
                             log_data = {
-                                "train/loss": avg_loss,
+                                "train/loss_total": avg_total_loss,
+                                "train/loss_lm": avg_lm_loss,
                                 "train/perplexity": perplexity,
                                 "train/learning_rate": optimizer.param_groups[0]["lr"],
                                 "train/avg_selected_tick": avg_tick,
                                 "epoch": epoch + 1,
                             }
+                            if sync_pred_weight > 0:
+                                log_data["train/loss_sync_pred"] = avg_sync_pred_loss
+                                log_data["train/loss_sync_pred_weighted"] = avg_sync_pred_loss * sync_pred_weight
+                                log_data["train/sync_pred_cosine"] = avg_sync_pred_cos
+                                log_data["train/sync_pred_weight"] = sync_pred_weight
+                                log_data["train/aux_to_lm_ratio"] = (
+                                    (avg_sync_pred_loss * sync_pred_weight) / (avg_lm_loss + 1e-8)
+                                )
                             # Log per-tick losses
                             per_tick = metrics["per_tick_loss"]
                             for t, tl in enumerate(per_tick):
                                 log_data[f"train/tick_{t}_loss"] = tl.item()
+
+                            if (
+                                args.tick_heatmap_interval > 0
+                                and global_step % args.tick_heatmap_interval == 0
+                            ):
+                                selected_ticks = metrics.get("selected_ticks")
+                                if selected_ticks is not None:
+                                    heatmap = _selected_ticks_to_rgb(
+                                        selected_ticks,
+                                        num_ticks=per_tick.numel(),
+                                        max_tokens=args.tick_heatmap_max_tokens,
+                                    )
+                                    log_data["train/selected_tick_heatmap"] = wandb.Image(
+                                        heatmap,
+                                        caption=f"Selected tick per token @ step {global_step}",
+                                    )
 
                             # Log tick distribution as bar chart
                             tick_dist = metrics.get("tick_distribution")
@@ -685,6 +824,9 @@ def train(args: Namespace):
                             wandb.log(log_data, step=global_step)
 
                     total_loss_accum = 0.0
+                    lm_loss_accum = 0.0
+                    sync_pred_loss_accum = 0.0
+                    sync_pred_cos_accum = 0.0
                     micro_steps_count = 0
 
                 # --- Debug Generation ---
@@ -705,13 +847,29 @@ def train(args: Namespace):
                     )
 
                     if args.is_main_process:
-                        logger.info(f"Eval @ step {global_step}: Loss={eval_loss:.4f}, PPL={eval_ppl:.2f}")
+                        log_msg = f"Eval @ step {global_step}: Loss={eval_loss:.4f}, PPL={eval_ppl:.2f}"
+                        if sync_pred_weight > 0:
+                            sync_loss = eval_metrics.get("sync_pred_loss")
+                            sync_cos = eval_metrics.get("sync_pred_cosine")
+                            if sync_loss is not None and sync_cos is not None:
+                                log_msg += f", SyncAux={sync_loss:.4f}, SyncCos={sync_cos:.3f}"
+                        logger.info(log_msg)
 
                         if not getattr(args, "disable_wandb", False) and wandb.run:
                             eval_log = {
                                 "eval/loss": eval_loss,
                                 "eval/perplexity": eval_ppl,
                             }
+                            if sync_pred_weight > 0:
+                                eval_log["eval/loss_sync_pred"] = eval_metrics.get("sync_pred_loss", float("nan"))
+                                eval_log["eval/loss_sync_pred_weighted"] = (
+                                    eval_metrics.get("sync_pred_loss", float("nan")) * sync_pred_weight
+                                )
+                                eval_log["eval/sync_pred_cosine"] = eval_metrics.get("sync_pred_cosine", float("nan"))
+                                eval_log["eval/sync_pred_weight"] = sync_pred_weight
+                                eval_log["eval/total_loss"] = (
+                                    eval_loss + sync_pred_weight * eval_metrics.get("sync_pred_loss", 0.0)
+                                )
                             tick_dist = eval_metrics.get("tick_distribution")
                             if tick_dist is not None:
                                 tick_idx = torch.arange(
@@ -795,6 +953,13 @@ def main():
     parser.add_argument("--nlm_hidden", type=int, default=64, help="NLM hidden dimension")
     parser.add_argument("--nlm_depth", type=int, default=2, help="NLM depth")
     parser.add_argument("--sync_pairs", type=int, default=512, help="Number of sync pairs")
+    parser.add_argument("--sync_order", type=int, default=3, help="Higher-order sync interactions (>=2)")
+    parser.add_argument("--sync_pred_weight", type=float, default=0.0,
+                        help="Weight for sync prediction auxiliary loss (0 to disable)")
+    parser.add_argument("--sync_pred_hidden", type=int, default=None,
+                        help="Hidden size for sync prediction head (default: sync_pairs)")
+    parser.add_argument("--sync_pred_dropout", type=float, default=0.0,
+                        help="Dropout for sync prediction head")
     parser.add_argument("--tick_selection", type=str, default="min_loss",
                         choices=["min_loss", "max_certainty", "weighted", "last", "all"],
                         help="Tick selection strategy")
@@ -836,6 +1001,10 @@ def main():
         default=1000,
         help="Evaluate on a random subset of N examples per eval (0 to disable).",
     )
+    parser.add_argument("--tick_heatmap_interval", type=int, default=100,
+                        help="Log selected tick heatmap every N steps (0 to disable).")
+    parser.add_argument("--tick_heatmap_max_tokens", type=int, default=256,
+                        help="Max token positions to include in tick heatmap (0 = no limit).")
     parser.add_argument("--num_workers", type=int, default=4, help="DataLoader workers")
     parser.add_argument("--debug_generate_interval", type=int, default=100,
                         help="Run debug generation every N steps (0 to disable)")

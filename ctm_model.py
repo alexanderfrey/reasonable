@@ -57,6 +57,9 @@ class CTMConfig:
     n_sync_heads: int = 8           # Number of sync heads (like attention heads)
     sync_local_window: int = 3      # Window for local (recent) sync patterns
     use_enhanced_sync: bool = True  # Use enhanced sync vs original
+    sync_order: int = 3             # Higher-order sync interactions (>=2)
+    sync_pred_hidden: Optional[int] = None  # Hidden size for sync prediction head
+    sync_pred_dropout: float = 0.0          # Dropout for sync prediction head
 
     # Enhanced NLM parameters
     use_enhanced_nlm: bool = True   # Use enhanced NLM with temporal attention + gating
@@ -76,6 +79,7 @@ class CTMConfig:
         # Ensure sync_pairs is divisible by n_sync_heads
         assert self.sync_pairs % self.n_sync_heads == 0, \
             f"sync_pairs ({self.sync_pairs}) must be divisible by n_sync_heads ({self.n_sync_heads})"
+        assert self.sync_order >= 2, "sync_order must be >= 2 for higher-order synchronization"
 
 
 # --- Neuron-Level Models ---
@@ -380,12 +384,12 @@ class SynchronizationModule(nn.Module):
 
 class EnhancedSynchronizationModule(nn.Module):
     """
-    Enhanced sync with learned projections and multi-scale temporal attention.
+    Enhanced sync with higher-order projections and multi-scale temporal attention.
 
     Key improvements over random pair sampling:
-    1. Learned projections: Instead of random pairs, learn A(h) and B(h) projections
-       where correlation(A, B) captures meaningful neural coordination patterns
-    2. Multi-head: Multiple projection pairs capture diverse correlation patterns
+    1. Higher-order projections: Learn multiple projections whose element-wise
+       product captures n-way coordination patterns (not just pairwise)
+    2. Multi-head: Multiple projection groups capture diverse coordination patterns
        (analogous to multi-head attention)
     3. Multi-scale temporal: Separate local (recent) and global (full history)
        patterns with learned blending
@@ -403,6 +407,7 @@ class EnhancedSynchronizationModule(nn.Module):
         n_heads: int = 8,
         local_window: int = 3,
         dropout: float = 0.0,
+        order: int = 3,
     ):
         super().__init__()
         self.d_model = d_model
@@ -410,12 +415,20 @@ class EnhancedSynchronizationModule(nn.Module):
         self.n_heads = n_heads
         self.head_dim = sync_pairs // n_heads
         self.local_window = local_window
+        self.order = order
 
-        # Learned projection pairs A and B (per head)
-        # Sync = sum_t attention_t * (A(h_t) ⊙ B(h_t))
-        # Using separate projections allows learning asymmetric correlations
-        self.proj_A = nn.Linear(d_model, sync_pairs, bias=False)
-        self.proj_B = nn.Linear(d_model, sync_pairs, bias=False)
+        if order < 2:
+            raise ValueError("order must be >= 2 for higher-order synchronization")
+
+        # Learned projections for higher-order interactions
+        # Sync = sum_t attention_t * Π_k proj_k(h_t)
+        self.projections = nn.ModuleList([
+            nn.Linear(d_model, sync_pairs, bias=False)
+            for _ in range(order)
+        ])
+        self.proj_norms = nn.ModuleList([
+            OptimizedRMSNorm(sync_pairs) for _ in range(order)
+        ])
 
         # Temporal attention: learn which time steps matter
         # Query is learned per head, Key is projected from history
@@ -438,8 +451,8 @@ class EnhancedSynchronizationModule(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
-        nn.init.normal_(self.proj_A.weight, std=0.02)
-        nn.init.normal_(self.proj_B.weight, std=0.02)
+        for proj in self.projections:
+            nn.init.normal_(proj.weight, std=0.02)
         nn.init.normal_(self.temporal_key.weight, std=0.02)
         nn.init.normal_(self.out_proj.weight, std=0.02)
 
@@ -456,20 +469,26 @@ class EnhancedSynchronizationModule(nn.Module):
         HD = self.head_dim
 
         # Use float32 for stability
-        compute_dtype = self.proj_A.weight.dtype
+        compute_dtype = self.projections[0].weight.dtype
         h = history.to(compute_dtype)
 
-        # Project history to A and B spaces: (B, S, T, sync_pairs)
-        h_A = self.proj_A(h)
-        h_B = self.proj_B(h)
+        # Project history for higher-order interactions
+        # Each projection is normalized and squashed for numerical stability
+        proj_terms = []
+        for proj, norm in zip(self.projections, self.proj_norms):
+            term = proj(h)
+            term = norm(term)
+            term = torch.tanh(term)
+            proj_terms.append(term)
 
         # Reshape to heads: (B, S, T, H, HD)
-        h_A = h_A.view(B, S, T, H, HD)
-        h_B = h_B.view(B, S, T, H, HD)
+        proj_terms = [term.view(B, S, T, H, HD) for term in proj_terms]
 
-        # Compute element-wise product (pairwise correlation proxy)
+        # Compute element-wise product across order
         # (B, S, T, H, HD)
-        correlation = h_A * h_B
+        correlation = proj_terms[0]
+        for term in proj_terms[1:]:
+            correlation = correlation * term
 
         # Temporal attention: which time steps matter?
         # Keys from history: (B, S, T, H, HD)
@@ -518,6 +537,78 @@ class EnhancedSynchronizationModule(nn.Module):
         sync = self.dropout(sync)
 
         return sync
+
+
+# --- Sync Prediction Head (Auxiliary Task) ---
+
+class SyncPredictionHead(nn.Module):
+    """
+    Predict the next sync state from the current sync state.
+
+    Used as an auxiliary training objective to encourage temporally
+    coherent synchronization patterns across ticks.
+    """
+
+    def __init__(self, sync_dim: int, hidden_dim: Optional[int] = None, dropout: float = 0.0):
+        super().__init__()
+        hidden_dim = hidden_dim or sync_dim
+
+        self.in_norm = OptimizedRMSNorm(sync_dim)
+        self.predictor = nn.Sequential(
+            nn.Linear(sync_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout) if dropout > 0 else nn.Identity(),
+            nn.Linear(hidden_dim, sync_dim),
+        )
+
+    def forward(
+        self,
+        all_syncs: List[torch.Tensor],
+        mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            all_syncs: List[(B, S, sync_dim)] for each tick
+            mask: Optional (B, S) float mask for valid tokens
+
+        Returns:
+            loss: Scalar MSE loss across tick transitions
+            cosine: Scalar cosine similarity metric across transitions
+        """
+        if len(all_syncs) < 2:
+            device = all_syncs[0].device if all_syncs else None
+            zero = torch.tensor(0.0, device=device)
+            return zero, zero
+
+        losses = []
+        cosines = []
+
+        for t in range(len(all_syncs) - 1):
+            current = self.in_norm(all_syncs[t])
+            pred = self.predictor(current)
+            target = all_syncs[t + 1].detach()
+
+            pred_f = pred.float()
+            target_f = target.float()
+
+            per_pos_loss = F.mse_loss(pred_f, target_f, reduction="none").mean(dim=-1)
+            if mask is not None:
+                loss = (per_pos_loss * mask).sum() / (mask.sum() + 1e-8)
+            else:
+                loss = per_pos_loss.mean()
+            losses.append(loss)
+
+            with torch.no_grad():
+                cos = F.cosine_similarity(pred_f, target_f, dim=-1)
+                if mask is not None:
+                    cos = (cos * mask).sum() / (mask.sum() + 1e-8)
+                else:
+                    cos = cos.mean()
+            cosines.append(cos)
+
+        loss_out = torch.stack(losses).mean()
+        cosine_out = torch.stack(cosines).mean()
+        return loss_out, cosine_out
 
 
 # --- Synapse Model ---
@@ -928,6 +1019,7 @@ class CTMCore(nn.Module):
                 n_heads=config.n_sync_heads,
                 local_window=config.sync_local_window,
                 dropout=config.dropout,
+                order=config.sync_order,
             )
         else:
             self.global_sync = SynchronizationModule(
@@ -1129,6 +1221,13 @@ class CTMLanguageModel(nn.Module):
         self.sync_norm = OptimizedRMSNorm(config.sync_pairs)
         self.sync_head = nn.Linear(config.sync_pairs, config.vocab_size, bias=False)
 
+        # Auxiliary sync prediction head (optional loss in training)
+        self.sync_predictor = SyncPredictionHead(
+            sync_dim=config.sync_pairs,
+            hidden_dim=config.sync_pred_hidden,
+            dropout=config.sync_pred_dropout,
+        )
+
         # RoPE cache
         self.head_dim = config.d_model // config.n_head
         self._init_rope()
@@ -1168,13 +1267,20 @@ class CTMLanguageModel(nn.Module):
         input_pos: Optional[torch.Tensor] = None,
         return_all_ticks: bool = False,
         num_ticks: Optional[int] = None,
-    ) -> Union[Tuple[torch.Tensor, None], Tuple[torch.Tensor, List[torch.Tensor]]]:
+        return_syncs: bool = False,
+    ) -> Union[
+        Tuple[torch.Tensor, None],
+        Tuple[torch.Tensor, List[torch.Tensor]],
+        Tuple[torch.Tensor, None, List[torch.Tensor]],
+        Tuple[torch.Tensor, List[torch.Tensor], List[torch.Tensor]],
+    ]:
         """
         Args:
             input_ids: (B, S) token IDs
             input_pos: (S,) position indices for RoPE
             return_all_ticks: If True, return logits for all ticks
             num_ticks: Override number of ticks (for adaptive compute)
+            return_syncs: If True, also return all per-tick syncs
 
         Returns:
             If return_all_ticks=False: (logits, None) where logits is (B, S, V)
@@ -1209,9 +1315,13 @@ class CTMLanguageModel(nn.Module):
                 logits = self.sync_head(self.sync_norm(sync))
                 all_logits.append(logits)
             final_logits = self.sync_head(self.sync_norm(final_sync))
+            if return_syncs:
+                return final_logits, all_logits, all_syncs
             return final_logits, all_logits
         else:
             logits = self.sync_head(self.sync_norm(final_sync))
+            if return_syncs:
+                return logits, None, all_syncs
             return logits, None
 
     @torch.no_grad()
