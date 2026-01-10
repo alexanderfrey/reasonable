@@ -55,11 +55,9 @@ class CTMConfig:
 
     # Enhanced sync parameters
     n_sync_heads: int = 8           # Number of sync heads (like attention heads)
-    sync_local_window: int = 3      # Window for local (recent) sync patterns
+    sync_local_window: int = 3      # Window for exponential decay (kept for compat)
     use_enhanced_sync: bool = True  # Use enhanced sync vs original
-    sync_order: int = 3             # Higher-order sync interactions (>=2)
-    sync_pred_hidden: Optional[int] = None  # Hidden size for sync prediction head
-    sync_pred_dropout: float = 0.0          # Dropout for sync prediction head
+    sync_order: int = 2             # Correlation order (2=covariance, faithful to CTM paper)
 
     # Enhanced NLM parameters
     use_enhanced_nlm: bool = True   # Use enhanced NLM with temporal attention + gating
@@ -79,7 +77,7 @@ class CTMConfig:
         # Ensure sync_pairs is divisible by n_sync_heads
         assert self.sync_pairs % self.n_sync_heads == 0, \
             f"sync_pairs ({self.sync_pairs}) must be divisible by n_sync_heads ({self.n_sync_heads})"
-        assert self.sync_order >= 2, "sync_order must be >= 2 for higher-order synchronization"
+        assert self.sync_order >= 2, "sync_order must be >= 2 for correlation computation"
 
 
 # --- Neuron-Level Models ---
@@ -176,16 +174,17 @@ class NeuronLevelModels(nn.Module):
 
 class EnhancedNeuronLevelModels(nn.Module):
     """
-    Enhanced NLM with temporal attention and gating (faithful to CTM).
+    Enhanced NLM with temporal attention and per-neuron gating (faithful to CTM).
 
     Improvements over basic NLM:
     1. Temporal attention: Each neuron learns which past states matter most,
        dynamically weighting history entries instead of fixed MLP processing
-    2. GRU-style gating: Controls information flow, improving gradient
-       propagation and allowing learned "think more vs keep state" decisions
+    2. Per-neuron gating: Each neuron independently decides how much to update
+       vs keep previous state (NO cross-channel communication)
 
-    Faithful to CTM: Neurons remain INDEPENDENT - no cross-channel communication.
+    CRITICAL: Neurons remain INDEPENDENT - no cross-channel communication.
     Neurons only "communicate" through sync (correlation patterns).
+    The gating is per-neuron with private weights, not a shared linear layer.
 
     Input: (B, S, T, D) - history of activations per neuron
     Output: (B, S, D) - updated state
@@ -235,11 +234,12 @@ class EnhancedNeuronLevelModels(nn.Module):
         self.w_out = nn.Parameter(torch.empty(d_model, nlm_hidden, 1))
         self.b_out = nn.Parameter(torch.zeros(d_model, 1))
 
-        # === 3. GRU-style Gating ===
-        # Controls how much NLM output affects the state
-        # gate = sigmoid(W_z @ [nlm_out, most_recent])
-        # output = gate * nlm_out + (1 - gate) * most_recent
-        self.gate_proj = nn.Linear(d_model * 2, d_model, bias=True)
+        # === 3. Per-Neuron Gating (NO cross-channel mixing!) ===
+        # Each neuron has its own gate weights: maps [nlm_out_d, recent_d] -> gate_d
+        # Shape: (D, 2) weights + (D,) bias per neuron
+        # gate_d = sigmoid(w_gate[d] @ [nlm_out[d], recent[d]] + b_gate[d])
+        self.w_gate = nn.Parameter(torch.empty(d_model, 2))
+        self.b_gate = nn.Parameter(torch.full((d_model,), -2.0))  # Start conservative
 
         self._init_weights()
 
@@ -251,9 +251,8 @@ class EnhancedNeuronLevelModels(nn.Module):
         nn.init.normal_(self.w_out, std=std)
         for w in self.w_hidden:
             nn.init.normal_(w, std=std)
-        # Initialize gate bias to -2 so gate starts near 0 (conservative updates)
-        nn.init.zeros_(self.gate_proj.weight)
-        nn.init.constant_(self.gate_proj.bias, -2.0)
+        # Initialize gate weights small, bias already set to -2 in __init__
+        nn.init.normal_(self.w_gate, std=std)
 
     def forward(self, history: torch.Tensor) -> torch.Tensor:
         """
@@ -304,12 +303,15 @@ class EnhancedNeuronLevelModels(nn.Module):
         nlm_out = torch.einsum('bsdh,dho->bsdo', h, self.w_out) + self.b_out
         nlm_out = nlm_out.squeeze(-1)  # (B, S, D)
 
-        # === 3. GRU-style Gating ===
-        # Decide how much to update vs keep previous state
-        gate_input = torch.cat([nlm_out, most_recent], dim=-1)
-        update_gate = torch.sigmoid(self.gate_proj(gate_input))
+        # === 3. Per-Neuron Gating (NO cross-channel mixing!) ===
+        # Stack inputs per neuron: (B, S, D, 2)
+        gate_input = torch.stack([nlm_out, most_recent], dim=-1)
+        # Per-neuron gate: (B, S, D, 2) @ (D, 2) -> (B, S, D) via einsum
+        # Each neuron d uses only its own w_gate[d] weights
+        gate_logits = torch.einsum('bsdi,di->bsd', gate_input, self.w_gate) + self.b_gate
+        update_gate = torch.sigmoid(gate_logits)  # (B, S, D)
 
-        # Blend NLM output with most recent state
+        # Blend NLM output with most recent state (per neuron, independently)
         output = update_gate * nlm_out + (1 - update_gate) * most_recent
 
         return output
@@ -384,20 +386,25 @@ class SynchronizationModule(nn.Module):
 
 class EnhancedSynchronizationModule(nn.Module):
     """
-    Enhanced sync with higher-order projections and multi-scale temporal attention.
+    Pure correlation-based synchronization module (faithful to CTM).
 
-    Key improvements over random pair sampling:
-    1. Higher-order projections: Learn multiple projections whose element-wise
-       product captures n-way coordination patterns (not just pairwise)
-    2. Multi-head: Multiple projection groups capture diverse coordination patterns
-       (analogous to multi-head attention)
-    3. Multi-scale temporal: Separate local (recent) and global (full history)
-       patterns with learned blending
-    4. Temporal attention: Learn which time steps matter for each sync head
-       (instead of fixed exponential decay)
+    CRITICAL DESIGN PRINCIPLE: Sync is a MEASUREMENT of neural coordination,
+    not a learned transformation. Temporal integration is NLM's job.
+
+    This module:
+    1. Projects history to multiple learned spaces (captures what to correlate)
+    2. Computes element-wise products (the actual correlation measurement)
+    3. Averages over time with simple exponential decay (not learned attention)
+    4. Applies minimal normalization for numerical stability
+
+    What this module does NOT do (separation of concerns):
+    - NO learned temporal attention (NLMs handle temporal integration)
+    - NO state-dependent gating (sync should be pure function of history)
+    - NO learned output projection (sync IS the representation, not input to one)
+    - NO tanh squashing (preserves correlation magnitude information)
 
     Input: (B, S, T, D) - post-activation history
-    Output: (B, S, sync_pairs) - sync features
+    Output: (B, S, sync_pairs) - sync features (raw correlation patterns)
     """
 
     def __init__(
@@ -405,45 +412,33 @@ class EnhancedSynchronizationModule(nn.Module):
         d_model: int,
         sync_pairs: int,
         n_heads: int = 8,
-        local_window: int = 3,
+        local_window: int = 3,  # Kept for config compat, but not used for learned gating
         dropout: float = 0.0,
-        order: int = 3,
+        order: int = 2,  # Default to 2 for covariance (second-order statistics)
     ):
         super().__init__()
         self.d_model = d_model
         self.sync_pairs = sync_pairs
         self.n_heads = n_heads
         self.head_dim = sync_pairs // n_heads
-        self.local_window = local_window
         self.order = order
 
         if order < 2:
-            raise ValueError("order must be >= 2 for higher-order synchronization")
+            raise ValueError("order must be >= 2 for correlation computation")
 
-        # Learned projections for higher-order interactions
-        # Sync = sum_t attention_t * Π_k proj_k(h_t)
+        # Learned projections define WHAT to correlate (not HOW to weight time)
+        # These learn which neuron combinations are meaningful to track
         self.projections = nn.ModuleList([
             nn.Linear(d_model, sync_pairs, bias=False)
             for _ in range(order)
         ])
-        self.proj_norms = nn.ModuleList([
-            OptimizedRMSNorm(sync_pairs) for _ in range(order)
-        ])
 
-        # Temporal attention: learn which time steps matter
-        # Query is learned per head, Key is projected from history
-        self.temporal_query = nn.Parameter(torch.randn(n_heads, self.head_dim) * 0.02)
-        self.temporal_key = nn.Linear(d_model, sync_pairs, bias=False)
+        # Simple exponential decay for temporal weighting (not learned per-sample)
+        # This gives recent states more weight, but uniformly across all inputs
+        self.decay_rate = nn.Parameter(torch.tensor(0.5))  # Learnable but global
 
-        # Multi-scale: blend local (recent) and global (full history) patterns
-        # Local captures recent dynamics, global captures stable patterns
-        self.scale_gate = nn.Sequential(
-            nn.Linear(d_model, n_heads * 2),
-            nn.Sigmoid()
-        )
-
-        # Output projection to blend heads
-        self.out_proj = nn.Linear(sync_pairs, sync_pairs, bias=False)
+        # Minimal output normalization for numerical stability only
+        # No learned projection - sync IS the representation
         self.norm = OptimizedRMSNorm(sync_pairs)
 
         self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
@@ -453,8 +448,6 @@ class EnhancedSynchronizationModule(nn.Module):
     def _init_weights(self):
         for proj in self.projections:
             nn.init.normal_(proj.weight, std=0.02)
-        nn.init.normal_(self.temporal_key.weight, std=0.02)
-        nn.init.normal_(self.out_proj.weight, std=0.02)
 
     def forward(self, history: torch.Tensor) -> torch.Tensor:
         """
@@ -462,153 +455,45 @@ class EnhancedSynchronizationModule(nn.Module):
             history: (B, S, T, D) post-activation history
 
         Returns:
-            (B, S, sync_pairs) synchronization values
+            (B, S, sync_pairs) synchronization values (raw correlations)
         """
         B, S, T, D = history.shape
-        H = self.n_heads
-        HD = self.head_dim
 
-        # Use float32 for stability
+        # Use float32 for numerical stability in correlation computation
         compute_dtype = self.projections[0].weight.dtype
         h = history.to(compute_dtype)
 
-        # Project history for higher-order interactions
-        # Each projection is normalized and squashed for numerical stability
+        # Project history to correlation spaces
+        # NO normalization or squashing - preserve the signal
         proj_terms = []
-        for proj, norm in zip(self.projections, self.proj_norms):
-            term = proj(h)
-            term = norm(term)
-            term = torch.tanh(term)
+        for proj in self.projections:
+            term = proj(h)  # (B, S, T, sync_pairs)
             proj_terms.append(term)
 
-        # Reshape to heads: (B, S, T, H, HD)
-        proj_terms = [term.view(B, S, T, H, HD) for term in proj_terms]
-
-        # Compute element-wise product across order
-        # (B, S, T, H, HD)
+        # Compute element-wise product (correlation measurement)
+        # For order=2: A * B captures covariance-like patterns
+        # For order=3: A * B * C captures higher-order coordination
         correlation = proj_terms[0]
         for term in proj_terms[1:]:
-            correlation = correlation * term
+            correlation = correlation * term  # (B, S, T, sync_pairs)
 
-        # Temporal attention: which time steps matter?
-        # Keys from history: (B, S, T, H, HD)
-        keys = self.temporal_key(h).view(B, S, T, H, HD)
+        # Simple exponential decay weighting (not learned per-sample)
+        # decay_weight[t] = exp(-decay_rate * (T - 1 - t))
+        # More recent = higher weight
+        decay_rate = F.softplus(self.decay_rate)  # Ensure positive
+        time_offsets = torch.arange(T, device=h.device, dtype=compute_dtype)
+        time_offsets = T - 1 - time_offsets  # [T-1, T-2, ..., 1, 0]
+        decay_weights = torch.exp(-decay_rate * time_offsets)  # (T,)
+        decay_weights = decay_weights / (decay_weights.sum() + 1e-8)  # Normalize
 
-        # Query is learned: (H, HD)
-        # Attention scores: (B, S, T, H)
-        attn_scores = torch.einsum('bsthd,hd->bsth', keys, self.temporal_query)
-        attn_scores = attn_scores / math.sqrt(HD)
+        # Weighted average over time: (B, S, T, sync_pairs) * (T,) -> (B, S, sync_pairs)
+        sync = torch.einsum('bstp,t->bsp', correlation, decay_weights)
 
-        # === Multi-scale: separate local and global attention ===
-
-        # Global attention over full history
-        global_attn = F.softmax(attn_scores, dim=2)  # (B, S, T, H)
-
-        # Local attention: only attend to recent window
-        local_mask = torch.zeros(T, device=h.device, dtype=torch.bool)
-        local_start = max(0, T - self.local_window)
-        local_mask[local_start:] = True
-
-        local_scores = attn_scores.clone()
-        local_scores[:, :, ~local_mask, :] = float('-inf')
-        local_attn = F.softmax(local_scores, dim=2)  # (B, S, T, H)
-
-        # Compute scale gate from most recent state
-        # (B, S, D) -> (B, S, H*2)
-        most_recent = h[:, :, -1, :]
-        scale_weights = self.scale_gate(most_recent)  # (B, S, H*2)
-        local_weight = scale_weights[..., :H]  # (B, S, H)
-        global_weight = scale_weights[..., H:]  # (B, S, H)
-
-        # Blend local and global attention
-        # (B, S, T, H)
-        blended_attn = local_weight.unsqueeze(2) * local_attn + global_weight.unsqueeze(2) * global_attn
-
-        # Apply attention to correlations
-        # (B, S, T, H, HD) * (B, S, T, H, 1) -> sum over T -> (B, S, H, HD)
-        sync_heads = (correlation * blended_attn.unsqueeze(-1)).sum(dim=2)
-
-        # Flatten heads: (B, S, sync_pairs)
-        sync = sync_heads.view(B, S, self.sync_pairs)
-
-        # Output projection and normalization
-        sync = self.out_proj(sync)
+        # Minimal normalization for stability (not a learned transformation)
         sync = self.norm(sync)
         sync = self.dropout(sync)
 
         return sync
-
-
-# --- Sync Prediction Head (Auxiliary Task) ---
-
-class SyncPredictionHead(nn.Module):
-    """
-    Predict the next sync state from the current sync state.
-
-    Used as an auxiliary training objective to encourage temporally
-    coherent synchronization patterns across ticks.
-    """
-
-    def __init__(self, sync_dim: int, hidden_dim: Optional[int] = None, dropout: float = 0.0):
-        super().__init__()
-        hidden_dim = hidden_dim or sync_dim
-
-        self.in_norm = OptimizedRMSNorm(sync_dim)
-        self.predictor = nn.Sequential(
-            nn.Linear(sync_dim, hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout) if dropout > 0 else nn.Identity(),
-            nn.Linear(hidden_dim, sync_dim),
-        )
-
-    def forward(
-        self,
-        all_syncs: List[torch.Tensor],
-        mask: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Args:
-            all_syncs: List[(B, S, sync_dim)] for each tick
-            mask: Optional (B, S) float mask for valid tokens
-
-        Returns:
-            loss: Scalar MSE loss across tick transitions
-            cosine: Scalar cosine similarity metric across transitions
-        """
-        if len(all_syncs) < 2:
-            device = all_syncs[0].device if all_syncs else None
-            zero = torch.tensor(0.0, device=device)
-            return zero, zero
-
-        losses = []
-        cosines = []
-
-        for t in range(len(all_syncs) - 1):
-            current = self.in_norm(all_syncs[t])
-            pred = self.predictor(current)
-            target = all_syncs[t + 1].detach()
-
-            pred_f = pred.float()
-            target_f = target.float()
-
-            per_pos_loss = F.mse_loss(pred_f, target_f, reduction="none").mean(dim=-1)
-            if mask is not None:
-                loss = (per_pos_loss * mask).sum() / (mask.sum() + 1e-8)
-            else:
-                loss = per_pos_loss.mean()
-            losses.append(loss)
-
-            with torch.no_grad():
-                cos = F.cosine_similarity(pred_f, target_f, dim=-1)
-                if mask is not None:
-                    cos = (cos * mask).sum() / (mask.sum() + 1e-8)
-                else:
-                    cos = cos.mean()
-            cosines.append(cos)
-
-        loss_out = torch.stack(losses).mean()
-        cosine_out = torch.stack(cosines).mean()
-        return loss_out, cosine_out
 
 
 # --- Synapse Model ---
@@ -1037,6 +922,13 @@ class CTMCore(nn.Module):
         num_ticks: Optional[int] = None,  # Override for adaptive compute
     ) -> Tuple[torch.Tensor, List[torch.Tensor], torch.Tensor, List[torch.Tensor]]:
         """
+        CTM forward pass with sync computed ONLY at tick boundaries.
+
+        CRITICAL: Sync is computed once per tick (after all layers), not mid-layer.
+        This maintains clean separation: layers process within a tick using
+        the sync from the PREVIOUS tick's end. Sync captures the state of
+        thinking at discrete time points, not continuously during processing.
+
         Returns:
             final_state: (B, S, D)
             all_states: List of (B, S, D) for each complete tick
@@ -1057,40 +949,46 @@ class CTMCore(nn.Module):
         # Indexed as: history_list[tick * n_layer + layer_idx]
         history_list: List[torch.Tensor] = []
 
+        # Sync from previous tick (used by all layers within current tick)
+        # This is the key fix: sync is computed once per tick, not per layer
+        prev_tick_sync = torch.zeros(B, S, self.global_sync.sync_pairs, device=device, dtype=dtype)
+
         for tick in range(num_ticks):
+            # All layers in this tick use the SAME sync (from previous tick boundary)
+            # This maintains separation: sync captures state at tick boundaries only
+            current_sync = prev_tick_sync
+
             for layer_idx, layer in enumerate(self.layers):
+                # Per-layer history for NLM (strided view of this layer's history across ticks)
                 if len(history_list) > 0:
-                    # Stack maintains gradient flow through time
                     global_hist = torch.stack(history_list, dim=2)  # (B, S, T, D)
-                    sync = self.global_sync(global_hist)
-                    # Per-layer history via strided view over global history
                     layer_history = global_hist[:, :, layer_idx::self.n_layer]
                 else:
-                    sync = torch.zeros(B, S, self.global_sync.sync_pairs, device=device, dtype=dtype)
                     layer_history = None
 
                 # Layer forward with per-layer NLM
+                # Uses current_sync (from previous tick boundary), not recomputed mid-layer
                 if self.use_gradient_checkpointing and self.training:
                     state, post_act = gradient_checkpoint(
                         layer.forward,
-                        state, sync, layer_history, static_k, static_v, cos, sin,
+                        state, current_sync, layer_history, static_k, static_v, cos, sin,
                         use_reentrant=False
                     )
                 else:
                     state, post_act = layer.forward(
-                        state, sync, layer_history, static_k, static_v, cos, sin
+                        state, current_sync, layer_history, static_k, static_v, cos, sin
                     )
 
                 # Append to history (preserves gradients)
                 history_list.append(post_act)
 
-            # Compute FINAL sync for this tick (after all layers processed)
+            # Compute sync ONLY at tick boundary (after all layers processed)
             # This is THE representation per the CTM paper
-            if len(history_list) > 0:
-                tick_global_hist = torch.stack(history_list, dim=2)
-                tick_sync = self.global_sync(tick_global_hist)
-            else:
-                tick_sync = torch.zeros(B, S, self.global_sync.sync_pairs, device=device, dtype=dtype)
+            tick_global_hist = torch.stack(history_list, dim=2)
+            tick_sync = self.global_sync(tick_global_hist)
+
+            # Store for next tick's layers to use
+            prev_tick_sync = tick_sync
 
             # Store state and sync at end of each tick
             all_states.append(state.clone())
@@ -1221,13 +1119,6 @@ class CTMLanguageModel(nn.Module):
         self.sync_norm = OptimizedRMSNorm(config.sync_pairs)
         self.sync_head = nn.Linear(config.sync_pairs, config.vocab_size, bias=False)
 
-        # Auxiliary sync prediction head (optional loss in training)
-        self.sync_predictor = SyncPredictionHead(
-            sync_dim=config.sync_pairs,
-            hidden_dim=config.sync_pred_hidden,
-            dropout=config.sync_pred_dropout,
-        )
-
         # RoPE cache
         self.head_dim = config.d_model // config.n_head
         self._init_rope()
@@ -1267,20 +1158,13 @@ class CTMLanguageModel(nn.Module):
         input_pos: Optional[torch.Tensor] = None,
         return_all_ticks: bool = False,
         num_ticks: Optional[int] = None,
-        return_syncs: bool = False,
-    ) -> Union[
-        Tuple[torch.Tensor, None],
-        Tuple[torch.Tensor, List[torch.Tensor]],
-        Tuple[torch.Tensor, None, List[torch.Tensor]],
-        Tuple[torch.Tensor, List[torch.Tensor], List[torch.Tensor]],
-    ]:
+    ) -> Union[Tuple[torch.Tensor, None], Tuple[torch.Tensor, List[torch.Tensor]]]:
         """
         Args:
             input_ids: (B, S) token IDs
             input_pos: (S,) position indices for RoPE
             return_all_ticks: If True, return logits for all ticks
             num_ticks: Override number of ticks (for adaptive compute)
-            return_syncs: If True, also return all per-tick syncs
 
         Returns:
             If return_all_ticks=False: (logits, None) where logits is (B, S, V)
@@ -1315,13 +1199,9 @@ class CTMLanguageModel(nn.Module):
                 logits = self.sync_head(self.sync_norm(sync))
                 all_logits.append(logits)
             final_logits = self.sync_head(self.sync_norm(final_sync))
-            if return_syncs:
-                return final_logits, all_logits, all_syncs
             return final_logits, all_logits
         else:
             logits = self.sync_head(self.sync_norm(final_sync))
-            if return_syncs:
-                return logits, None, all_syncs
             return logits, None
 
     @torch.no_grad()

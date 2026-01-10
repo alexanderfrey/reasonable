@@ -16,11 +16,16 @@ class CTMLoss(nn.Module):
     Loss computation with tick selection for CTM.
 
     Strategies:
-    - "min_loss": Select tick with minimum loss per position (train on best)
+    - "all": Average loss across all ticks (DEFAULT - most faithful to CTM paper)
+    - "min_loss": Select tick with minimum loss per position (can discourage exploration)
     - "max_certainty": Select tick with highest confidence
     - "weighted": Soft attention over ticks based on inverse loss
     - "last": Always use final tick (for warmup/debugging)
-    - "all": Average loss across all ticks (most stable for early training)
+
+    Per the CTM paper, the model should be allowed to develop rich dynamics across
+    ticks without being pressured to produce correct answers early. The "all"
+    strategy treats all ticks equally, allowing emergent behaviors to develop
+    naturally without explicit bias toward early stopping.
 
     The loss is computed per position across the sequence, respecting
     the autoregressive language modeling objective.
@@ -35,7 +40,7 @@ class CTMLoss(nn.Module):
         vocab_size: int,
         pad_token_id: int = -100,
         ignore_index: int = -100,
-        selection: str = "min_loss",
+        selection: str = "all",  # Changed from "min_loss" - more faithful to CTM
         tau: float = 1.0,
         label_smoothing: float = 0.0,
     ):
