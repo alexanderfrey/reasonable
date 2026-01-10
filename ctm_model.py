@@ -863,7 +863,7 @@ class CTMLayer(nn.Module):
 
         # 2. Cross-attention: get observation from data
         # Sync modulates WHERE to look, attention retrieves WHAT
-        obs = self.cross_attn(nlm_state, static_k, static_v, cos, sin, sync)
+        obs = self.cross_attn(self.norm_cross(nlm_state), static_k, static_v, cos, sin, sync)
 
         # 3. Synapse: integrate NLM-driven state with observation
         # NLM state + observation → combined understanding
