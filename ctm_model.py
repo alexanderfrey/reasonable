@@ -60,7 +60,6 @@ class CTMConfig:
 
     # Enhanced NLM parameters
     use_enhanced_nlm: bool = True   # Use enhanced NLM with temporal attention + gating
-    nlm_cross_channel_ratio: float = 0.25  # Ratio of d_model for cross-channel context
 
     # Training
     dropout: float = 0.0
@@ -173,18 +172,16 @@ class NeuronLevelModels(nn.Module):
 
 class EnhancedNeuronLevelModels(nn.Module):
     """
-    Enhanced NLM with temporal attention, cross-channel mixing, and gating.
+    Enhanced NLM with temporal attention and gating (faithful to CTM).
 
     Improvements over basic NLM:
     1. Temporal attention: Each neuron learns which past states matter most,
        dynamically weighting history entries instead of fixed MLP processing
-    2. Cross-channel context: Light mixing allows neurons to be informed by
-       neighbors while preserving per-neuron independence
-    3. GRU-style gating: Controls information flow, improving gradient
+    2. GRU-style gating: Controls information flow, improving gradient
        propagation and allowing learned "think more vs keep state" decisions
 
-    The core insight: neurons should be mostly independent (per CTM paper)
-    but can benefit from knowing what their neighbors are doing.
+    Faithful to CTM: Neurons remain INDEPENDENT - no cross-channel communication.
+    Neurons only "communicate" through sync (correlation patterns).
 
     Input: (B, S, T, D) - history of activations per neuron
     Output: (B, S, D) - updated state
@@ -196,15 +193,12 @@ class EnhancedNeuronLevelModels(nn.Module):
         nlm_hidden: int,
         nlm_depth: int,
         max_ticks: int,
-        n_groups: int = 8,
-        cross_channel_ratio: float = 0.25,
     ):
         super().__init__()
         self.d_model = d_model
         self.nlm_hidden = nlm_hidden
         self.nlm_depth = nlm_depth
         self.max_ticks = max_ticks
-        self.n_groups = n_groups
 
         # === 1. Temporal Attention ===
         # Each neuron has a learned query to attend over its history
@@ -237,15 +231,7 @@ class EnhancedNeuronLevelModels(nn.Module):
         self.w_out = nn.Parameter(torch.empty(d_model, nlm_hidden, 1))
         self.b_out = nn.Parameter(torch.zeros(d_model, 1))
 
-        # === 3. Cross-Channel Context ===
-        # Light mixing: each neuron sees a compressed view of all neurons
-        # Uses grouped structure for efficiency
-        cross_dim = int(d_model * cross_channel_ratio)
-        self.cross_compress = nn.Linear(d_model, cross_dim, bias=False)
-        self.cross_expand = nn.Linear(cross_dim, d_model, bias=False)
-        self.cross_gate = nn.Linear(d_model * 2, d_model, bias=False)
-
-        # === 4. GRU-style Gating ===
+        # === 3. GRU-style Gating ===
         # Controls how much NLM output affects the state
         # gate = sigmoid(W_z @ [nlm_out, most_recent])
         # output = gate * nlm_out + (1 - gate) * most_recent
@@ -261,9 +247,6 @@ class EnhancedNeuronLevelModels(nn.Module):
         nn.init.normal_(self.w_out, std=std)
         for w in self.w_hidden:
             nn.init.normal_(w, std=std)
-        nn.init.normal_(self.cross_compress.weight, std=std)
-        nn.init.normal_(self.cross_expand.weight, std=std)
-        nn.init.normal_(self.cross_gate.weight, std=std)
         # Initialize gate bias to -2 so gate starts near 0 (conservative updates)
         nn.init.zeros_(self.gate_proj.weight)
         nn.init.constant_(self.gate_proj.bias, -2.0)
@@ -317,19 +300,7 @@ class EnhancedNeuronLevelModels(nn.Module):
         nlm_out = torch.einsum('bsdh,dho->bsdo', h, self.w_out) + self.b_out
         nlm_out = nlm_out.squeeze(-1)  # (B, S, D)
 
-        # === 3. Cross-Channel Context ===
-        # Compress all neurons, then expand back
-        cross_context = self.cross_compress(nlm_out)  # (B, S, cross_dim)
-        cross_context = F.gelu(cross_context)
-        cross_context = self.cross_expand(cross_context)  # (B, S, D)
-
-        # Gate: decide how much cross-channel info to incorporate
-        cross_gate = torch.sigmoid(self.cross_gate(
-            torch.cat([nlm_out, cross_context], dim=-1)
-        ))
-        nlm_out = nlm_out + cross_gate * cross_context
-
-        # === 4. GRU-style Gating ===
+        # === 3. GRU-style Gating ===
         # Decide how much to update vs keep previous state
         gate_input = torch.cat([nlm_out, most_recent], dim=-1)
         update_gate = torch.sigmoid(self.gate_proj(gate_input))
@@ -830,7 +801,6 @@ class CTMLayer(nn.Module):
                 nlm_hidden=config.nlm_hidden,
                 nlm_depth=config.nlm_depth,
                 max_ticks=config.num_ticks,
-                cross_channel_ratio=config.nlm_cross_channel_ratio,
             )
         else:
             self.nlm = NeuronLevelModels(
