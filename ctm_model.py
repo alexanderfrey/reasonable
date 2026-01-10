@@ -58,6 +58,10 @@ class CTMConfig:
     sync_local_window: int = 3      # Window for local (recent) sync patterns
     use_enhanced_sync: bool = True  # Use enhanced sync vs original
 
+    # Enhanced NLM parameters
+    use_enhanced_nlm: bool = True   # Use enhanced NLM with temporal attention + gating
+    nlm_cross_channel_ratio: float = 0.25  # Ratio of d_model for cross-channel context
+
     # Training
     dropout: float = 0.0
     rope_theta: float = 500000.0
@@ -165,6 +169,175 @@ class NeuronLevelModels(nn.Module):
         out = torch.einsum('bsdh,dho->bsdo', h, self.w_out) + self.b_out
 
         return out.squeeze(-1)  # (B, S, D)
+
+
+class EnhancedNeuronLevelModels(nn.Module):
+    """
+    Enhanced NLM with temporal attention, cross-channel mixing, and gating.
+
+    Improvements over basic NLM:
+    1. Temporal attention: Each neuron learns which past states matter most,
+       dynamically weighting history entries instead of fixed MLP processing
+    2. Cross-channel context: Light mixing allows neurons to be informed by
+       neighbors while preserving per-neuron independence
+    3. GRU-style gating: Controls information flow, improving gradient
+       propagation and allowing learned "think more vs keep state" decisions
+
+    The core insight: neurons should be mostly independent (per CTM paper)
+    but can benefit from knowing what their neighbors are doing.
+
+    Input: (B, S, T, D) - history of activations per neuron
+    Output: (B, S, D) - updated state
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        nlm_hidden: int,
+        nlm_depth: int,
+        max_ticks: int,
+        n_groups: int = 8,
+        cross_channel_ratio: float = 0.25,
+    ):
+        super().__init__()
+        self.d_model = d_model
+        self.nlm_hidden = nlm_hidden
+        self.nlm_depth = nlm_depth
+        self.max_ticks = max_ticks
+        self.n_groups = n_groups
+
+        # === 1. Temporal Attention ===
+        # Each neuron has a learned query to attend over its history
+        # Query: (D, nlm_hidden) - one query vector per neuron
+        self.temporal_query = nn.Parameter(torch.randn(d_model, nlm_hidden) * 0.02)
+
+        # Project history to keys and values: (D, 1, nlm_hidden) per time step
+        # Using per-neuron projections for independence
+        self.temporal_k_proj = nn.Parameter(torch.empty(d_model, 1, nlm_hidden))
+        self.temporal_v_proj = nn.Parameter(torch.empty(d_model, 1, nlm_hidden))
+
+        # === 2. Per-Neuron MLP (processes attention output) ===
+        # After temporal attention aggregates history, MLP refines it
+        self.w_in = nn.Parameter(torch.empty(d_model, nlm_hidden, nlm_hidden))
+        self.b_in = nn.Parameter(torch.zeros(d_model, nlm_hidden))
+
+        if nlm_depth > 2:
+            self.w_hidden = nn.ParameterList([
+                nn.Parameter(torch.empty(d_model, nlm_hidden, nlm_hidden))
+                for _ in range(nlm_depth - 2)
+            ])
+            self.b_hidden = nn.ParameterList([
+                nn.Parameter(torch.zeros(d_model, nlm_hidden))
+                for _ in range(nlm_depth - 2)
+            ])
+        else:
+            self.w_hidden = nn.ParameterList()
+            self.b_hidden = nn.ParameterList()
+
+        self.w_out = nn.Parameter(torch.empty(d_model, nlm_hidden, 1))
+        self.b_out = nn.Parameter(torch.zeros(d_model, 1))
+
+        # === 3. Cross-Channel Context ===
+        # Light mixing: each neuron sees a compressed view of all neurons
+        # Uses grouped structure for efficiency
+        cross_dim = int(d_model * cross_channel_ratio)
+        self.cross_compress = nn.Linear(d_model, cross_dim, bias=False)
+        self.cross_expand = nn.Linear(cross_dim, d_model, bias=False)
+        self.cross_gate = nn.Linear(d_model * 2, d_model, bias=False)
+
+        # === 4. GRU-style Gating ===
+        # Controls how much NLM output affects the state
+        # gate = sigmoid(W_z @ [nlm_out, most_recent])
+        # output = gate * nlm_out + (1 - gate) * most_recent
+        self.gate_proj = nn.Linear(d_model * 2, d_model, bias=True)
+
+        self._init_weights()
+
+    def _init_weights(self):
+        std = 0.02
+        nn.init.normal_(self.temporal_k_proj, std=std)
+        nn.init.normal_(self.temporal_v_proj, std=std)
+        nn.init.normal_(self.w_in, std=std)
+        nn.init.normal_(self.w_out, std=std)
+        for w in self.w_hidden:
+            nn.init.normal_(w, std=std)
+        nn.init.normal_(self.cross_compress.weight, std=std)
+        nn.init.normal_(self.cross_expand.weight, std=std)
+        nn.init.normal_(self.cross_gate.weight, std=std)
+        # Initialize gate bias to -2 so gate starts near 0 (conservative updates)
+        nn.init.zeros_(self.gate_proj.weight)
+        nn.init.constant_(self.gate_proj.bias, -2.0)
+
+    def forward(self, history: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            history: (B, S, T, D) where T is current tick count
+
+        Returns:
+            (B, S, D) updated activations
+        """
+        B, S, T, D = history.shape
+        compute_dtype = self.temporal_query.dtype
+        h = history.to(compute_dtype)
+
+        # Most recent state (for gating)
+        most_recent = h[:, :, -1, :]  # (B, S, D)
+
+        # === 1. Temporal Attention ===
+        # Project history to keys and values per neuron
+        # h: (B, S, T, D) -> transpose to (B, S, D, T)
+        h_t = h.transpose(-1, -2)  # (B, S, D, T)
+
+        # Keys: (B, S, D, T) @ (D, 1, H) -> (B, S, D, T, H) via broadcasting
+        # We compute this as: for each neuron d, k[d] = h[d,:] @ k_proj[d]
+        keys = torch.einsum('bsdt,doh->bsdth', h_t, self.temporal_k_proj)  # (B, S, D, T, H)
+        values = torch.einsum('bsdt,doh->bsdth', h_t, self.temporal_v_proj)  # (B, S, D, T, H)
+
+        # Query: (D, H) broadcast to (B, S, D, H)
+        query = self.temporal_query.unsqueeze(0).unsqueeze(0)  # (1, 1, D, H)
+
+        # Attention scores: (B, S, D, H) @ (B, S, D, T, H).T -> (B, S, D, T)
+        attn_scores = torch.einsum('bsdh,bsdth->bsdt', query.expand(B, S, -1, -1), keys)
+        attn_scores = attn_scores / math.sqrt(self.nlm_hidden)
+
+        # Softmax over time dimension
+        attn_weights = F.softmax(attn_scores, dim=-1)  # (B, S, D, T)
+
+        # Weighted sum of values: (B, S, D, T) @ (B, S, D, T, H) -> (B, S, D, H)
+        attn_out = torch.einsum('bsdt,bsdth->bsdh', attn_weights, values)
+
+        # === 2. Per-Neuron MLP ===
+        h = torch.einsum('bsdh,dhk->bsdk', attn_out, self.w_in) + self.b_in
+        h = F.gelu(h)
+
+        for w, b in zip(self.w_hidden, self.b_hidden):
+            h = torch.einsum('bsdh,dhk->bsdk', h, w) + b
+            h = F.gelu(h)
+
+        nlm_out = torch.einsum('bsdh,dho->bsdo', h, self.w_out) + self.b_out
+        nlm_out = nlm_out.squeeze(-1)  # (B, S, D)
+
+        # === 3. Cross-Channel Context ===
+        # Compress all neurons, then expand back
+        cross_context = self.cross_compress(nlm_out)  # (B, S, cross_dim)
+        cross_context = F.gelu(cross_context)
+        cross_context = self.cross_expand(cross_context)  # (B, S, D)
+
+        # Gate: decide how much cross-channel info to incorporate
+        cross_gate = torch.sigmoid(self.cross_gate(
+            torch.cat([nlm_out, cross_context], dim=-1)
+        ))
+        nlm_out = nlm_out + cross_gate * cross_context
+
+        # === 4. GRU-style Gating ===
+        # Decide how much to update vs keep previous state
+        gate_input = torch.cat([nlm_out, most_recent], dim=-1)
+        update_gate = torch.sigmoid(self.gate_proj(gate_input))
+
+        # Blend NLM output with most recent state
+        output = update_gate * nlm_out + (1 - update_gate) * most_recent
+
+        return output
 
 
 # --- Synchronization Module ---
@@ -651,12 +824,21 @@ class CTMLayer(nn.Module):
 
         # Per-layer NLM: each layer has private temporal processors
         # Each layer only sees its own history across ticks (num_ticks entries)
-        self.nlm = NeuronLevelModels(
-            d_model=config.d_model,
-            nlm_hidden=config.nlm_hidden,
-            nlm_depth=config.nlm_depth,
-            max_ticks=config.num_ticks
-        )
+        if config.use_enhanced_nlm:
+            self.nlm = EnhancedNeuronLevelModels(
+                d_model=config.d_model,
+                nlm_hidden=config.nlm_hidden,
+                nlm_depth=config.nlm_depth,
+                max_ticks=config.num_ticks,
+                cross_channel_ratio=config.nlm_cross_channel_ratio,
+            )
+        else:
+            self.nlm = NeuronLevelModels(
+                d_model=config.d_model,
+                nlm_hidden=config.nlm_hidden,
+                nlm_depth=config.nlm_depth,
+                max_ticks=config.num_ticks
+            )
 
         # FFN
         self.ffn = OptimizedMLP(config.d_model, config.d_ff)
@@ -808,27 +990,21 @@ class CTMCore(nn.Module):
         all_states = []  # States at end of each full tick
         all_syncs = []   # Syncs at end of each full tick (for output/tick selection)
 
-        # History as list of tensors (preserves gradients for temporal credit assignment)
+        # History as list of tensors (preserves gradients through time)
         # Each entry is (B, S, D) post-activation from a layer-tick step
         # Indexed as: history_list[tick * n_layer + layer_idx]
         history_list: List[torch.Tensor] = []
 
         for tick in range(num_ticks):
             for layer_idx, layer in enumerate(self.layers):
-                # Build GLOBAL history by stacking (for sync computation)
                 if len(history_list) > 0:
                     # Stack maintains gradient flow through time
                     global_hist = torch.stack(history_list, dim=2)  # (B, S, T, D)
                     sync = self.global_sync(global_hist)
+                    # Per-layer history via strided view over global history
+                    layer_history = global_hist[:, :, layer_idx::self.n_layer]
                 else:
                     sync = torch.zeros(B, S, self.global_sync.sync_pairs, device=device, dtype=dtype)
-
-                # Build PER-LAYER history for this layer's NLM
-                # Layer L's entries are at indices: [L, n_layer+L, 2*n_layer+L, ...]
-                if tick > 0:
-                    layer_entries = [history_list[t * self.n_layer + layer_idx] for t in range(tick)]
-                    layer_history = torch.stack(layer_entries, dim=2)  # (B, S, tick, D)
-                else:
                     layer_history = None
 
                 # Layer forward with per-layer NLM
@@ -848,8 +1024,11 @@ class CTMCore(nn.Module):
 
             # Compute FINAL sync for this tick (after all layers processed)
             # This is THE representation per the CTM paper
-            tick_global_hist = torch.stack(history_list, dim=2)
-            tick_sync = self.global_sync(tick_global_hist)
+            if len(history_list) > 0:
+                tick_global_hist = torch.stack(history_list, dim=2)
+                tick_sync = self.global_sync(tick_global_hist)
+            else:
+                tick_sync = torch.zeros(B, S, self.global_sync.sync_pairs, device=device, dtype=dtype)
 
             # Store state and sync at end of each tick
             all_states.append(state.clone())
