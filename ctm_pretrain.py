@@ -769,6 +769,60 @@ def log_nlm_diagnostics(
             log_data["nlm/neuron_trajectories"] = wandb.Image(fig)
             plt.close(fig)
 
+            # 7. Tick-to-tick DELTAS: shows the change between ticks
+            # This reveals dynamics even when absolute values are similar
+            if num_ticks > 1:
+                # Compute deltas: (num_ticks-1, n_layer, D)
+                deltas = np.diff(layer_post_acts, axis=0)
+
+                fig, axes = plt.subplots(n_rows, n_cols, figsize=(6 * n_cols, 4 * n_rows),
+                                         sharex=True)
+                axes = np.atleast_2d(axes)
+
+                for layer_idx in range(n_layer):
+                    row, col = layer_idx // n_cols, layer_idx % n_cols
+                    ax = axes[row, col]
+
+                    # Sort neurons by delta variance (most changing first)
+                    layer_deltas = deltas[:, layer_idx, :]  # (num_ticks-1, D)
+                    delta_var = layer_deltas.var(axis=0)
+                    sorted_idx = np.argsort(delta_var)[::-1]
+
+                    # Plot top 30 most changing neurons
+                    n_show = min(30, D)
+                    delta_ticks = np.arange(num_ticks - 1) + 0.5  # Centered between ticks
+
+                    for i in range(n_show):
+                        neuron_idx = sorted_idx[i]
+                        trajectory = layer_deltas[:, neuron_idx]
+                        alpha = 0.8 - (i / n_show) * 0.5  # Fade out less dynamic ones
+                        ax.plot(delta_ticks, trajectory, alpha=alpha, linewidth=1.5,
+                               marker='o', markersize=4)
+
+                    ax.set_title(f'Layer {layer_idx}', fontsize=11, fontweight='bold')
+                    ax.set_xlabel('Tick transition')
+                    ax.set_ylabel('Δ Activation')
+                    ax.set_xticks(delta_ticks)
+                    ax.set_xticklabels([f'{i}→{i+1}' for i in range(num_ticks - 1)])
+                    ax.axhline(y=0, color='gray', linestyle='--', linewidth=1)
+                    ax.grid(True, alpha=0.3)
+
+                # Hide empty subplots
+                for idx in range(n_layer, n_rows * n_cols):
+                    row, col = idx // n_cols, idx % n_cols
+                    axes[row, col].set_visible(False)
+
+                plt.suptitle(f'Tick-to-Tick Changes (Δ) @ Step {global_step}\n(How much neurons change between ticks)', fontsize=12)
+                plt.tight_layout()
+                log_data["nlm/tick_deltas"] = wandb.Image(fig)
+                plt.close(fig)
+
+                # Log delta statistics
+                mean_abs_delta = np.abs(deltas).mean()
+                max_abs_delta = np.abs(deltas).max()
+                log_data["nlm/mean_abs_delta"] = float(mean_abs_delta)
+                log_data["nlm/max_abs_delta"] = float(max_abs_delta)
+
         # === NLM INTERNAL DIAGNOSTICS (from last tick) ===
         if 'gate_mean' in diagnostics:
             gate_mean = diagnostics['gate_mean'].mean(dim=0).numpy()  # (D,)
