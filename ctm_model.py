@@ -316,13 +316,21 @@ class EnhancedNeuronLevelModels(nn.Module):
             gate_bias_variation = gate_bias_variation[torch.randperm(self.d_model)]
             self.b_gate.add_(gate_bias_variation)
 
-    def forward(self, history: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, history: torch.Tensor, return_diagnostics: bool = False
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, Dict[str, torch.Tensor]]]:
         """
         Args:
             history: (B, S, T, D) where T is current tick count
+            return_diagnostics: If True, return dict with attention weights and gate values
 
         Returns:
-            (B, S, D) updated activations
+            output: (B, S, D) updated activations
+            diagnostics (optional): Dict with:
+                - 'attn_weights': (B, S, D, T) temporal attention per neuron
+                - 'gate_values': (B, S, D) update gate per neuron
+                - 'attn_entropy': (D,) entropy of attention distribution per neuron
+                - 'gate_mean': (D,) mean gate value per neuron
         """
         B, S, T, D = history.shape
         compute_dtype = self.temporal_query.dtype
@@ -375,6 +383,30 @@ class EnhancedNeuronLevelModels(nn.Module):
 
         # Blend NLM output with most recent state (per neuron, independently)
         output = update_gate * nlm_out + (1 - update_gate) * most_recent
+
+        if return_diagnostics:
+            with torch.no_grad():
+                # Compute attention entropy per neuron (averaged over batch and sequence)
+                # High entropy = uniform attention (integrator), low entropy = focused (selective)
+                attn_entropy = -(attn_weights * (attn_weights + 1e-8).log()).sum(dim=-1)  # (B, S, D)
+                attn_entropy = attn_entropy.mean(dim=(0, 1))  # (D,)
+
+                # Mean gate value per neuron (averaged over batch and sequence)
+                # High = responsive (uses NLM output), low = sticky (keeps previous)
+                gate_mean = update_gate.mean(dim=(0, 1))  # (D,)
+
+                # Average attention weights per neuron (shows temporal focus)
+                # (B, S, D, T) -> (D, T)
+                attn_mean = attn_weights.mean(dim=(0, 1))
+
+                diagnostics = {
+                    'attn_weights': attn_weights.detach(),  # (B, S, D, T)
+                    'gate_values': update_gate.detach(),     # (B, S, D)
+                    'attn_entropy': attn_entropy,            # (D,)
+                    'gate_mean': gate_mean,                  # (D,)
+                    'attn_mean': attn_mean,                  # (D, T)
+                }
+            return output, diagnostics
 
         return output
 
@@ -1304,3 +1336,118 @@ class CTMLanguageModel(nn.Module):
             generated = torch.cat([generated, next_token], dim=1)
 
         return generated
+
+    @torch.no_grad()
+    def get_nlm_diagnostics(
+        self,
+        input_ids: torch.Tensor,
+        num_ticks: Optional[int] = None,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Run a forward pass and collect NLM diagnostics for visualization.
+
+        Returns diagnostics aggregated across all layers:
+            - 'attn_entropy': (n_layer, D) - temporal attention entropy per neuron
+            - 'gate_mean': (n_layer, D) - mean gate value per neuron
+            - 'attn_mean': (n_layer, D, T) - average attention pattern per neuron
+            - 'attn_focus': (n_layer, D) - "center of mass" of attention (low=recent, high=old)
+        """
+        self.eval()
+        B, S = input_ids.shape
+        device = input_ids.device
+        num_ticks = num_ticks or self.config.num_ticks
+
+        # Get RoPE
+        input_pos = torch.arange(S, device=device)
+        cos = self.cos_cached[input_pos]
+        sin = self.sin_cached[input_pos]
+
+        # Embed and encode
+        x = self.token_embedding(input_ids)
+        encoded, static_k, static_v = self.input_encoder(x, cos, sin)
+
+        # Run CTM core manually to collect diagnostics
+        state = encoded
+        history_list: List[torch.Tensor] = []
+        prev_tick_sync = torch.zeros(
+            B, S, self.config.sync_pairs, device=device, dtype=encoded.dtype
+        )
+
+        # Collect diagnostics per layer
+        all_attn_entropy = []
+        all_gate_mean = []
+        all_attn_mean = []
+
+        for tick in range(num_ticks):
+            current_sync = prev_tick_sync
+
+            for layer_idx, layer in enumerate(self.ctm_core.layers):
+                # Get layer history
+                if len(history_list) > 0:
+                    global_hist = torch.stack(history_list, dim=2)
+                    layer_history = global_hist[:, :, layer_idx::self.config.n_layer]
+                else:
+                    layer_history = None
+
+                # Run layer (simplified - just need NLM diagnostics)
+                # We need to run the layer's NLM with diagnostics
+                if layer_history is not None and layer_history.size(2) > 0:
+                    _, nlm_diag = layer.nlm(layer_history, return_diagnostics=True)
+
+                    # Only collect on last tick (most representative)
+                    if tick == num_ticks - 1:
+                        if layer_idx >= len(all_attn_entropy):
+                            all_attn_entropy.append(nlm_diag['attn_entropy'])
+                            all_gate_mean.append(nlm_diag['gate_mean'])
+                            all_attn_mean.append(nlm_diag['attn_mean'])
+                        else:
+                            # Update with latest
+                            all_attn_entropy[layer_idx] = nlm_diag['attn_entropy']
+                            all_gate_mean[layer_idx] = nlm_diag['gate_mean']
+                            all_attn_mean[layer_idx] = nlm_diag['attn_mean']
+
+                # Run full layer forward for state update
+                state, post_act = layer.forward(
+                    state, current_sync, layer_history, static_k, static_v, cos, sin
+                )
+                history_list.append(post_act)
+
+            # Update sync at tick boundary
+            tick_global_hist = torch.stack(history_list, dim=2)
+            prev_tick_sync = self.ctm_core.global_sync(tick_global_hist)
+
+        # Stack across layers
+        if all_attn_entropy:
+            attn_entropy = torch.stack(all_attn_entropy, dim=0)  # (n_layer, D)
+            gate_mean = torch.stack(all_gate_mean, dim=0)        # (n_layer, D)
+
+            # Compute attention focus (center of mass)
+            # Low value = attends to recent, high value = attends to old
+            attn_focus_list = []
+            for attn in all_attn_mean:
+                T = attn.size(-1)
+                time_indices = torch.arange(T, device=device, dtype=attn.dtype)
+                # Reverse so 0 = most recent, T-1 = oldest
+                time_indices = T - 1 - time_indices
+                focus = (attn * time_indices).sum(dim=-1)  # (D,)
+                attn_focus_list.append(focus)
+            attn_focus = torch.stack(attn_focus_list, dim=0)  # (n_layer, D)
+
+            # Pad attn_mean to same T across layers
+            max_T = max(a.size(-1) for a in all_attn_mean)
+            padded_attn = []
+            for attn in all_attn_mean:
+                if attn.size(-1) < max_T:
+                    pad = torch.zeros(attn.size(0), max_T - attn.size(-1), device=device)
+                    attn = torch.cat([pad, attn], dim=-1)
+                padded_attn.append(attn)
+            attn_mean = torch.stack(padded_attn, dim=0)  # (n_layer, D, T)
+
+            return {
+                'attn_entropy': attn_entropy,  # (n_layer, D)
+                'gate_mean': gate_mean,        # (n_layer, D)
+                'attn_mean': attn_mean,        # (n_layer, D, T)
+                'attn_focus': attn_focus,      # (n_layer, D)
+            }
+
+        return {}

@@ -407,6 +407,121 @@ def run_debug_generation(
             model.train()
 
 
+def log_nlm_diagnostics(
+    args: Namespace,
+    model: nn.Module,
+    batch: Dict[str, torch.Tensor],
+    device: torch.device,
+    global_step: int,
+):
+    """
+    Log NLM oscillation patterns to wandb.
+
+    Visualizations:
+    1. Gate value distribution - shows which neurons are sticky vs responsive
+    2. Attention focus distribution - shows which neurons attend to recent vs old history
+    3. Attention entropy distribution - shows which neurons are selective vs integrators
+    4. Heatmap of attention patterns across neurons and time
+    """
+    if getattr(args, "disable_wandb", False) or not wandb.run:
+        return
+
+    base_model = unwrap_model(model)
+    if not hasattr(base_model, "get_nlm_diagnostics"):
+        return
+
+    try:
+        input_ids = batch["input_ids"].to(device, non_blocking=True)
+        # Use a small subset to avoid slowdown
+        input_ids = input_ids[:2, :64]  # 2 samples, 64 tokens max
+
+        diagnostics = base_model.get_nlm_diagnostics(input_ids)
+        if not diagnostics:
+            return
+
+        log_data = {}
+
+        # 1. Gate value histogram (averaged across layers)
+        gate_mean = diagnostics['gate_mean'].mean(dim=0).cpu().numpy()  # (D,)
+        log_data["nlm/gate_value_hist"] = wandb.Histogram(gate_mean)
+        log_data["nlm/gate_mean"] = float(gate_mean.mean())
+        log_data["nlm/gate_std"] = float(gate_mean.std())
+
+        # 2. Attention focus histogram (averaged across layers)
+        # Low = attends to recent (high freq), High = attends to old (low freq)
+        attn_focus = diagnostics['attn_focus'].mean(dim=0).cpu().numpy()  # (D,)
+        log_data["nlm/attn_focus_hist"] = wandb.Histogram(attn_focus)
+        log_data["nlm/attn_focus_mean"] = float(attn_focus.mean())
+        log_data["nlm/attn_focus_std"] = float(attn_focus.std())
+
+        # 3. Attention entropy histogram (averaged across layers)
+        # Low = selective (focused), High = integrator (uniform)
+        attn_entropy = diagnostics['attn_entropy'].mean(dim=0).cpu().numpy()  # (D,)
+        log_data["nlm/attn_entropy_hist"] = wandb.Histogram(attn_entropy)
+        log_data["nlm/attn_entropy_mean"] = float(attn_entropy.mean())
+        log_data["nlm/attn_entropy_std"] = float(attn_entropy.std())
+
+        # 4. Heatmap: attention patterns for a subset of neurons
+        # attn_mean: (n_layer, D, T) - take layer 0, sample neurons
+        attn_mean = diagnostics['attn_mean']
+        if attn_mean.numel() > 0:
+            # Take first layer, sample 64 neurons evenly spaced
+            layer0_attn = attn_mean[0].cpu().numpy()  # (D, T)
+            D, T = layer0_attn.shape
+            neuron_indices = np.linspace(0, D - 1, min(64, D), dtype=int)
+            sampled_attn = layer0_attn[neuron_indices, :]  # (64, T)
+
+            # Create heatmap image
+            import matplotlib
+            matplotlib.use('Agg')
+            import matplotlib.pyplot as plt
+
+            fig, ax = plt.subplots(figsize=(10, 6))
+            im = ax.imshow(sampled_attn, aspect='auto', cmap='viridis',
+                          origin='lower', interpolation='nearest')
+            ax.set_xlabel('Time step (0=oldest, T-1=most recent)')
+            ax.set_ylabel('Neuron (sampled)')
+            ax.set_title(f'NLM Temporal Attention Patterns @ Step {global_step}')
+            plt.colorbar(im, ax=ax, label='Attention weight')
+            plt.tight_layout()
+
+            log_data["nlm/attention_heatmap"] = wandb.Image(fig)
+            plt.close(fig)
+
+            # 5. "Frequency spectrum" visualization
+            # Sort neurons by attention focus (low to high = fast to slow)
+            sorted_indices = np.argsort(attn_focus)
+            fast_neurons = sorted_indices[:16]  # 16 fastest (attend to recent)
+            slow_neurons = sorted_indices[-16:]  # 16 slowest (attend to old)
+
+            fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+
+            # Fast neurons (high frequency - attend to recent)
+            for i, idx in enumerate(fast_neurons[:8]):
+                axes[0].plot(layer0_attn[idx], alpha=0.7, label=f'n{idx}')
+            axes[0].set_title('Fast Neurons (attend to recent)')
+            axes[0].set_xlabel('Time step')
+            axes[0].set_ylabel('Attention')
+            axes[0].legend(fontsize=6, ncol=2)
+
+            # Slow neurons (low frequency - attend to old)
+            for i, idx in enumerate(slow_neurons[:8]):
+                axes[1].plot(layer0_attn[idx], alpha=0.7, label=f'n{idx}')
+            axes[1].set_title('Slow Neurons (attend to old)')
+            axes[1].set_xlabel('Time step')
+            axes[1].set_ylabel('Attention')
+            axes[1].legend(fontsize=6, ncol=2)
+
+            plt.tight_layout()
+            log_data["nlm/frequency_spectrum"] = wandb.Image(fig)
+            plt.close(fig)
+
+        wandb.log(log_data, step=global_step)
+
+    except Exception as e:
+        logger.warning(f"Error logging NLM diagnostics: {e}")
+
+
 def _build_tick_palette(num_ticks: int) -> np.ndarray:
     base_palette = [
         (31, 119, 180),
@@ -750,6 +865,16 @@ def train(args: Namespace):
                         args, model, tokenizer, device, use_amp, use_bf16, global_step
                     )
 
+                # --- NLM Diagnostics ---
+                nlm_diag_interval = getattr(args, "nlm_diagnostics_interval", 500)
+                if (
+                    args.is_main_process
+                    and nlm_diag_interval > 0
+                    and global_step % nlm_diag_interval == 0
+                    and global_step > 0
+                ):
+                    log_nlm_diagnostics(args, model, batch, device, global_step)
+
                 # --- Evaluation ---
                 if args.eval_interval > 0 and global_step % args.eval_interval == 0 and eval_dataloader:
                     eval_loss, eval_ppl, eval_metrics = ctm_evaluate(
@@ -896,6 +1021,8 @@ def main():
                         help="Log selected tick heatmap every N steps (0 to disable).")
     parser.add_argument("--tick_heatmap_max_tokens", type=int, default=256,
                         help="Max token positions to include in tick heatmap (0 = no limit).")
+    parser.add_argument("--nlm_diagnostics_interval", type=int, default=500,
+                        help="Log NLM oscillation patterns every N steps (0 to disable)")
     parser.add_argument("--num_workers", type=int, default=4, help="DataLoader workers")
     parser.add_argument("--debug_generate_interval", type=int, default=100,
                         help="Run debug generation every N steps (0 to disable)")
