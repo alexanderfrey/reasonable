@@ -431,30 +431,38 @@ def log_nlm_diagnostics(
         return
 
     try:
-        input_ids = batch["input_ids"].to(device, non_blocking=True)
-        # Use a small subset to avoid slowdown
-        input_ids = input_ids[:2, :64]  # 2 samples, 64 tokens max
+        # Use a very small subset to minimize memory usage
+        input_ids = batch["input_ids"][:1, :32].to(device)  # 1 sample, 32 tokens
 
         diagnostics = base_model.get_nlm_diagnostics(input_ids)
+
+        # Immediately free GPU memory
+        del input_ids
+        torch.cuda.empty_cache()
+
         if not diagnostics:
             return
 
+        # Move all tensors to CPU immediately to free GPU memory
+        diagnostics = {k: v.cpu() for k, v in diagnostics.items()}
+
         log_data = {}
 
-        def safe_histogram(data, num_bins=32):
+        def safe_histogram(data, num_bins=16):
             """Create histogram, handling edge cases where data has no variance."""
-            data = np.asarray(data).flatten()
-            if len(data) == 0:
+            try:
+                data = np.asarray(data).flatten()
+                if len(data) == 0:
+                    return None
+                # Just log scalar stats if variance is too low
+                if data.std() < 1e-6:
+                    return None
+                return wandb.Histogram(data, num_bins=num_bins)
+            except Exception:
                 return None
-            # Check if data has sufficient variance for binning
-            data_range = data.max() - data.min()
-            if data_range < 1e-8:
-                # All values are essentially the same - add tiny noise for binning
-                data = data + np.random.normal(0, 1e-6, data.shape)
-            return wandb.Histogram(data, num_bins=num_bins)
 
         # 1. Gate value histogram (averaged across layers)
-        gate_mean = diagnostics['gate_mean'].mean(dim=0).cpu().numpy()  # (D,)
+        gate_mean = diagnostics['gate_mean'].mean(dim=0).numpy()  # (D,) - already on CPU
         hist = safe_histogram(gate_mean)
         if hist:
             log_data["nlm/gate_value_hist"] = hist
@@ -463,7 +471,7 @@ def log_nlm_diagnostics(
 
         # 2. Attention focus histogram (averaged across layers)
         # Low = attends to recent (high freq), High = attends to old (low freq)
-        attn_focus = diagnostics['attn_focus'].mean(dim=0).cpu().numpy()  # (D,)
+        attn_focus = diagnostics['attn_focus'].mean(dim=0).numpy()  # (D,) - already on CPU
         hist = safe_histogram(attn_focus)
         if hist:
             log_data["nlm/attn_focus_hist"] = hist
@@ -472,7 +480,7 @@ def log_nlm_diagnostics(
 
         # 3. Attention entropy histogram (averaged across layers)
         # Low = selective (focused), High = integrator (uniform)
-        attn_entropy = diagnostics['attn_entropy'].mean(dim=0).cpu().numpy()  # (D,)
+        attn_entropy = diagnostics['attn_entropy'].mean(dim=0).numpy()  # (D,) - already on CPU
         hist = safe_histogram(attn_entropy)
         if hist:
             log_data["nlm/attn_entropy_hist"] = hist
@@ -484,7 +492,7 @@ def log_nlm_diagnostics(
         attn_mean = diagnostics['attn_mean']
         if attn_mean.numel() > 0:
             # Take first layer, sample 64 neurons evenly spaced
-            layer0_attn = attn_mean[0].cpu().numpy()  # (D, T)
+            layer0_attn = attn_mean[0].numpy()  # (D, T) - already on CPU
             D, T = layer0_attn.shape
             neuron_indices = np.linspace(0, D - 1, min(64, D), dtype=int)
             sampled_attn = layer0_attn[neuron_indices, :]  # (64, T)
@@ -536,8 +544,16 @@ def log_nlm_diagnostics(
 
         wandb.log(log_data, step=global_step)
 
+        # Clean up to free memory
+        del diagnostics, log_data
+        import gc
+        gc.collect()
+
     except Exception as e:
         logger.warning(f"Error logging NLM diagnostics: {e}")
+    finally:
+        # Always try to free GPU memory after diagnostics
+        torch.cuda.empty_cache()
 
 
 def _build_tick_palette(num_ticks: int) -> np.ndarray:
