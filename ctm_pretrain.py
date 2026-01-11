@@ -410,18 +410,18 @@ def run_debug_generation(
 def log_nlm_diagnostics(
     args: Namespace,
     model: nn.Module,
-    batch: Dict[str, torch.Tensor],
+    batch: Optional[Dict[str, torch.Tensor]],  # Not used, kept for API compatibility
     device: torch.device,
     global_step: int,
 ):
     """
-    Log NLM oscillation patterns to wandb.
+    Log NLM tick-level dynamics to wandb.
 
     Visualizations:
-    1. Gate value distribution - shows which neurons are sticky vs responsive
-    2. Attention focus distribution - shows which neurons attend to recent vs old history
-    3. Attention entropy distribution - shows which neurons are selective vs integrators
-    4. Heatmap of attention patterns across neurons and time
+    1. Neuron activation trajectories across ticks
+    2. FFT frequency spectrum over tick dimension
+    3. Sync evolution across ticks
+    4. Gate/entropy distributions (NLM internals)
     """
     if getattr(args, "disable_wandb", False) or not wandb.run:
         return
@@ -430,9 +430,17 @@ def log_nlm_diagnostics(
     if not hasattr(base_model, "get_nlm_diagnostics"):
         return
 
+    # Clear memory BEFORE running diagnostics to avoid doubling
+    torch.cuda.empty_cache()
+    import gc
+    gc.collect()
+
     try:
-        # Use a very small subset to minimize memory usage
-        input_ids = batch["input_ids"][:1, :32].to(device)  # 1 sample, 32 tokens
+        # Generate a fresh random input instead of using training batch
+        # This avoids holding references to the training batch
+        vocab_size = base_model.config.vocab_size
+        seq_len = 32  # Short sequence for diagnostics
+        input_ids = torch.randint(0, vocab_size, (1, seq_len), device=device)
 
         diagnostics = base_model.get_nlm_diagnostics(input_ids)
 
@@ -978,7 +986,9 @@ def train(args: Namespace):
                     and global_step % nlm_diag_interval == 0
                     and global_step > 0
                 ):
-                    log_nlm_diagnostics(args, model, batch, device, global_step)
+                    # Release batch memory before running diagnostics
+                    del batch
+                    log_nlm_diagnostics(args, model, None, device, global_step)
 
                 # --- Evaluation ---
                 if args.eval_interval > 0 and global_step % args.eval_interval == 0 and eval_dataloader:
