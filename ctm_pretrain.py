@@ -410,13 +410,13 @@ def log_nlm_diagnostics(
     global_step: int,
 ):
     """
-    Log NLM tick-level dynamics to wandb.
+    Log NLM tick-level dynamics to wandb for CTM v2.
 
     Visualizations:
-    1. Neuron activation trajectories across ticks
-    2. FFT frequency spectrum over tick dimension
+    1. Post-activation (z) trajectories across ticks - shows neuron oscillation
+    2. Pre-activation (a) trajectories across ticks
     3. Sync evolution across ticks
-    4. Gate/entropy distributions (NLM internals)
+    4. FFT frequency spectrum - which neurons oscillate fast vs slow
     """
     if getattr(args, "disable_wandb", False) or not wandb.run:
         return
@@ -425,442 +425,236 @@ def log_nlm_diagnostics(
     if not hasattr(base_model, "get_nlm_diagnostics"):
         return
 
-    # Clear memory BEFORE running diagnostics to avoid doubling
     torch.cuda.empty_cache()
     import gc
     gc.collect()
 
     try:
-        # Generate a fresh random input instead of using training batch
-        # This avoids holding references to the training batch
+        # Generate random input for diagnostics
         vocab_size = base_model.config.vocab_size
-        seq_len = 32  # Short sequence for diagnostics
+        seq_len = 32
         input_ids = torch.randint(0, vocab_size, (1, seq_len), device=device)
 
         diagnostics = base_model.get_nlm_diagnostics(input_ids)
 
-        # Immediately free GPU memory
         del input_ids
         torch.cuda.empty_cache()
 
         if not diagnostics:
             return
 
-        # Move all tensors to CPU immediately to free GPU memory
-        diagnostics = {k: v.cpu() for k, v in diagnostics.items()}
+        # Move to CPU
+        diagnostics = {k: v.cpu() if torch.is_tensor(v) else v for k, v in diagnostics.items()}
 
         log_data = {}
-
-        def safe_histogram(data, num_bins=16):
-            """Create histogram, handling edge cases where data has no variance."""
-            try:
-                data = np.asarray(data).flatten()
-                if len(data) == 0:
-                    return None
-                # Just log scalar stats if variance is too low
-                if data.std() < 1e-6:
-                    return None
-                return wandb.Histogram(data, num_bins=num_bins)
-            except Exception:
-                return None
 
         import matplotlib
         matplotlib.use('Agg')
         import matplotlib.pyplot as plt
 
-        # === TICK-LEVEL DYNAMICS (the correct frame for CTM) ===
-        # tick_activations: (num_ticks, D) - neuron activations at each tick boundary
-        tick_activations = diagnostics['tick_activations'].numpy()  # (num_ticks, D)
-        tick_sync = diagnostics['tick_sync'].numpy()  # (num_ticks, sync_pairs)
-        num_ticks, D = tick_activations.shape
+        # Get data
+        z_act = diagnostics['z_activations'].numpy()  # (num_ticks+1, D)
+        a_act = diagnostics['a_activations'].numpy()  # (num_ticks, D)
+        sync_vals = diagnostics['sync_values'].numpy()  # (num_ticks, sync_pairs)
+        num_ticks = diagnostics['num_ticks'].item()
+        D = z_act.shape[1]
 
-        # 1. Neuron activation trajectories across ticks
-        # This shows how each neuron's output evolves during "thinking"
-        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+        # ============================================================
+        # 1. POST-ACTIVATION (z) NEURON TRAJECTORIES - THE MAIN PLOT
+        # ============================================================
+        fig, axes = plt.subplots(2, 2, figsize=(16, 12))
 
-        # Top-left: Heatmap of ALL neurons across ticks (sorted by variance = "activity")
-        neuron_variance = tick_activations.var(axis=0)  # (D,) - how much each neuron changes
-        sorted_by_variance = np.argsort(neuron_variance)[::-1]  # Most active first
-        sorted_activations = tick_activations[:, sorted_by_variance].T  # (D, num_ticks)
+        # Top-left: Heatmap of ALL neurons across ticks
+        neuron_variance = z_act.var(axis=0)
+        sorted_idx = np.argsort(neuron_variance)[::-1]
+        sorted_z = z_act[:, sorted_idx].T  # (D, num_ticks+1)
 
-        im = axes[0, 0].imshow(sorted_activations, aspect='auto', cmap='RdBu_r',
+        im = axes[0, 0].imshow(sorted_z, aspect='auto', cmap='RdBu_r',
                                origin='upper', interpolation='nearest')
         axes[0, 0].set_xlabel('Tick')
-        axes[0, 0].set_ylabel('Neuron (sorted by variance: active→stable)')
-        axes[0, 0].set_title(f'Neuron Activations Across Ticks @ Step {global_step}')
-        axes[0, 0].set_xticks(range(num_ticks))
+        axes[0, 0].set_ylabel('Neuron (sorted by variance)')
+        axes[0, 0].set_title(f'z (post-activations) @ Step {global_step}')
+        axes[0, 0].set_xticks(range(num_ticks + 1))
         plt.colorbar(im, ax=axes[0, 0], label='Activation')
 
-        # Top-right: Distribution of neuron variance (activity levels)
-        hist = axes[0, 1].hist(neuron_variance, bins=32, alpha=0.7, color='steelblue')
-        axes[0, 1].set_xlabel('Variance across ticks')
-        axes[0, 1].set_ylabel('Count')
-        axes[0, 1].set_title('Neuron Activity Distribution')
-        axes[0, 1].axvline(x=np.median(neuron_variance), color='red', linestyle='--',
-                          label=f'Median: {np.median(neuron_variance):.4f}')
-        axes[0, 1].legend()
+        # Top-right: Individual neuron trajectories (top 20 most dynamic)
+        top_neurons = sorted_idx[:20]
+        ticks = np.arange(num_ticks + 1)
+        colors = plt.cm.viridis(np.linspace(0, 1, len(top_neurons)))
+        for i, n_idx in enumerate(top_neurons):
+            axes[0, 1].plot(ticks, z_act[:, n_idx], color=colors[i],
+                           marker='o', markersize=4, linewidth=1.5,
+                           alpha=0.8, label=f'n{n_idx}')
+        axes[0, 1].set_xlabel('Tick')
+        axes[0, 1].set_ylabel('z (post-activation)')
+        axes[0, 1].set_title('Top 20 Most Dynamic Neurons')
+        axes[0, 1].set_xticks(ticks)
+        axes[0, 1].legend(fontsize=6, ncol=4, loc='upper right')
+        axes[0, 1].grid(True, alpha=0.3)
+        axes[0, 1].axhline(y=0, color='black', linewidth=0.5, linestyle='--')
 
-        # Bottom-left: Sample trajectories for most active neurons
-        top_active = sorted_by_variance[:8]  # 8 most active
-        for i, idx in enumerate(top_active):
-            axes[1, 0].plot(range(num_ticks), tick_activations[:, idx],
-                           marker='o', alpha=0.7, label=f'n{idx}')
-        axes[1, 0].set_xlabel('Tick')
-        axes[1, 0].set_ylabel('Activation')
-        axes[1, 0].set_title('Most Active Neurons (high variance)')
-        axes[1, 0].set_xticks(range(num_ticks))
-        axes[1, 0].legend(fontsize=6, ncol=2)
+        # Bottom-left: Tick-to-tick changes (deltas)
+        z_deltas = np.diff(z_act, axis=0)  # (num_ticks, D)
+        delta_var = z_deltas.var(axis=0)
+        sorted_delta_idx = np.argsort(delta_var)[::-1]
+
+        delta_ticks = np.arange(num_ticks)
+        for i, n_idx in enumerate(sorted_delta_idx[:15]):
+            alpha = 0.9 - (i / 15) * 0.5
+            axes[1, 0].plot(delta_ticks, z_deltas[:, n_idx],
+                           marker='o', markersize=4, linewidth=1.5, alpha=alpha)
+        axes[1, 0].set_xlabel('Tick → Tick+1')
+        axes[1, 0].set_ylabel('Δz (change in activation)')
+        axes[1, 0].set_title('Tick-to-Tick Changes (top 15 neurons by delta variance)')
+        axes[1, 0].set_xticks(delta_ticks)
+        axes[1, 0].set_xticklabels([f'{i}→{i+1}' for i in range(num_ticks)])
         axes[1, 0].grid(True, alpha=0.3)
+        axes[1, 0].axhline(y=0, color='black', linewidth=1, linestyle='--')
 
-        # Bottom-right: Sample trajectories for most stable neurons
-        bottom_stable = sorted_by_variance[-8:]  # 8 most stable
-        for i, idx in enumerate(bottom_stable):
-            axes[1, 1].plot(range(num_ticks), tick_activations[:, idx],
-                           marker='o', alpha=0.7, label=f'n{idx}')
-        axes[1, 1].set_xlabel('Tick')
-        axes[1, 1].set_ylabel('Activation')
-        axes[1, 1].set_title('Most Stable Neurons (low variance)')
-        axes[1, 1].set_xticks(range(num_ticks))
-        axes[1, 1].legend(fontsize=6, ncol=2)
-        axes[1, 1].grid(True, alpha=0.3)
+        # Bottom-right: Variance distribution
+        axes[1, 1].hist(neuron_variance, bins=50, alpha=0.7, color='steelblue', edgecolor='black')
+        axes[1, 1].axvline(x=np.median(neuron_variance), color='red', linestyle='--',
+                          linewidth=2, label=f'Median: {np.median(neuron_variance):.4f}')
+        axes[1, 1].axvline(x=np.mean(neuron_variance), color='orange', linestyle='--',
+                          linewidth=2, label=f'Mean: {np.mean(neuron_variance):.4f}')
+        axes[1, 1].set_xlabel('Variance across ticks')
+        axes[1, 1].set_ylabel('Count')
+        axes[1, 1].set_title('Distribution of Neuron Dynamics')
+        axes[1, 1].legend()
 
         plt.tight_layout()
-        log_data["nlm/tick_dynamics"] = wandb.Image(fig)
+        log_data["ctm/z_dynamics"] = wandb.Image(fig)
         plt.close(fig)
 
-        # 2. FFT-based frequency spectrum over TICKS (the correct domain!)
-        # This shows which neurons oscillate fast vs slow in tick-space
-        if num_ticks >= 2:
-            fig, axes = plt.subplots(1, 3, figsize=(16, 5))
+        # ============================================================
+        # 2. PRE-ACTIVATION (a) DYNAMICS
+        # ============================================================
+        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
 
-            # Compute FFT over tick dimension for each neuron
-            # Subtract mean to remove DC component for cleaner spectrum
-            centered = tick_activations - tick_activations.mean(axis=0, keepdims=True)
-            fft_result = np.fft.rfft(centered, axis=0)  # (num_ticks//2+1, D)
-            power_spectrum = np.abs(fft_result) ** 2  # Power spectrum
-            freqs = np.fft.rfftfreq(num_ticks)  # Normalized frequencies (cycles per tick)
+        # Left: Heatmap
+        a_var = a_act.var(axis=0)
+        a_sorted_idx = np.argsort(a_var)[::-1]
+        sorted_a = a_act[:, a_sorted_idx].T
 
-            # Left: Power spectrum heatmap (neurons sorted by dominant frequency)
-            if power_spectrum.shape[0] > 1:
-                dominant_freq_idx = np.argmax(power_spectrum[1:, :], axis=0)  # Skip DC
-            else:
-                dominant_freq_idx = np.zeros(D, dtype=int)
-            freq_sorted_indices = np.argsort(dominant_freq_idx)
-            sorted_power = power_spectrum[:, freq_sorted_indices]  # (freqs, D_sorted)
+        im = axes[0].imshow(sorted_a, aspect='auto', cmap='RdBu_r',
+                           origin='upper', interpolation='nearest')
+        axes[0].set_xlabel('Tick')
+        axes[0].set_ylabel('Neuron (sorted by variance)')
+        axes[0].set_title(f'a (pre-activations) @ Step {global_step}')
+        axes[0].set_xticks(range(num_ticks))
+        plt.colorbar(im, ax=axes[0], label='Activation')
 
-            # Log scale for better visualization
-            sorted_power_log = np.log1p(sorted_power.T)  # (D, freqs)
+        # Right: Top trajectories
+        for i, n_idx in enumerate(a_sorted_idx[:15]):
+            alpha = 0.9 - (i / 15) * 0.4
+            axes[1].plot(range(num_ticks), a_act[:, n_idx],
+                        marker='o', markersize=4, linewidth=1.5, alpha=alpha)
+        axes[1].set_xlabel('Tick')
+        axes[1].set_ylabel('a (pre-activation)')
+        axes[1].set_title('Top 15 Most Dynamic Neurons (pre-activation)')
+        axes[1].set_xticks(range(num_ticks))
+        axes[1].grid(True, alpha=0.3)
 
-            im = axes[0].imshow(sorted_power_log, aspect='auto', cmap='magma',
-                               origin='upper', interpolation='nearest')
-            axes[0].set_xlabel('Frequency bin (cycles/tick)')
-            axes[0].set_ylabel('Neuron (sorted by dominant freq)')
-            axes[0].set_title('FFT Power Spectrum Over Ticks')
+        plt.tight_layout()
+        log_data["ctm/a_dynamics"] = wandb.Image(fig)
+        plt.close(fig)
+
+        # ============================================================
+        # 3. SYNC EVOLUTION
+        # ============================================================
+        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+        # Left: Heatmap of sync pairs
+        sync_var = sync_vals.var(axis=0)
+        sync_sorted_idx = np.argsort(sync_var)[::-1]
+        sorted_sync = sync_vals[:, sync_sorted_idx].T
+
+        im = axes[0].imshow(sorted_sync[:64], aspect='auto', cmap='viridis',
+                           origin='upper', interpolation='nearest')
+        axes[0].set_xlabel('Tick')
+        axes[0].set_ylabel('Sync pair (top 64 by variance)')
+        axes[0].set_title(f'Synchronization @ Step {global_step}')
+        axes[0].set_xticks(range(num_ticks))
+        plt.colorbar(im, ax=axes[0], label='Sync value')
+
+        # Right: Top sync pair trajectories
+        for i, p_idx in enumerate(sync_sorted_idx[:10]):
+            axes[1].plot(range(num_ticks), sync_vals[:, p_idx],
+                        marker='o', markersize=4, linewidth=1.5, alpha=0.7,
+                        label=f'pair{p_idx}')
+        axes[1].set_xlabel('Tick')
+        axes[1].set_ylabel('Sync value')
+        axes[1].set_title('Top 10 Most Dynamic Sync Pairs')
+        axes[1].set_xticks(range(num_ticks))
+        axes[1].legend(fontsize=7, ncol=2)
+        axes[1].grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        log_data["ctm/sync_evolution"] = wandb.Image(fig)
+        plt.close(fig)
+
+        # ============================================================
+        # 4. FFT FREQUENCY ANALYSIS
+        # ============================================================
+        if num_ticks >= 3:
+            fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+
+            # FFT of z activations (skip initial state)
+            z_for_fft = z_act[1:]  # (num_ticks, D) - skip t=0
+            centered = z_for_fft - z_for_fft.mean(axis=0, keepdims=True)
+            fft_result = np.fft.rfft(centered, axis=0)
+            power = np.abs(fft_result) ** 2
+            freqs = np.fft.rfftfreq(num_ticks)
+
+            # Left: Power spectrum heatmap
+            power_sorted = power[:, sorted_idx].T  # (D, freqs)
+            im = axes[0].imshow(np.log1p(power_sorted[:100]), aspect='auto',
+                               cmap='magma', origin='upper')
+            axes[0].set_xlabel('Frequency bin')
+            axes[0].set_ylabel('Neuron (top 100 by variance)')
+            axes[0].set_title('FFT Power Spectrum (log scale)')
             plt.colorbar(im, ax=axes[0], label='Log power')
 
-            # Middle: Average power spectrum
-            avg_power = power_spectrum.mean(axis=1)
-            axes[1].bar(range(len(freqs)), avg_power, alpha=0.7, color='steelblue')
+            # Right: Average power by frequency
+            avg_power = power.mean(axis=1)
+            axes[1].bar(range(len(freqs)), avg_power, alpha=0.7, color='coral')
             axes[1].set_xlabel('Frequency bin')
             axes[1].set_ylabel('Average Power')
-            axes[1].set_title('Average Power Spectrum')
+            axes[1].set_title('Average Power by Frequency')
             axes[1].set_xticks(range(len(freqs)))
             axes[1].set_xticklabels([f'{f:.2f}' for f in freqs], rotation=45)
 
-            # Right: Distribution of dominant frequencies
-            axes[2].hist(dominant_freq_idx, bins=max(1, len(freqs)-1), alpha=0.7, color='coral')
-            axes[2].set_xlabel('Dominant Frequency Bin')
-            axes[2].set_ylabel('Count')
-            axes[2].set_title('Distribution of Neuron Frequencies')
-
             plt.tight_layout()
-            log_data["nlm/tick_fft_spectrum"] = wandb.Image(fig)
+            log_data["ctm/fft_spectrum"] = wandb.Image(fig)
             plt.close(fig)
 
-        # 3. Sync evolution across ticks
-        fig, ax = plt.subplots(figsize=(10, 5))
-        sync_pairs = tick_sync.shape[1]
-        for p in range(min(sync_pairs, 16)):  # Plot up to 16 sync pairs
-            ax.plot(range(num_ticks), tick_sync[:, p], marker='o', alpha=0.6, label=f'pair{p}')
-        ax.set_xlabel('Tick')
-        ax.set_ylabel('Sync Value')
-        ax.set_title(f'Synchronization Evolution Across Ticks @ Step {global_step}')
-        ax.set_xticks(range(num_ticks))
-        ax.legend(fontsize=6, ncol=4, loc='upper right')
-        ax.grid(True, alpha=0.3)
+        # ============================================================
+        # 5. SCALAR METRICS
+        # ============================================================
+        log_data["ctm/z_variance_mean"] = float(neuron_variance.mean())
+        log_data["ctm/z_variance_max"] = float(neuron_variance.max())
+        log_data["ctm/z_delta_mean"] = float(np.abs(z_deltas).mean())
+        log_data["ctm/z_delta_max"] = float(np.abs(z_deltas).max())
+        log_data["ctm/a_variance_mean"] = float(a_var.mean())
+        log_data["ctm/sync_variance_mean"] = float(sync_var.mean())
+        log_data["ctm/sync_final_mean"] = float(sync_vals[-1].mean())
 
-        plt.tight_layout()
-        log_data["nlm/sync_evolution"] = wandb.Image(fig)
-        plt.close(fig)
-
-        # Log scalar metrics
-        log_data["nlm/neuron_variance_mean"] = float(neuron_variance.mean())
-        log_data["nlm/neuron_variance_std"] = float(neuron_variance.std())
-        log_data["nlm/sync_final_mean"] = float(tick_sync[-1].mean())
-        log_data["nlm/sync_change"] = float(tick_sync[-1].mean() - tick_sync[0].mean())
-
-        # 4. Per-layer post-activations across ticks
-        # layer_post_acts: (num_ticks, n_layer, D)
-        if 'layer_post_acts' in diagnostics:
-            layer_post_acts = diagnostics['layer_post_acts'].numpy()  # (num_ticks, n_layer, D)
-            n_layer = layer_post_acts.shape[1]
-
-            # Create a grid: each row is a layer, showing its neurons across ticks
-            fig, axes = plt.subplots(2, 2, figsize=(16, 12))
-
-            # Top-left: Heatmap of layer mean activations across ticks
-            # Average over neurons to get (num_ticks, n_layer)
-            layer_means = layer_post_acts.mean(axis=2)  # (num_ticks, n_layer)
-            im = axes[0, 0].imshow(layer_means.T, aspect='auto', cmap='RdBu_r',
-                                   origin='lower', interpolation='nearest')
-            axes[0, 0].set_xlabel('Tick')
-            axes[0, 0].set_ylabel('Layer')
-            axes[0, 0].set_title('Mean Post-Activation per Layer Across Ticks')
-            axes[0, 0].set_xticks(range(num_ticks))
-            axes[0, 0].set_yticks(range(n_layer))
-            plt.colorbar(im, ax=axes[0, 0], label='Mean activation')
-
-            # Top-right: Layer activation trajectories (line plot)
-            for layer_idx in range(n_layer):
-                axes[0, 1].plot(range(num_ticks), layer_means[:, layer_idx],
-                               marker='o', alpha=0.7, label=f'L{layer_idx}')
-            axes[0, 1].set_xlabel('Tick')
-            axes[0, 1].set_ylabel('Mean Activation')
-            axes[0, 1].set_title('Layer Activation Trajectories')
-            axes[0, 1].set_xticks(range(num_ticks))
-            axes[0, 1].legend(fontsize=6, ncol=max(1, n_layer // 4))
-            axes[0, 1].grid(True, alpha=0.3)
-
-            # Bottom-left: Per-layer neuron variance across ticks
-            # Shows which layers have more dynamic neurons
-            layer_neuron_var = layer_post_acts.var(axis=0)  # (n_layer, D) - variance over ticks
-            layer_var_mean = layer_neuron_var.mean(axis=1)  # (n_layer,) - mean variance per layer
-            axes[1, 0].bar(range(n_layer), layer_var_mean, alpha=0.7, color='steelblue')
-            axes[1, 0].set_xlabel('Layer')
-            axes[1, 0].set_ylabel('Mean Neuron Variance')
-            axes[1, 0].set_title('Neuron Dynamics per Layer (variance across ticks)')
-            axes[1, 0].set_xticks(range(n_layer))
-
-            # Bottom-right: Detailed heatmap for one layer (layer 0)
-            # Show sample neurons across ticks
-            layer0_acts = layer_post_acts[:, 0, :]  # (num_ticks, D)
-            # Sort neurons by variance
-            neuron_var = layer0_acts.var(axis=0)
-            sorted_idx = np.argsort(neuron_var)[::-1]
-            # Show top 64 most dynamic neurons
-            top_neurons = sorted_idx[:min(64, D)]
-            sorted_acts = layer0_acts[:, top_neurons].T  # (64, num_ticks)
-
-            im = axes[1, 1].imshow(sorted_acts, aspect='auto', cmap='RdBu_r',
-                                   origin='upper', interpolation='nearest')
-            axes[1, 1].set_xlabel('Tick')
-            axes[1, 1].set_ylabel('Neuron (sorted by variance)')
-            axes[1, 1].set_title('Layer 0: Top 64 Dynamic Neurons Across Ticks')
-            axes[1, 1].set_xticks(range(num_ticks))
-            plt.colorbar(im, ax=axes[1, 1], label='Activation')
-
-            plt.tight_layout()
-            log_data["nlm/layer_post_acts"] = wandb.Image(fig)
-            plt.close(fig)
-
-            # 5. All-layers neuron grid: show ALL neurons for ALL layers
-            # This is the comprehensive view the user asked for
-            fig, axes = plt.subplots(1, n_layer, figsize=(4 * n_layer, 8), sharey=True)
-            if n_layer == 1:
-                axes = [axes]
-
-            for layer_idx in range(n_layer):
-                layer_acts = layer_post_acts[:, layer_idx, :]  # (num_ticks, D)
-                # Sort by variance
-                var = layer_acts.var(axis=0)
-                sorted_idx = np.argsort(var)[::-1]
-                sorted_acts = layer_acts[:, sorted_idx].T  # (D, num_ticks)
-
-                im = axes[layer_idx].imshow(sorted_acts, aspect='auto', cmap='RdBu_r',
-                                            origin='upper', interpolation='nearest')
-                axes[layer_idx].set_xlabel('Tick')
-                if layer_idx == 0:
-                    axes[layer_idx].set_ylabel('Neuron (sorted by variance)')
-                axes[layer_idx].set_title(f'Layer {layer_idx}')
-                axes[layer_idx].set_xticks(range(num_ticks))
-
-            plt.suptitle(f'All NLM Post-Activations Across Ticks @ Step {global_step}', fontsize=14)
-            plt.tight_layout()
-            log_data["nlm/all_layers_grid"] = wandb.Image(fig)
-            plt.close(fig)
-
-            # 6. Neuron trajectories: X=tick, Y=activation
-            # Grid of subplots, one per layer, showing how neurons evolve over ticks
-            n_cols = 3
-            n_rows = (n_layer + n_cols - 1) // n_cols
-            fig, axes = plt.subplots(n_rows, n_cols, figsize=(6 * n_cols, 4 * n_rows),
-                                     sharex=True)
-            axes = np.atleast_2d(axes)
-
-            # Select neurons to plot: sample evenly across variance spectrum
-            overall_var = layer_post_acts.var(axis=0).mean(axis=0)  # (D,)
-            sorted_neuron_idx = np.argsort(overall_var)[::-1]
-
-            # Sample neurons: top 10 most dynamic, 10 from middle, 10 most stable
-            n_sample = min(10, D // 3)
-            top_neurons = sorted_neuron_idx[:n_sample]
-            mid_neurons = sorted_neuron_idx[D//2 - n_sample//2 : D//2 + n_sample//2]
-            bottom_neurons = sorted_neuron_idx[-n_sample:]
-            sample_neurons = np.concatenate([top_neurons, mid_neurons, bottom_neurons])
-
-            # Color map: dynamic=red, mid=green, stable=blue
-            colors_top = plt.cm.Reds(np.linspace(0.4, 0.8, n_sample))
-            colors_mid = plt.cm.Greens(np.linspace(0.4, 0.8, len(mid_neurons)))
-            colors_bottom = plt.cm.Blues(np.linspace(0.4, 0.8, n_sample))
-
-            for layer_idx in range(n_layer):
-                row, col = layer_idx // n_cols, layer_idx % n_cols
-                ax = axes[row, col]
-
-                # Plot trajectories for sampled neurons
-                ticks = np.arange(num_ticks)
-
-                # Dynamic neurons (red)
-                for i, neuron_idx in enumerate(top_neurons):
-                    trajectory = layer_post_acts[:, layer_idx, neuron_idx]
-                    ax.plot(ticks, trajectory, color=colors_top[i], alpha=0.7,
-                           linewidth=1.5, marker='o', markersize=4)
-
-                # Mid neurons (green)
-                for i, neuron_idx in enumerate(mid_neurons):
-                    trajectory = layer_post_acts[:, layer_idx, neuron_idx]
-                    ax.plot(ticks, trajectory, color=colors_mid[i], alpha=0.5,
-                           linewidth=1, marker='s', markersize=3)
-
-                # Stable neurons (blue)
-                for i, neuron_idx in enumerate(bottom_neurons):
-                    trajectory = layer_post_acts[:, layer_idx, neuron_idx]
-                    ax.plot(ticks, trajectory, color=colors_bottom[i], alpha=0.7,
-                           linewidth=1.5, marker='^', markersize=4)
-
-                ax.set_title(f'Layer {layer_idx}', fontsize=11, fontweight='bold')
-                ax.set_xlabel('Tick')
-                ax.set_ylabel('Activation')
-                ax.set_xticks(ticks)
-                ax.axhline(y=0, color='gray', linestyle='--', linewidth=0.5, alpha=0.5)
-                ax.grid(True, alpha=0.3)
-
-            # Hide empty subplots
-            for idx in range(n_layer, n_rows * n_cols):
-                row, col = idx // n_cols, idx % n_cols
-                axes[row, col].set_visible(False)
-
-            # Add legend
-            from matplotlib.lines import Line2D
-            legend_elements = [
-                Line2D([0], [0], color='red', linewidth=2, label='Dynamic neurons'),
-                Line2D([0], [0], color='green', linewidth=2, label='Mid neurons'),
-                Line2D([0], [0], color='blue', linewidth=2, label='Stable neurons'),
-            ]
-            fig.legend(handles=legend_elements, loc='upper right', fontsize=10)
-
-            plt.suptitle(f'Neuron Trajectories Over Ticks @ Step {global_step}\n(X=tick, Y=activation)', fontsize=12)
-            plt.tight_layout()
-            log_data["nlm/neuron_trajectories"] = wandb.Image(fig)
-            plt.close(fig)
-
-            # 7. Tick-to-tick DELTAS: shows the change between ticks
-            # This reveals dynamics even when absolute values are similar
-            if num_ticks > 1:
-                # Compute deltas: (num_ticks-1, n_layer, D)
-                deltas = np.diff(layer_post_acts, axis=0)
-
-                fig, axes = plt.subplots(n_rows, n_cols, figsize=(6 * n_cols, 4 * n_rows),
-                                         sharex=True)
-                axes = np.atleast_2d(axes)
-
-                for layer_idx in range(n_layer):
-                    row, col = layer_idx // n_cols, layer_idx % n_cols
-                    ax = axes[row, col]
-
-                    # Sort neurons by delta variance (most changing first)
-                    layer_deltas = deltas[:, layer_idx, :]  # (num_ticks-1, D)
-                    delta_var = layer_deltas.var(axis=0)
-                    sorted_idx = np.argsort(delta_var)[::-1]
-
-                    # Plot top 30 most changing neurons
-                    n_show = min(30, D)
-                    delta_ticks = np.arange(num_ticks - 1) + 0.5  # Centered between ticks
-
-                    for i in range(n_show):
-                        neuron_idx = sorted_idx[i]
-                        trajectory = layer_deltas[:, neuron_idx]
-                        alpha = 0.8 - (i / n_show) * 0.5  # Fade out less dynamic ones
-                        ax.plot(delta_ticks, trajectory, alpha=alpha, linewidth=1.5,
-                               marker='o', markersize=4)
-
-                    ax.set_title(f'Layer {layer_idx}', fontsize=11, fontweight='bold')
-                    ax.set_xlabel('Tick transition')
-                    ax.set_ylabel('Δ Activation')
-                    ax.set_xticks(delta_ticks)
-                    ax.set_xticklabels([f'{i}→{i+1}' for i in range(num_ticks - 1)])
-                    ax.axhline(y=0, color='gray', linestyle='--', linewidth=1)
-                    ax.grid(True, alpha=0.3)
-
-                # Hide empty subplots
-                for idx in range(n_layer, n_rows * n_cols):
-                    row, col = idx // n_cols, idx % n_cols
-                    axes[row, col].set_visible(False)
-
-                plt.suptitle(f'Tick-to-Tick Changes (Δ) @ Step {global_step}\n(How much neurons change between ticks)', fontsize=12)
-                plt.tight_layout()
-                log_data["nlm/tick_deltas"] = wandb.Image(fig)
-                plt.close(fig)
-
-                # Log delta statistics
-                mean_abs_delta = np.abs(deltas).mean()
-                max_abs_delta = np.abs(deltas).max()
-                log_data["nlm/mean_abs_delta"] = float(mean_abs_delta)
-                log_data["nlm/max_abs_delta"] = float(max_abs_delta)
-
-                # Log activation scale for context
-                activation_mean = np.abs(layer_post_acts).mean()
-                activation_std = layer_post_acts.std()
-                log_data["nlm/activation_mean_abs"] = float(activation_mean)
-                log_data["nlm/activation_std"] = float(activation_std)
-
-                # Relative change (delta / activation magnitude)
-                # This shows % change, not absolute
-                eps = 1e-6
-                relative_deltas = np.abs(deltas) / (np.abs(layer_post_acts[:-1]) + eps)
-                mean_relative_delta = relative_deltas.mean()
-                max_relative_delta = relative_deltas.max()
-                log_data["nlm/mean_relative_delta"] = float(mean_relative_delta)
-                log_data["nlm/max_relative_delta"] = float(max_relative_delta)
-
-        # === NLM INTERNAL DIAGNOSTICS (from last tick) ===
-        if 'gate_mean' in diagnostics:
-            gate_mean = diagnostics['gate_mean'].mean(dim=0).numpy()  # (D,)
-            hist = safe_histogram(gate_mean)
-            if hist:
-                log_data["nlm/gate_value_hist"] = hist
-            log_data["nlm/gate_mean"] = float(gate_mean.mean())
-            log_data["nlm/gate_std"] = float(gate_mean.std())
-
-        if 'attn_entropy' in diagnostics:
-            attn_entropy = diagnostics['attn_entropy'].mean(dim=0).numpy()  # (D,)
-            hist = safe_histogram(attn_entropy)
-            if hist:
-                log_data["nlm/attn_entropy_hist"] = hist
-            log_data["nlm/attn_entropy_mean"] = float(attn_entropy.mean())
-            log_data["nlm/attn_entropy_std"] = float(attn_entropy.std())
+        # Oscillation metric: how much neurons change direction
+        if num_ticks >= 2:
+            sign_changes = np.diff(np.sign(z_deltas), axis=0)
+            oscillation_count = (sign_changes != 0).sum(axis=0).mean()
+            log_data["ctm/oscillation_score"] = float(oscillation_count)
 
         wandb.log(log_data, step=global_step)
 
-        # Clean up to free memory
         del diagnostics, log_data
-        import gc
         gc.collect()
 
     except Exception as e:
-        logger.warning(f"Error logging NLM diagnostics: {e}")
+        logger.warning(f"Error logging CTM diagnostics: {e}")
+        import traceback
+        traceback.print_exc()
     finally:
-        # Always try to free GPU memory after diagnostics
         torch.cuda.empty_cache()
 
 

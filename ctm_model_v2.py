@@ -577,3 +577,82 @@ class CTMLanguageModel(nn.Module):
             generated = torch.cat([generated, next_token], dim=1)
 
         return generated
+
+    @torch.no_grad()
+    def get_nlm_diagnostics(
+        self,
+        input_ids: torch.Tensor,
+        num_ticks: Optional[int] = None,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Run forward pass and collect neuron dynamics for visualization.
+
+        Returns:
+            z_activations: (num_ticks+1, D) - post-activations at each tick (mean over B, S)
+            a_activations: (num_ticks, D) - pre-activations at each tick (mean over B, S)
+            sync_values: (num_ticks, sync_pairs) - sync at each tick (mean over B, S)
+            z_full: (num_ticks+1, B, S, D) - full post-activations for detailed analysis
+        """
+        self.eval()
+        B, S = input_ids.shape
+        device = input_ids.device
+        num_ticks = num_ticks or self.config.num_ticks
+
+        # Get RoPE
+        input_pos = torch.arange(S, device=device)
+        cos = self.cos_cached[input_pos]
+        sin = self.sin_cached[input_pos]
+
+        # Embed and encode
+        x = self.token_embedding(input_ids)
+        encoded, static_k, static_v = self.input_encoder(x, cos, sin)
+
+        # Run CTM manually to collect all activations
+        z = encoded
+        o = torch.zeros_like(z)
+
+        z_list = [z]  # post-activations (includes initial)
+        a_list = []   # pre-activations
+        sync_list = []
+
+        for tick in range(num_ticks):
+            tick_idx = torch.tensor(tick, device=device)
+            tick_emb = self.ctm_core.tick_embed(tick_idx)
+
+            # 1. Synapse
+            a = self.ctm_core.synapse(z, o)
+            a = a + tick_emb
+            a_list.append(a)
+
+            # 2. NLM
+            a_hist = torch.stack(a_list, dim=2)
+            z = self.ctm_core.nlm(a_hist)
+            z = self.ctm_core.z_norm(z)
+            z_list.append(z)
+
+            # 3. Sync
+            z_hist = torch.stack(z_list, dim=2)
+            sync_out = self.ctm_core.sync(z_hist)
+            sync_list.append(sync_out)
+
+            # 4. Attention
+            o = self.ctm_core.attention(sync_out, static_k, static_v, cos, sin)
+
+        # Stack and compute means
+        z_full = torch.stack(z_list, dim=0)  # (num_ticks+1, B, S, D)
+        a_full = torch.stack(a_list, dim=0)  # (num_ticks, B, S, D)
+        sync_full = torch.stack(sync_list, dim=0)  # (num_ticks, B, S, sync_pairs)
+
+        # Mean over batch and sequence for summary stats
+        z_mean = z_full.mean(dim=(1, 2))  # (num_ticks+1, D)
+        a_mean = a_full.mean(dim=(1, 2))  # (num_ticks, D)
+        sync_mean = sync_full.mean(dim=(1, 2))  # (num_ticks, sync_pairs)
+
+        return {
+            'z_activations': z_mean,      # (num_ticks+1, D) post-activations
+            'a_activations': a_mean,      # (num_ticks, D) pre-activations
+            'sync_values': sync_mean,     # (num_ticks, sync_pairs)
+            'z_full': z_full,             # (num_ticks+1, B, S, D) for detailed analysis
+            'a_full': a_full,             # (num_ticks, B, S, D)
+            'num_ticks': torch.tensor(num_ticks),
+        }
