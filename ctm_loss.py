@@ -16,16 +16,19 @@ class CTMLoss(nn.Module):
     Loss computation with tick selection for CTM.
 
     Strategies:
-    - "all": Average loss across all ticks (DEFAULT - most faithful to CTM paper)
+    - "all": Average loss across all ticks (most stable, treats all ticks equally)
+    - "progressive": Weight later ticks more heavily (RECOMMENDED - encourages refinement)
     - "min_loss": Select tick with minimum loss per position (can discourage exploration)
     - "max_certainty": Select tick with highest confidence
     - "weighted": Soft attention over ticks based on inverse loss
     - "last": Always use final tick (for warmup/debugging)
 
+    The "progressive" strategy is recommended for encouraging multi-tick reasoning:
+    it weights later ticks more heavily, so the model is incentivized to improve
+    its predictions over time rather than trying to be correct immediately.
+
     Per the CTM paper, the model should be allowed to develop rich dynamics across
-    ticks without being pressured to produce correct answers early. The "all"
-    strategy treats all ticks equally, allowing emergent behaviors to develop
-    naturally without explicit bias toward early stopping.
+    ticks without being pressured to produce correct answers early.
 
     The loss is computed per position across the sequence, respecting
     the autoregressive language modeling objective.
@@ -40,9 +43,10 @@ class CTMLoss(nn.Module):
         vocab_size: int,
         pad_token_id: int = -100,
         ignore_index: int = -100,
-        selection: str = "all",  # Changed from "min_loss" - more faithful to CTM
+        selection: str = "progressive",  # Encourages improvement over ticks
         tau: float = 1.0,
         label_smoothing: float = 0.0,
+        progressive_steepness: float = 1.0,  # Higher = more weight on later ticks
     ):
         """
         Args:
@@ -53,6 +57,8 @@ class CTMLoss(nn.Module):
             selection: Tick selection strategy
             tau: Temperature for soft selection (used in "weighted" mode)
             label_smoothing: Label smoothing factor
+            progressive_steepness: How much to weight later ticks in "progressive" mode
+                                   (1.0 = linear, 2.0 = quadratic, etc.)
         """
         super().__init__()
         self.vocab_size = vocab_size
@@ -61,6 +67,7 @@ class CTMLoss(nn.Module):
         self.selection = selection
         self.tau = tau
         self.label_smoothing = label_smoothing
+        self.progressive_steepness = progressive_steepness
 
         # Base criterion with no reduction for per-position losses
         # Use ignore_index (default -100) to control what's excluded from loss
@@ -148,8 +155,25 @@ class CTMLoss(nn.Module):
             loss = (weighted_loss * mask).sum() / (num_valid + 1e-8)
             selected_ticks = weights.argmax(dim=0)
 
+        elif self.selection == "progressive":
+            # Weight later ticks more heavily to encourage refinement over time
+            # weights[t] = (t + 1)^steepness, normalized
+            # With steepness=1: linear [1, 2, 3, ...] / sum
+            # With steepness=2: quadratic [1, 4, 9, ...] / sum
+            tick_indices = torch.arange(T, device=device, dtype=torch.float32) + 1
+            weights = tick_indices.pow(self.progressive_steepness)
+            weights = weights / weights.sum()  # Normalize to sum to 1
+
+            # Weighted average: (T,) weights applied to (T, B, S) losses
+            weighted_loss_per_pos = (tick_losses * weights.view(T, 1, 1)).sum(dim=0)  # (B, S)
+            loss = (weighted_loss_per_pos * mask).sum() / (num_valid + 1e-8)
+
+            # For metrics, report which tick was best
+            masked_losses = tick_losses + (1 - mask.unsqueeze(0)) * 1e9
+            _, selected_ticks = masked_losses.min(dim=0)
+
         elif self.selection == "all":
-            # Average across all ticks (most stable)
+            # Average across all ticks (most stable, all ticks equal)
             avg_loss_per_pos = tick_losses.mean(dim=0)  # (B, S)
             loss = (avg_loss_per_pos * mask).sum() / (num_valid + 1e-8)
             # For metrics, report which tick was best

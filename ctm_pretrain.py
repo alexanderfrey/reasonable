@@ -560,6 +560,7 @@ def train(args: Namespace):
         ignore_index=-100,  # Train on all tokens including EOS
         selection=args.tick_selection,
         tau=getattr(args, "tick_selection_tau", 1.0),
+        progressive_steepness=getattr(args, "progressive_steepness", 1.0),
     )
 
     # --- Scaler (FP16 only) ---
@@ -848,11 +849,13 @@ def main():
     parser.add_argument("--sync_pairs", type=int, default=512, help="Number of sync pairs")
     parser.add_argument("--sync_order", type=int, default=2,
                         help="Correlation order (2=covariance, faithful to CTM paper)")
-    parser.add_argument("--tick_selection", type=str, default="all",
-                        choices=["min_loss", "max_certainty", "weighted", "last", "all"],
-                        help="Tick selection strategy (default: 'all' for faithful CTM)")
+    parser.add_argument("--tick_selection", type=str, default="progressive",
+                        choices=["progressive", "all", "min_loss", "max_certainty", "weighted", "last"],
+                        help="Tick selection strategy (default: 'progressive' encourages multi-tick reasoning)")
     parser.add_argument("--tick_selection_tau", type=float, default=1.0,
                         help="Temperature for weighted tick selection")
+    parser.add_argument("--progressive_steepness", type=float, default=1.0,
+                        help="Steepness for progressive tick weighting (1=linear, 2=quadratic)")
     parser.add_argument("--tick_warmup_steps", type=int, default=0,
                         help="Steps to warmup tick budget (0 = disabled)")
     parser.add_argument("--min_warmup_ticks", type=int, default=2,

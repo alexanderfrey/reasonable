@@ -125,12 +125,26 @@ class NeuronLevelModels(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
-        # Xavier-like initialization scaled for the architecture
-        std = 0.02
-        nn.init.normal_(self.w_in, mean=0.0, std=std)
-        nn.init.normal_(self.w_out, mean=0.0, std=std)
+        """
+        Initialize with DIVERSITY across neurons for heterogeneous temporal dynamics.
+        """
+        base_std = 0.02
+
+        # Per-neuron scale factors for diverse dynamics
+        # Log-uniform in ~[0.5, 2.0] range
+        neuron_scales = torch.exp(torch.linspace(-0.7, 0.7, self.d_model))
+        neuron_scales = neuron_scales[torch.randperm(self.d_model)]
+
+        nn.init.normal_(self.w_in, mean=0.0, std=base_std)
+        nn.init.normal_(self.w_out, mean=0.0, std=base_std)
+        with torch.no_grad():
+            self.w_in.mul_(neuron_scales.view(-1, 1, 1))
+            self.w_out.mul_(neuron_scales.view(-1, 1, 1))
+
         for w in self.w_hidden:
-            nn.init.normal_(w, mean=0.0, std=std)
+            nn.init.normal_(w, mean=0.0, std=base_std)
+            with torch.no_grad():
+                w.mul_(neuron_scales.view(-1, 1, 1))
 
     def forward(self, history: torch.Tensor) -> torch.Tensor:
         """
@@ -244,15 +258,63 @@ class EnhancedNeuronLevelModels(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
-        std = 0.02
-        nn.init.normal_(self.temporal_k_proj, std=std)
-        nn.init.normal_(self.temporal_v_proj, std=std)
-        nn.init.normal_(self.w_in, std=std)
-        nn.init.normal_(self.w_out, std=std)
+        """
+        Initialize NLM weights with DIVERSITY across neurons.
+
+        Key insight from CTM: Each NLM should develop different temporal dynamics
+        (different "frequencies"). Homogeneous initialization leads to similar
+        dynamics across neurons, reducing sync's ability to capture meaningful
+        coordination patterns.
+
+        Strategy:
+        1. Temporal queries get per-neuron scale factors (diverse attention patterns)
+        2. MLP weights get per-neuron scale variation (diverse processing)
+        3. Gate biases vary per neuron (diverse update rates)
+        """
+        base_std = 0.02
+
+        # === Diverse temporal attention initialization ===
+        # Each neuron gets a different scale for its temporal query
+        # This encourages different neurons to attend to different time scales
+        # Scale factors log-uniformly distributed: some neurons 0.5x, some 2x base
+        neuron_scales = torch.exp(torch.linspace(-0.7, 0.7, self.d_model))  # ~[0.5, 2.0]
+        neuron_scales = neuron_scales[torch.randperm(self.d_model)]  # Shuffle
+
+        # temporal_query: (D, nlm_hidden) - scale each neuron's query differently
+        nn.init.normal_(self.temporal_query, std=base_std)
+        with torch.no_grad():
+            self.temporal_query.mul_(neuron_scales.unsqueeze(1))
+
+        # temporal_k_proj, temporal_v_proj: (D, 1, nlm_hidden)
+        nn.init.normal_(self.temporal_k_proj, std=base_std)
+        nn.init.normal_(self.temporal_v_proj, std=base_std)
+        with torch.no_grad():
+            self.temporal_k_proj.mul_(neuron_scales.view(-1, 1, 1))
+            self.temporal_v_proj.mul_(neuron_scales.view(-1, 1, 1))
+
+        # === Diverse MLP initialization ===
+        # w_in, w_out: different scales per neuron for diverse dynamics
+        nn.init.normal_(self.w_in, std=base_std)
+        nn.init.normal_(self.w_out, std=base_std)
+        with torch.no_grad():
+            self.w_in.mul_(neuron_scales.view(-1, 1, 1))
+            self.w_out.mul_(neuron_scales.view(-1, 1, 1))
+
         for w in self.w_hidden:
-            nn.init.normal_(w, std=std)
-        # Initialize gate weights small, bias already set to -2 in __init__
-        nn.init.normal_(self.w_gate, std=std)
+            nn.init.normal_(w, std=base_std)
+            with torch.no_grad():
+                w.mul_(neuron_scales.view(-1, 1, 1))
+
+        # === Diverse gating initialization ===
+        # Different neurons start with different update tendencies
+        # Some neurons more "sticky" (low gate), some more "responsive" (high gate)
+        nn.init.normal_(self.w_gate, std=base_std)
+        with torch.no_grad():
+            # Vary gate bias: some neurons at -3 (very sticky), some at -1 (responsive)
+            # Base is -2, add uniform noise in [-1, 1]
+            gate_bias_variation = torch.linspace(-1, 1, self.d_model)
+            gate_bias_variation = gate_bias_variation[torch.randperm(self.d_model)]
+            self.b_gate.add_(gate_bias_variation)
 
     def forward(self, history: torch.Tensor) -> torch.Tensor:
         """
