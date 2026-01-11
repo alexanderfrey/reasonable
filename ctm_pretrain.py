@@ -694,52 +694,79 @@ def log_nlm_diagnostics(
             log_data["nlm/all_layers_grid"] = wandb.Image(fig)
             plt.close(fig)
 
-            # 6. Layer × Tick grid: X=neuron index, Y=activation value
-            # Each subplot shows the activation distribution for one layer at one tick
-            fig, axes = plt.subplots(n_layer, num_ticks, figsize=(4 * num_ticks, 3 * n_layer),
-                                     sharex=True, sharey='row')
+            # 6. Neuron trajectories: X=tick, Y=activation
+            # Grid of subplots, one per layer, showing how neurons evolve over ticks
+            n_cols = 3
+            n_rows = (n_layer + n_cols - 1) // n_cols
+            fig, axes = plt.subplots(n_rows, n_cols, figsize=(6 * n_cols, 4 * n_rows),
+                                     sharex=True)
+            axes = np.atleast_2d(axes)
 
-            # Handle edge cases for subplot array shape
-            if n_layer == 1 and num_ticks == 1:
-                axes = np.array([[axes]])
-            elif n_layer == 1:
-                axes = axes.reshape(1, -1)
-            elif num_ticks == 1:
-                axes = axes.reshape(-1, 1)
-
-            # Sort neurons once by overall variance for consistent ordering
+            # Select neurons to plot: sample evenly across variance spectrum
             overall_var = layer_post_acts.var(axis=0).mean(axis=0)  # (D,)
-            sorted_neuron_idx = np.argsort(overall_var)[::-1]  # Most variable first
+            sorted_neuron_idx = np.argsort(overall_var)[::-1]
+
+            # Sample neurons: top 10 most dynamic, 10 from middle, 10 most stable
+            n_sample = min(10, D // 3)
+            top_neurons = sorted_neuron_idx[:n_sample]
+            mid_neurons = sorted_neuron_idx[D//2 - n_sample//2 : D//2 + n_sample//2]
+            bottom_neurons = sorted_neuron_idx[-n_sample:]
+            sample_neurons = np.concatenate([top_neurons, mid_neurons, bottom_neurons])
+
+            # Color map: dynamic=red, mid=green, stable=blue
+            colors_top = plt.cm.Reds(np.linspace(0.4, 0.8, n_sample))
+            colors_mid = plt.cm.Greens(np.linspace(0.4, 0.8, len(mid_neurons)))
+            colors_bottom = plt.cm.Blues(np.linspace(0.4, 0.8, n_sample))
 
             for layer_idx in range(n_layer):
-                for tick_idx in range(num_ticks):
-                    ax = axes[layer_idx, tick_idx]
-                    # Get activations for this layer and tick, sorted by variance
-                    acts = layer_post_acts[tick_idx, layer_idx, sorted_neuron_idx]  # (D,)
+                row, col = layer_idx // n_cols, layer_idx % n_cols
+                ax = axes[row, col]
 
-                    # Plot as scatter/line with neuron index on X, activation on Y
-                    ax.plot(range(D), acts, linewidth=0.5, alpha=0.7, color='steelblue')
-                    ax.fill_between(range(D), 0, acts, alpha=0.3, color='steelblue')
+                # Plot trajectories for sampled neurons
+                ticks = np.arange(num_ticks)
 
-                    # Add zero line
-                    ax.axhline(y=0, color='gray', linestyle='--', linewidth=0.5, alpha=0.5)
+                # Dynamic neurons (red)
+                for i, neuron_idx in enumerate(top_neurons):
+                    trajectory = layer_post_acts[:, layer_idx, neuron_idx]
+                    ax.plot(ticks, trajectory, color=colors_top[i], alpha=0.7,
+                           linewidth=1.5, marker='o', markersize=4)
 
-                    # Labels
-                    if tick_idx == 0:
-                        ax.set_ylabel(f'L{layer_idx}', fontsize=10, fontweight='bold')
-                    if layer_idx == n_layer - 1:
-                        ax.set_xlabel('Neuron')
-                    if layer_idx == 0:
-                        ax.set_title(f'Tick {tick_idx}', fontsize=10, fontweight='bold')
+                # Mid neurons (green)
+                for i, neuron_idx in enumerate(mid_neurons):
+                    trajectory = layer_post_acts[:, layer_idx, neuron_idx]
+                    ax.plot(ticks, trajectory, color=colors_mid[i], alpha=0.5,
+                           linewidth=1, marker='s', markersize=3)
 
-                    # Clean up ticks for readability
-                    ax.set_xlim(0, D - 1)
-                    if D > 100:
-                        ax.set_xticks([0, D // 2, D - 1])
+                # Stable neurons (blue)
+                for i, neuron_idx in enumerate(bottom_neurons):
+                    trajectory = layer_post_acts[:, layer_idx, neuron_idx]
+                    ax.plot(ticks, trajectory, color=colors_bottom[i], alpha=0.7,
+                           linewidth=1.5, marker='^', markersize=4)
 
-            plt.suptitle(f'Post-Activations: Layer × Tick Grid @ Step {global_step}\n(X=neuron index sorted by variance, Y=activation)', fontsize=12)
+                ax.set_title(f'Layer {layer_idx}', fontsize=11, fontweight='bold')
+                ax.set_xlabel('Tick')
+                ax.set_ylabel('Activation')
+                ax.set_xticks(ticks)
+                ax.axhline(y=0, color='gray', linestyle='--', linewidth=0.5, alpha=0.5)
+                ax.grid(True, alpha=0.3)
+
+            # Hide empty subplots
+            for idx in range(n_layer, n_rows * n_cols):
+                row, col = idx // n_cols, idx % n_cols
+                axes[row, col].set_visible(False)
+
+            # Add legend
+            from matplotlib.lines import Line2D
+            legend_elements = [
+                Line2D([0], [0], color='red', linewidth=2, label='Dynamic neurons'),
+                Line2D([0], [0], color='green', linewidth=2, label='Mid neurons'),
+                Line2D([0], [0], color='blue', linewidth=2, label='Stable neurons'),
+            ]
+            fig.legend(handles=legend_elements, loc='upper right', fontsize=10)
+
+            plt.suptitle(f'Neuron Trajectories Over Ticks @ Step {global_step}\n(X=tick, Y=activation)', fontsize=12)
             plt.tight_layout()
-            log_data["nlm/layer_tick_grid"] = wandb.Image(fig)
+            log_data["nlm/neuron_trajectories"] = wandb.Image(fig)
             plt.close(fig)
 
         # === NLM INTERNAL DIAGNOSTICS (from last tick) ===
