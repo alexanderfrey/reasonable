@@ -441,23 +441,41 @@ def log_nlm_diagnostics(
 
         log_data = {}
 
+        def safe_histogram(data, num_bins=32):
+            """Create histogram, handling edge cases where data has no variance."""
+            data = np.asarray(data).flatten()
+            if len(data) == 0:
+                return None
+            # Check if data has sufficient variance for binning
+            data_range = data.max() - data.min()
+            if data_range < 1e-8:
+                # All values are essentially the same - add tiny noise for binning
+                data = data + np.random.normal(0, 1e-6, data.shape)
+            return wandb.Histogram(data, num_bins=num_bins)
+
         # 1. Gate value histogram (averaged across layers)
         gate_mean = diagnostics['gate_mean'].mean(dim=0).cpu().numpy()  # (D,)
-        log_data["nlm/gate_value_hist"] = wandb.Histogram(gate_mean)
+        hist = safe_histogram(gate_mean)
+        if hist:
+            log_data["nlm/gate_value_hist"] = hist
         log_data["nlm/gate_mean"] = float(gate_mean.mean())
         log_data["nlm/gate_std"] = float(gate_mean.std())
 
         # 2. Attention focus histogram (averaged across layers)
         # Low = attends to recent (high freq), High = attends to old (low freq)
         attn_focus = diagnostics['attn_focus'].mean(dim=0).cpu().numpy()  # (D,)
-        log_data["nlm/attn_focus_hist"] = wandb.Histogram(attn_focus)
+        hist = safe_histogram(attn_focus)
+        if hist:
+            log_data["nlm/attn_focus_hist"] = hist
         log_data["nlm/attn_focus_mean"] = float(attn_focus.mean())
         log_data["nlm/attn_focus_std"] = float(attn_focus.std())
 
         # 3. Attention entropy histogram (averaged across layers)
         # Low = selective (focused), High = integrator (uniform)
         attn_entropy = diagnostics['attn_entropy'].mean(dim=0).cpu().numpy()  # (D,)
-        log_data["nlm/attn_entropy_hist"] = wandb.Histogram(attn_entropy)
+        hist = safe_histogram(attn_entropy)
+        if hist:
+            log_data["nlm/attn_entropy_hist"] = hist
         log_data["nlm/attn_entropy_mean"] = float(attn_entropy.mean())
         log_data["nlm/attn_entropy_std"] = float(attn_entropy.std())
 

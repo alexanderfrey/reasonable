@@ -31,8 +31,9 @@ class OptimizedRMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x):
-        # PyTorch 2.4+ fused kernel
-        return F.rms_norm(x, (x.size(-1),), self.weight, self.eps)
+        # PyTorch 2.4+ fused kernel - cast weight to input dtype to avoid mismatch
+        weight = self.weight.to(x.dtype) if self.weight.dtype != x.dtype else self.weight
+        return F.rms_norm(x, (x.size(-1),), weight, self.eps)
 
 
 class OptimizedMLP(nn.Module):
