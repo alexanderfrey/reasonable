@@ -514,32 +514,69 @@ def log_nlm_diagnostics(
             log_data["nlm/attention_heatmap"] = wandb.Image(fig)
             plt.close(fig)
 
-            # 5. "Frequency spectrum" visualization
-            # Sort neurons by attention focus (low to high = fast to slow)
+            # 5. Full neuron grid sorted by "frequency" (attention focus)
+            # Sort all neurons by attention focus: fast (recent) at top, slow (old) at bottom
             sorted_indices = np.argsort(attn_focus)
-            fast_neurons = sorted_indices[:16]  # 16 fastest (attend to recent)
-            slow_neurons = sorted_indices[-16:]  # 16 slowest (attend to old)
+            sorted_attn = layer0_attn[sorted_indices, :]  # (D, T) sorted by frequency
 
-            fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+            fig, axes = plt.subplots(1, 2, figsize=(14, 6))
 
-            # Fast neurons (high frequency - attend to recent)
-            for i, idx in enumerate(fast_neurons[:8]):
-                axes[0].plot(layer0_attn[idx], alpha=0.7, label=f'n{idx}')
-            axes[0].set_title('Fast Neurons (attend to recent)')
-            axes[0].set_xlabel('Time step')
-            axes[0].set_ylabel('Attention')
-            axes[0].legend(fontsize=6, ncol=2)
+            # Left: Heatmap of ALL neurons sorted by frequency
+            im = axes[0].imshow(sorted_attn, aspect='auto', cmap='viridis',
+                               origin='upper', interpolation='nearest')
+            axes[0].set_xlabel('Time step (0=oldest, T-1=most recent)')
+            axes[0].set_ylabel('Neuron (sorted: fast→slow)')
+            axes[0].set_title(f'All Neurons by Frequency @ Step {global_step}')
+            plt.colorbar(im, ax=axes[0], label='Attention weight')
 
-            # Slow neurons (low frequency - attend to old)
-            for i, idx in enumerate(slow_neurons[:8]):
-                axes[1].plot(layer0_attn[idx], alpha=0.7, label=f'n{idx}')
-            axes[1].set_title('Slow Neurons (attend to old)')
-            axes[1].set_xlabel('Time step')
-            axes[1].set_ylabel('Attention')
-            axes[1].legend(fontsize=6, ncol=2)
+            # Add frequency distribution on the right side
+            # This shows the distribution of attention focus values
+            axes[1].hist(attn_focus, bins=32, orientation='horizontal', alpha=0.7, color='steelblue')
+            axes[1].set_ylabel('Attention Focus (low=fast, high=slow)')
+            axes[1].set_xlabel('Count')
+            axes[1].set_title('Frequency Distribution')
+            axes[1].axhline(y=np.median(attn_focus), color='red', linestyle='--', label=f'Median: {np.median(attn_focus):.2f}')
+            axes[1].legend()
 
             plt.tight_layout()
-            log_data["nlm/frequency_spectrum"] = wandb.Image(fig)
+            log_data["nlm/neuron_frequency_grid"] = wandb.Image(fig)
+            plt.close(fig)
+
+            # 6. True FFT-based frequency spectrum (power spectrum of attention patterns)
+            # For each neuron, compute FFT of its attention pattern to see actual frequencies
+            fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+            # Compute FFT for all neurons
+            fft_result = np.fft.rfft(layer0_attn, axis=1)  # (D, T//2+1)
+            power_spectrum = np.abs(fft_result) ** 2  # Power spectrum
+            freqs = np.fft.rfftfreq(T)  # Normalized frequencies
+
+            # Left: Power spectrum heatmap (neurons sorted by dominant frequency)
+            dominant_freq_idx = np.argmax(power_spectrum[:, 1:], axis=1)  # Skip DC component
+            freq_sorted_indices = np.argsort(dominant_freq_idx)
+            sorted_power = power_spectrum[freq_sorted_indices, :]
+
+            # Log scale for better visualization
+            sorted_power_log = np.log1p(sorted_power)
+
+            im = axes[0].imshow(sorted_power_log, aspect='auto', cmap='magma',
+                               origin='upper', interpolation='nearest')
+            axes[0].set_xlabel('Frequency bin')
+            axes[0].set_ylabel('Neuron (sorted by dominant freq)')
+            axes[0].set_title('FFT Power Spectrum (log scale)')
+            plt.colorbar(im, ax=axes[0], label='Log power')
+
+            # Right: Average power spectrum across all neurons
+            avg_power = power_spectrum.mean(axis=0)
+            axes[1].plot(freqs, avg_power, color='steelblue', linewidth=2)
+            axes[1].fill_between(freqs, 0, avg_power, alpha=0.3)
+            axes[1].set_xlabel('Normalized Frequency')
+            axes[1].set_ylabel('Average Power')
+            axes[1].set_title('Average Power Spectrum Across Neurons')
+            axes[1].set_xlim(0, 0.5)
+
+            plt.tight_layout()
+            log_data["nlm/fft_spectrum"] = wandb.Image(fig)
             plt.close(fig)
 
         wandb.log(log_data, step=global_step)
