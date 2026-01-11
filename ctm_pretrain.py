@@ -823,6 +823,21 @@ def log_nlm_diagnostics(
                 log_data["nlm/mean_abs_delta"] = float(mean_abs_delta)
                 log_data["nlm/max_abs_delta"] = float(max_abs_delta)
 
+                # Log activation scale for context
+                activation_mean = np.abs(layer_post_acts).mean()
+                activation_std = layer_post_acts.std()
+                log_data["nlm/activation_mean_abs"] = float(activation_mean)
+                log_data["nlm/activation_std"] = float(activation_std)
+
+                # Relative change (delta / activation magnitude)
+                # This shows % change, not absolute
+                eps = 1e-6
+                relative_deltas = np.abs(deltas) / (np.abs(layer_post_acts[:-1]) + eps)
+                mean_relative_delta = relative_deltas.mean()
+                max_relative_delta = relative_deltas.max()
+                log_data["nlm/mean_relative_delta"] = float(mean_relative_delta)
+                log_data["nlm/max_relative_delta"] = float(max_relative_delta)
+
         # === NLM INTERNAL DIAGNOSTICS (from last tick) ===
         if 'gate_mean' in diagnostics:
             gate_mean = diagnostics['gate_mean'].mean(dim=0).numpy()  # (D,)
