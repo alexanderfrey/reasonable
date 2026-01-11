@@ -461,123 +461,157 @@ def log_nlm_diagnostics(
             except Exception:
                 return None
 
-        # 1. Gate value histogram (averaged across layers)
-        gate_mean = diagnostics['gate_mean'].mean(dim=0).numpy()  # (D,) - already on CPU
-        hist = safe_histogram(gate_mean)
-        if hist:
-            log_data["nlm/gate_value_hist"] = hist
-        log_data["nlm/gate_mean"] = float(gate_mean.mean())
-        log_data["nlm/gate_std"] = float(gate_mean.std())
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
 
-        # 2. Attention focus histogram (averaged across layers)
-        # Low = attends to recent (high freq), High = attends to old (low freq)
-        attn_focus = diagnostics['attn_focus'].mean(dim=0).numpy()  # (D,) - already on CPU
-        hist = safe_histogram(attn_focus)
-        if hist:
-            log_data["nlm/attn_focus_hist"] = hist
-        log_data["nlm/attn_focus_mean"] = float(attn_focus.mean())
-        log_data["nlm/attn_focus_std"] = float(attn_focus.std())
+        # === TICK-LEVEL DYNAMICS (the correct frame for CTM) ===
+        # tick_activations: (num_ticks, D) - neuron activations at each tick boundary
+        tick_activations = diagnostics['tick_activations'].numpy()  # (num_ticks, D)
+        tick_sync = diagnostics['tick_sync'].numpy()  # (num_ticks, sync_pairs)
+        num_ticks, D = tick_activations.shape
 
-        # 3. Attention entropy histogram (averaged across layers)
-        # Low = selective (focused), High = integrator (uniform)
-        attn_entropy = diagnostics['attn_entropy'].mean(dim=0).numpy()  # (D,) - already on CPU
-        hist = safe_histogram(attn_entropy)
-        if hist:
-            log_data["nlm/attn_entropy_hist"] = hist
-        log_data["nlm/attn_entropy_mean"] = float(attn_entropy.mean())
-        log_data["nlm/attn_entropy_std"] = float(attn_entropy.std())
+        # 1. Neuron activation trajectories across ticks
+        # This shows how each neuron's output evolves during "thinking"
+        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
 
-        # 4. Heatmap: attention patterns for a subset of neurons
-        # attn_mean: (n_layer, D, T) - take layer 0, sample neurons
-        attn_mean = diagnostics['attn_mean']
-        if attn_mean.numel() > 0:
-            # Take first layer, sample 64 neurons evenly spaced
-            layer0_attn = attn_mean[0].numpy()  # (D, T) - already on CPU
-            D, T = layer0_attn.shape
-            neuron_indices = np.linspace(0, D - 1, min(64, D), dtype=int)
-            sampled_attn = layer0_attn[neuron_indices, :]  # (64, T)
+        # Top-left: Heatmap of ALL neurons across ticks (sorted by variance = "activity")
+        neuron_variance = tick_activations.var(axis=0)  # (D,) - how much each neuron changes
+        sorted_by_variance = np.argsort(neuron_variance)[::-1]  # Most active first
+        sorted_activations = tick_activations[:, sorted_by_variance].T  # (D, num_ticks)
 
-            # Create heatmap image
-            import matplotlib
-            matplotlib.use('Agg')
-            import matplotlib.pyplot as plt
-
-            fig, ax = plt.subplots(figsize=(10, 6))
-            im = ax.imshow(sampled_attn, aspect='auto', cmap='viridis',
-                          origin='lower', interpolation='nearest')
-            ax.set_xlabel('Time step (0=oldest, T-1=most recent)')
-            ax.set_ylabel('Neuron (sampled)')
-            ax.set_title(f'NLM Temporal Attention Patterns @ Step {global_step}')
-            plt.colorbar(im, ax=ax, label='Attention weight')
-            plt.tight_layout()
-
-            log_data["nlm/attention_heatmap"] = wandb.Image(fig)
-            plt.close(fig)
-
-            # 5. Full neuron grid sorted by "frequency" (attention focus)
-            # Sort all neurons by attention focus: fast (recent) at top, slow (old) at bottom
-            sorted_indices = np.argsort(attn_focus)
-            sorted_attn = layer0_attn[sorted_indices, :]  # (D, T) sorted by frequency
-
-            fig, axes = plt.subplots(1, 2, figsize=(14, 6))
-
-            # Left: Heatmap of ALL neurons sorted by frequency
-            im = axes[0].imshow(sorted_attn, aspect='auto', cmap='viridis',
+        im = axes[0, 0].imshow(sorted_activations, aspect='auto', cmap='RdBu_r',
                                origin='upper', interpolation='nearest')
-            axes[0].set_xlabel('Time step (0=oldest, T-1=most recent)')
-            axes[0].set_ylabel('Neuron (sorted: fast→slow)')
-            axes[0].set_title(f'All Neurons by Frequency @ Step {global_step}')
-            plt.colorbar(im, ax=axes[0], label='Attention weight')
+        axes[0, 0].set_xlabel('Tick')
+        axes[0, 0].set_ylabel('Neuron (sorted by variance: active→stable)')
+        axes[0, 0].set_title(f'Neuron Activations Across Ticks @ Step {global_step}')
+        axes[0, 0].set_xticks(range(num_ticks))
+        plt.colorbar(im, ax=axes[0, 0], label='Activation')
 
-            # Add frequency distribution on the right side
-            # This shows the distribution of attention focus values
-            axes[1].hist(attn_focus, bins=32, orientation='horizontal', alpha=0.7, color='steelblue')
-            axes[1].set_ylabel('Attention Focus (low=fast, high=slow)')
-            axes[1].set_xlabel('Count')
-            axes[1].set_title('Frequency Distribution')
-            axes[1].axhline(y=np.median(attn_focus), color='red', linestyle='--', label=f'Median: {np.median(attn_focus):.2f}')
-            axes[1].legend()
+        # Top-right: Distribution of neuron variance (activity levels)
+        hist = axes[0, 1].hist(neuron_variance, bins=32, alpha=0.7, color='steelblue')
+        axes[0, 1].set_xlabel('Variance across ticks')
+        axes[0, 1].set_ylabel('Count')
+        axes[0, 1].set_title('Neuron Activity Distribution')
+        axes[0, 1].axvline(x=np.median(neuron_variance), color='red', linestyle='--',
+                          label=f'Median: {np.median(neuron_variance):.4f}')
+        axes[0, 1].legend()
 
-            plt.tight_layout()
-            log_data["nlm/neuron_frequency_grid"] = wandb.Image(fig)
-            plt.close(fig)
+        # Bottom-left: Sample trajectories for most active neurons
+        top_active = sorted_by_variance[:8]  # 8 most active
+        for i, idx in enumerate(top_active):
+            axes[1, 0].plot(range(num_ticks), tick_activations[:, idx],
+                           marker='o', alpha=0.7, label=f'n{idx}')
+        axes[1, 0].set_xlabel('Tick')
+        axes[1, 0].set_ylabel('Activation')
+        axes[1, 0].set_title('Most Active Neurons (high variance)')
+        axes[1, 0].set_xticks(range(num_ticks))
+        axes[1, 0].legend(fontsize=6, ncol=2)
+        axes[1, 0].grid(True, alpha=0.3)
 
-            # 6. True FFT-based frequency spectrum (power spectrum of attention patterns)
-            # For each neuron, compute FFT of its attention pattern to see actual frequencies
-            fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+        # Bottom-right: Sample trajectories for most stable neurons
+        bottom_stable = sorted_by_variance[-8:]  # 8 most stable
+        for i, idx in enumerate(bottom_stable):
+            axes[1, 1].plot(range(num_ticks), tick_activations[:, idx],
+                           marker='o', alpha=0.7, label=f'n{idx}')
+        axes[1, 1].set_xlabel('Tick')
+        axes[1, 1].set_ylabel('Activation')
+        axes[1, 1].set_title('Most Stable Neurons (low variance)')
+        axes[1, 1].set_xticks(range(num_ticks))
+        axes[1, 1].legend(fontsize=6, ncol=2)
+        axes[1, 1].grid(True, alpha=0.3)
 
-            # Compute FFT for all neurons
-            fft_result = np.fft.rfft(layer0_attn, axis=1)  # (D, T//2+1)
+        plt.tight_layout()
+        log_data["nlm/tick_dynamics"] = wandb.Image(fig)
+        plt.close(fig)
+
+        # 2. FFT-based frequency spectrum over TICKS (the correct domain!)
+        # This shows which neurons oscillate fast vs slow in tick-space
+        if num_ticks >= 2:
+            fig, axes = plt.subplots(1, 3, figsize=(16, 5))
+
+            # Compute FFT over tick dimension for each neuron
+            # Subtract mean to remove DC component for cleaner spectrum
+            centered = tick_activations - tick_activations.mean(axis=0, keepdims=True)
+            fft_result = np.fft.rfft(centered, axis=0)  # (num_ticks//2+1, D)
             power_spectrum = np.abs(fft_result) ** 2  # Power spectrum
-            freqs = np.fft.rfftfreq(T)  # Normalized frequencies
+            freqs = np.fft.rfftfreq(num_ticks)  # Normalized frequencies (cycles per tick)
 
             # Left: Power spectrum heatmap (neurons sorted by dominant frequency)
-            dominant_freq_idx = np.argmax(power_spectrum[:, 1:], axis=1)  # Skip DC component
+            if power_spectrum.shape[0] > 1:
+                dominant_freq_idx = np.argmax(power_spectrum[1:, :], axis=0)  # Skip DC
+            else:
+                dominant_freq_idx = np.zeros(D, dtype=int)
             freq_sorted_indices = np.argsort(dominant_freq_idx)
-            sorted_power = power_spectrum[freq_sorted_indices, :]
+            sorted_power = power_spectrum[:, freq_sorted_indices]  # (freqs, D_sorted)
 
             # Log scale for better visualization
-            sorted_power_log = np.log1p(sorted_power)
+            sorted_power_log = np.log1p(sorted_power.T)  # (D, freqs)
 
             im = axes[0].imshow(sorted_power_log, aspect='auto', cmap='magma',
                                origin='upper', interpolation='nearest')
-            axes[0].set_xlabel('Frequency bin')
+            axes[0].set_xlabel('Frequency bin (cycles/tick)')
             axes[0].set_ylabel('Neuron (sorted by dominant freq)')
-            axes[0].set_title('FFT Power Spectrum (log scale)')
+            axes[0].set_title('FFT Power Spectrum Over Ticks')
             plt.colorbar(im, ax=axes[0], label='Log power')
 
-            # Right: Average power spectrum across all neurons
-            avg_power = power_spectrum.mean(axis=0)
-            axes[1].plot(freqs, avg_power, color='steelblue', linewidth=2)
-            axes[1].fill_between(freqs, 0, avg_power, alpha=0.3)
-            axes[1].set_xlabel('Normalized Frequency')
+            # Middle: Average power spectrum
+            avg_power = power_spectrum.mean(axis=1)
+            axes[1].bar(range(len(freqs)), avg_power, alpha=0.7, color='steelblue')
+            axes[1].set_xlabel('Frequency bin')
             axes[1].set_ylabel('Average Power')
-            axes[1].set_title('Average Power Spectrum Across Neurons')
-            axes[1].set_xlim(0, 0.5)
+            axes[1].set_title('Average Power Spectrum')
+            axes[1].set_xticks(range(len(freqs)))
+            axes[1].set_xticklabels([f'{f:.2f}' for f in freqs], rotation=45)
+
+            # Right: Distribution of dominant frequencies
+            axes[2].hist(dominant_freq_idx, bins=max(1, len(freqs)-1), alpha=0.7, color='coral')
+            axes[2].set_xlabel('Dominant Frequency Bin')
+            axes[2].set_ylabel('Count')
+            axes[2].set_title('Distribution of Neuron Frequencies')
 
             plt.tight_layout()
-            log_data["nlm/fft_spectrum"] = wandb.Image(fig)
+            log_data["nlm/tick_fft_spectrum"] = wandb.Image(fig)
             plt.close(fig)
+
+        # 3. Sync evolution across ticks
+        fig, ax = plt.subplots(figsize=(10, 5))
+        sync_pairs = tick_sync.shape[1]
+        for p in range(min(sync_pairs, 16)):  # Plot up to 16 sync pairs
+            ax.plot(range(num_ticks), tick_sync[:, p], marker='o', alpha=0.6, label=f'pair{p}')
+        ax.set_xlabel('Tick')
+        ax.set_ylabel('Sync Value')
+        ax.set_title(f'Synchronization Evolution Across Ticks @ Step {global_step}')
+        ax.set_xticks(range(num_ticks))
+        ax.legend(fontsize=6, ncol=4, loc='upper right')
+        ax.grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        log_data["nlm/sync_evolution"] = wandb.Image(fig)
+        plt.close(fig)
+
+        # Log scalar metrics
+        log_data["nlm/neuron_variance_mean"] = float(neuron_variance.mean())
+        log_data["nlm/neuron_variance_std"] = float(neuron_variance.std())
+        log_data["nlm/sync_final_mean"] = float(tick_sync[-1].mean())
+        log_data["nlm/sync_change"] = float(tick_sync[-1].mean() - tick_sync[0].mean())
+
+        # === NLM INTERNAL DIAGNOSTICS (from last tick) ===
+        if 'gate_mean' in diagnostics:
+            gate_mean = diagnostics['gate_mean'].mean(dim=0).numpy()  # (D,)
+            hist = safe_histogram(gate_mean)
+            if hist:
+                log_data["nlm/gate_value_hist"] = hist
+            log_data["nlm/gate_mean"] = float(gate_mean.mean())
+            log_data["nlm/gate_std"] = float(gate_mean.std())
+
+        if 'attn_entropy' in diagnostics:
+            attn_entropy = diagnostics['attn_entropy'].mean(dim=0).numpy()  # (D,)
+            hist = safe_histogram(attn_entropy)
+            if hist:
+                log_data["nlm/attn_entropy_hist"] = hist
+            log_data["nlm/attn_entropy_mean"] = float(attn_entropy.mean())
+            log_data["nlm/attn_entropy_std"] = float(attn_entropy.std())
 
         wandb.log(log_data, step=global_step)
 

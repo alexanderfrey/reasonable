@@ -1346,11 +1346,14 @@ class CTMLanguageModel(nn.Module):
         """
         Run a forward pass and collect NLM diagnostics for visualization.
 
-        Returns diagnostics aggregated across all layers:
-            - 'attn_entropy': (n_layer, D) - temporal attention entropy per neuron
-            - 'gate_mean': (n_layer, D) - mean gate value per neuron
-            - 'attn_mean': (n_layer, D, T) - average attention pattern per neuron
-            - 'attn_focus': (n_layer, D) - "center of mass" of attention (low=recent, high=old)
+        Returns diagnostics:
+            - 'tick_activations': (num_ticks, D) - mean neuron activation at each tick boundary
+            - 'tick_sync': (num_ticks, sync_pairs) - sync values at each tick boundary
+            - 'gate_mean': (n_layer, D) - mean gate value per neuron (last tick)
+            - 'attn_entropy': (n_layer, D) - temporal attention entropy per neuron (last tick)
+
+        The tick_activations show how each neuron's output evolves across ticks,
+        which is what the sync module measures correlations over.
         """
         self.eval()
         B, S = input_ids.shape
@@ -1373,10 +1376,13 @@ class CTMLanguageModel(nn.Module):
             B, S, self.config.sync_pairs, device=device, dtype=encoded.dtype
         )
 
-        # Collect diagnostics per layer
-        all_attn_entropy = []
-        all_gate_mean = []
-        all_attn_mean = []
+        # Collect tick-level dynamics (the key insight: sync operates at tick boundaries)
+        tick_activations = []  # State at each tick boundary
+        tick_sync_values = []  # Sync at each tick boundary
+
+        # Also collect NLM internals at last tick
+        last_tick_attn_entropy = []
+        last_tick_gate_mean = []
 
         for tick in range(num_ticks):
             current_sync = prev_tick_sync
@@ -1389,22 +1395,12 @@ class CTMLanguageModel(nn.Module):
                 else:
                     layer_history = None
 
-                # Run layer (simplified - just need NLM diagnostics)
-                # We need to run the layer's NLM with diagnostics
+                # Collect NLM diagnostics on last tick
                 if layer_history is not None and layer_history.size(2) > 0:
-                    _, nlm_diag = layer.nlm(layer_history, return_diagnostics=True)
-
-                    # Only collect on last tick (most representative)
                     if tick == num_ticks - 1:
-                        if layer_idx >= len(all_attn_entropy):
-                            all_attn_entropy.append(nlm_diag['attn_entropy'])
-                            all_gate_mean.append(nlm_diag['gate_mean'])
-                            all_attn_mean.append(nlm_diag['attn_mean'])
-                        else:
-                            # Update with latest
-                            all_attn_entropy[layer_idx] = nlm_diag['attn_entropy']
-                            all_gate_mean[layer_idx] = nlm_diag['gate_mean']
-                            all_attn_mean[layer_idx] = nlm_diag['attn_mean']
+                        _, nlm_diag = layer.nlm(layer_history, return_diagnostics=True)
+                        last_tick_attn_entropy.append(nlm_diag['attn_entropy'])
+                        last_tick_gate_mean.append(nlm_diag['gate_mean'])
 
                 # Run full layer forward for state update
                 state, post_act = layer.forward(
@@ -1412,42 +1408,32 @@ class CTMLanguageModel(nn.Module):
                 )
                 history_list.append(post_act)
 
-            # Update sync at tick boundary
+            # === TICK BOUNDARY: This is where sync is computed ===
             tick_global_hist = torch.stack(history_list, dim=2)
             prev_tick_sync = self.ctm_core.global_sync(tick_global_hist)
 
-        # Stack across layers
-        if all_attn_entropy:
-            attn_entropy = torch.stack(all_attn_entropy, dim=0)  # (n_layer, D)
-            gate_mean = torch.stack(all_gate_mean, dim=0)        # (n_layer, D)
+            # Capture state at tick boundary (averaged over batch and sequence)
+            # state: (B, S, D) -> (D,) mean activation per neuron
+            tick_state_mean = state.mean(dim=(0, 1))  # (D,)
+            tick_activations.append(tick_state_mean)
 
-            # Compute attention focus (center of mass)
-            # Low value = attends to recent, high value = attends to old
-            attn_focus_list = []
-            for attn in all_attn_mean:
-                T = attn.size(-1)
-                time_indices = torch.arange(T, device=device, dtype=attn.dtype)
-                # Reverse so 0 = most recent, T-1 = oldest
-                time_indices = T - 1 - time_indices
-                focus = (attn * time_indices).sum(dim=-1)  # (D,)
-                attn_focus_list.append(focus)
-            attn_focus = torch.stack(attn_focus_list, dim=0)  # (n_layer, D)
+            # Capture sync at tick boundary
+            tick_sync_mean = prev_tick_sync.mean(dim=(0, 1))  # (sync_pairs,)
+            tick_sync_values.append(tick_sync_mean)
 
-            # Pad attn_mean to same T across layers
-            max_T = max(a.size(-1) for a in all_attn_mean)
-            padded_attn = []
-            for attn in all_attn_mean:
-                if attn.size(-1) < max_T:
-                    pad = torch.zeros(attn.size(0), max_T - attn.size(-1), device=device)
-                    attn = torch.cat([pad, attn], dim=-1)
-                padded_attn.append(attn)
-            attn_mean = torch.stack(padded_attn, dim=0)  # (n_layer, D, T)
+        # Stack tick-level data
+        tick_activations = torch.stack(tick_activations, dim=0)  # (num_ticks, D)
+        tick_sync_values = torch.stack(tick_sync_values, dim=0)  # (num_ticks, sync_pairs)
 
-            return {
-                'attn_entropy': attn_entropy,  # (n_layer, D)
-                'gate_mean': gate_mean,        # (n_layer, D)
-                'attn_mean': attn_mean,        # (n_layer, D, T)
-                'attn_focus': attn_focus,      # (n_layer, D)
-            }
+        result = {
+            'tick_activations': tick_activations,  # (num_ticks, D)
+            'tick_sync': tick_sync_values,         # (num_ticks, sync_pairs)
+            'num_ticks': torch.tensor(num_ticks),
+        }
 
-        return {}
+        # Add NLM internals if available
+        if last_tick_attn_entropy:
+            result['attn_entropy'] = torch.stack(last_tick_attn_entropy, dim=0)  # (n_layer, D)
+            result['gate_mean'] = torch.stack(last_tick_gate_mean, dim=0)        # (n_layer, D)
+
+        return result
