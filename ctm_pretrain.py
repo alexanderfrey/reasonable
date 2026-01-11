@@ -604,6 +604,96 @@ def log_nlm_diagnostics(
         log_data["nlm/sync_final_mean"] = float(tick_sync[-1].mean())
         log_data["nlm/sync_change"] = float(tick_sync[-1].mean() - tick_sync[0].mean())
 
+        # 4. Per-layer post-activations across ticks
+        # layer_post_acts: (num_ticks, n_layer, D)
+        if 'layer_post_acts' in diagnostics:
+            layer_post_acts = diagnostics['layer_post_acts'].numpy()  # (num_ticks, n_layer, D)
+            n_layer = layer_post_acts.shape[1]
+
+            # Create a grid: each row is a layer, showing its neurons across ticks
+            fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+
+            # Top-left: Heatmap of layer mean activations across ticks
+            # Average over neurons to get (num_ticks, n_layer)
+            layer_means = layer_post_acts.mean(axis=2)  # (num_ticks, n_layer)
+            im = axes[0, 0].imshow(layer_means.T, aspect='auto', cmap='RdBu_r',
+                                   origin='lower', interpolation='nearest')
+            axes[0, 0].set_xlabel('Tick')
+            axes[0, 0].set_ylabel('Layer')
+            axes[0, 0].set_title('Mean Post-Activation per Layer Across Ticks')
+            axes[0, 0].set_xticks(range(num_ticks))
+            axes[0, 0].set_yticks(range(n_layer))
+            plt.colorbar(im, ax=axes[0, 0], label='Mean activation')
+
+            # Top-right: Layer activation trajectories (line plot)
+            for layer_idx in range(n_layer):
+                axes[0, 1].plot(range(num_ticks), layer_means[:, layer_idx],
+                               marker='o', alpha=0.7, label=f'L{layer_idx}')
+            axes[0, 1].set_xlabel('Tick')
+            axes[0, 1].set_ylabel('Mean Activation')
+            axes[0, 1].set_title('Layer Activation Trajectories')
+            axes[0, 1].set_xticks(range(num_ticks))
+            axes[0, 1].legend(fontsize=6, ncol=max(1, n_layer // 4))
+            axes[0, 1].grid(True, alpha=0.3)
+
+            # Bottom-left: Per-layer neuron variance across ticks
+            # Shows which layers have more dynamic neurons
+            layer_neuron_var = layer_post_acts.var(axis=0)  # (n_layer, D) - variance over ticks
+            layer_var_mean = layer_neuron_var.mean(axis=1)  # (n_layer,) - mean variance per layer
+            axes[1, 0].bar(range(n_layer), layer_var_mean, alpha=0.7, color='steelblue')
+            axes[1, 0].set_xlabel('Layer')
+            axes[1, 0].set_ylabel('Mean Neuron Variance')
+            axes[1, 0].set_title('Neuron Dynamics per Layer (variance across ticks)')
+            axes[1, 0].set_xticks(range(n_layer))
+
+            # Bottom-right: Detailed heatmap for one layer (layer 0)
+            # Show sample neurons across ticks
+            layer0_acts = layer_post_acts[:, 0, :]  # (num_ticks, D)
+            # Sort neurons by variance
+            neuron_var = layer0_acts.var(axis=0)
+            sorted_idx = np.argsort(neuron_var)[::-1]
+            # Show top 64 most dynamic neurons
+            top_neurons = sorted_idx[:min(64, D)]
+            sorted_acts = layer0_acts[:, top_neurons].T  # (64, num_ticks)
+
+            im = axes[1, 1].imshow(sorted_acts, aspect='auto', cmap='RdBu_r',
+                                   origin='upper', interpolation='nearest')
+            axes[1, 1].set_xlabel('Tick')
+            axes[1, 1].set_ylabel('Neuron (sorted by variance)')
+            axes[1, 1].set_title('Layer 0: Top 64 Dynamic Neurons Across Ticks')
+            axes[1, 1].set_xticks(range(num_ticks))
+            plt.colorbar(im, ax=axes[1, 1], label='Activation')
+
+            plt.tight_layout()
+            log_data["nlm/layer_post_acts"] = wandb.Image(fig)
+            plt.close(fig)
+
+            # 5. All-layers neuron grid: show ALL neurons for ALL layers
+            # This is the comprehensive view the user asked for
+            fig, axes = plt.subplots(1, n_layer, figsize=(4 * n_layer, 8), sharey=True)
+            if n_layer == 1:
+                axes = [axes]
+
+            for layer_idx in range(n_layer):
+                layer_acts = layer_post_acts[:, layer_idx, :]  # (num_ticks, D)
+                # Sort by variance
+                var = layer_acts.var(axis=0)
+                sorted_idx = np.argsort(var)[::-1]
+                sorted_acts = layer_acts[:, sorted_idx].T  # (D, num_ticks)
+
+                im = axes[layer_idx].imshow(sorted_acts, aspect='auto', cmap='RdBu_r',
+                                            origin='upper', interpolation='nearest')
+                axes[layer_idx].set_xlabel('Tick')
+                if layer_idx == 0:
+                    axes[layer_idx].set_ylabel('Neuron (sorted by variance)')
+                axes[layer_idx].set_title(f'Layer {layer_idx}')
+                axes[layer_idx].set_xticks(range(num_ticks))
+
+            plt.suptitle(f'All NLM Post-Activations Across Ticks @ Step {global_step}', fontsize=14)
+            plt.tight_layout()
+            log_data["nlm/all_layers_grid"] = wandb.Image(fig)
+            plt.close(fig)
+
         # === NLM INTERNAL DIAGNOSTICS (from last tick) ===
         if 'gate_mean' in diagnostics:
             gate_mean = diagnostics['gate_mean'].mean(dim=0).numpy()  # (D,)

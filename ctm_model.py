@@ -1379,19 +1379,23 @@ class CTMLanguageModel(nn.Module):
         # Collect tick-level dynamics (the key insight: sync operates at tick boundaries)
         tick_activations = []  # State at each tick boundary
         tick_sync_values = []  # Sync at each tick boundary
+        tick_layer_post_acts = []  # Post-act from each layer at each tick
 
         # Also collect NLM internals at last tick
         last_tick_attn_entropy = []
         last_tick_gate_mean = []
 
+        n_layer = self.config.n_layer
+
         for tick in range(num_ticks):
             current_sync = prev_tick_sync
+            tick_post_acts = []  # Post-act for each layer in this tick
 
             for layer_idx, layer in enumerate(self.ctm_core.layers):
                 # Get layer history
                 if len(history_list) > 0:
                     global_hist = torch.stack(history_list, dim=2)
-                    layer_history = global_hist[:, :, layer_idx::self.config.n_layer]
+                    layer_history = global_hist[:, :, layer_idx::n_layer]
                 else:
                     layer_history = None
 
@@ -1407,6 +1411,13 @@ class CTMLanguageModel(nn.Module):
                     state, current_sync, layer_history, static_k, static_v, cos, sin
                 )
                 history_list.append(post_act)
+
+                # Capture post_act for this layer (averaged over batch and sequence)
+                post_act_mean = post_act.mean(dim=(0, 1))  # (D,)
+                tick_post_acts.append(post_act_mean)
+
+            # Stack post_acts for all layers in this tick
+            tick_layer_post_acts.append(torch.stack(tick_post_acts, dim=0))  # (n_layer, D)
 
             # === TICK BOUNDARY: This is where sync is computed ===
             tick_global_hist = torch.stack(history_list, dim=2)
@@ -1424,11 +1435,14 @@ class CTMLanguageModel(nn.Module):
         # Stack tick-level data
         tick_activations = torch.stack(tick_activations, dim=0)  # (num_ticks, D)
         tick_sync_values = torch.stack(tick_sync_values, dim=0)  # (num_ticks, sync_pairs)
+        layer_post_acts = torch.stack(tick_layer_post_acts, dim=0)  # (num_ticks, n_layer, D)
 
         result = {
             'tick_activations': tick_activations,  # (num_ticks, D)
             'tick_sync': tick_sync_values,         # (num_ticks, sync_pairs)
+            'layer_post_acts': layer_post_acts,    # (num_ticks, n_layer, D)
             'num_ticks': torch.tensor(num_ticks),
+            'n_layer': torch.tensor(n_layer),
         }
 
         # Add NLM internals if available
