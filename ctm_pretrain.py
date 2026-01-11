@@ -49,8 +49,8 @@ from pretrain import (
     compute_default_n_kv_head,
 )
 
-# Import CTM model and loss
-from ctm_model import CTMConfig, CTMLanguageModel
+# Import CTM model and loss (v2 = faithful to original paper)
+from ctm_model_v2 import CTMConfig, CTMLanguageModel
 from ctm_loss import CTMLoss, CTMPerplexity
 
 
@@ -162,7 +162,7 @@ def prepare_dataloaders(args: Namespace, tokenizer, vocab_size, pad_token_id, eo
 
 
 def initialize_ctm_model(args: Namespace, vocab_size: int, device: torch.device):
-    """Initialize CTM model."""
+    """Initialize CTM model (v2 - faithful to original paper)."""
     n_kv_head = getattr(args, "n_kv_head", None)
     if n_kv_head is None:
         n_kv_head = compute_default_n_kv_head(args.n_head)
@@ -172,17 +172,13 @@ def initialize_ctm_model(args: Namespace, vocab_size: int, device: torch.device)
         d_model=args.d_model,
         n_head=args.n_head,
         n_kv_head=n_kv_head,
-        n_layer=args.n_layer,
         max_seq_len=args.max_seq_len,
-        d_ff=getattr(args, "d_ff", None),
         num_ticks=args.num_ticks,
         nlm_hidden=args.nlm_hidden,
         nlm_depth=args.nlm_depth,
         sync_pairs=args.sync_pairs,
-        sync_order=args.sync_order,
         dropout=args.dropout,
         rope_theta=getattr(args, "rope_theta", 500000.0),
-        use_gradient_checkpointing=getattr(args, "use_gradient_checkpointing", False),
     )
 
     model = CTMLanguageModel(config)
@@ -191,15 +187,14 @@ def initialize_ctm_model(args: Namespace, vocab_size: int, device: torch.device)
     # Log model info
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    logger.info(f"CTM Model initialized:")
+    logger.info(f"CTM Model (v2 - faithful) initialized:")
     logger.info(f"  - d_model: {config.d_model}")
-    logger.info(f"  - n_layer: {config.n_layer}")
     logger.info(f"  - n_head: {config.n_head}")
     logger.info(f"  - n_kv_head: {config.n_kv_head}")
     logger.info(f"  - num_ticks: {config.num_ticks}")
     logger.info(f"  - nlm_hidden: {config.nlm_hidden}")
+    logger.info(f"  - nlm_depth: {config.nlm_depth}")
     logger.info(f"  - sync_pairs: {config.sync_pairs}")
-    logger.info(f"  - sync_order: {config.sync_order}")
     logger.info(f"  - Total parameters: {total_params:,} ({total_params/1e6:.2f}M)")
     logger.info(f"  - Trainable parameters: {trainable_params:,}")
 
@@ -1048,7 +1043,7 @@ def train(args: Namespace):
             model,
             device_ids=[args.local_rank],
             output_device=args.local_rank,
-            find_unused_parameters=False,
+            find_unused_parameters=False,  # SA+FFN fully removed from CTMLayer
         )
 
     # --- Gradient Accumulation ---
@@ -1312,17 +1307,13 @@ def main():
     parser.add_argument("--d_model", type=int, default=512, help="Model dimension")
     parser.add_argument("--n_head", type=int, default=8, help="Number of attention heads")
     parser.add_argument("--n_kv_head", type=int, default=None, help="Number of KV heads (GQA)")
-    parser.add_argument("--n_layer", type=int, default=6, help="Number of CTM layers")
-    parser.add_argument("--d_ff", type=int, default=None, help="FFN dimension")
     parser.add_argument("--dropout", type=float, default=0.0, help="Dropout rate")
 
-    # CTM-specific
+    # CTM-specific (v2 - faithful to original paper)
     parser.add_argument("--num_ticks", type=int, default=8, help="Number of internal ticks")
     parser.add_argument("--nlm_hidden", type=int, default=64, help="NLM hidden dimension")
     parser.add_argument("--nlm_depth", type=int, default=2, help="NLM depth")
     parser.add_argument("--sync_pairs", type=int, default=512, help="Number of sync pairs")
-    parser.add_argument("--sync_order", type=int, default=2,
-                        help="Correlation order (2=covariance, faithful to CTM paper)")
     parser.add_argument("--tick_selection", type=str, default="progressive",
                         choices=["progressive", "all", "min_loss", "max_certainty", "weighted", "last"],
                         help="Tick selection strategy (default: 'progressive' encourages multi-tick reasoning)")
@@ -1351,8 +1342,6 @@ def main():
     # Precision
     parser.add_argument("--use_bf16", action="store_true", default=True, help="Use BF16")
     parser.add_argument("--use_amp", action="store_true", help="Use FP16 AMP")
-    parser.add_argument("--use_gradient_checkpointing", action="store_true",
-                        help="Enable gradient checkpointing")
     parser.add_argument("--compile_model", action="store_true", help="torch.compile the model")
 
     # Logging and checkpointing
@@ -1399,7 +1388,7 @@ def main():
 
     # Set default run name
     if args.wandb_run_name is None:
-        args.wandb_run_name = f"ctm-d{args.d_model}-l{args.n_layer}-t{args.num_ticks}"
+        args.wandb_run_name = f"ctm-v2-d{args.d_model}-t{args.num_ticks}"
 
     train(args)
 

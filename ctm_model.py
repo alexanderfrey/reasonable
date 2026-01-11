@@ -853,8 +853,9 @@ class CTMLayer(nn.Module):
         self.layer_idx = layer_idx
         self.d_model = config.d_model
 
-        # Self-attention (tokens communicate during thinking)
-        self.self_attn = CTMSelfAttention(config)
+        # NOTE: Self-attention and FFN removed for pure CTM dynamics
+        # self.self_attn = CTMSelfAttention(config)
+        # self.ffn = OptimizedMLP(config.d_model, config.d_ff)
 
         # Cross-attention to static KV (sync modulates query inside)
         self.cross_attn = CTMCrossAttention(config)
@@ -882,14 +883,9 @@ class CTMLayer(nn.Module):
                 max_ticks=config.num_ticks
             )
 
-        # FFN
-        self.ffn = OptimizedMLP(config.d_model, config.d_ff)
-
-        # Normalizations
-        self.norm_self = OptimizedRMSNorm(config.d_model)
+        # Normalizations (removed norm_self and norm_ffn - not needed)
         self.norm_cross = OptimizedRMSNorm(config.d_model)
         self.norm_nlm = OptimizedRMSNorm(config.d_model)
-        self.norm_ffn = OptimizedRMSNorm(config.d_model)
         self.norm_post = OptimizedRMSNorm(config.d_model)
 
         # Residual dropout
@@ -904,34 +900,41 @@ class CTMLayer(nn.Module):
         static_v: torch.Tensor,        # (B, S, n_kv_head, head_dim)
         cos: torch.Tensor,
         sin: torch.Tensor,
+        tick_embed: Optional[torch.Tensor] = None,  # (D,) tick embedding
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Forward pass with NLM as the PRIMARY driver of neural dynamics.
+        Forward pass with proper layer stacking.
 
-        Per the CTM paper, NLM IS the thinking mechanism:
-            - NLM processes temporal history to produce the next state
-            - Observation from data informs but doesn't dominate
-            - Self-attention allows token communication
+        Each layer:
+            1. NLM processes this layer's temporal history
+            2. COMBINE NLM output with incoming state (from previous layer)
+            3. Add tick embedding
+            4. Cross-attention: sync → WHERE, retrieves observation
+            5. Synapse: integrates combined state with observation
 
-        Flow:
-            1. NLM: PRIMARY state from temporal history (THE thinking)
-            2. Cross-attention: sync → WHERE, retrieves observation
-            3. Synapse: integrates NLM state with observation
-            4. Self-attention: tokens communicate (for language modeling)
+        This ensures layer 1 actually consumes layer 0's output!
 
         Returns:
             state: (B, S, D) updated state
             post_act: (B, S, D) post-activation for history
         """
-        # 1. NLM: THE PRIMARY driver of neural dynamics
-        # NLM processes this layer's temporal history to produce next state
+        # 1. NLM: processes this layer's temporal history
         if layer_history is not None and layer_history.size(2) > 0:
-            # NLM output IS the new state (not a residual!)
-            nlm_state = self.nlm(layer_history)
-            nlm_state = self.norm_nlm(nlm_state)
+            nlm_out = self.nlm(layer_history)
         else:
-            # Tick 0: no history yet, use incoming state
-            nlm_state = self.norm_nlm(state)
+            # Tick 0: no history yet, NLM contributes nothing
+            nlm_out = torch.zeros_like(state)
+
+        # 2. COMBINE NLM output with incoming state from previous layer
+        # This is the key fix: layer 1 now actually uses layer 0's output!
+        # NLM provides temporal context, incoming state provides layer context
+        combined = state + nlm_out
+
+        # 3. Add tick embedding
+        if tick_embed is not None:
+            combined = combined + tick_embed.unsqueeze(0).unsqueeze(0)  # (B, S, D)
+
+        nlm_state = self.norm_nlm(combined)
 
         # 2. Cross-attention: get observation from data
         # Sync modulates WHERE to look, attention retrieves WHAT
@@ -942,16 +945,21 @@ class CTMLayer(nn.Module):
         state = self.synapse(nlm_state, obs)
         state = self.resid_dropout(state)
 
-        # 4. Self-attention: tokens communicate (needed for language modeling)
-        # This is an addition to pure CTM for sequential reasoning
-        self_attn_out = self.self_attn(self.norm_self(state), cos, sin)
-        state = state + self.resid_dropout(self_attn_out)
-
-        # 5. FFN for expressiveness
-        ffn_out = self.ffn(self.norm_ffn(state))
-        state = state + self.resid_dropout(ffn_out)
+        # NOTE: Self-attention and FFN disabled for pure CTM dynamics
+        # The hypothesis is that SA+FFN were homogenizing representations
+        # and washing out the temporal dynamics that NLM creates.
+        #
+        # # 4. Self-attention: tokens communicate (needed for language modeling)
+        # # This is an addition to pure CTM for sequential reasoning
+        # self_attn_out = self.self_attn(self.norm_self(state), cos, sin)
+        # state = state + self.resid_dropout(self_attn_out)
+        #
+        # # 5. FFN for expressiveness
+        # ffn_out = self.ffn(self.norm_ffn(state))
+        # state = state + self.resid_dropout(ffn_out)
 
         # Post-activation for history (this feeds into next tick's NLM)
+        # Now captures purer NLM+synapse dynamics without SA+FFN dilution
         post_act = self.norm_post(state)
 
         return state, post_act
@@ -986,6 +994,11 @@ class CTMCore(nn.Module):
 
         # Total history length = num_ticks * n_layer (one entry per layer-tick)
         self.total_history_len = config.num_ticks * config.n_layer
+
+        # Tick embeddings: give each tick a unique identity
+        # This allows NLMs to know "which tick am I processing" even if
+        # history entries are similar, enabling diverse temporal dynamics
+        self.tick_embed = nn.Embedding(config.num_ticks, config.d_model)
 
         self.layers = nn.ModuleList([
             CTMLayer(config, i) for i in range(config.n_layer)
@@ -1054,6 +1067,10 @@ class CTMCore(nn.Module):
             # This maintains separation: sync captures state at tick boundaries only
             current_sync = prev_tick_sync
 
+            # Get tick embedding for this tick
+            tick_idx = torch.tensor(tick, device=device)
+            tick_signal = self.tick_embed(tick_idx)  # (D,)
+
             for layer_idx, layer in enumerate(self.layers):
                 # Per-layer history for NLM (strided view of this layer's history across ticks)
                 if len(history_list) > 0:
@@ -1063,16 +1080,17 @@ class CTMCore(nn.Module):
                     layer_history = None
 
                 # Layer forward with per-layer NLM
+                # Pass tick_embed so layer can add it AFTER NLM output
                 # Uses current_sync (from previous tick boundary), not recomputed mid-layer
                 if self.use_gradient_checkpointing and self.training:
                     state, post_act = gradient_checkpoint(
                         layer.forward,
-                        state, current_sync, layer_history, static_k, static_v, cos, sin,
+                        state, current_sync, layer_history, static_k, static_v, cos, sin, tick_signal,
                         use_reentrant=False
                     )
                 else:
                     state, post_act = layer.forward(
-                        state, current_sync, layer_history, static_k, static_v, cos, sin
+                        state, current_sync, layer_history, static_k, static_v, cos, sin, tick_signal
                     )
 
                 # Append to history (preserves gradients)
@@ -1393,6 +1411,10 @@ class CTMLanguageModel(nn.Module):
             current_sync = prev_tick_sync
             tick_post_acts = []  # Post-act for each layer in this tick
 
+            # Get tick embedding
+            tick_idx = torch.tensor(tick, device=device)
+            tick_signal = self.ctm_core.tick_embed(tick_idx)  # (D,)
+
             for layer_idx, layer in enumerate(self.ctm_core.layers):
                 # Get layer history
                 if len(history_list) > 0:
@@ -1408,9 +1430,9 @@ class CTMLanguageModel(nn.Module):
                         last_tick_attn_entropy.append(nlm_diag['attn_entropy'])
                         last_tick_gate_mean.append(nlm_diag['gate_mean'])
 
-                # Run full layer forward for state update
+                # Run full layer forward for state update (with tick embedding)
                 state, post_act = layer.forward(
-                    state, current_sync, layer_history, static_k, static_v, cos, sin
+                    state, current_sync, layer_history, static_k, static_v, cos, sin, tick_signal
                 )
                 history_list.append(post_act)
 
