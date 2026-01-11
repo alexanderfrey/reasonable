@@ -253,7 +253,7 @@ class EnhancedNeuronLevelModels(nn.Module):
         # Shape: (D, 2) weights + (D,) bias per neuron
         # gate_d = sigmoid(w_gate[d] @ [nlm_out[d], recent[d]] + b_gate[d])
         self.w_gate = nn.Parameter(torch.empty(d_model, 2))
-        self.b_gate = nn.Parameter(torch.full((d_model,), -2.0))  # Start conservative
+        self.b_gate = nn.Parameter(torch.full((d_model,), -0.5))  # Less conservative for more dynamics
 
         self._init_weights()
 
@@ -310,9 +310,11 @@ class EnhancedNeuronLevelModels(nn.Module):
         # Some neurons more "sticky" (low gate), some more "responsive" (high gate)
         nn.init.normal_(self.w_gate, std=base_std)
         with torch.no_grad():
-            # Vary gate bias: some neurons at -3 (very sticky), some at -1 (responsive)
-            # Base is -2, add uniform noise in [-1, 1]
-            gate_bias_variation = torch.linspace(-1, 1, self.d_model)
+            # Gate biases: vary from -1.5 to +1.5 around base of -0.5
+            # Final range: -2.0 to +1.0
+            # sigmoid(-2.0) ≈ 0.12 (slow neurons), sigmoid(+1.0) ≈ 0.73 (fast neurons)
+            # This creates diverse update rates across neurons
+            gate_bias_variation = torch.linspace(-1.5, 1.5, self.d_model)
             gate_bias_variation = gate_bias_variation[torch.randperm(self.d_model)]
             self.b_gate.add_(gate_bias_variation)
 
