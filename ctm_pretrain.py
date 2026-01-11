@@ -694,6 +694,54 @@ def log_nlm_diagnostics(
             log_data["nlm/all_layers_grid"] = wandb.Image(fig)
             plt.close(fig)
 
+            # 6. Layer × Tick grid: X=neuron index, Y=activation value
+            # Each subplot shows the activation distribution for one layer at one tick
+            fig, axes = plt.subplots(n_layer, num_ticks, figsize=(4 * num_ticks, 3 * n_layer),
+                                     sharex=True, sharey='row')
+
+            # Handle edge cases for subplot array shape
+            if n_layer == 1 and num_ticks == 1:
+                axes = np.array([[axes]])
+            elif n_layer == 1:
+                axes = axes.reshape(1, -1)
+            elif num_ticks == 1:
+                axes = axes.reshape(-1, 1)
+
+            # Sort neurons once by overall variance for consistent ordering
+            overall_var = layer_post_acts.var(axis=0).mean(axis=0)  # (D,)
+            sorted_neuron_idx = np.argsort(overall_var)[::-1]  # Most variable first
+
+            for layer_idx in range(n_layer):
+                for tick_idx in range(num_ticks):
+                    ax = axes[layer_idx, tick_idx]
+                    # Get activations for this layer and tick, sorted by variance
+                    acts = layer_post_acts[tick_idx, layer_idx, sorted_neuron_idx]  # (D,)
+
+                    # Plot as scatter/line with neuron index on X, activation on Y
+                    ax.plot(range(D), acts, linewidth=0.5, alpha=0.7, color='steelblue')
+                    ax.fill_between(range(D), 0, acts, alpha=0.3, color='steelblue')
+
+                    # Add zero line
+                    ax.axhline(y=0, color='gray', linestyle='--', linewidth=0.5, alpha=0.5)
+
+                    # Labels
+                    if tick_idx == 0:
+                        ax.set_ylabel(f'L{layer_idx}', fontsize=10, fontweight='bold')
+                    if layer_idx == n_layer - 1:
+                        ax.set_xlabel('Neuron')
+                    if layer_idx == 0:
+                        ax.set_title(f'Tick {tick_idx}', fontsize=10, fontweight='bold')
+
+                    # Clean up ticks for readability
+                    ax.set_xlim(0, D - 1)
+                    if D > 100:
+                        ax.set_xticks([0, D // 2, D - 1])
+
+            plt.suptitle(f'Post-Activations: Layer × Tick Grid @ Step {global_step}\n(X=neuron index sorted by variance, Y=activation)', fontsize=12)
+            plt.tight_layout()
+            log_data["nlm/layer_tick_grid"] = wandb.Image(fig)
+            plt.close(fig)
+
         # === NLM INTERNAL DIAGNOSTICS (from last tick) ===
         if 'gate_mean' in diagnostics:
             gate_mean = diagnostics['gate_mean'].mean(dim=0).numpy()  # (D,)
