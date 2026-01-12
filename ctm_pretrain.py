@@ -746,6 +746,124 @@ def log_nlm_diagnostics(
             oscillation_count = (sign_changes != 0).sum(axis=0).mean()
             log_data["ctm/oscillation_score"] = float(oscillation_count)
 
+        # ============================================================
+        # 6. TAU (PER-NEURON TIME CONSTANTS) DIAGNOSTICS
+        # ============================================================
+        # Check if NLM has tau parameter
+        nlm = base_model.ctm_core.nlm
+        if hasattr(nlm, 'tau'):
+            tau = nlm.tau.detach().cpu().numpy()  # (D,)
+
+            # Basic tau statistics
+            log_data["ctm/tau_mean"] = float(tau.mean())
+            log_data["ctm/tau_std"] = float(tau.std())
+            log_data["ctm/tau_min"] = float(tau.min())
+            log_data["ctm/tau_max"] = float(tau.max())
+            log_data["ctm/tau_range"] = float(tau.max() - tau.min())
+
+            # Compute per-neuron metrics for correlation analysis
+            # a) Delta magnitude per neuron (mean absolute change across ticks)
+            delta_magnitude = np.abs(z_deltas).mean(axis=0)  # (D,)
+
+            # b) Autocorrelation at lag-1 per neuron
+            # corr(z[t], z[t+1]) for each neuron
+            z_t = z_act[:-1, :]  # (num_ticks, D)
+            z_t1 = z_act[1:, :]  # (num_ticks, D)
+            # Compute correlation per neuron
+            z_t_centered = z_t - z_t.mean(axis=0, keepdims=True)
+            z_t1_centered = z_t1 - z_t1.mean(axis=0, keepdims=True)
+            numerator = (z_t_centered * z_t1_centered).sum(axis=0)
+            denominator = np.sqrt((z_t_centered**2).sum(axis=0) * (z_t1_centered**2).sum(axis=0)) + 1e-8
+            autocorr_lag1 = numerator / denominator  # (D,)
+
+            # c) Dominant frequency per neuron (from FFT, if enough ticks)
+            dominant_freq = None
+            if num_ticks >= 3:
+                z_for_fft = z_act[1:]  # skip initial
+                centered = z_for_fft - z_for_fft.mean(axis=0, keepdims=True)
+                fft_result = np.fft.rfft(centered, axis=0)
+                power = np.abs(fft_result) ** 2  # (num_freq_bins, D)
+                dominant_freq = np.argmax(power, axis=0).astype(float)  # (D,)
+                # Normalize by number of freq bins
+                dominant_freq = dominant_freq / (power.shape[0] - 1)
+
+            # Compute correlations with tau
+            def safe_corrcoef(x, y):
+                """Compute correlation, return 0 if undefined."""
+                if np.std(x) < 1e-8 or np.std(y) < 1e-8:
+                    return 0.0
+                return np.corrcoef(x, y)[0, 1]
+
+            corr_tau_delta = safe_corrcoef(tau, delta_magnitude)
+            corr_tau_autocorr = safe_corrcoef(tau, autocorr_lag1)
+            log_data["ctm/corr_tau_delta"] = float(corr_tau_delta)
+            log_data["ctm/corr_tau_autocorr"] = float(corr_tau_autocorr)
+
+            if dominant_freq is not None:
+                corr_tau_freq = safe_corrcoef(tau, dominant_freq)
+                log_data["ctm/corr_tau_freq"] = float(corr_tau_freq)
+
+            # Create tau diagnostics figure
+            fig, axes = plt.subplots(2, 2, figsize=(14, 12))
+
+            # Top-left: Tau histogram
+            axes[0, 0].hist(tau, bins=50, alpha=0.7, color='steelblue', edgecolor='black')
+            axes[0, 0].axvline(x=tau.mean(), color='red', linestyle='--', linewidth=2,
+                              label=f'Mean: {tau.mean():.2f}')
+            axes[0, 0].axvline(x=np.median(tau), color='orange', linestyle='--', linewidth=2,
+                              label=f'Median: {np.median(tau):.2f}')
+            axes[0, 0].set_xlabel('Tau (time constant)')
+            axes[0, 0].set_ylabel('Count')
+            axes[0, 0].set_title(f'Per-Neuron Time Constants @ Step {global_step}')
+            axes[0, 0].legend()
+
+            # Top-right: Tau vs Delta magnitude (expect negative correlation)
+            axes[0, 1].scatter(tau, delta_magnitude, alpha=0.5, s=10, c='steelblue')
+            # Add trend line
+            z_fit = np.polyfit(tau, delta_magnitude, 1)
+            p_fit = np.poly1d(z_fit)
+            tau_sorted = np.sort(tau)
+            axes[0, 1].plot(tau_sorted, p_fit(tau_sorted), 'r--', linewidth=2,
+                           label=f'r = {corr_tau_delta:.3f}')
+            axes[0, 1].set_xlabel('Tau (time constant)')
+            axes[0, 1].set_ylabel('Mean |Δz| (delta magnitude)')
+            axes[0, 1].set_title(f'Tau vs Delta (expect negative corr)')
+            axes[0, 1].legend()
+            axes[0, 1].grid(True, alpha=0.3)
+
+            # Bottom-left: Tau vs Autocorrelation (expect positive correlation)
+            axes[1, 0].scatter(tau, autocorr_lag1, alpha=0.5, s=10, c='steelblue')
+            z_fit = np.polyfit(tau, autocorr_lag1, 1)
+            p_fit = np.poly1d(z_fit)
+            axes[1, 0].plot(tau_sorted, p_fit(tau_sorted), 'r--', linewidth=2,
+                           label=f'r = {corr_tau_autocorr:.3f}')
+            axes[1, 0].set_xlabel('Tau (time constant)')
+            axes[1, 0].set_ylabel('Autocorrelation (lag-1)')
+            axes[1, 0].set_title(f'Tau vs Autocorr (expect positive corr)')
+            axes[1, 0].legend()
+            axes[1, 0].grid(True, alpha=0.3)
+
+            # Bottom-right: Tau vs Dominant frequency (expect negative correlation)
+            if dominant_freq is not None:
+                axes[1, 1].scatter(tau, dominant_freq, alpha=0.5, s=10, c='steelblue')
+                z_fit = np.polyfit(tau, dominant_freq, 1)
+                p_fit = np.poly1d(z_fit)
+                axes[1, 1].plot(tau_sorted, p_fit(tau_sorted), 'r--', linewidth=2,
+                               label=f'r = {corr_tau_freq:.3f}')
+                axes[1, 1].set_xlabel('Tau (time constant)')
+                axes[1, 1].set_ylabel('Dominant frequency (normalized)')
+                axes[1, 1].set_title(f'Tau vs Frequency (expect negative corr)')
+                axes[1, 1].legend()
+                axes[1, 1].grid(True, alpha=0.3)
+            else:
+                axes[1, 1].text(0.5, 0.5, 'Need ≥3 ticks for FFT',
+                               ha='center', va='center', fontsize=12)
+                axes[1, 1].set_title('Tau vs Frequency (N/A)')
+
+            plt.tight_layout()
+            log_data["ctm/tau_diagnostics"] = wandb.Image(fig)
+            plt.close(fig)
+
         wandb.log(log_data, step=global_step)
 
         # Cleanup matplotlib figures and data

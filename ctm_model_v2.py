@@ -145,10 +145,12 @@ class NeuronLevelModel(nn.Module):
     Input: (B, S, T, D) - history of pre-activations per neuron
     Output: (B, S, D) - post-activations
 
-    Improvements:
+    Features:
     - SwiGLU activation (gated, more expressive)
     - Layer normalization (training stability)
-    - Residual connection (better gradient flow)
+    - Internal residuals in hidden layers (gradient flow)
+    - No output residual (forces history-driven dynamics)
+    - Per-neuron time constants (heterogeneous temporal scales)
     """
 
     def __init__(self, d_model: int, nlm_hidden: int, nlm_depth: int, max_ticks: int):
@@ -157,6 +159,13 @@ class NeuronLevelModel(nn.Module):
         self.nlm_hidden = nlm_hidden
         self.max_ticks = max_ticks
         self.nlm_depth = nlm_depth
+
+        # Per-neuron time constants for history decay
+        # tau controls how far back each neuron "looks" in history
+        # Higher tau = longer memory, lower tau = focuses on recent
+        # Initialize with diversity: log-uniform in [0.5, 4.0] ticks
+        self.tau_raw = nn.Parameter(torch.empty(d_model))
+        self._init_tau()
 
         # Per-neuron input projection: (D, max_ticks, nlm_hidden)
         # SwiGLU needs 2x hidden for gate
@@ -184,11 +193,23 @@ class NeuronLevelModel(nn.Module):
         self.w_out = nn.Parameter(torch.empty(d_model, nlm_hidden, 1))
         self.b_out = nn.Parameter(torch.zeros(d_model, 1))
 
-        # Residual projection: project most recent pre-activation to output
-        # This creates a skip connection from input to output
-        self.w_residual = nn.Parameter(torch.empty(d_model, 1, 1))
-
         self._init_weights()
+
+    def _init_tau(self):
+        """Initialize per-neuron time constants with diversity."""
+        # Log-uniform initialization in [0.5, 4.0] ticks
+        # This creates neurons with different temporal preferences:
+        # - Low tau (~0.5): focuses on very recent history
+        # - High tau (~4.0): integrates over longer history
+        with torch.no_grad():
+            log_tau = torch.linspace(math.log(0.5), math.log(4.0), self.d_model)
+            log_tau = log_tau[torch.randperm(self.d_model)]  # shuffle
+            self.tau_raw.copy_(log_tau)
+
+    @property
+    def tau(self):
+        """Get positive time constants via exp."""
+        return torch.exp(self.tau_raw)
 
     def _init_weights(self):
         """Initialize with diversity across neurons."""
@@ -199,7 +220,6 @@ class NeuronLevelModel(nn.Module):
 
         nn.init.normal_(self.w_in, std=std)
         nn.init.normal_(self.w_out, std=std)
-        nn.init.ones_(self.w_residual)  # Start with identity-like residual
 
         with torch.no_grad():
             self.w_in.mul_(scales.view(-1, 1, 1))
@@ -232,9 +252,6 @@ class NeuronLevelModel(nn.Module):
         """
         B, S, T, D = history.shape
 
-        # Store most recent pre-activation for residual
-        most_recent = history[:, :, -1, :]  # (B, S, D)
-
         # Pad to max_ticks if needed
         if T < self.max_ticks:
             pad = torch.zeros(B, S, self.max_ticks - T, D,
@@ -246,6 +263,16 @@ class NeuronLevelModel(nn.Module):
         # (B, S, D, max_ticks)
         h = history.to(self.w_in.dtype).transpose(-1, -2)
 
+        # Apply per-neuron temporal decay
+        # Each neuron has its own time constant tau controlling how far it looks back
+        # decay_weight[t] = exp(-(max_ticks - 1 - t) / tau) for position t
+        # Position max_ticks-1 (most recent) has weight 1, older positions decay
+        t_idx = torch.arange(self.max_ticks, device=h.device, dtype=h.dtype)
+        age = (self.max_ticks - 1) - t_idx  # age: 0 for most recent, max_ticks-1 for oldest
+        tau = self.tau.to(h.dtype)  # (D,)
+        decay_weights = torch.exp(-age.unsqueeze(0) / tau.unsqueeze(1))  # (D, max_ticks)
+        h = h * decay_weights  # (B, S, D, max_ticks) * (D, max_ticks) broadcast
+
         # Input projection with SwiGLU
         h = torch.einsum('bsdt,dth->bsdh', h, self.w_in) + self.b_in
         h = self._swiglu(h)
@@ -254,21 +281,16 @@ class NeuronLevelModel(nn.Module):
         # Hidden layers with SwiGLU and LayerNorm
         for w, b, ln_s, ln_b in zip(self.w_hidden, self.b_hidden,
                                      self.ln_hidden_scale, self.ln_hidden_bias):
-            h_in = h  # For potential residual within hidden layers
+            h_in = h  # For internal residual
             h = torch.einsum('bsdh,dhk->bsdk', h, w) + b
             h = self._swiglu(h)
             h = self._layer_norm(h, ln_s, ln_b)
-            # Residual connection within hidden layers (if shapes match)
+            # Internal residual within hidden layers
             h = h + h_in
 
         # Output projection
         out = torch.einsum('bsdh,dho->bsdo', h, self.w_out) + self.b_out
         out = out.squeeze(-1)  # (B, S, D)
-
-        # Residual connection from most recent pre-activation
-        # This helps gradient flow and gives a "default" behavior
-        residual = most_recent * self.w_residual.squeeze(-1).squeeze(-1)  # (B, S, D)
-        out = out + residual
 
         return out
 
