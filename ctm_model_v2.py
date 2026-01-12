@@ -150,7 +150,6 @@ class NeuronLevelModel(nn.Module):
     - Layer normalization (training stability)
     - Internal residuals in hidden layers (gradient flow)
     - No output residual (forces history-driven dynamics)
-    - Per-neuron time constants (heterogeneous temporal scales)
     """
 
     def __init__(self, d_model: int, nlm_hidden: int, nlm_depth: int, max_ticks: int):
@@ -159,13 +158,6 @@ class NeuronLevelModel(nn.Module):
         self.nlm_hidden = nlm_hidden
         self.max_ticks = max_ticks
         self.nlm_depth = nlm_depth
-
-        # Per-neuron time constants for history decay
-        # tau controls how far back each neuron "looks" in history
-        # Higher tau = longer memory, lower tau = focuses on recent
-        # Initialize with diversity: log-uniform in [0.5, 4.0] ticks
-        self.tau_raw = nn.Parameter(torch.empty(d_model))
-        self._init_tau()
 
         # Per-neuron input projection: (D, max_ticks, nlm_hidden)
         # SwiGLU needs 2x hidden for gate
@@ -194,22 +186,6 @@ class NeuronLevelModel(nn.Module):
         self.b_out = nn.Parameter(torch.zeros(d_model, 1))
 
         self._init_weights()
-
-    def _init_tau(self):
-        """Initialize per-neuron time constants with diversity."""
-        # Log-uniform initialization in [0.5, 4.0] ticks
-        # This creates neurons with different temporal preferences:
-        # - Low tau (~0.5): focuses on very recent history
-        # - High tau (~4.0): integrates over longer history
-        with torch.no_grad():
-            log_tau = torch.linspace(math.log(0.5), math.log(4.0), self.d_model)
-            log_tau = log_tau[torch.randperm(self.d_model)]  # shuffle
-            self.tau_raw.copy_(log_tau)
-
-    @property
-    def tau(self):
-        """Get positive time constants via exp."""
-        return torch.exp(self.tau_raw)
 
     def _init_weights(self):
         """Initialize with diversity across neurons."""
@@ -262,16 +238,6 @@ class NeuronLevelModel(nn.Module):
 
         # (B, S, D, max_ticks)
         h = history.to(self.w_in.dtype).transpose(-1, -2)
-
-        # Apply per-neuron temporal decay
-        # Each neuron has its own time constant tau controlling how far it looks back
-        # decay_weight[t] = exp(-(max_ticks - 1 - t) / tau) for position t
-        # Position max_ticks-1 (most recent) has weight 1, older positions decay
-        t_idx = torch.arange(self.max_ticks, device=h.device, dtype=h.dtype)
-        age = (self.max_ticks - 1) - t_idx  # age: 0 for most recent, max_ticks-1 for oldest
-        tau = self.tau.to(h.dtype)  # (D,)
-        decay_weights = torch.exp(-age.unsqueeze(0) / tau.unsqueeze(1))  # (D, max_ticks)
-        h = h * decay_weights  # (B, S, D, max_ticks) * (D, max_ticks) broadcast
 
         # Input projection with SwiGLU
         h = torch.einsum('bsdt,dth->bsdh', h, self.w_in) + self.b_in
@@ -775,18 +741,15 @@ class CTMLanguageModel(nn.Module):
         input_pos: Optional[torch.Tensor] = None,
         return_all_ticks: bool = False,
         num_ticks: Optional[int] = None,
-        return_oscillation_loss: bool = False,
-    ) -> Tuple[torch.Tensor, Optional[List[torch.Tensor]], Optional[torch.Tensor]]:
+    ) -> Tuple[torch.Tensor, Optional[List[torch.Tensor]]]:
         """
         Args:
             input_ids: (B, S) token IDs
             return_all_ticks: if True, return logits for all ticks
-            return_oscillation_loss: if True, compute and return oscillation loss
 
         Returns:
             logits: (B, S, V)
             all_logits: List of logits per tick (if return_all_ticks)
-            oscillation_loss: scalar loss penalizing flat z trajectories (if return_oscillation_loss)
         """
         B, S = input_ids.shape
 
@@ -807,50 +770,13 @@ class CTMLanguageModel(nn.Module):
             encoded, static_k, static_v, cos, sin, num_ticks
         )
 
-        # Compute oscillation loss if requested
-        oscillation_loss = None
-        if return_oscillation_loss and len(z_history) > 1:
-            # Stack z history: (B, S, T, D)
-            z_stack = torch.stack(z_history, dim=2)
-
-            # Target thresholds - stop pushing once reached
-            target_variance = 0.3
-            target_delta = 0.2
-
-            # 1. Variance loss: penalize low variance across ticks (up to target)
-            z_var = z_stack.var(dim=2)  # (B, S, D)
-            var_mean = z_var.mean()
-            # Only penalize if below target, otherwise loss = 0
-            var_loss = F.relu(target_variance - var_mean) / target_variance
-
-            # 2. Delta loss: penalize small tick-to-tick changes (up to target)
-            z_deltas = z_stack[:, :, 1:, :] - z_stack[:, :, :-1, :]  # (B, S, T-1, D)
-            delta_magnitude = z_deltas.abs().mean()
-            # Only penalize if below target
-            delta_loss = F.relu(target_delta - delta_magnitude) / target_delta
-
-            # 3. Diversity loss: penalize neurons being too correlated
-            # Compute correlation between neurons across ticks
-            z_flat = z_stack.mean(dim=(0, 1))  # (T, D) - average over batch and seq
-            z_centered = z_flat - z_flat.mean(dim=0, keepdim=True)
-            # Sample neuron pairs for efficiency
-            n_pairs = min(256, z_centered.shape[1] // 2)
-            idx1 = torch.randperm(z_centered.shape[1], device=z_centered.device)[:n_pairs]
-            idx2 = torch.randperm(z_centered.shape[1], device=z_centered.device)[:n_pairs]
-            corr = (z_centered[:, idx1] * z_centered[:, idx2]).sum(dim=0)
-            corr = corr / (z_centered[:, idx1].norm(dim=0) * z_centered[:, idx2].norm(dim=0) + 1e-6)
-            diversity_loss = corr.abs().mean()  # penalize high correlation
-
-            # Combined oscillation loss (will be ~0 once targets reached)
-            oscillation_loss = var_loss + delta_loss + 0.5 * diversity_loss
-
         # Output from sync
         if return_all_ticks:
             all_logits = [self.output_head(self.sync_norm(s)) for s in all_syncs]
-            return all_logits[-1], all_logits, oscillation_loss
+            return all_logits[-1], all_logits
         else:
             logits = self.output_head(self.sync_norm(final_sync))
-            return logits, None, oscillation_loss
+            return logits, None
 
     @torch.no_grad()
     def generate(
@@ -867,7 +793,7 @@ class CTMLanguageModel(nn.Module):
 
         for _ in range(max_new_tokens):
             context = generated[:, -self.config.max_seq_len:]
-            logits, _, _ = self(context, num_ticks=num_ticks)
+            logits, _ = self(context, num_ticks=num_ticks)
             next_logits = logits[:, -1, :]
 
             if temperature > 0:
