@@ -179,6 +179,7 @@ def initialize_ctm_model(args: Namespace, vocab_size: int, device: torch.device)
         sync_pairs=args.sync_pairs,
         dropout=args.dropout,
         rope_theta=getattr(args, "rope_theta", 500000.0),
+        use_gradient_checkpointing=getattr(args, "use_gradient_checkpointing", False),
     )
 
     model = CTMLanguageModel(config)
@@ -195,6 +196,7 @@ def initialize_ctm_model(args: Namespace, vocab_size: int, device: torch.device)
     logger.info(f"  - nlm_hidden: {config.nlm_hidden}")
     logger.info(f"  - nlm_depth: {config.nlm_depth}")
     logger.info(f"  - sync_pairs: {config.sync_pairs}")
+    logger.info(f"  - gradient_checkpointing: {config.use_gradient_checkpointing}")
     logger.info(f"  - Total parameters: {total_params:,} ({total_params/1e6:.2f}M)")
     logger.info(f"  - Trainable parameters: {trainable_params:,}")
 
@@ -210,6 +212,7 @@ def ctm_train_step(
     use_bf16: bool,
     gradient_accumulation_steps: int,
     num_ticks: Optional[int] = None,
+    oscillation_loss_weight: float = 0.0,
 ):
     """
     Perform a single CTM training step.
@@ -234,11 +237,22 @@ def ctm_train_step(
 
     from torch.amp import autocast
     with autocast("cuda", enabled=amp_enabled, dtype=amp_dtype):
-        # Forward pass with all ticks
-        _, all_logits = model(input_ids, return_all_ticks=True, num_ticks=num_ticks)
+        # Forward pass with all ticks (and oscillation loss if weight > 0)
+        use_osc_loss = oscillation_loss_weight > 0
+        _, all_logits, oscillation_loss = model(
+            input_ids,
+            return_all_ticks=True,
+            num_ticks=num_ticks,
+            return_oscillation_loss=use_osc_loss,
+        )
 
         # Compute loss with tick selection
         loss, metrics = criterion(all_logits, labels)
+
+        # Add oscillation loss if enabled
+        if use_osc_loss and oscillation_loss is not None:
+            loss = loss + oscillation_loss_weight * oscillation_loss
+            metrics["oscillation_loss"] = oscillation_loss.item()
 
     # Scale loss for gradient accumulation
     loss_scaled = loss / gradient_accumulation_steps
@@ -316,7 +330,7 @@ def ctm_evaluate(
         labels = batch["labels"].to(device, non_blocking=True)
 
         with autocast("cuda", enabled=amp_enabled, dtype=amp_dtype):
-            _, all_logits = model(input_ids, return_all_ticks=True, num_ticks=num_ticks)
+            _, all_logits, _ = model(input_ids, return_all_ticks=True, num_ticks=num_ticks)
             loss, metrics = criterion(all_logits, labels)
 
         batch_tokens = metrics["num_valid_tokens"].item()
@@ -425,19 +439,29 @@ def log_nlm_diagnostics(
     if not hasattr(base_model, "get_nlm_diagnostics"):
         return
 
-    torch.cuda.empty_cache()
     import gc
+
+    # Aggressive cleanup before diagnostics
     gc.collect()
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+
+    # Store training state
+    was_training = base_model.training
 
     try:
-        # Generate random input for diagnostics
+        # Generate random input for diagnostics - small batch, short seq
         vocab_size = base_model.config.vocab_size
         seq_len = 32
         input_ids = torch.randint(0, vocab_size, (1, seq_len), device=device)
 
-        diagnostics = base_model.get_nlm_diagnostics(input_ids)
+        # Run diagnostics WITHOUT autocast to avoid AMP caching issues
+        with torch.no_grad():
+            diagnostics = base_model.get_nlm_diagnostics(input_ids)
 
+        # Immediate cleanup of GPU tensors
         del input_ids
+        torch.cuda.synchronize()
         torch.cuda.empty_cache()
 
         if not diagnostics:
@@ -524,6 +548,41 @@ def log_nlm_diagnostics(
 
         plt.tight_layout()
         log_data["ctm/z_dynamics"] = wandb.Image(fig)
+        plt.close(fig)
+
+        # ============================================================
+        # 1b. INDIVIDUAL NEURON GRID (8x8 = 64 neurons)
+        # ============================================================
+        fig, axes = plt.subplots(8, 8, figsize=(20, 20))
+        axes = axes.flatten()
+
+        # Select top 64 most dynamic neurons
+        top_64_neurons = sorted_idx[:64]
+        ticks = np.arange(num_ticks + 1)
+
+        for i, n_idx in enumerate(top_64_neurons):
+            ax = axes[i]
+            trajectory = z_act[:, n_idx]
+            var = neuron_variance[n_idx]
+
+            ax.plot(ticks, trajectory, color='steelblue', marker='o',
+                   markersize=3, linewidth=1.5)
+            ax.axhline(y=0, color='gray', linewidth=0.5, linestyle='--', alpha=0.5)
+            ax.set_title(f'n{n_idx} (var={var:.3f})', fontsize=8)
+            ax.set_xticks(ticks)
+            ax.tick_params(axis='both', labelsize=6)
+            ax.grid(True, alpha=0.2)
+
+            # Color background based on variance
+            if var < 0.01:
+                ax.set_facecolor('#ffeeee')  # Light red for low variance
+            elif var > 0.1:
+                ax.set_facecolor('#eeffee')  # Light green for high variance
+
+        fig.suptitle(f'Individual Neuron Trajectories (Top 64 by variance) @ Step {global_step}',
+                    fontsize=14, y=1.01)
+        plt.tight_layout()
+        log_data["ctm/z_neuron_grid"] = wandb.Image(fig)
         plt.close(fig)
 
         # ============================================================
@@ -628,6 +687,48 @@ def log_nlm_diagnostics(
             log_data["ctm/fft_spectrum"] = wandb.Image(fig)
             plt.close(fig)
 
+            # ============================================================
+            # 4b. FREQUENCY DIVERSITY METRICS
+            # ============================================================
+            # 1. Dominant frequency per neuron - which freq bin has most power
+            dominant_freqs = np.argmax(power, axis=0)  # (D,) - dominant freq bin per neuron
+            num_unique_dominant = len(np.unique(dominant_freqs))
+            log_data["ctm/num_unique_dominant_freqs"] = int(num_unique_dominant)
+
+            # 2. Spectral entropy - how spread out power is across frequencies
+            # High entropy = diverse frequencies, low entropy = single dominant freq
+            power_sum = power.sum(axis=0, keepdims=True) + 1e-8
+            power_norm = power / power_sum  # Normalize to probability distribution
+            spectral_entropy_per_neuron = -np.sum(power_norm * np.log(power_norm + 1e-8), axis=0)
+            mean_spectral_entropy = float(spectral_entropy_per_neuron.mean())
+            max_possible_entropy = np.log(len(freqs))  # Maximum entropy for uniform distribution
+            normalized_entropy = mean_spectral_entropy / max_possible_entropy if max_possible_entropy > 0 else 0
+            log_data["ctm/spectral_entropy"] = mean_spectral_entropy
+            log_data["ctm/spectral_entropy_normalized"] = float(normalized_entropy)
+
+            # 3. Peak counting in average spectrum
+            from scipy.signal import find_peaks
+            # Find peaks that are at least 10% of the max power
+            peak_threshold = avg_power.max() * 0.1
+            peaks, peak_properties = find_peaks(avg_power, height=peak_threshold)
+            num_peaks = len(peaks)
+
+            # Also check edges (find_peaks doesn't detect edge peaks)
+            if len(avg_power) >= 2:
+                # Check left edge (f=0)
+                if avg_power[0] >= peak_threshold and avg_power[0] > avg_power[1]:
+                    num_peaks += 1
+                # Check right edge (f=Nyquist)
+                if avg_power[-1] >= peak_threshold and avg_power[-1] > avg_power[-2]:
+                    num_peaks += 1
+
+            log_data["ctm/num_spectral_peaks"] = int(num_peaks)
+
+            # 4. Frequency distribution - histogram of dominant frequencies
+            freq_histogram = np.bincount(dominant_freqs, minlength=len(freqs))
+            freq_diversity = (freq_histogram > 0).sum()  # How many freq bins are used
+            log_data["ctm/freq_bins_used"] = int(freq_diversity)
+
         # ============================================================
         # 5. SCALAR METRICS
         # ============================================================
@@ -647,7 +748,9 @@ def log_nlm_diagnostics(
 
         wandb.log(log_data, step=global_step)
 
+        # Cleanup matplotlib figures and data
         del diagnostics, log_data
+        plt.close('all')
         gc.collect()
 
     except Exception as e:
@@ -655,6 +758,13 @@ def log_nlm_diagnostics(
         import traceback
         traceback.print_exc()
     finally:
+        # Restore training state
+        if was_training:
+            base_model.train()
+        # Final cleanup
+        plt.close('all')
+        gc.collect()
+        torch.cuda.synchronize()
         torch.cuda.empty_cache()
 
 
@@ -904,7 +1014,8 @@ def train(args: Namespace):
             # Training step
             step_loss, metrics = ctm_train_step(
                 model, batch, criterion, device, use_amp, use_bf16,
-                gradient_accumulation_steps, num_ticks=num_ticks
+                gradient_accumulation_steps, num_ticks=num_ticks,
+                oscillation_loss_weight=getattr(args, "oscillation_loss_weight", 0.0),
             )
 
             total_loss_accum += step_loss
@@ -955,10 +1066,9 @@ def train(args: Namespace):
                                 "train/avg_selected_tick": avg_tick,
                                 "epoch": epoch + 1,
                             }
-                            # Log per-tick losses
-                            per_tick = metrics["per_tick_loss"]
-                            for t, tl in enumerate(per_tick):
-                                log_data[f"train/tick_{t}_loss"] = tl.item()
+                            # Log oscillation loss if present
+                            if "oscillation_loss" in metrics:
+                                log_data["train/oscillation_loss"] = metrics["oscillation_loss"]
 
                             if (
                                 args.tick_heatmap_interval > 0
@@ -968,7 +1078,7 @@ def train(args: Namespace):
                                 if selected_ticks is not None:
                                     heatmap = _selected_ticks_to_rgb(
                                         selected_ticks,
-                                        num_ticks=per_tick.numel(),
+                                        num_ticks=metrics["per_tick_loss"].numel(),
                                         max_tokens=args.tick_heatmap_max_tokens,
                                     )
                                     log_data["train/selected_tick_heatmap"] = wandb.Image(
@@ -1041,13 +1151,6 @@ def train(args: Namespace):
                                     dist_table, "tick", "frequency", title="Eval Tick Distribution"
                                 )
 
-                            if "per_tick_loss" in eval_metrics:
-                                for t, tl in enumerate(eval_metrics["per_tick_loss"]):
-                                    tick_loss = tl.item()
-                                    eval_log[f"eval/tick_{t}_loss"] = tick_loss
-                                    eval_log[f"eval/tick_{t}_ppl"] = (
-                                        math.exp(tick_loss) if tick_loss < 700 else float("inf")
-                                    )
                             wandb.log(eval_log, step=global_step)
 
                         # Save best model
@@ -1117,6 +1220,10 @@ def main():
                         help="Steepness for progressive tick weighting (1=linear, 2=quadratic)")
     parser.add_argument("--tick_warmup_steps", type=int, default=0,
                         help="Steps to warmup tick budget (0 = disabled)")
+    parser.add_argument("--oscillation_loss_weight", type=float, default=0.0,
+                        help="Weight for oscillation loss (encourages z dynamics, 0 = disabled)")
+    parser.add_argument("--use_gradient_checkpointing", action="store_true",
+                        help="Enable gradient checkpointing to reduce memory (trades compute for memory)")
     parser.add_argument("--min_warmup_ticks", type=int, default=2,
                         help="Minimum ticks during warmup")
 
