@@ -9,10 +9,29 @@ from .feature_extractor import (
     FeatureExtractorConfig,
     FeatureExtractor,
     Qwen3VLFeatureExtractor,
+    LearningMode,
+    create_feature_extractor,
+)
+
+from .prediction_module import (
+    PredictionConfig,
+    PredictionModule,
+    PredictionTargets,
+    PredictionLoss,
+    create_prediction_module,
 )
 
 __all__ = [
+    # Feature extraction
     "FeatureExtractorConfig",
     "FeatureExtractor",
     "Qwen3VLFeatureExtractor",
+    "LearningMode",
+    "create_feature_extractor",
+    # Prediction
+    "PredictionConfig",
+    "PredictionModule",
+    "PredictionTargets",
+    "PredictionLoss",
+    "create_prediction_module",
 ]
