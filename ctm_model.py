@@ -59,6 +59,12 @@ class CTMConfig:
     use_enhanced_sync: bool = True  # Use enhanced sync vs original
     sync_order: int = 2             # Correlation order (2=covariance, faithful to CTM paper)
 
+    # PEM Sync Module (memory-augmented, personality-colored)
+    use_pem_sync: bool = False      # Use PEM SyncModule instead of correlation-based
+    pem_memory_slots: int = 100     # Number of memory slots for PEM sync
+    pem_use_intention: bool = False # Enable intention (oscillating goal-directed drive)
+    pem_intention_oscillators: int = 16  # Number of oscillator frequency components
+
     # Enhanced NLM parameters
     use_enhanced_nlm: bool = True   # Use enhanced NLM with temporal attention + gating
 
@@ -1005,8 +1011,21 @@ class CTMCore(nn.Module):
         ])
 
         # Global sync module (shared, computes sync from full history)
-        # Use enhanced sync for learned projections + multi-scale attention
-        if config.use_enhanced_sync:
+        # Three options: PEM sync (memory+personality), enhanced sync, or basic sync
+        if config.use_pem_sync:
+            from pem.sync_module import SyncModule, SyncModuleConfig
+            sync_config = SyncModuleConfig(
+                d_model=config.d_model,
+                sync_pairs=config.sync_pairs,
+                n_heads=config.n_sync_heads,
+                memory_slots=config.pem_memory_slots,
+                dropout=config.dropout,
+                # Intention (oscillating goal-directed drive)
+                use_intention=config.pem_use_intention,
+                intention_oscillators=config.pem_intention_oscillators,
+            )
+            self.global_sync = SyncModule(sync_config)
+        elif config.use_enhanced_sync:
             self.global_sync = EnhancedSynchronizationModule(
                 d_model=config.d_model,
                 sync_pairs=config.sync_pairs,

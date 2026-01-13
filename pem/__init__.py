@@ -28,6 +28,17 @@ from .surprise_module import (
     create_surprise_module,
 )
 
+from .sync_module import (
+    SyncModuleConfig,
+    SyncModule,
+    ChangePointDetector,
+    MemoryBank,
+    PersonalityModule,
+    IntentionConfig,
+    IntentionModule,
+    create_sync_module,
+)
+
 __all__ = [
     # Feature extraction
     "FeatureExtractorConfig",
@@ -46,4 +57,13 @@ __all__ = [
     "SurpriseModule",
     "SurpriseLoss",
     "create_surprise_module",
+    # Sync
+    "SyncModuleConfig",
+    "SyncModule",
+    "ChangePointDetector",
+    "MemoryBank",
+    "PersonalityModule",
+    "IntentionConfig",
+    "IntentionModule",
+    "create_sync_module",
 ]
