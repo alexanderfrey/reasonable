@@ -147,7 +147,7 @@ class Qwen3VLFeatureExtractor(FeatureExtractor):
 
         # Lazy imports to avoid dependency issues
         try:
-            from transformers import Qwen3VLModel, Qwen3VLConfig, AutoProcessor
+            from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
         except ImportError:
             raise ImportError(
                 "transformers >= 4.57.0 required for Qwen3-VL. "
@@ -156,24 +156,25 @@ class Qwen3VLFeatureExtractor(FeatureExtractor):
 
         logger.info(f"Loading Qwen3-VL model from {config.model_name_or_path}")
 
-        # Load model configuration
-        model_config = Qwen3VLConfig.from_pretrained(
+        # Load the full model first (includes pretrained weights for all layers)
+        # Then extract the inner model (without LM head)
+        full_model = Qwen3VLForConditionalGeneration.from_pretrained(
             config.model_name_or_path,
-            trust_remote_code=config.trust_remote_code,
-        )
-
-        # Store hidden size before loading
-        self._hidden_size = model_config.text_config.hidden_size
-
-        # Load the base model (not ForConditionalGeneration - we don't need LM head)
-        self.model = Qwen3VLModel.from_pretrained(
-            config.model_name_or_path,
-            config=model_config,
             torch_dtype=config.torch_dtype,
             device_map=config.device_map,
             attn_implementation=config.attn_implementation,
             trust_remote_code=config.trust_remote_code,
         )
+
+        # Extract the base model (Qwen3VLModel) from the full model
+        self.model = full_model.model
+
+        # Store hidden size
+        self._hidden_size = full_model.config.text_config.hidden_size
+
+        # Clean up the LM head we don't need
+        del full_model.lm_head
+        del full_model
 
         # Load processor for handling multimodal inputs
         self.processor = AutoProcessor.from_pretrained(
@@ -192,6 +193,10 @@ class Qwen3VLFeatureExtractor(FeatureExtractor):
             nn.init.normal_(self.projection.weight, std=0.02)
             if config.projection_bias:
                 nn.init.zeros_(self.projection.bias)
+
+            # Move projection to the same device as the model
+            model_device = next(self.model.parameters()).device
+            self.projection = self.projection.to(model_device)
             logger.info(f"Added projection: {self._hidden_size} -> {config.output_dim}")
         else:
             self.projection = None
@@ -268,9 +273,10 @@ class Qwen3VLFeatureExtractor(FeatureExtractor):
 
         # Apply projection if configured
         if self.projection is not None:
-            # Only project if not frozen, or if we're in eval mode
-            if not self.config.learning_mode == LearningMode.FROZEN or not self.training:
-                features = self.projection(features)
+            # Ensure projection is on the same device and dtype as features
+            if self.projection.weight.device != features.device or self.projection.weight.dtype != features.dtype:
+                self.projection = self.projection.to(device=features.device, dtype=features.dtype)
+            features = self.projection(features)
 
         return features
 
