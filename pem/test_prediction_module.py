@@ -111,7 +111,8 @@ def test_prediction_targets():
     logger.info("TEST: Prediction targets computation")
     logger.info("=" * 60)
 
-    target_computer = PredictionTargets(shortterm_horizon=4)
+    # Test with longterm_horizon=None (rest of sequence)
+    target_computer = PredictionTargets(shortterm_horizon=4, longterm_horizon=None)
 
     # Create simple features for easy verification
     B, S, D = 2, 10, 8
@@ -141,19 +142,31 @@ def test_prediction_targets():
     expected_shortterm_3 = (4 + 5 + 6 + 7) / 4  # 5.5
     logger.info(f"  Position 3 shortterm: {shortterm_at_3:.2f} (expected: {expected_shortterm_3})")
 
-    # Verify longterm targets (mean of all remaining)
+    # Verify longterm targets (mean of all remaining when longterm_horizon=None)
     # longterm[3] = mean(features[4:10]) = mean([4,5,6,7,8,9]) = 6.5
     longterm_at_3 = targets['longterm'][0, 3, 0].item()
     expected_longterm_3 = (4 + 5 + 6 + 7 + 8 + 9) / 6  # 6.5
-    logger.info(f"  Position 3 longterm: {longterm_at_3:.2f} (expected: {expected_longterm_3})")
+    logger.info(f"  Position 3 longterm (horizon=None): {longterm_at_3:.2f} (expected: {expected_longterm_3})")
 
     assert abs(shortterm_at_3 - expected_shortterm_3) < 0.01
     assert abs(longterm_at_3 - expected_longterm_3) < 0.01
 
+    # Test with fixed longterm_horizon=4
+    logger.info("\nTesting with fixed longterm_horizon=4:")
+    target_computer_fixed = PredictionTargets(shortterm_horizon=4, longterm_horizon=4)
+    targets_fixed = target_computer_fixed.compute_targets_efficient(features)
+
+    # longterm[3] with horizon=4 = mean(features[4:8]) = mean([4,5,6,7]) = 5.5
+    longterm_fixed_at_3 = targets_fixed['longterm'][0, 3, 0].item()
+    expected_longterm_fixed_3 = (4 + 5 + 6 + 7) / 4  # 5.5
+    logger.info(f"  Position 3 longterm (horizon=4): {longterm_fixed_at_3:.2f} (expected: {expected_longterm_fixed_3})")
+    assert abs(longterm_fixed_at_3 - expected_longterm_fixed_3) < 0.01
+
     # Check validity masks
-    logger.info(f"Immediate valid positions: {targets['immediate_valid'].sum(dim=1).tolist()}")
-    logger.info(f"Shortterm valid positions: {targets['shortterm_valid'].sum(dim=1).tolist()}")
-    logger.info(f"Longterm valid positions: {targets['longterm_valid'].sum(dim=1).tolist()}")
+    logger.info(f"\nValidity masks (horizon=None):")
+    logger.info(f"  Immediate valid positions: {targets['immediate_valid'].sum(dim=1).tolist()}")
+    logger.info(f"  Shortterm valid positions: {targets['shortterm_valid'].sum(dim=1).tolist()}")
+    logger.info(f"  Longterm valid positions: {targets['longterm_valid'].sum(dim=1).tolist()}")
 
     logger.info("Prediction targets test PASSED ✓")
     return True
@@ -167,9 +180,12 @@ def test_prediction_loss():
     logger.info("TEST: Prediction loss")
     logger.info("=" * 60)
 
-    config = PredictionConfig(sync_pairs=64, d_model=128, n_head=4, shortterm_horizon=8)
+    config = PredictionConfig(sync_pairs=64, d_model=128, n_head=4, shortterm_horizon=8, longterm_horizon=16)
     module = PredictionModule(config)
-    target_computer = PredictionTargets(shortterm_horizon=config.shortterm_horizon)
+    target_computer = PredictionTargets(
+        shortterm_horizon=config.shortterm_horizon,
+        longterm_horizon=config.longterm_horizon,
+    )
     loss_fn = PredictionLoss(use_cosine=True, use_mse=False)
 
     # Create inputs

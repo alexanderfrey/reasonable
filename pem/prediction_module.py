@@ -32,7 +32,9 @@ class PredictionConfig:
     dropout: float = 0.0
 
     # Prediction horizons
-    shortterm_horizon: int = 64  # Tokens ahead for short-term prediction
+    shortterm_horizon: int = 64   # Tokens ahead for short-term prediction
+    longterm_horizon: Optional[int] = 2048  # Tokens ahead for long-term prediction
+                                            # None = rest of sequence (up to context limit)
 
     # Architecture options
     use_flash_attn: bool = True
@@ -304,8 +306,15 @@ class PredictionTargets:
     should match.
     """
 
-    def __init__(self, shortterm_horizon: int = 64):
+    def __init__(self, shortterm_horizon: int = 64, longterm_horizon: Optional[int] = 2048):
+        """
+        Args:
+            shortterm_horizon: Number of tokens ahead for short-term target
+            longterm_horizon: Number of tokens ahead for long-term target.
+                              None = rest of sequence (original behavior)
+        """
         self.shortterm_horizon = shortterm_horizon
+        self.longterm_horizon = longterm_horizon
 
     def compute_targets(
         self,
@@ -317,8 +326,8 @@ class PredictionTargets:
 
         For position t, compute:
             - immediate: features[t+1]
-            - shortterm: mean(features[t+1:t+1+horizon])
-            - longterm:  mean(features[t+1:])
+            - shortterm: mean(features[t+1:t+1+shortterm_horizon])
+            - longterm:  mean(features[t+1:t+1+longterm_horizon]) or rest of seq if None
 
         Args:
             features: Actual features from feature extractor
@@ -356,15 +365,19 @@ class PredictionTargets:
                 immediate_targets[b, t] = features[b, t + 1]
                 immediate_valid[b, t] = True
 
-                # Short-term: mean of next `horizon` tokens (or remaining)
+                # Short-term: mean of next `shortterm_horizon` tokens (or remaining)
                 end_short = min(t + 1 + self.shortterm_horizon, int(seq_len))
                 if end_short > t + 1:
                     shortterm_targets[b, t] = features[b, t+1:end_short].mean(dim=0)
                     shortterm_valid[b, t] = True
 
-                # Long-term: mean of all remaining tokens
-                if t + 1 < seq_len:
-                    longterm_targets[b, t] = features[b, t+1:int(seq_len)].mean(dim=0)
+                # Long-term: mean of next `longterm_horizon` tokens (or rest of seq if None)
+                if self.longterm_horizon is None:
+                    end_long = int(seq_len)
+                else:
+                    end_long = min(t + 1 + self.longterm_horizon, int(seq_len))
+                if end_long > t + 1:
+                    longterm_targets[b, t] = features[b, t+1:end_long].mean(dim=0)
                     longterm_valid[b, t] = True
 
         return {
@@ -418,17 +431,22 @@ class PredictionTargets:
                 shortterm_targets[:, t] = (cumsum_padded[:, end_idx] - cumsum_padded[:, t + 1]) / count
                 shortterm_valid[:, t] = True
 
-        # Long-term targets: mean of features[t+1:]
+        # Long-term targets: mean of features[t+1:t+1+longterm_horizon] or rest of seq
         longterm_targets = torch.zeros_like(features)
         longterm_valid = torch.zeros(B, S, dtype=torch.bool, device=device)
 
-        total_sum = cumsum[:, -1:]  # (B, 1, D) - sum of all features
-
         for t in range(S - 1):
-            # mean of features[t+1:S] = (total - cumsum[t]) / (S - t - 1)
-            count = S - t - 1
+            if self.longterm_horizon is None:
+                # Rest of sequence
+                end_idx = S
+            else:
+                # Fixed horizon
+                end_idx = min(t + 1 + self.longterm_horizon, S)
+
+            count = end_idx - (t + 1)
             if count > 0:
-                longterm_targets[:, t] = (total_sum[:, 0] - cumsum_padded[:, t + 1]) / count
+                # mean = (cumsum[end_idx] - cumsum[t+1]) / count
+                longterm_targets[:, t] = (cumsum_padded[:, end_idx] - cumsum_padded[:, t + 1]) / count
                 longterm_valid[:, t] = True
 
         # Apply padding mask if provided
@@ -539,14 +557,25 @@ def create_prediction_module(
     d_model: int = 1536,
     n_head: int = 8,
     shortterm_horizon: int = 64,
+    longterm_horizon: Optional[int] = 2048,
     **kwargs,
 ) -> PredictionModule:
-    """Factory function to create a prediction module."""
+    """Factory function to create a prediction module.
+
+    Args:
+        sync_pairs: Dimension of sync from CTM
+        d_model: Dimension of features from extractor
+        n_head: Number of attention heads
+        shortterm_horizon: Tokens ahead for short-term prediction (default: 64)
+        longterm_horizon: Tokens ahead for long-term prediction (default: 2048)
+                         Set to None for "rest of sequence" behavior
+    """
     config = PredictionConfig(
         sync_pairs=sync_pairs,
         d_model=d_model,
         n_head=n_head,
         shortterm_horizon=shortterm_horizon,
+        longterm_horizon=longterm_horizon,
         **kwargs,
     )
     return PredictionModule(config)
