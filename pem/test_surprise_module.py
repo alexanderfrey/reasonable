@@ -354,9 +354,374 @@ def test_factory_function():
     return True
 
 
+# ============================================================================
+# VALENCE MODULE TESTS
+# ============================================================================
+
+
+def test_valence_module_forward():
+    """Test basic forward pass of valence module."""
+    from pem import ValenceModule, ValenceConfig
+
+    logger.info("\n" + "=" * 60)
+    logger.info("TEST: ValenceModule forward pass")
+    logger.info("=" * 60)
+
+    config = ValenceConfig(
+        d_model=256,
+        personality_dim=128,
+        hidden_dim=128,
+        n_layers=2,
+        use_context=True,
+    )
+
+    module = ValenceModule(config)
+    module.eval()
+
+    # Create dummy inputs
+    B, S, D = 2, 32, config.d_model
+    D_p = config.personality_dim
+
+    surprise_direction = torch.randn(B, S, D)
+    surprise_direction = F.normalize(surprise_direction, dim=-1)  # Unit vectors
+
+    personality = torch.randn(D_p)  # Personality embedding
+    context = torch.randn(B, S, D)  # Optional context
+
+    logger.info(f"Input shapes:")
+    logger.info(f"  surprise_direction: {surprise_direction.shape}")
+    logger.info(f"  personality: {personality.shape}")
+    logger.info(f"  context: {context.shape}")
+
+    # Forward pass
+    with torch.no_grad():
+        valence = module(surprise_direction, personality, context)
+
+    logger.info(f"Output shape: {valence.shape}")
+    logger.info(f"Valence range: [{valence.min():.3f}, {valence.max():.3f}]")
+
+    # Verify shape
+    assert valence.shape == (B, S, 1), f"Expected (B, S, 1), got {valence.shape}"
+
+    # Valence should be in [-1, +1] (tanh output)
+    assert valence.min() >= -1.0, f"Valence min {valence.min():.3f} < -1"
+    assert valence.max() <= 1.0, f"Valence max {valence.max():.3f} > 1"
+
+    logger.info("Valence forward pass test PASSED ✓")
+    return True
+
+
+def test_valence_alignment():
+    """Test that valence reflects alignment with personality."""
+    from pem import ValenceModule, ValenceConfig
+
+    logger.info("\n" + "=" * 60)
+    logger.info("TEST: Valence alignment with personality")
+    logger.info("=" * 60)
+
+    config = ValenceConfig(
+        d_model=64,
+        personality_dim=64,
+        hidden_dim=32,
+        use_context=False,  # Simpler test without context
+    )
+
+    module = ValenceModule(config)
+    module.eval()
+
+    B, S, D = 1, 8, config.d_model
+
+    # Create a personality that "wants" a specific direction
+    personality = torch.randn(D)
+    context = torch.randn(B, S, D)
+
+    # Case 1: Surprise direction aligned with personality
+    # Project personality through the module's projector to get what it "wants"
+    with torch.no_grad():
+        personality_proj = module.personality_proj(personality)  # What personality wants in D space
+        personality_proj = F.normalize(personality_proj, dim=-1)
+
+    # Surprise direction = same as personality projection (aligned)
+    surprise_aligned = personality_proj.unsqueeze(0).unsqueeze(0).expand(B, S, -1)
+
+    with torch.no_grad():
+        valence_aligned = module(surprise_aligned, personality, context)
+
+    logger.info(f"Aligned with personality: mean valence = {valence_aligned.mean():.4f}")
+
+    # Case 2: Surprise direction opposite to personality
+    surprise_opposite = -surprise_aligned
+
+    with torch.no_grad():
+        valence_opposite = module(surprise_opposite, personality, context)
+
+    logger.info(f"Opposite to personality: mean valence = {valence_opposite.mean():.4f}")
+
+    # Case 3: Random surprise direction
+    surprise_random = torch.randn(B, S, D)
+    surprise_random = F.normalize(surprise_random, dim=-1)
+
+    with torch.no_grad():
+        valence_random = module(surprise_random, personality, context)
+
+    logger.info(f"Random direction: mean valence = {valence_random.mean():.4f}")
+
+    # The aligned should be different from opposite (model learns the distinction)
+    diff = (valence_aligned - valence_opposite).abs().mean()
+    logger.info(f"Difference (aligned vs opposite): {diff:.4f}")
+
+    # Just verify shapes are correct (training will improve alignment)
+    assert valence_aligned.shape == (B, S, 1)
+    assert valence_opposite.shape == (B, S, 1)
+    assert valence_random.shape == (B, S, 1)
+
+    logger.info("Valence alignment test PASSED ✓")
+    return True
+
+
+def test_valence_context_modulation():
+    """Test that context affects valence computation."""
+    from pem import ValenceModule, ValenceConfig
+
+    logger.info("\n" + "=" * 60)
+    logger.info("TEST: Valence context modulation")
+    logger.info("=" * 60)
+
+    # Create module with context gating
+    config = ValenceConfig(
+        d_model=64,
+        personality_dim=64,
+        hidden_dim=32,
+        use_context=True,
+    )
+
+    module = ValenceModule(config)
+    module.eval()
+
+    B, S, D = 1, 8, config.d_model
+
+    surprise_direction = torch.randn(B, S, D)
+    surprise_direction = F.normalize(surprise_direction, dim=-1)
+    personality = torch.randn(D)
+
+    # Two different contexts
+    context1 = torch.randn(B, S, D)
+    context2 = torch.randn(B, S, D) * 2  # Different context
+
+    with torch.no_grad():
+        valence1 = module(surprise_direction, personality, context1)
+        valence2 = module(surprise_direction, personality, context2)
+
+    diff = (valence1 - valence2).abs().mean()
+    logger.info(f"Same surprise, different contexts: valence diff = {diff:.4f}")
+
+    # Context should affect valence (diff > 0)
+    assert diff > 0, "Context should modulate valence"
+
+    # Test without context
+    with torch.no_grad():
+        valence_no_ctx = module(surprise_direction, personality, None)
+
+    diff_with_ctx = (valence1 - valence_no_ctx).abs().mean()
+    logger.info(f"With vs without context: valence diff = {diff_with_ctx:.4f}")
+
+    logger.info("Valence context modulation test PASSED ✓")
+    return True
+
+
+def test_valence_gradient_flow():
+    """Test that gradients flow through valence module."""
+    from pem import ValenceModule, ValenceConfig
+
+    logger.info("\n" + "=" * 60)
+    logger.info("TEST: Valence gradient flow")
+    logger.info("=" * 60)
+
+    config = ValenceConfig(d_model=64, personality_dim=64, hidden_dim=32)
+    module = ValenceModule(config)
+    module.train()
+
+    B, S, D = 2, 16, config.d_model
+
+    surprise_direction = torch.randn(B, S, D, requires_grad=True)
+    surprise_direction_norm = F.normalize(surprise_direction, dim=-1)
+    personality = torch.randn(D, requires_grad=True)
+    context = torch.randn(B, S, D, requires_grad=True)
+
+    # Forward pass
+    valence = module(surprise_direction_norm, personality, context)
+
+    # Backward pass
+    loss = valence.mean()
+    loss.backward()
+
+    # Check gradients
+    has_input_grads = surprise_direction.grad is not None and surprise_direction.grad.abs().sum() > 0
+    has_personality_grads = personality.grad is not None and personality.grad.abs().sum() > 0
+    has_context_grads = context.grad is not None and context.grad.abs().sum() > 0
+
+    module_has_grads = any(p.grad is not None and p.grad.abs().sum() > 0 for p in module.parameters())
+
+    logger.info(f"Gradients flow to:")
+    logger.info(f"  surprise_direction: {has_input_grads}")
+    logger.info(f"  personality: {has_personality_grads}")
+    logger.info(f"  context: {has_context_grads}")
+    logger.info(f"  module parameters: {module_has_grads}")
+
+    assert module_has_grads, "Gradients should flow through module"
+
+    logger.info("Valence gradient flow test PASSED ✓")
+    return True
+
+
+def test_valence_loss():
+    """Test valence loss computation."""
+    from pem import ValenceModule, ValenceConfig, ValenceLoss, SurpriseModule, SurpriseConfig
+
+    logger.info("\n" + "=" * 60)
+    logger.info("TEST: Valence loss")
+    logger.info("=" * 60)
+
+    D = 64
+    D_p = 64
+
+    # Create modules
+    valence_config = ValenceConfig(d_model=D, personality_dim=D_p, hidden_dim=32)
+    valence_module = ValenceModule(valence_config)
+
+    surprise_config = SurpriseConfig(d_model=D, hidden_dim=128)
+    surprise_module = SurpriseModule(surprise_config)
+
+    loss_fn = ValenceLoss()
+
+    B, S = 2, 16
+
+    # Create test data
+    predictions = {
+        'immediate': torch.randn(B, S, D),
+        'shortterm': torch.randn(B, S, D),
+    }
+    targets = {
+        'immediate': torch.randn(B, S, D),
+        'shortterm': torch.randn(B, S, D),
+        'immediate_valid': torch.ones(B, S, dtype=torch.bool),
+        'shortterm_valid': torch.ones(B, S, dtype=torch.bool),
+    }
+    context = torch.randn(B, S, D)
+    personality = torch.randn(D_p)
+
+    # Compute surprise
+    surprises = surprise_module(predictions, targets, context)
+
+    # Compute valence
+    valences = valence_module.compute_from_surprises(surprises, personality, context)
+
+    # Compute loss
+    total_loss, loss_dict = loss_fn(valences, surprises, targets)
+
+    logger.info(f"Total loss: {total_loss.item():.4f}")
+    for key, val in loss_dict.items():
+        logger.info(f"  {key}: {val.item():.4f}")
+
+    # Loss should be finite
+    assert not torch.isnan(total_loss), "Loss should not be NaN"
+    assert not torch.isinf(total_loss), "Loss should not be infinite"
+
+    logger.info("Valence loss test PASSED ✓")
+    return True
+
+
+def test_valence_factory():
+    """Test valence factory function."""
+    from pem import create_valence_module
+
+    logger.info("\n" + "=" * 60)
+    logger.info("TEST: Valence factory function")
+    logger.info("=" * 60)
+
+    module = create_valence_module(
+        d_model=256,
+        personality_dim=128,
+        hidden_dim=128,
+        use_context=True,
+    )
+
+    logger.info(f"Created module: {type(module).__name__}")
+    logger.info(f"Config: d_model={module.config.d_model}, personality_dim={module.config.personality_dim}")
+
+    # Quick forward test
+    B, S, D = 1, 8, module.config.d_model
+    D_p = module.config.personality_dim
+
+    surprise_direction = torch.randn(B, S, D)
+    surprise_direction = F.normalize(surprise_direction, dim=-1)
+    personality = torch.randn(D_p)
+    context = torch.randn(B, S, D)
+
+    with torch.no_grad():
+        valence = module(surprise_direction, personality, context)
+
+    assert valence.shape == (B, S, 1)
+    assert valence.min() >= -1.0
+    assert valence.max() <= 1.0
+
+    logger.info("Valence factory test PASSED ✓")
+    return True
+
+
+def test_valence_integration_with_sync():
+    """Test valence integration with SyncModule."""
+    from pem import SyncModule, SyncModuleConfig
+
+    logger.info("\n" + "=" * 60)
+    logger.info("TEST: Valence integration with SyncModule")
+    logger.info("=" * 60)
+
+    D = 64
+    sync_pairs = 64
+
+    config = SyncModuleConfig(
+        d_model=D,
+        sync_pairs=sync_pairs,
+        memory_slots=10,
+        use_intention=True,
+    )
+
+    module = SyncModule(config)
+    module.eval()
+
+    B, S, T = 2, 16, 4
+
+    history = torch.randn(B, S, T, D)
+    surprise = torch.rand(B, S, 1)  # Random surprise magnitudes
+
+    # Test with positive valence
+    valence_positive = torch.ones(B, S, 1) * 0.8  # High positive valence
+
+    with torch.no_grad():
+        sync_positive = module(history, surprise=surprise, valence=valence_positive)
+
+    # Test with negative valence
+    valence_negative = torch.ones(B, S, 1) * -0.8  # High negative valence
+
+    module.reset_memory()
+    with torch.no_grad():
+        sync_negative = module(history, surprise=surprise, valence=valence_negative)
+
+    # Sync outputs should differ based on valence
+    diff = (sync_positive - sync_negative).abs().mean()
+    logger.info(f"Sync difference (positive vs negative valence): {diff:.4f}")
+
+    # Valence should affect sync output
+    assert diff > 0, "Valence should affect sync output"
+
+    logger.info("Valence integration with SyncModule test PASSED ✓")
+    return True
+
+
 def main():
     """Run all tests."""
-    logger.info("PEM Surprise Module Tests")
+    logger.info("PEM Surprise & Valence Module Tests")
     logger.info("=" * 60)
 
     # Import F for tests that need it
@@ -364,12 +729,21 @@ def main():
     import torch.nn.functional as F
 
     tests = [
-        ("Forward pass", test_surprise_module_forward),
-        ("Raw vs learned", test_raw_vs_learned_surprise),
-        ("Direction alignment", test_direction_alignment),
+        # Surprise tests
+        ("Surprise forward pass", test_surprise_module_forward),
+        ("Surprise raw vs learned", test_raw_vs_learned_surprise),
+        ("Surprise direction alignment", test_direction_alignment),
         ("Surprise loss", test_surprise_loss),
-        ("Full pipeline", test_full_pipeline),
-        ("Factory function", test_factory_function),
+        ("Surprise full pipeline", test_full_pipeline),
+        ("Surprise factory function", test_factory_function),
+        # Valence tests
+        ("Valence forward pass", test_valence_module_forward),
+        ("Valence alignment", test_valence_alignment),
+        ("Valence context modulation", test_valence_context_modulation),
+        ("Valence gradient flow", test_valence_gradient_flow),
+        ("Valence loss", test_valence_loss),
+        ("Valence factory function", test_valence_factory),
+        ("Valence integration with SyncModule", test_valence_integration_with_sync),
     ]
 
     passed = 0

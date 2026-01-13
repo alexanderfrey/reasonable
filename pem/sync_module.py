@@ -465,14 +465,26 @@ class MemoryBank(nn.Module):
         features: torch.Tensor,      # (B, S, D) features to potentially store
         chunk_ids: torch.Tensor,     # (B, S) chunk assignment per position
         surprise: Optional[torch.Tensor] = None,  # (B, S, 1) or (B, S) surprise magnitude
+        valence: Optional[torch.Tensor] = None,   # (B, S, 1) or (B, S) valence in [-1, +1]
+        curiosity: Optional[torch.Tensor] = None, # (B, S, 1) or (B, S) curiosity intensity
+        arousal: Optional[torch.Tensor] = None,   # (B, S, 1) or (B, S) arousal/activation level
     ) -> None:
         """
         Write new chunks to memory with importance-weighted eviction.
 
         For each unique chunk in the batch:
         1. Compute chunk embedding (mean of tokens in chunk)
-        2. Compute importance from surprise
+        2. Compute importance from surprise, valence, curiosity, AND arousal
         3. Store in available or evicted slot
+
+        Importance calculation:
+            base_importance = surprise_magnitude
+            valence_boost = 1 + |valence|  # Both good and bad are memorable
+            curiosity_boost = 1 + curiosity  # Curious things are informative
+            arousal_boost = arousal  # High arousal = vivid encoding
+            importance = base_importance * valence_boost * curiosity_boost * arousal_boost
+
+        High surprise + high |valence| + high curiosity + high arousal = maximally memorable
         """
         B, S, D = features.shape
         device = features.device
@@ -481,6 +493,21 @@ class MemoryBank(nn.Module):
         if surprise is not None:
             if surprise.dim() == 3:
                 surprise = surprise.squeeze(-1)  # (B, S)
+
+        # Handle valence shape
+        if valence is not None:
+            if valence.dim() == 3:
+                valence = valence.squeeze(-1)  # (B, S)
+
+        # Handle curiosity shape
+        if curiosity is not None:
+            if curiosity.dim() == 3:
+                curiosity = curiosity.squeeze(-1)  # (B, S)
+
+        # Handle arousal shape
+        if arousal is not None:
+            if arousal.dim() == 3:
+                arousal = arousal.squeeze(-1)  # (B, S)
 
         # Process each batch item
         for b in range(B):
@@ -502,11 +529,32 @@ class MemoryBank(nn.Module):
                 chunk_mean = chunk_features.mean(dim=0, keepdim=True)  # (1, D)
                 chunk_embed = self.chunk_encoder(chunk_mean).squeeze(0)  # (D,)
 
-                # Compute importance from surprise
+                # Compute importance from surprise, valence, AND curiosity
                 if surprise is not None:
                     chunk_surprise = surprise[b, mask].mean().item()
-                    importance = self.importance_scale * chunk_surprise + self.importance_bias
-                    importance = max(0.0, min(1.0, importance.item()))  # Clamp to [0, 1]
+                    base_importance = self.importance_scale * chunk_surprise + self.importance_bias
+
+                    # Valence modulation: both positive and negative extremes are memorable
+                    if valence is not None:
+                        chunk_valence = valence[b, mask].mean().item()
+                        valence_boost = 1.0 + abs(chunk_valence)  # Range [1, 2]
+                        base_importance = base_importance * valence_boost
+
+                    # Curiosity modulation: informative things should be remembered
+                    if curiosity is not None:
+                        chunk_curiosity = curiosity[b, mask].mean().item()
+                        curiosity_boost = 1.0 + chunk_curiosity  # Range [1, 2]
+                        base_importance = base_importance * curiosity_boost
+
+                    # Arousal modulation: high arousal = vivid encoding
+                    if arousal is not None:
+                        chunk_arousal = arousal[b, mask].mean().item()
+                        # Map arousal [0, 1] to boost [0.5, 1.5]
+                        # Low arousal dampens encoding, high arousal strengthens
+                        arousal_boost = 0.5 + chunk_arousal  # Range [0.5, 1.5]
+                        base_importance = base_importance * arousal_boost
+
+                    importance = max(0.0, min(1.0, base_importance))  # Clamp to [0, 1]
                 else:
                     importance = 0.5  # Default importance
 
@@ -1100,6 +1148,9 @@ class SyncModule(nn.Module):
         self,
         history: torch.Tensor,  # (B, S, T, D)
         surprise: Optional[torch.Tensor] = None,  # (B, S, 1) from PEM
+        valence: Optional[torch.Tensor] = None,   # (B, S, 1) from ValenceModule
+        curiosity: Optional[torch.Tensor] = None, # (B, S, 1) from CuriosityModule
+        arousal: Optional[torch.Tensor] = None,   # (B, S, 1) from ActivationModule
         personality_text: Optional[torch.Tensor] = None,  # Runtime instruction
         positions: Optional[torch.Tensor] = None,  # (S,) position indices for intention
     ) -> torch.Tensor:
@@ -1109,6 +1160,9 @@ class SyncModule(nn.Module):
         Args:
             history: Neural activation history from CTM
             surprise: Optional surprise signal from PEM SurpriseModule
+            valence: Optional valence signal from ValenceModule (good/bad)
+            curiosity: Optional curiosity signal from CuriosityModule
+            arousal: Optional arousal signal from ActivationModule (engagement level)
             personality_text: Optional text embedding for runtime objective
             positions: Optional position indices for intention oscillation phase
 
@@ -1119,8 +1173,22 @@ class SyncModule(nn.Module):
             Sets self.last_kl_loss: KL divergence from personality prior
             Sets self.last_boundary_probs: Detected semantic boundaries
             Sets self.last_intention_strength: Intention intensity (if intention enabled)
+            Sets self.last_valence: Valence signal (if provided)
+            Sets self.last_curiosity: Curiosity signal (if provided)
+            Sets self.last_arousal: Arousal signal (if provided)
+
+        Modulation:
+            - Memory: surprise + |valence| + curiosity + arousal boost importance
+            - Intention: Positive valence amplifies, negative dampens; curiosity adds exploration
+            - KL: Positive valence tightens constraint, negative loosens
+            - Arousal: High arousal = vivid memory encoding
         """
         B, S, T, D = history.shape
+
+        # Store signals for external access
+        self.last_valence = valence
+        self.last_curiosity = curiosity
+        self.last_arousal = arousal
 
         # 1. Encode context from history (aggregate temporal dimension)
         context = self.context_encoder(history)  # (B, S, D)
@@ -1128,8 +1196,8 @@ class SyncModule(nn.Module):
         # 2. Detect change points (semantic boundaries)
         boundary_probs, chunk_ids = self.cpd(context)  # (B, S), (B, S)
 
-        # 3. Update memory with new chunks (importance from surprise)
-        self.memory.write(context, chunk_ids, surprise)
+        # 3. Update memory with new chunks (importance from surprise, valence, curiosity, AND arousal)
+        self.memory.write(context, chunk_ids, surprise, valence, curiosity, arousal)
 
         # 4. Retrieve from memory
         memory_state = self.memory.read(context)  # (B, S, D)
@@ -1147,6 +1215,29 @@ class SyncModule(nn.Module):
             # Intention scales HOW MUCH personality influences the sync
             # (1 + intention_signal) centers modulation around 1.0
             personality_signal = personality_signal * (1.0 + 0.5 * torch.tanh(intention_signal))
+
+            # === VALENCE MODULATION OF INTENTION ===
+            # Positive valence → amplify intention (it's working!)
+            # Negative valence → dampen intention (retreat/replan)
+            if valence is not None:
+                # valence is (B, S, 1), need (B, S)
+                valence_2d = valence.squeeze(-1) if valence.dim() == 3 else valence
+                # Map valence [-1, +1] to multiplier [0.5, 1.5]
+                # Positive valence → multiplier > 1 → amplify
+                # Negative valence → multiplier < 1 → dampen
+                valence_mult = 1.0 + 0.5 * valence_2d  # Range [0.5, 1.5]
+                intention_signal = intention_signal * valence_mult.unsqueeze(-1)
+
+            # === CURIOSITY MODULATION OF INTENTION ===
+            # High curiosity → boost intention for exploration
+            # Curiosity can override low valence: "I want to understand this even if it seems bad"
+            if curiosity is not None:
+                # curiosity is (B, S, 1), need (B, S)
+                curiosity_2d = curiosity.squeeze(-1) if curiosity.dim() == 3 else curiosity
+                # Map curiosity [0, 1] to multiplier [1.0, 1.5]
+                # High curiosity → boost intention (explore!)
+                curiosity_boost = 1.0 + 0.5 * curiosity_2d  # Range [1.0, 1.5]
+                intention_signal = intention_signal * curiosity_boost.unsqueeze(-1)
 
             # Compute intention strength for integrator
             intention_strength = intention_signal.norm(dim=-1)  # (B, S)
@@ -1167,7 +1258,19 @@ class SyncModule(nn.Module):
 
         # 9. Compute KL divergence from personality prior (stored for training)
         # With intention, KL temperature varies by position (stronger intention = tighter)
+        # === VALENCE MODULATION OF KL ===
+        # Positive valence → tighter KL (stay close to personality, on track)
+        # Negative valence → looser KL (allow deviation, need to adapt)
         if kl_temp_mult is not None and self.config.intention_modulate_kl:
+            # Apply valence modulation to KL temperature multiplier
+            if valence is not None:
+                valence_2d = valence.squeeze(-1) if valence.dim() == 3 else valence
+                # Positive valence → higher mult → tighter KL
+                # Negative valence → lower mult → looser KL
+                # Map valence [-1, +1] to kl_mult_factor [0.7, 1.3]
+                valence_kl_factor = 1.0 + 0.3 * valence_2d
+                kl_temp_mult = kl_temp_mult * valence_kl_factor
+
             self.last_kl_loss = self._compute_modulated_kl(
                 sync, kl_temp_mult, personality_text
             )

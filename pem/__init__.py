@@ -26,6 +26,32 @@ from .surprise_module import (
     SurpriseModule,
     SurpriseLoss,
     create_surprise_module,
+    # Valence (affective dimension of experience)
+    ValenceConfig,
+    ValenceModule,
+    ValenceLoss,
+    create_valence_module,
+)
+
+from .curiosity_module import (
+    CuriosityConfig,
+    CuriosityModule,
+    CuriosityOutput,
+    CuriosityLoss,
+    UncertaintyEstimator,
+    NoveltyMemory,
+    InformationGainComputer,
+    create_curiosity_module,
+)
+
+from .activation_module import (
+    ActivationConfig,
+    ActivationModule,
+    ActivationOutput,
+    ActivationLoss,
+    ArousalComputer,
+    ModulationComputer,
+    create_activation_module,
 )
 
 from .sync_module import (
@@ -68,6 +94,28 @@ __all__ = [
     "SurpriseModule",
     "SurpriseLoss",
     "create_surprise_module",
+    # Valence (affective dimension)
+    "ValenceConfig",
+    "ValenceModule",
+    "ValenceLoss",
+    "create_valence_module",
+    # Curiosity (epistemic drive)
+    "CuriosityConfig",
+    "CuriosityModule",
+    "CuriosityOutput",
+    "CuriosityLoss",
+    "UncertaintyEstimator",
+    "NoveltyMemory",
+    "InformationGainComputer",
+    "create_curiosity_module",
+    # Activation (arousal/engagement)
+    "ActivationConfig",
+    "ActivationModule",
+    "ActivationOutput",
+    "ActivationLoss",
+    "ArousalComputer",
+    "ModulationComputer",
+    "create_activation_module",
     # Sync
     "SyncModuleConfig",
     "SyncModule",

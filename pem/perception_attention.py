@@ -220,7 +220,7 @@ class OscillationQueryBuilder(nn.Module):
         # Scale factor for oscillation contribution
         self.oscillation_scale = nn.Parameter(torch.tensor(1.0))
 
-        # === 6. Surprise → Query (NEW: closes the experience loop) ===
+        # === 6. Surprise → Query (closes the experience loop) ===
         # Surprise direction tells us WHAT was unexpected
         # Surprise magnitude tells us HOW unexpected it was
         # Together they steer attention toward surprising things
@@ -234,11 +234,21 @@ class OscillationQueryBuilder(nn.Module):
         # Higher surprise = stronger/more focused attention
         self.surprise_magnitude_scale = nn.Parameter(torch.tensor(0.5))
 
-        # === 7. Final Query Projection ===
+        # === 7. Valence → Query Focus (affective modulation) ===
+        # Positive valence → sharper/more focused query (exploit)
+        # Negative valence → broader/more diffuse query (explore)
+        self.valence_focus_scale = nn.Parameter(torch.tensor(0.3))
+
+        # === 8. Curiosity → Query Exploration (epistemic drive) ===
+        # Curiosity drives exploration of uncertain/novel regions
+        # exploration_bonus from CuriosityModule adds to query
+        self.curiosity_scale = nn.Parameter(torch.tensor(0.5))
+
+        # === 9. Final Query Projection ===
         # Combines all signals into final query
-        # Input: personality_query + intention_scaled + sync_modulation + oscillation + surprise
+        # Input: personality_query + intention_scaled + sync_modulation + oscillation + surprise + curiosity
         self.query_combiner = nn.Sequential(
-            nn.Linear(d_model * 5, d_model * 2),  # Now 5 inputs instead of 4
+            nn.Linear(d_model * 6, d_model * 2),  # Now 6 inputs (added curiosity)
             nn.GELU(),
             nn.Linear(d_model * 2, d_model),
         )
@@ -271,6 +281,8 @@ class OscillationQueryBuilder(nn.Module):
         context: Optional[torch.Tensor] = None,  # (B, S, D) optional context
         surprise_magnitude: Optional[torch.Tensor] = None,  # (B, S, 1) or (B, S)
         surprise_direction: Optional[torch.Tensor] = None,  # (B, S, D) what was unexpected
+        valence: Optional[torch.Tensor] = None,  # (B, S, 1) or (B, S) good/bad
+        exploration_bonus: Optional[torch.Tensor] = None,  # (B, S, D) from CuriosityModule
     ) -> torch.Tensor:
         """
         Build attention query by synchronizing all signals.
@@ -281,6 +293,8 @@ class OscillationQueryBuilder(nn.Module):
         - How my neurons are coordinating (sync)
         - Where I am in the oscillation cycle (tick)
         - What surprised me (surprise - closes the experience loop)
+        - Was it good or bad (valence - affective modulation)
+        - What am I curious about (exploration_bonus - epistemic drive)
 
         Args:
             personality_signal: Personality-modulated context
@@ -290,6 +304,8 @@ class OscillationQueryBuilder(nn.Module):
             context: Optional additional context
             surprise_magnitude: How surprising (scalar per position)
             surprise_direction: What was unexpected (direction in feature space)
+            valence: Was the surprise good (+1) or bad (-1)
+            exploration_bonus: Curiosity-driven exploration signal
 
         Returns:
             query: (B, S, D) attention query
@@ -340,17 +356,36 @@ class OscillationQueryBuilder(nn.Module):
             # No surprise: use zeros
             surprise_query = torch.zeros_like(personality_query)
 
-        # 7. Combine all signals (now including surprise)
+        # 7. Process curiosity exploration bonus
+        if exploration_bonus is not None:
+            curiosity_query = self.curiosity_scale * exploration_bonus
+        else:
+            curiosity_query = torch.zeros_like(personality_query)
+
+        # 8. Combine all signals (personality, intention, sync, oscillation, surprise, curiosity)
         combined = torch.cat([
             personality_query,
             intention_scaled,
             sync_modulation,
             oscillation_signal,
             surprise_query,
-        ], dim=-1)  # (B, S, D*5)
+            curiosity_query,
+        ], dim=-1)  # (B, S, D*6)
 
         query = self.query_combiner(combined)  # (B, S, D)
         query = self.norm(query)
+
+        # 9. Valence → query focus modulation
+        # Positive valence → sharper query (amplify magnitude)
+        # Negative valence → softer query (reduce magnitude)
+        # This affects attention: sharper queries → more focused attention
+        if valence is not None:
+            if valence.dim() == 2:
+                valence = valence.unsqueeze(-1)  # (B, S, 1)
+            # Map valence [-1, +1] to focus multiplier [0.7, 1.3]
+            # Positive → amplify, Negative → dampen
+            focus_mult = 1.0 + self.valence_focus_scale * valence
+            query = query * focus_mult
 
         return query
 
@@ -405,6 +440,7 @@ class PerceptionCrossAttention(nn.Module):
         key: torch.Tensor,      # (B, S_kv, n_heads, head_dim) from KVCache
         value: torch.Tensor,    # (B, S_kv, n_heads, head_dim) from KVCache
         causal: bool = True,    # Use causal masking
+        attention_temperature: Optional[torch.Tensor] = None,  # (B, S, 1) from ActivationModule
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Attend to perception features.
@@ -414,6 +450,9 @@ class PerceptionCrossAttention(nn.Module):
             key: Cached keys from Qwen
             value: Cached values from Qwen
             causal: Whether to use causal attention
+            attention_temperature: Temperature for attention softmax (from ActivationModule).
+                                   Lower temperature = sharper focus (high arousal)
+                                   Higher temperature = broader attention (low arousal)
 
         Returns:
             output: (B, S, D) attended perception
@@ -461,6 +500,14 @@ class PerceptionCrossAttention(nn.Module):
             # Attention scores
             scale = self.head_dim ** -0.5
             scores = torch.matmul(q, k.transpose(-2, -1)) * scale  # (B, H, S, S_kv)
+
+            # Apply attention temperature (from arousal)
+            # Lower temperature = sharper attention (high arousal, focused)
+            # Higher temperature = broader attention (low arousal, relaxed)
+            if attention_temperature is not None:
+                # attention_temperature: (B, S, 1) -> (B, 1, S, 1) for broadcasting
+                temp = attention_temperature.unsqueeze(1)  # (B, 1, S, 1)
+                scores = scores / temp
 
             # Causal mask
             if causal:
@@ -642,6 +689,9 @@ class PerceptionAttention(nn.Module):
         causal: bool = True,              # Use causal attention
         surprise_magnitude: Optional[torch.Tensor] = None,  # (B, S, 1) or (B, S)
         surprise_direction: Optional[torch.Tensor] = None,  # (B, S, D)
+        valence: Optional[torch.Tensor] = None,  # (B, S, 1) or (B, S) good/bad
+        exploration_bonus: Optional[torch.Tensor] = None,  # (B, S, D) from CuriosityModule
+        attention_temperature: Optional[torch.Tensor] = None,  # (B, S, 1) from ActivationModule
     ) -> PerceptionOutput:
         """
         Attend to perception based on current mental state.
@@ -651,6 +701,9 @@ class PerceptionAttention(nn.Module):
         - Intention defines HOW MUCH to pursue it
         - Sync captures HOW neurons are coordinating
         - Surprise steers attention to WHAT was unexpected (closes the loop!)
+        - Valence modulates attention FOCUS (positive→sharp, negative→broad)
+        - Curiosity drives EXPLORATION of uncertain/novel regions
+        - Arousal controls attention SHARPNESS via temperature
 
         Args:
             state: Current hidden state
@@ -661,6 +714,11 @@ class PerceptionAttention(nn.Module):
             causal: Whether to use causal attention
             surprise_magnitude: How surprising each position was
             surprise_direction: What was unexpected (unit vector in feature space)
+            valence: Was the surprise good (+1) or bad (-1)
+            exploration_bonus: Curiosity-driven exploration signal
+            attention_temperature: Softmax temperature from ActivationModule.
+                                   Lower = sharper focus (high arousal)
+                                   Higher = broader attention (low arousal)
 
         Returns:
             PerceptionOutput with:
@@ -672,7 +730,7 @@ class PerceptionAttention(nn.Module):
                 "Perception KV not cached. Call cache_perception() first."
             )
 
-        # 1. Build query from oscillation synchronization + surprise
+        # 1. Build query from all signals: personality, intention, sync, surprise, valence, curiosity
         query = self.query_builder(
             personality_signal=personality_signal,
             intention_signal=intention_signal,
@@ -680,14 +738,17 @@ class PerceptionAttention(nn.Module):
             tick=tick,
             surprise_magnitude=surprise_magnitude,
             surprise_direction=surprise_direction,
+            valence=valence,
+            exploration_bonus=exploration_bonus,
         )
 
-        # 2. Cross-attend to perception
+        # 2. Cross-attend to perception (with arousal-modulated temperature)
         attended, attn_weights = self.cross_attention(
             query=query,
             key=self._cached_k,
             value=self._cached_v,
             causal=causal,
+            attention_temperature=attention_temperature,
         )
 
         # 3. Integrate with current state via synapse

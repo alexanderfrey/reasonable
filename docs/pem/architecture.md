@@ -10,25 +10,39 @@ PEM is built on the principle that experience requires:
 3. **Memory** - WHAT happened (episodic storage weighted by surprise)
 4. **Attention** - WHERE to look (query built from synchronized oscillations)
 5. **Surprise** - WHAT was unexpected (prediction errors)
+6. **Valence** - Was it GOOD or BAD? (affective dimension)
+7. **Curiosity** - WHAT do I want to understand? (epistemic drive)
+8. **Arousal** - HOW INTENSELY to engage? (activation level)
 
 ## The Experience Loop (CLOSED)
 
 The key insight is that these components form a closed feedback loop:
 
 ```
-Perception (Qwen) → Prediction → Surprise
-       ↑                            ↓
-       │                       Memory (store surprising things)
-       │                            ↓
-       │                         Sync
-       │                            ↓
-       └──── Attention Query ←── Surprise + Personality + Intention
+Perception (Qwen) → Prediction → Surprise → Valence
+       ↑                  ↓           ↓         ↓
+       │            Uncertainty   Curiosity    │
+       │                  │           │         │
+       │                  └─────┬─────┘         │
+       │                        ↓               │
+       │              ┌─────────┴─────────┐     │
+       │              │                   │     │
+       │       Memory (importance)   Intention  │
+       │              │                   │     │
+       │              └─────────┬─────────┘     │
+       │                        ↓               │
+       │                     Sync ←─────────────┘
+       │                        ↓
+       └──── Attention Query ←── Surprise + Valence + Curiosity + Personality + Intention
 ```
 
-Three critical connections close this loop:
+Six critical connections close this loop:
 1. **Surprise → Attention**: What surprised us steers where we look next
 2. **Observation → State**: What we perceive changes what we think
 3. **Surprise → Memory**: Surprising experiences persist longer
+4. **Valence → Everything**: Good/bad colors memory, intention, attention, KL
+5. **Curiosity → Exploration**: Uncertainty drives seeking new information
+6. **Arousal → Intensity**: Engagement level modulates attention sharpness and memory strength
 
 ## Complete Architecture
 
@@ -399,13 +413,424 @@ kl_temperature = base_temperature / intention_strength
 
 ---
 
+## Valence Module
+
+Valence is the **affective dimension** of experience - whether something is good or bad.
+
+### Why Valence Matters
+
+Without valence, all surprises are the same. The system can't distinguish between:
+
+| Event | Surprise Magnitude | Valence |
+|-------|-------------------|---------|
+| Finding treasure | HIGH | **+1** (good) |
+| Stepping in mud | HIGH | **-1** (bad) |
+| Expected rain | LOW | **0** (neutral) |
+
+Both treasure and mud have high surprise, but should trigger **opposite behaviors**:
+- **Positive valence** → approach, amplify intention, focus attention
+- **Negative valence** → avoid, dampen intention, broaden attention
+
+### Architecture
+
+```
+                    Surprise
+                       │
+         ┌─────────────┼─────────────┐
+         ▼             ▼             ▼
+    magnitude      direction      valence
+     (scalar)      (vector)    (this module)
+         │             │             │
+    "how much"    "what kind"    "good or bad?"
+```
+
+### Core Equation
+
+```python
+valence = alignment(surprise_direction, personality_goals, context)
+```
+
+Where:
+- `surprise_direction`: What was unexpected (unit vector in feature space)
+- `personality_goals`: What the agent wants (from PersonalityModule)
+- `context`: Current situation (modulates goal interpretation)
+
+### Data Flow
+
+```
+PersonalityModule.base_personality
+         │
+         ▼
+┌────────────────────────┐
+│  PersonalityProjector  │  Project personality to surprise space
+│   (D_p → D_model)      │
+└────────────────────────┘
+         │
+         ▼
+┌────────────────────────┐
+│ ContextualGoalModulator│  What does personality mean in this context?
+│  personality + context │  "Be helpful" means different things for code vs poetry
+└────────────────────────┘
+         │
+         ▼ goal_direction
+         │
+┌────────────────────────┐
+│   AlignmentComputer    │  How aligned is surprise with goals?
+│ surprise_dir × goal_dir│
+└────────────────────────┘
+         │
+         ▼
+   valence ∈ [-1, +1]
+   +1 = toward goals (good)
+   -1 = away from goals (bad)
+    0 = orthogonal (neutral)
+```
+
+### Valence Modulates Everything
+
+| Component | Positive Valence | Negative Valence |
+|-----------|-----------------|------------------|
+| **Memory** | High importance (good to remember) | High importance (threat to remember) |
+| **Intention** | Amplify pursuit (it's working!) | Dampen pursuit (retreat/replan) |
+| **Attention** | Focus sharper (exploit) | Broaden (explore alternatives) |
+| **KL** | Tighter constraint (stay on track) | Looser (allow adaptation) |
+
+### Implementation
+
+```python
+from pem import ValenceModule, ValenceConfig
+
+config = ValenceConfig(
+    d_model=1536,           # Same as Qwen hidden dim
+    personality_dim=512,    # Personality embedding size
+    hidden_dim=768,
+    use_context=True,       # Context-dependent valence
+)
+
+valence_module = ValenceModule(config)
+
+# Compute valence from surprise
+valence = valence_module(
+    surprise_direction=surprise['direction'],   # (B, S, D)
+    personality=sync_module.personality.base_personality,  # (D_p,)
+    context=features,                           # (B, S, D)
+)
+# valence: (B, S, 1) in [-1, +1]
+
+# Or compute for all scales at once
+valences = valence_module.compute_from_surprises(
+    surprises=surprise_module(predictions, targets, context),
+    personality=personality_embedding,
+    context=features,
+)
+```
+
+### Integration with SyncModule
+
+```python
+# Valence flows through SyncModule.forward()
+sync = sync_module(
+    history=ctm_history,
+    surprise=surprise_magnitude,  # How surprising
+    valence=valence,              # Was it good or bad?
+)
+
+# Internally:
+# - memory.write() uses valence to boost importance (both +/- are memorable)
+# - intention is amplified/dampened by valence
+# - KL constraint is tightened/loosened by valence
+```
+
+---
+
+## Curiosity Module
+
+Curiosity is the **epistemic drive** - the motivation to seek information and reduce uncertainty.
+
+### Why Curiosity Matters
+
+Without curiosity, the system is entirely **reactive**. It responds to surprise but never seeks it out.
+
+| With Surprise Only | With Curiosity |
+|-------------------|----------------|
+| React to the unexpected | **Seek** the uncertain |
+| Passive learner | Active explorer |
+| Exploit known patterns | Balance exploit/explore |
+
+### The Two Types of Value
+
+In decision-making, there are two types of value:
+
+1. **Pragmatic Value** (Valence): "Is this good for my goals?"
+   - Exploitation of known rewards
+
+2. **Epistemic Value** (Curiosity): "Will this teach me something?"
+   - Exploration to reduce uncertainty
+
+### Architecture
+
+```
+Features + Predictions
+         │
+         ▼
+┌────────────────────────┐
+│  UncertaintyEstimator  │  How confident are my predictions?
+│   features × pred → σ  │
+└────────────────────────┘
+         │
+         ▼
+┌────────────────────────┐
+│    NoveltyMemory       │  Have I seen this before?
+│  (tracks past states)  │
+└────────────────────────┘
+         │
+         ▼
+┌────────────────────────┐
+│ InformationGainComputer│  How much would I learn?
+│  uncertainty + novelty │
+└────────────────────────┘
+         │
+         ▼
+┌────────────────────────┐
+│    CuriosityModule     │  Combine into curiosity signal
+│  + exploration_bonus   │
+└────────────────────────┘
+         │
+         ├─────────────────────────────┐
+         ▼                             ▼
+   curiosity ∈ [0, 1]         exploration_bonus (D,)
+   "how curious am I?"        "where should I explore?"
+```
+
+### Curiosity Modulates
+
+| Component | Effect |
+|-----------|--------|
+| **Memory** | Informative things are memorable |
+| **Intention** | Curiosity boosts exploration even with low valence |
+| **Attention** | exploration_bonus steers where we look |
+
+### Implementation
+
+```python
+from pem import CuriosityModule, CuriosityConfig
+
+config = CuriosityConfig(
+    d_model=1536,
+    hidden_dim=768,
+    use_temporal_novelty=True,    # Track what's been seen
+    novelty_memory_size=256,      # How many past states to remember
+    exploration_weight=0.5,       # Balance explore vs exploit
+)
+
+curiosity_module = CuriosityModule(config)
+
+# Compute curiosity from features and predictions
+output = curiosity_module(
+    features=qwen_features,       # (B, S, D)
+    predictions=pred_module(...), # (B, S, D)
+    context=features,             # Optional
+)
+
+# Output:
+# - output.curiosity: (B, S, 1) curiosity intensity [0, 1]
+# - output.uncertainty: (B, S, 1) prediction uncertainty
+# - output.information_gain: (B, S, 1) expected info gain
+# - output.exploration_bonus: (B, S, D) attention modulation
+
+# Compute epistemic value for decision-making
+epistemic_value = curiosity_module.compute_epistemic_value(features, predictions)
+```
+
+### Integration with SyncModule
+
+```python
+# Curiosity flows through SyncModule.forward()
+sync = sync_module(
+    history=ctm_history,
+    surprise=surprise_magnitude,
+    valence=valence,
+    curiosity=curiosity_output.curiosity,  # Epistemic drive
+)
+
+# Internally:
+# - memory.write() uses curiosity to boost importance
+# - intention is boosted by curiosity (explore even if valence is low)
+```
+
+### Integration with PerceptionAttention
+
+```python
+# Curiosity modulates attention query
+perception_output = perception_attention(
+    state=state,
+    personality_signal=personality,
+    intention_signal=intention,
+    sync=sync,
+    tick=tick,
+    surprise_magnitude=surprise,
+    surprise_direction=direction,
+    valence=valence,
+    exploration_bonus=curiosity_output.exploration_bonus,  # Explore!
+)
+```
+
+---
+
+## Activation Module (Arousal)
+
+Arousal is the **intensity/engagement dimension** - how intensely to engage with an experience.
+
+### Why Arousal Matters
+
+Without arousal, all experiences are processed with the same intensity. But real experience has:
+
+| Situation | Arousal Level | Processing |
+|-----------|---------------|------------|
+| Threatening event | **HIGH** | Narrow focus, vivid memory, rapid processing |
+| Familiar routine | **LOW** | Broad attention, weak memory, relaxed processing |
+| Novel discovery | **HIGH** | Focused attention, strong encoding |
+
+### The Three Dimensions of Affect
+
+Arousal completes the PAD (Pleasure-Arousal-Dominance) model of affect:
+
+| Dimension | Question | Module |
+|-----------|----------|--------|
+| **Pleasure** (Valence) | Is this good or bad? | ValenceModule |
+| **Arousal** | How intensely should I engage? | ActivationModule |
+| **Dominance** | Do I have control? | (Future work) |
+
+### Architecture
+
+```
+Surprise + |Valence| + Novelty
+         │
+         ▼
+┌────────────────────────┐
+│    ArousalComputer     │  Combine inputs into arousal level
+│  surprise × valence ×  │
+│       novelty          │
+└────────────────────────┘
+         │
+         ▼
+┌────────────────────────┐
+│   TemporalSmoother     │  Smooth arousal over time
+│   (prevents jarring    │  (no sudden jumps)
+│    transitions)        │
+└────────────────────────┘
+         │
+         ▼
+┌────────────────────────┐
+│  ModulationComputer    │  Convert arousal to modulations
+└────────────────────────┘
+         │
+         ├─────────────────────────────────┐
+         │                                 │
+         ▼                                 ▼
+   arousal ∈ [0, 1]              Modulation signals:
+   "how engaged am I?"           - tick_multiplier (more/fewer ticks)
+                                 - attention_temperature (sharp/broad)
+                                 - memory_strength (vivid/weak)
+```
+
+### Arousal Computes From
+
+| Input | Effect |
+|-------|--------|
+| **Surprise magnitude** | Unexpected events are arousing |
+| **Valence extremity** | Both very good AND very bad are arousing |
+| **Novelty** | Never-seen-before requires more engagement |
+
+### Arousal Modulates
+
+| Component | Low Arousal | High Arousal |
+|-----------|-------------|--------------|
+| **Attention** | Broad (high temperature) | Sharp (low temperature) |
+| **Memory** | Weak encoding | Vivid encoding |
+| **Processing** | Fewer ticks | More ticks |
+
+### Implementation
+
+```python
+from pem import ActivationModule, ActivationConfig
+
+config = ActivationConfig(
+    d_model=1536,
+    hidden_dim=384,
+    use_context=True,
+    use_temporal_smoothing=True,
+    tick_multiplier_range=(0.5, 2.0),
+    attention_temperature_range=(0.5, 2.0),
+    memory_strength_range=(0.5, 2.0),
+)
+
+activation_module = ActivationModule(config)
+
+# Compute activation from current state
+output = activation_module(
+    surprise_magnitude=surprise,      # (B, S, 1)
+    valence=valence,                  # (B, S, 1)
+    novelty=curiosity_output.novelty, # (B, S, 1)
+    context=features,                 # (B, S, D) optional
+)
+
+# Output:
+# - output.arousal: (B, S, 1) arousal level [0, 1]
+# - output.tick_multiplier: (B, S, 1) for adaptive tick count
+# - output.attention_temperature: (B, S, 1) for attention softmax
+# - output.memory_strength: (B, S, 1) for memory encoding
+```
+
+### Integration with SyncModule
+
+```python
+# Arousal flows through SyncModule.forward()
+sync = sync_module(
+    history=ctm_history,
+    surprise=surprise_magnitude,
+    valence=valence,
+    curiosity=curiosity_output.curiosity,
+    arousal=activation_output.arousal,  # Engagement intensity
+)
+
+# Internally:
+# - memory.write() uses arousal to boost/dampen encoding strength
+# - High arousal = vivid memory, low arousal = weak memory
+```
+
+### Integration with PerceptionAttention
+
+```python
+# Arousal modulates attention sharpness
+perception_output = perception_attention(
+    state=state,
+    personality_signal=personality,
+    intention_signal=intention,
+    sync=sync,
+    tick=tick,
+    surprise_magnitude=surprise,
+    surprise_direction=direction,
+    valence=valence,
+    exploration_bonus=curiosity_output.exploration_bonus,
+    attention_temperature=activation_output.attention_temperature,  # Arousal!
+)
+
+# Lower temperature = sharper attention (high arousal, focused)
+# Higher temperature = broader attention (low arousal, relaxed)
+```
+
+---
+
 ## Files
 
 | File | Description |
 |------|-------------|
 | `pem/feature_extractor.py` | Qwen3-VL feature extraction |
 | `pem/prediction_module.py` | Multi-scale prediction heads |
-| `pem/surprise_module.py` | Surprise computation from prediction errors |
+| `pem/surprise_module.py` | Surprise and Valence modules (affective dimension) |
+| `pem/curiosity_module.py` | Curiosity module (epistemic drive) |
+| `pem/activation_module.py` | Activation/Arousal module (engagement intensity) |
 | `pem/sync_module.py` | SyncModule with Memory, Personality, Intention |
 | `pem/perception_attention.py` | Perception attention with oscillation query builder |
 | `pem/__init__.py` | Package exports |

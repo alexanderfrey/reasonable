@@ -408,6 +408,399 @@ class SurpriseLoss(nn.Module):
         return total_loss, loss_dict
 
 
+@dataclass
+class ValenceConfig:
+    """Configuration for the valence module.
+
+    Valence = the affective dimension of experience (good vs bad).
+    Measures alignment between surprise and personality goals.
+    """
+
+    d_model: int = 1536              # Feature dimension
+    personality_dim: int = 512       # Personality embedding dimension
+    hidden_dim: Optional[int] = None # Hidden layer size (defaults to d_model // 2)
+    n_layers: int = 2                # Depth of alignment network
+    use_context: bool = True         # Context-dependent valence
+    dropout: float = 0.0
+
+    def __post_init__(self):
+        if self.hidden_dim is None:
+            self.hidden_dim = self.d_model // 2
+
+
+class PersonalityProjector(nn.Module):
+    """
+    Project personality embedding into surprise direction space.
+
+    Personality lives in a different representational space than surprise.
+    This module learns the mapping so we can compute alignment.
+    """
+
+    def __init__(self, personality_dim: int, d_model: int, hidden_dim: int):
+        super().__init__()
+
+        self.net = nn.Sequential(
+            nn.Linear(personality_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, d_model),
+        )
+        self._init_weights()
+
+    def _init_weights(self):
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.normal_(module.weight, std=0.02)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+
+    def forward(self, personality: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            personality: (D_p,) or (B, D_p) personality embedding
+
+        Returns:
+            projected: (D,) or (B, D) in surprise direction space
+        """
+        return self.net(personality)
+
+
+class ContextualGoalModulator(nn.Module):
+    """
+    Context-dependent goal interpretation.
+
+    The same personality goal can mean different things in different contexts.
+    "Be helpful" means different things when reading code vs poetry.
+
+    This module learns how context modulates the effective goal representation.
+    """
+
+    def __init__(self, d_model: int, hidden_dim: int, dropout: float = 0.0):
+        super().__init__()
+
+        # Input: [projected_personality, context] = 2 * d_model
+        self.net = nn.Sequential(
+            nn.Linear(d_model * 2, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout) if dropout > 0 else nn.Identity(),
+            nn.Linear(hidden_dim, d_model),
+        )
+
+        # Residual gate: how much should context modulate?
+        self.gate = nn.Sequential(
+            nn.Linear(d_model * 2, hidden_dim // 2),
+            nn.GELU(),
+            nn.Linear(hidden_dim // 2, 1),
+            nn.Sigmoid(),
+        )
+
+        self._init_weights()
+
+    def _init_weights(self):
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.normal_(module.weight, std=0.02)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+
+    def forward(
+        self,
+        personality_proj: torch.Tensor,  # (B, S, D) or (B, D)
+        context: torch.Tensor,           # (B, S, D)
+    ) -> torch.Tensor:
+        """
+        Modulate goal representation based on context.
+
+        Returns:
+            modulated: (B, S, D) context-dependent goal direction
+        """
+        # Expand personality if needed
+        if personality_proj.dim() == 2:
+            personality_proj = personality_proj.unsqueeze(1).expand(-1, context.shape[1], -1)
+
+        combined = torch.cat([personality_proj, context], dim=-1)
+
+        # Compute modulation
+        modulation = self.net(combined)
+        gate = self.gate(combined)
+
+        # Residual connection with learned gate
+        modulated = personality_proj + gate * modulation
+
+        # Normalize to unit vector (it's a direction)
+        return F.normalize(modulated, dim=-1)
+
+
+class AlignmentComputer(nn.Module):
+    """
+    Compute alignment between surprise direction and goal direction.
+
+    Goes beyond simple cosine similarity to learn nuanced alignment:
+    - Some surprise directions are more important than others
+    - Alignment might be non-linear (small deviations OK, large ones bad)
+    """
+
+    def __init__(self, d_model: int, hidden_dim: int, n_layers: int = 2, dropout: float = 0.0):
+        super().__init__()
+
+        # Input: [surprise_direction, goal_direction, element_wise_product]
+        # The element-wise product captures interaction patterns
+        layers = []
+        in_dim = d_model * 3
+
+        for i in range(n_layers):
+            out_dim = hidden_dim if i < n_layers - 1 else 1
+            layers.append(nn.Linear(in_dim, out_dim, bias=True))
+            if i < n_layers - 1:
+                layers.append(nn.GELU())
+                if dropout > 0:
+                    layers.append(nn.Dropout(dropout))
+            in_dim = out_dim
+
+        layers.append(nn.Tanh())  # Output in [-1, +1]
+
+        self.net = nn.Sequential(*layers)
+        self._init_weights()
+
+    def _init_weights(self):
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.normal_(module.weight, std=0.02)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+
+    def forward(
+        self,
+        surprise_direction: torch.Tensor,  # (B, S, D) unit vector
+        goal_direction: torch.Tensor,      # (B, S, D) unit vector
+    ) -> torch.Tensor:
+        """
+        Compute valence as learned alignment.
+
+        Returns:
+            valence: (B, S, 1) in [-1, +1]
+                +1 = surprise moves toward goals (positive)
+                -1 = surprise moves away from goals (negative)
+                 0 = surprise is orthogonal to goals (neutral)
+        """
+        # Element-wise product captures interaction
+        interaction = surprise_direction * goal_direction
+
+        # Concatenate all inputs
+        alignment_input = torch.cat([
+            surprise_direction,
+            goal_direction,
+            interaction,
+        ], dim=-1)
+
+        return self.net(alignment_input)
+
+
+class ValenceModule(nn.Module):
+    """
+    Compute affective valence of surprise: is it good or bad?
+
+    Core equation:
+        valence = alignment(surprise_direction, personality_goals, context)
+
+    Where:
+        - surprise_direction: WHAT was unexpected (unit vector)
+        - personality_goals: WHAT the agent wants (from PersonalityModule)
+        - context: current situation (modulates goal interpretation)
+
+    Output:
+        - valence in [-1, +1]: positive = good for goals, negative = bad
+
+    Usage:
+        valence_module = ValenceModule(config)
+        valence = valence_module(
+            surprise_direction=surprise['direction'],
+            personality=sync_module.personality.base_personality,
+            context=features,
+        )
+    """
+
+    def __init__(self, config: ValenceConfig):
+        super().__init__()
+        self.config = config
+
+        # 1. Project personality to surprise space
+        self.personality_proj = PersonalityProjector(
+            personality_dim=config.personality_dim,
+            d_model=config.d_model,
+            hidden_dim=config.hidden_dim,
+        )
+
+        # 2. Context-dependent goal modulation (optional)
+        if config.use_context:
+            self.context_modulator = ContextualGoalModulator(
+                d_model=config.d_model,
+                hidden_dim=config.hidden_dim,
+                dropout=config.dropout,
+            )
+        else:
+            self.context_modulator = None
+
+        # 3. Alignment computation
+        self.alignment = AlignmentComputer(
+            d_model=config.d_model,
+            hidden_dim=config.hidden_dim,
+            n_layers=config.n_layers,
+            dropout=config.dropout,
+        )
+
+    def forward(
+        self,
+        surprise_direction: torch.Tensor,  # (B, S, D) from SurpriseModule
+        personality: torch.Tensor,          # (D,) or (D_p,) from PersonalityModule
+        context: Optional[torch.Tensor] = None,  # (B, S, D) features/context
+    ) -> torch.Tensor:
+        """
+        Compute valence of surprise relative to personality goals.
+
+        Args:
+            surprise_direction: Direction of prediction error (unit vector)
+            personality: Personality embedding (base_personality from PersonalityModule)
+            context: Optional context for goal modulation
+
+        Returns:
+            valence: (B, S, 1) in [-1, +1]
+        """
+        B, S, D = surprise_direction.shape
+
+        # 1. Project personality to surprise direction space
+        personality_proj = self.personality_proj(personality)  # (D,) -> (D,)
+
+        # Expand to match surprise shape
+        personality_proj = personality_proj.unsqueeze(0).unsqueeze(0)  # (1, 1, D)
+        personality_proj = personality_proj.expand(B, S, -1)  # (B, S, D)
+
+        # 2. Modulate by context (optional)
+        if self.context_modulator is not None and context is not None:
+            goal_direction = self.context_modulator(personality_proj, context)
+        else:
+            goal_direction = F.normalize(personality_proj, dim=-1)
+
+        # 3. Compute alignment (valence)
+        valence = self.alignment(surprise_direction, goal_direction)
+
+        return valence
+
+    def compute_from_surprises(
+        self,
+        surprises: Dict[str, Dict[str, torch.Tensor]],  # From SurpriseModule
+        personality: torch.Tensor,
+        context: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Convenience method to compute valence for all surprise scales.
+
+        Args:
+            surprises: Output from SurpriseModule with 'direction' for each scale
+            personality: Personality embedding
+            context: Feature context
+
+        Returns:
+            Dict mapping scale -> valence tensor
+        """
+        valences = {}
+
+        for scale, surprise_data in surprises.items():
+            if 'direction' in surprise_data:
+                valences[scale] = self.forward(
+                    surprise_direction=surprise_data['direction'],
+                    personality=personality,
+                    context=context,
+                )
+
+        return valences
+
+
+class ValenceLoss(nn.Module):
+    """
+    Loss for training the valence module.
+
+    Self-supervised approach based on prediction improvement:
+    - If surprise helped improve next prediction → positive valence was correct
+    - If surprise hurt next prediction → negative valence was correct
+
+    Also includes consistency losses:
+    - Valence should be smooth over time (no random flips)
+    - Valence magnitude should correlate with surprise magnitude
+    """
+
+    def __init__(
+        self,
+        consistency_weight: float = 0.3,
+        magnitude_correlation_weight: float = 0.2,
+    ):
+        super().__init__()
+        self.consistency_weight = consistency_weight
+        self.magnitude_correlation_weight = magnitude_correlation_weight
+
+    def forward(
+        self,
+        valences: Dict[str, torch.Tensor],       # {scale: (B, S, 1)}
+        surprises: Dict[str, Dict[str, torch.Tensor]],  # From SurpriseModule
+        valid_masks: Dict[str, torch.Tensor],    # Validity masks
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """
+        Compute valence training loss.
+
+        Returns:
+            total_loss: Scalar loss
+            loss_dict: Breakdown by component
+        """
+        loss_dict = {}
+        total_loss = torch.tensor(0.0, device=next(iter(valences.values())).device)
+
+        for scale, valence in valences.items():
+            valid_mask = valid_masks.get(f'{scale}_valid', None)
+            magnitude = surprises[scale]['magnitude']
+
+            # 1. Temporal consistency: valence shouldn't flip randomly
+            if valence.shape[1] > 1:
+                valence_diff = (valence[:, 1:] - valence[:, :-1]).abs()
+                consistency_loss = valence_diff.mean()
+                loss_dict[f'{scale}_consistency'] = consistency_loss.detach()
+                total_loss = total_loss + self.consistency_weight * consistency_loss
+
+            # 2. Magnitude correlation: high surprise = high |valence|
+            # (both very good and very bad things are surprising)
+            if valid_mask is not None and valid_mask.any():
+                valence_valid = valence.abs()[valid_mask.unsqueeze(-1).expand_as(valence)].view(-1)
+                mag_valid = magnitude[valid_mask.unsqueeze(-1).expand_as(magnitude)].view(-1)
+
+                if valence_valid.numel() > 1:
+                    # Soft correlation: |valence| should increase with magnitude
+                    # Using ranking loss: if mag_i > mag_j, then |val_i| > |val_j|
+                    mag_corr_loss = F.mse_loss(
+                        valence_valid,
+                        mag_valid / (mag_valid.max() + 1e-8)  # Normalize magnitude
+                    )
+                    loss_dict[f'{scale}_mag_correlation'] = mag_corr_loss.detach()
+                    total_loss = total_loss + self.magnitude_correlation_weight * mag_corr_loss
+
+        return total_loss, loss_dict
+
+
+def create_valence_module(
+    d_model: int = 1536,
+    personality_dim: int = 512,
+    hidden_dim: Optional[int] = None,
+    use_context: bool = True,
+    **kwargs,
+) -> ValenceModule:
+    """Factory function to create a valence module."""
+    config = ValenceConfig(
+        d_model=d_model,
+        personality_dim=personality_dim,
+        hidden_dim=hidden_dim,
+        use_context=use_context,
+        **kwargs,
+    )
+    return ValenceModule(config)
+
+
 def create_surprise_module(
     d_model: int = 1536,
     hidden_dim: Optional[int] = None,
