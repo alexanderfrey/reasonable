@@ -50,6 +50,11 @@ class ImaginationConfig:
     # This allows imagination and prediction to share weights
     use_shared_generative_core: bool = False
 
+    # Show-o2 native generation (optional)
+    # When True and a Show-o2 extractor is provided, uses its native imagine()
+    # This enables true generative imagination with discrete diffusion
+    use_native_generation: bool = True
+
     def __post_init__(self):
         if self.hidden_dim is None:
             self.hidden_dim = self.d_model // 2
@@ -574,16 +579,22 @@ class ImaginationModule(nn.Module):
     The imagined features are in the same space as perception features,
     allowing them to be processed by existing PEM modules.
 
-    Supports optional shared GenerativeCore:
-        When `use_shared_generative_core=True` or a GenerativeCore is set via
-        `set_generative_core()`, the imagination uses shared weights with
-        prediction. This allows imagination to improve predictions and vice versa.
+    Generation modes (in order of preference):
+        1. **Native generation** (Show-o2): Uses Show-o2's discrete diffusion for
+           true generative imagination. Set via `set_feature_extractor()`.
+        2. **Shared GenerativeCore**: Uses shared weights with prediction for
+           faster, learned imagination. Set via `set_generative_core()`.
+        3. **Dedicated generators**: Independent scene/mind generators (default).
     """
 
     def __init__(self, config: ImaginationConfig):
         super().__init__()
         self.config = config
         hidden_dim = config.hidden_dim
+
+        # Show-o2 feature extractor for native generation (optional - can be set later)
+        self._feature_extractor = None
+        self._use_native_generation = config.use_native_generation
 
         # Shared generative core (optional - can be set later)
         self._generative_core = None
@@ -657,6 +668,23 @@ class ImaginationModule(nn.Module):
             dropout=config.dropout,
         )
 
+    def set_feature_extractor(self, extractor: nn.Module) -> None:
+        """
+        Set a feature extractor for native generation (Show-o2).
+
+        If the extractor has an `imagine()` method (like Showo2FeatureExtractor),
+        it will be used for true generative imagination.
+
+        Args:
+            extractor: Feature extractor with optional imagine() capability
+        """
+        self._feature_extractor = extractor
+        # Check if extractor supports native generation
+        self._use_native_generation = (
+            self.config.use_native_generation
+            and hasattr(extractor, 'imagine_from_features')
+        )
+
     def set_generative_core(self, core: 'GenerativeCore') -> None:
         """
         Set a shared GenerativeCore for imagination.
@@ -671,9 +699,23 @@ class ImaginationModule(nn.Module):
         self._use_shared_core = True
 
     @property
+    def feature_extractor(self):
+        """Get the feature extractor (if any)."""
+        return self._feature_extractor
+
+    @property
     def generative_core(self):
         """Get the generative core (if any)."""
         return self._generative_core
+
+    @property
+    def uses_native_generation(self) -> bool:
+        """Check if using native generation (Show-o2)."""
+        return (
+            self._use_native_generation
+            and self._feature_extractor is not None
+            and hasattr(self._feature_extractor, 'imagine_from_features')
+        )
 
     @property
     def uses_shared_core(self) -> bool:
@@ -705,7 +747,22 @@ class ImaginationModule(nn.Module):
         trigger_probs = self.trigger_detector(features)  # (B, S, 1)
 
         # 2. Generate scene imagery and mind states
-        if self.uses_shared_core:
+        # Priority: native generation > shared core > dedicated generators
+        if self.uses_native_generation:
+            # Use Show-o2's native generation (discrete diffusion)
+            scene = self._feature_extractor.imagine_from_features(
+                features, mode="scene"
+            )
+            vividness = self.vividness_net(scene)
+
+            if self.config.use_mind_modeling:
+                mind_states = self._feature_extractor.imagine_from_features(
+                    features, mode="mind"
+                )
+            else:
+                mind_states = None
+
+        elif self.uses_shared_core:
             # Use shared GenerativeCore for scene and mind
             scene = self._generative_core(
                 features,

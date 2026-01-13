@@ -87,8 +87,8 @@ def run_with_mock_features(text: str = "The quick brown fox jumps over the lazy 
     return predictions, targets, surprises
 
 
-def run_with_real_features(text: str, device: str = "cuda"):
-    """Run pipeline with real Qwen3-VL features."""
+def run_with_real_features(text: str, device: str = "cuda", model: str = "showlab/show-o2-1.5B"):
+    """Run pipeline with real features from Show-o2 (or legacy Qwen3-VL)."""
     from pem import (
         create_feature_extractor,
         PredictionModule, PredictionConfig, PredictionTargets,
@@ -98,10 +98,10 @@ def run_with_real_features(text: str, device: str = "cuda"):
     logger.info("Running PEM pipeline with REAL features")
     logger.info("=" * 60)
 
-    # Load feature extractor
-    logger.info("Loading Qwen3-VL feature extractor...")
+    # Load feature extractor (Show-o2 by default)
+    logger.info(f"Loading feature extractor: {model}...")
     feature_extractor = create_feature_extractor(
-        model_name_or_path="Qwen/Qwen3-VL-2B-Instruct",
+        model_name_or_path=model,
         learning_mode="frozen",
         device_map=device,  # Put entire model on specified device
     )
@@ -185,12 +185,14 @@ def main():
     parser.add_argument("--text", type=str, default="The quick brown fox jumps over the lazy dog. It was a sunny day in the forest.")
     parser.add_argument("--mock", action="store_true", help="Use mock features instead of real model")
     parser.add_argument("--device", type=str, default="cuda", help="Device for real features")
+    parser.add_argument("--model", type=str, default="showlab/show-o2-1.5B",
+                       help="Model to use (default: showlab/show-o2-1.5B, legacy: Qwen/Qwen3-VL-2B-Instruct)")
     args = parser.parse_args()
 
     if args.mock:
         run_with_mock_features(args.text)
     else:
-        run_with_real_features(args.text, args.device)
+        run_with_real_features(args.text, args.device, args.model)
 
 
 if __name__ == "__main__":

@@ -13,6 +13,12 @@ from .feature_extractor import (
     create_feature_extractor,
 )
 
+from .showo2_feature_extractor import (
+    Showo2Config,
+    Showo2FeatureExtractor,
+    create_showo2_extractor,
+)
+
 from .prediction_module import (
     PredictionConfig,
     PredictionModule,
@@ -103,6 +109,10 @@ __all__ = [
     "Qwen3VLFeatureExtractor",
     "LearningMode",
     "create_feature_extractor",
+    # Show-o2 (preferred unified model)
+    "Showo2Config",
+    "Showo2FeatureExtractor",
+    "create_showo2_extractor",
     # Prediction
     "PredictionConfig",
     "PredictionModule",

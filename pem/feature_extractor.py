@@ -2,7 +2,9 @@
 Feature Extractor (Perception Layer) for PEM.
 
 The "eyes" of the system - transforms raw tokens/images into rich contextual features.
-Designed to be swappable between different backends (Qwen3-VL, other HF models, custom).
+Designed to be swappable between different backends (Show-o2, Qwen3-VL, other HF models, custom).
+
+Show-o2 is the preferred backend as it provides unified understanding AND generation.
 """
 
 from abc import ABC, abstractmethod
@@ -368,7 +370,7 @@ class Qwen3VLFeatureExtractor(FeatureExtractor):
 
 
 def create_feature_extractor(
-    model_name_or_path: str = "Qwen/Qwen3-VL-2B-Instruct",
+    model_name_or_path: str = "showlab/show-o2-1.5B",
     output_dim: int = 1536,
     learning_mode: Union[str, LearningMode] = LearningMode.FROZEN,
     **kwargs,
@@ -377,9 +379,13 @@ def create_feature_extractor(
     Factory function to create a feature extractor.
 
     Automatically selects the appropriate implementation based on model name.
+    Default is Show-o2, which provides unified understanding AND generation.
 
     Args:
         model_name_or_path: HuggingFace model identifier or path
+            - "showlab/show-o2-1.5B" (default, recommended)
+            - "showlab/show-o2-7B" (larger model)
+            - "Qwen/Qwen3-VL-*" (legacy, understanding only)
         output_dim: Target feature dimension for PEM
         learning_mode: "frozen", "slow", or "trainable"
         **kwargs: Additional config options
@@ -387,24 +393,51 @@ def create_feature_extractor(
     Returns:
         Configured FeatureExtractor instance
     """
-    config = FeatureExtractorConfig(
-        model_name_or_path=model_name_or_path,
-        output_dim=output_dim,
-        learning_mode=learning_mode if isinstance(learning_mode, LearningMode)
-                      else LearningMode(learning_mode),
-        **kwargs,
-    )
-
     # Select implementation based on model name
     model_lower = model_name_or_path.lower()
 
-    if "qwen" in model_lower and ("vl" in model_lower or "vision" in model_lower):
-        return Qwen3VLFeatureExtractor(config)
-    else:
-        # Default to Qwen3-VL implementation for now
-        # Can add more backends here (CLIP, SigLIP, custom, etc.)
-        logger.warning(
-            f"Unknown model type '{model_name_or_path}', "
-            f"attempting Qwen3-VL loader..."
+    if "show-o" in model_lower or "showo" in model_lower:
+        # Show-o2 - preferred unified model
+        from .showo2_feature_extractor import (
+            Showo2Config,
+            Showo2FeatureExtractor,
+            LearningMode as Showo2LearningMode,
+        )
+        config = Showo2Config(
+            model_name_or_path=model_name_or_path,
+            output_dim=output_dim,
+            learning_mode=learning_mode if isinstance(learning_mode, Showo2LearningMode)
+                          else Showo2LearningMode(learning_mode.value if isinstance(learning_mode, LearningMode) else learning_mode),
+            **{k: v for k, v in kwargs.items() if k in Showo2Config.__dataclass_fields__},
+        )
+        return Showo2FeatureExtractor(config)
+
+    elif "qwen" in model_lower and ("vl" in model_lower or "vision" in model_lower):
+        # Qwen3-VL - legacy support
+        config = FeatureExtractorConfig(
+            model_name_or_path=model_name_or_path,
+            output_dim=output_dim,
+            learning_mode=learning_mode if isinstance(learning_mode, LearningMode)
+                          else LearningMode(learning_mode),
+            **kwargs,
         )
         return Qwen3VLFeatureExtractor(config)
+
+    else:
+        # Default to Show-o2
+        logger.warning(
+            f"Unknown model type '{model_name_or_path}', "
+            f"defaulting to Show-o2 loader..."
+        )
+        from .showo2_feature_extractor import (
+            Showo2Config,
+            Showo2FeatureExtractor,
+            LearningMode as Showo2LearningMode,
+        )
+        config = Showo2Config(
+            model_name_or_path=model_name_or_path,
+            output_dim=output_dim,
+            learning_mode=learning_mode if isinstance(learning_mode, Showo2LearningMode)
+                          else Showo2LearningMode(learning_mode.value if isinstance(learning_mode, LearningMode) else learning_mode),
+        )
+        return Showo2FeatureExtractor(config)

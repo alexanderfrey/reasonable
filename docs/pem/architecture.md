@@ -20,20 +20,22 @@ PEM is built on the principle that experience requires:
 The key insight is that these components form a closed feedback loop:
 
 ```
-Perception (Qwen) → Prediction → Surprise → Valence
-       ↑                  ↓           ↓         ↓
-       │            Uncertainty   Curiosity    │
-       │                  │           │         │
-       │                  └─────┬─────┘         │
-       │                        ↓               │
-       │              ┌─────────┴─────────┐     │
-       │              │                   │     │
-       │       Memory (importance)   Intention  │
-       │              │                   │     │
-       │              └─────────┬─────────┘     │
-       │                        ↓               │
-       │                     Sync ←─────────────┘
-       │                        ↓
+Perception (Show-o2) → Prediction → Surprise → Valence
+       ↑    ↑               ↓           ↓         ↓
+       │    │         Uncertainty   Curiosity    │
+       │    │               │           │         │
+       │    │               └─────┬─────┘         │
+       │    │                     ↓               │
+       │    │           ┌─────────┴─────────┐     │
+       │    │           │                   │     │
+       │    │    Memory (importance)   Intention  │
+       │    │           │                   │     │
+       │    │           └─────────┬─────────┘     │
+       │    │                     ↓               │
+       │    │                  Sync ←─────────────┘
+       │    │                     ↓
+       │    └── Imagination (native generation)
+       │                          ↓
        └──── Attention Query ←── Surprise + Valence + Curiosity + Personality + Intention
 ```
 
@@ -49,10 +51,13 @@ Six critical connections close this loop:
 
 ```
                          ┌─────────────────────────────────────┐
-                         │        QWEN3-VL (Perception)        │
+                         │    SHOW-O2 (Unified Perception)     │
                          │                                     │
                          │   text/image → hidden_states        │
                          │          (B, S, 1536)               │
+                         │                                     │
+                         │   + native imagine() for generation │
+                         │   (discrete diffusion)              │
                          └──────────────────┬──────────────────┘
                                             │
                               PerceptionKVCache.forward()
@@ -62,6 +67,7 @@ Six critical connections close this loop:
                          │  k: (B, S, n_heads, head_dim)       │
                          │  v: (B, S, n_heads, head_dim)       │
                          │       [computed once, cached]       │
+                         │  + imagination KV (same projection) │
                          └──────────────────┬──────────────────┘
                                             │
      ═══════════════════════════════════════╪═══════════════════════════════════
@@ -107,7 +113,7 @@ Six critical connections close this loop:
     │                    Attention(Q, K, V)                                   │
     │                                                                         │
     │    Q from: oscillation-synchronized query (personality × intention)     │
-    │    K, V from: cached Qwen perception features                           │
+    │    K, V from: cached perception features (+ imagination)                │
     │                                                                         │
     │    → "What I see given who I am and what I want"                        │
     └───────────────────────────────┬─────────────────────────────────────────┘
@@ -502,7 +508,7 @@ PersonalityModule.base_personality
 from pem import ValenceModule, ValenceConfig
 
 config = ValenceConfig(
-    d_model=1536,           # Same as Qwen hidden dim
+    d_model=1536,           # Same as Show-o2/Qwen hidden dim
     personality_dim=512,    # Personality embedding size
     hidden_dim=768,
     use_context=True,       # Context-dependent valence
@@ -628,7 +634,7 @@ curiosity_module = CuriosityModule(config)
 
 # Compute curiosity from features and predictions
 output = curiosity_module(
-    features=qwen_features,       # (B, S, D)
+    features=features,       # (B, S, D)
     predictions=pred_module(...), # (B, S, D)
     context=features,             # Optional
 )
@@ -932,7 +938,7 @@ imagination_module = ImaginationModule(config)
 
 # Generate imagination from features
 output = imagination_module(
-    features=qwen_features,         # (B, S, D)
+    features=features,         # (B, S, D)
     memory=memory_state,            # (B, S, D) optional - enriches imagination
     personality=personality_embed,  # (D,) optional - colors imagination
     context=context_features,       # (B, S, D) optional
@@ -970,7 +976,7 @@ Imagination feeds back into the system through the **unified attention pool**:
 │                                                             │
 │  ┌───────────────────┐       ┌───────────────────────┐      │
 │  │    K_real, V_real │       │    K_imag, V_imag     │      │
-│  │   (from Qwen)     │       │  (from Imagination)   │      │
+│  │   (from Show-o2)  │       │  (from Imagination)   │      │
 │  └─────────┬─────────┘       └──────────┬────────────┘      │
 │            │                            │                    │
 │            └────────────┬───────────────┘                    │
@@ -995,7 +1001,7 @@ Imagination feeds back into the system through the **unified attention pool**:
 **Usage:**
 ```python
 # Cache real perception
-perception.cache_perception(qwen_features)
+perception.cache_perception(features)
 
 # Add imagination to the pool
 perception.add_imagination(imagination_output.imagined_features)
@@ -1063,7 +1069,8 @@ prediction_module.set_generative_core(core)
 
 | File | Description |
 |------|-------------|
-| `pem/feature_extractor.py` | Qwen3-VL feature extraction |
+| `pem/feature_extractor.py` | Base classes and factory for feature extractors |
+| `pem/showo2_feature_extractor.py` | **Show-o2 unified feature extraction + generation** |
 | `pem/prediction_module.py` | Multi-scale prediction heads |
 | `pem/surprise_module.py` | Surprise and Valence modules (affective dimension) |
 | `pem/curiosity_module.py` | Curiosity module (epistemic drive) |
@@ -1076,13 +1083,65 @@ prediction_module.set_generative_core(core)
 
 ---
 
+## Show-o2 (Unified Backbone)
+
+Show-o2 is the **preferred backbone** for PEM because it provides both understanding AND generation in a unified model.
+
+### Why Show-o2?
+
+| Feature | Qwen3-VL (legacy) | Show-o2 |
+|---------|------------------|---------|
+| Understanding | ✓ | ✓ |
+| Generation | ✗ (need separate model) | ✓ (native discrete diffusion) |
+| Image generation | ✗ | ✓ |
+| Text-to-image | ✗ | ✓ |
+| Hidden dimension | 1536 (2B) | 1536 (1.5B), 3584 (7B) |
+
+### Architecture
+
+Show-o2 uses:
+- **Qwen2.5** as the LLM backbone (same architecture)
+- **MAGVITv2** for image tokenization
+- **Discrete diffusion** for image generation (MaskGIT-style)
+- **Unified multimodal tokens** for both understanding and generation
+
+### Integration with Imagination
+
+When Show-o2 is used, the ImaginationModule can leverage **native generation**:
+
+```python
+# Feature extractor with native generation
+extractor = create_feature_extractor(
+    model_name_or_path="showlab/show-o2-1.5B"
+)
+
+# Imagination can use native generation
+imagination_module.set_feature_extractor(extractor)
+
+# Now imagination uses discrete diffusion!
+output = imagination_module(features)
+```
+
+### Modes of Imagination
+
+With Show-o2, imagination has three modes (in order of preference):
+1. **Native generation**: Show-o2's discrete diffusion for true generative imagination
+2. **Shared GenerativeCore**: Learned transformation shared with prediction
+3. **Dedicated generators**: Independent scene/mind generators
+
+---
+
 ## Usage Example
 
 ```python
 from pem import (
     PerceptionAttention, PerceptionConfig,
     SyncModule, SyncModuleConfig,
+    create_feature_extractor,
 )
+
+# Create feature extractor (Show-o2 by default)
+extractor = create_feature_extractor()
 
 # Create modules
 sync_config = SyncModuleConfig(
@@ -1094,13 +1153,14 @@ sync_module = SyncModule(sync_config)
 
 perception_config = PerceptionConfig(
     d_model=512,
-    d_perception=1536,  # Qwen hidden size
+    d_perception=1536,  # Show-o2/Qwen hidden size
     sync_pairs=512,
 )
 perception = PerceptionAttention(perception_config)
 
-# Cache Qwen features (once per input)
-perception.cache_perception(qwen_features)
+# Extract and cache features (once per input)
+features = extractor(input_ids, pixel_values=images)
+perception.cache_perception(features)
 
 # Each tick: process with current mental state
 for tick in range(num_ticks):
@@ -1143,14 +1203,14 @@ config = CTMConfig(
     pem_use_intention=True,
     # PEM perception (closes the loop)
     use_pem_perception=True,
-    pem_perception_dim=1536,  # Qwen hidden size
+    pem_perception_dim=1536,  # Show-o2/Qwen hidden size
     pem_perception_weight=0.5,
 )
 
 model = CTMLanguageModel(config)
 
-# Cache perception features from Qwen (once per input)
-model.ctm_core.cache_perception(qwen_features)
+# Cache perception features (once per input)
+model.ctm_core.cache_perception(features)
 
 # Forward pass with surprise (from prediction errors)
 # Surprise steers attention and weights memory storage
@@ -1178,6 +1238,6 @@ At each tick boundary in CTM:
 2. **Pass surprise to sync** → Memory stores chunks weighted by surprise
 3. **Get personality/intention signals** from sync module
 4. **Build attention query** from personality + intention + sync + **surprise**
-5. **Cross-attend to perception** (cached Qwen features)
+5. **Cross-attend to perception** (cached perception features)
 6. **Blend observation into state** → What we perceive changes what we think
 7. **Next tick** uses updated state → Closed loop!
