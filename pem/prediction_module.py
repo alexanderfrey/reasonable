@@ -31,10 +31,11 @@ class PredictionConfig:
     n_head: int = 8
     dropout: float = 0.0
 
-    # Prediction horizons
-    shortterm_horizon: int = 64   # Tokens ahead for short-term prediction
-    longterm_horizon: Optional[int] = 2048  # Tokens ahead for long-term prediction
-                                            # None = rest of sequence (up to context limit)
+    # Prediction horizons (all in tokens)
+    immediate_horizon: int = 8    # ~2-3 words - next phrase fragment
+    shortterm_horizon: int = 64   # ~1-2 sentences
+    longterm_horizon: Optional[int] = 2048  # ~few paragraphs
+                                            # None = rest of sequence
 
     # Architecture options
     use_flash_attn: bool = True
@@ -306,13 +307,20 @@ class PredictionTargets:
     should match.
     """
 
-    def __init__(self, shortterm_horizon: int = 64, longterm_horizon: Optional[int] = 2048):
+    def __init__(
+        self,
+        immediate_horizon: int = 8,
+        shortterm_horizon: int = 64,
+        longterm_horizon: Optional[int] = 2048,
+    ):
         """
         Args:
-            shortterm_horizon: Number of tokens ahead for short-term target
-            longterm_horizon: Number of tokens ahead for long-term target.
-                              None = rest of sequence (original behavior)
+            immediate_horizon: Number of tokens ahead for immediate target (~2-3 words)
+            shortterm_horizon: Number of tokens ahead for short-term target (~1-2 sentences)
+            longterm_horizon: Number of tokens ahead for long-term target (~paragraphs)
+                              None = rest of sequence
         """
+        self.immediate_horizon = immediate_horizon
         self.shortterm_horizon = shortterm_horizon
         self.longterm_horizon = longterm_horizon
 
@@ -325,9 +333,9 @@ class PredictionTargets:
         Compute multi-scale prediction targets.
 
         For position t, compute:
-            - immediate: features[t+1]
-            - shortterm: mean(features[t+1:t+1+shortterm_horizon])
-            - longterm:  mean(features[t+1:t+1+longterm_horizon]) or rest of seq if None
+            - immediate: mean(features[t+1:t+1+immediate_horizon]) ~2-3 words
+            - shortterm: mean(features[t+1:t+1+shortterm_horizon]) ~1-2 sentences
+            - longterm:  mean(features[t+1:t+1+longterm_horizon]) or rest of seq
 
         Args:
             features: Actual features from feature extractor
@@ -361,11 +369,13 @@ class PredictionTargets:
             seq_len = seq_lengths[b].item()
 
             for t in range(int(seq_len) - 1):  # Can't predict from last position
-                # Immediate: just the next token
-                immediate_targets[b, t] = features[b, t + 1]
-                immediate_valid[b, t] = True
+                # Immediate: mean of next `immediate_horizon` tokens (~2-3 words)
+                end_imm = min(t + 1 + self.immediate_horizon, int(seq_len))
+                if end_imm > t + 1:
+                    immediate_targets[b, t] = features[b, t+1:end_imm].mean(dim=0)
+                    immediate_valid[b, t] = True
 
-                # Short-term: mean of next `shortterm_horizon` tokens (or remaining)
+                # Short-term: mean of next `shortterm_horizon` tokens (~1-2 sentences)
                 end_short = min(t + 1 + self.shortterm_horizon, int(seq_len))
                 if end_short > t + 1:
                     shortterm_targets[b, t] = features[b, t+1:end_short].mean(dim=0)
@@ -402,29 +412,31 @@ class PredictionTargets:
         B, S, D = features.shape
         device = features.device
 
-        # Immediate targets: just shift features by 1
-        # Position t predicts features at t+1
-        immediate_targets = torch.zeros_like(features)
-        immediate_targets[:, :-1] = features[:, 1:]
-        immediate_valid = torch.ones(B, S, dtype=torch.bool, device=device)
-        immediate_valid[:, -1] = False  # Last position has no target
-
-        # For shortterm and longterm, use cumulative sums
+        # Use cumulative sums for efficient mean computation
         # cumsum[i] = sum of features[0:i+1]
         # mean(features[a:b]) = (cumsum[b-1] - cumsum[a-1]) / (b - a)
-
         cumsum = torch.cumsum(features, dim=1)  # (B, S, D)
 
         # Prepend zeros for easier indexing
         cumsum_padded = F.pad(cumsum, (0, 0, 1, 0))  # (B, S+1, D)
 
-        # Short-term targets
-        horizon = self.shortterm_horizon
+        # Immediate targets: mean of next `immediate_horizon` tokens (~2-3 words)
+        immediate_targets = torch.zeros_like(features)
+        immediate_valid = torch.zeros(B, S, dtype=torch.bool, device=device)
+
+        for t in range(S - 1):
+            end_idx = min(t + 1 + self.immediate_horizon, S)
+            count = end_idx - (t + 1)
+            if count > 0:
+                immediate_targets[:, t] = (cumsum_padded[:, end_idx] - cumsum_padded[:, t + 1]) / count
+                immediate_valid[:, t] = True
+
+        # Short-term targets: mean of next `shortterm_horizon` tokens (~1-2 sentences)
         shortterm_targets = torch.zeros_like(features)
         shortterm_valid = torch.zeros(B, S, dtype=torch.bool, device=device)
 
         for t in range(S - 1):
-            end_idx = min(t + 1 + horizon, S)
+            end_idx = min(t + 1 + self.shortterm_horizon, S)
             count = end_idx - (t + 1)
             if count > 0:
                 # mean = (cumsum[end_idx-1] - cumsum[t]) / count
@@ -556,6 +568,7 @@ def create_prediction_module(
     sync_pairs: int = 512,
     d_model: int = 1536,
     n_head: int = 8,
+    immediate_horizon: int = 8,
     shortterm_horizon: int = 64,
     longterm_horizon: Optional[int] = 2048,
     **kwargs,
@@ -566,14 +579,16 @@ def create_prediction_module(
         sync_pairs: Dimension of sync from CTM
         d_model: Dimension of features from extractor
         n_head: Number of attention heads
-        shortterm_horizon: Tokens ahead for short-term prediction (default: 64)
-        longterm_horizon: Tokens ahead for long-term prediction (default: 2048)
+        immediate_horizon: Tokens ahead for immediate prediction (default: 8, ~2-3 words)
+        shortterm_horizon: Tokens ahead for short-term prediction (default: 64, ~1-2 sentences)
+        longterm_horizon: Tokens ahead for long-term prediction (default: 2048, ~paragraphs)
                          Set to None for "rest of sequence" behavior
     """
     config = PredictionConfig(
         sync_pairs=sync_pairs,
         d_model=d_model,
         n_head=n_head,
+        immediate_horizon=immediate_horizon,
         shortterm_horizon=shortterm_horizon,
         longterm_horizon=longterm_horizon,
         **kwargs,
