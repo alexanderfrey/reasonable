@@ -54,6 +54,17 @@ from .activation_module import (
     create_activation_module,
 )
 
+from .imagination_module import (
+    ImaginationConfig,
+    ImaginationModule,
+    ImaginationOutput,
+    ImaginationLoss,
+    SceneGenerator,
+    MindModeler,
+    CounterfactualGenerator,
+    create_imagination_module,
+)
+
 from .sync_module import (
     SyncModuleConfig,
     SyncModule,
@@ -116,6 +127,15 @@ __all__ = [
     "ArousalComputer",
     "ModulationComputer",
     "create_activation_module",
+    # Imagination (mental simulation)
+    "ImaginationConfig",
+    "ImaginationModule",
+    "ImaginationOutput",
+    "ImaginationLoss",
+    "SceneGenerator",
+    "MindModeler",
+    "CounterfactualGenerator",
+    "create_imagination_module",
     # Sync
     "SyncModuleConfig",
     "SyncModule",

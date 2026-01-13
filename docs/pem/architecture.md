@@ -13,6 +13,7 @@ PEM is built on the principle that experience requires:
 6. **Valence** - Was it GOOD or BAD? (affective dimension)
 7. **Curiosity** - WHAT do I want to understand? (epistemic drive)
 8. **Arousal** - HOW INTENSELY to engage? (activation level)
+9. **Imagination** - WHAT could be? (mental simulation beyond input)
 
 ## The Experience Loop (CLOSED)
 
@@ -822,6 +823,153 @@ perception_output = perception_attention(
 
 ---
 
+## Imagination Module
+
+Imagination is the **generative capability** - creating internal representations that go beyond the input.
+
+### Why Imagination Matters
+
+Without imagination, the system only processes what IS. It cannot:
+
+| Capability | Without Imagination | With Imagination |
+|------------|---------------------|------------------|
+| Mental imagery | Can't visualize | Generates scenes from descriptions |
+| Theory of Mind | Can't model others | Infers others' mental states |
+| Counterfactuals | Can't consider alternatives | Generates "what if" scenarios |
+| Understanding fiction | Literal only | Creates mental simulations |
+
+### The Key Insight
+
+All other modules **evaluate** input:
+- Prediction: What comes next?
+- Surprise: Was this expected?
+- Valence: Is this good or bad?
+- Curiosity: Is this informative?
+- Arousal: How intensely to engage?
+
+Imagination **generates** beyond input:
+- Creates what ISN'T there but COULD BE
+- Mental simulation of scenes, minds, alternatives
+- Outputs are in the same feature space → can be processed by other modules
+
+### Architecture
+
+```
+Features (B, S, D)
+         │
+         ├────────────────────────────────────┐
+         │                                    │
+         ▼                                    ▼
+┌────────────────────────┐      ┌────────────────────────┐
+│  ImaginationTrigger    │      │  Memory + Personality  │
+│  "Should I imagine?"   │      │  (context for imagining)│
+└────────────────────────┘      └────────────────────────┘
+         │                                    │
+         │ imagination_mask                   │
+         │                                    │
+         ├─────────────────┬──────────────────┤
+         │                 │                  │
+         ▼                 ▼                  ▼
+┌──────────────┐  ┌──────────────┐  ┌──────────────────┐
+│SceneGenerator│  │ MindModeler  │  │CounterfactualGen │
+│              │  │              │  │                  │
+│ "The forest  │  │ "She thinks  │  │ "What if the    │
+│  was dark"   │  │  that..."    │  │  key was lost?" │
+│      ↓       │  │      ↓       │  │       ↓         │
+│ mental image │  │ mental state │  │  alternative    │
+└──────────────┘  └──────────────┘  └──────────────────┘
+         │                 │                  │
+         └─────────────────┼──────────────────┘
+                           │
+                           ▼
+               ┌────────────────────────┐
+               │ ImaginationIntegrator  │
+               │                        │
+               │ Combine scene + mind   │
+               │ + counterfactuals      │
+               └────────────────────────┘
+                           │
+                           ├─────────────────────────────────┐
+                           │                                 │
+                           ▼                                 ▼
+                  imagined_features (B, S, D)        vividness (B, S, 1)
+                  "What I imagine"                   "How vivid is it?"
+```
+
+### The Three Imagination Types
+
+| Type | What It Does | Example |
+|------|--------------|---------|
+| **Scene Generation** | Creates mental imagery | "The forest was dark" → visual scene |
+| **Mind Modeling** | Infers others' mental states | "She smiled nervously" → her thoughts |
+| **Counterfactuals** | Generates alternatives | "He took the key" → what if he didn't? |
+
+### Vividness
+
+Not all imagination is equally vivid. Vividness represents how clear and detailed the mental simulation is:
+
+- **High vividness**: Concrete descriptions, familiar scenarios → clear imagery
+- **Low vividness**: Abstract concepts, unfamiliar territory → fuzzy imagination
+
+Vividness can modulate how much weight imagination has in downstream processing.
+
+### Implementation
+
+```python
+from pem import ImaginationModule, ImaginationConfig
+
+config = ImaginationConfig(
+    d_model=1536,
+    hidden_dim=768,
+    use_scene_generation=True,
+    use_mind_modeling=True,
+    use_counterfactuals=True,
+    num_counterfactuals=3,
+    max_entities=8,  # Max entities to track for Theory of Mind
+)
+
+imagination_module = ImaginationModule(config)
+
+# Generate imagination from features
+output = imagination_module(
+    features=qwen_features,         # (B, S, D)
+    memory=memory_state,            # (B, S, D) optional - enriches imagination
+    personality=personality_embed,  # (D,) optional - colors imagination
+    context=context_features,       # (B, S, D) optional
+)
+
+# Output:
+# - output.imagined_features: (B, S, D) what we imagine
+# - output.vividness: (B, S, 1) how vivid [0, 1]
+# - output.mind_states: (B, S, D) inferred mental states
+# - output.counterfactuals: (B, num_cf, S, D) alternative scenarios
+# - output.imagination_mask: (B, S, 1) where imagination was triggered
+
+# Explicit imagination methods
+scene = imagination_module.imagine_scenario(features)
+minds = imagination_module.imagine_minds(features)
+```
+
+### Key Design Decisions
+
+1. **Same feature space**: Imagined features are in the same space as perception features, so they can be processed by Prediction, Surprise, Valence, etc.
+
+2. **Memory enrichment**: Past experiences (from MemoryBank) enrich imagination - you can imagine better with relevant memories.
+
+3. **Personality colors imagination**: Your personality affects what you imagine (optimist vs pessimist imagine different counterfactuals).
+
+4. **Multiple counterfactuals**: Generate several alternatives, not just one, to represent uncertainty about "what could have been."
+
+### Future Integration Points
+
+Imagination outputs could:
+- **Feed into Prediction**: Predict consequences of imagined scenarios
+- **Affect Valence**: Feel emotions about imagined events (anticipation, dread)
+- **Modulate Curiosity**: Imagined scenarios could drive exploration
+- **Store in Memory**: Particularly vivid imaginations could become memories
+
+---
+
 ## Files
 
 | File | Description |
@@ -831,6 +979,7 @@ perception_output = perception_attention(
 | `pem/surprise_module.py` | Surprise and Valence modules (affective dimension) |
 | `pem/curiosity_module.py` | Curiosity module (epistemic drive) |
 | `pem/activation_module.py` | Activation/Arousal module (engagement intensity) |
+| `pem/imagination_module.py` | Imagination module (mental simulation) |
 | `pem/sync_module.py` | SyncModule with Memory, Personality, Intention |
 | `pem/perception_attention.py` | Perception attention with oscillation query builder |
 | `pem/__init__.py` | Package exports |
