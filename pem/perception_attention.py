@@ -73,10 +73,31 @@ class RMSNorm(nn.Module):
 
 class PerceptionKVCache(nn.Module):
     """
-    Caches Key-Value projections from perception (Qwen) features.
+    Caches Key-Value projections from perception (Qwen) AND imagination.
 
-    Computed once at the start, queried each tick.
-    Similar to CTM's static KV from InputEncoder.
+    Both real perception and imagination go through the SAME K, V projections,
+    ensuring they compete in the same attention space. The attention mechanism
+    naturally learns when to attend to real vs imagined content based on
+    personality, intention, and context signals.
+
+    Architecture:
+        Real Perception (d_perception)     Imagination (d_model)
+                    │                              │
+                    ▼                              │
+          perception_to_unified                   │
+            (d_perception → d_model)              │
+                    │                              │
+                    └──────────┬───────────────────┘
+                               │
+                               ▼
+                       Unified d_model space
+                               │
+                     ┌─────────┴─────────┐
+                     ▼                   ▼
+               k_proj (shared)     v_proj (shared)
+                     │                   │
+                     ▼                   ▼
+                  K_unified           V_unified
     """
 
     def __init__(
@@ -91,18 +112,34 @@ class PerceptionKVCache(nn.Module):
         self.n_heads = n_heads
         self.head_dim = d_model // n_heads
 
-        # Project perception features to K, V
-        self.k_proj = nn.Linear(d_perception, d_model, bias=False)
-        self.v_proj = nn.Linear(d_perception, d_model, bias=False)
+        # === Perception path: d_perception → d_model ===
+        self.perception_norm = RMSNorm(d_perception)
+        self.perception_to_unified = nn.Linear(d_perception, d_model, bias=False)
 
-        # Layer norm for stability
-        self.norm = RMSNorm(d_perception)
+        # === Imagination path: already d_model, just normalize ===
+        self.imagination_norm = RMSNorm(d_model)
+
+        # === SHARED K, V projections (both sources use these) ===
+        self.k_proj = nn.Linear(d_model, d_model, bias=False)
+        self.v_proj = nn.Linear(d_model, d_model, bias=False)
 
         self._init_weights()
 
     def _init_weights(self):
+        nn.init.normal_(self.perception_to_unified.weight, std=0.02)
         nn.init.normal_(self.k_proj.weight, std=0.02)
         nn.init.normal_(self.v_proj.weight, std=0.02)
+
+    def _reshape_kv(
+        self,
+        k: torch.Tensor,
+        v: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Reshape K, V for multi-head attention."""
+        B, S, _ = k.shape
+        k = k.view(B, S, self.n_heads, self.head_dim)
+        v = v.view(B, S, self.n_heads, self.head_dim)
+        return k, v
 
     def forward(
         self,
@@ -110,6 +147,16 @@ class PerceptionKVCache(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Project perception features to K, V for caching.
+        Alias for project_perception() for backward compatibility.
+        """
+        return self.project_perception(perception_features)
+
+    def project_perception(
+        self,
+        perception_features: torch.Tensor,  # (B, S, d_perception) from Qwen
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Project real perception features to K, V.
 
         Args:
             perception_features: Hidden states from Qwen
@@ -118,20 +165,44 @@ class PerceptionKVCache(nn.Module):
             k: (B, S, n_heads, head_dim) keys
             v: (B, S, n_heads, head_dim) values
         """
-        B, S, D = perception_features.shape
+        # Normalize in perception space
+        x = self.perception_norm(perception_features)
 
-        # Normalize
-        x = self.norm(perception_features)
+        # Project to unified d_model space
+        x = self.perception_to_unified(x)  # (B, S, d_model)
 
-        # Project
+        # Project through SHARED K, V
         k = self.k_proj(x)  # (B, S, d_model)
         v = self.v_proj(x)  # (B, S, d_model)
 
-        # Reshape for multi-head attention
-        k = k.view(B, S, self.n_heads, self.head_dim)
-        v = v.view(B, S, self.n_heads, self.head_dim)
+        return self._reshape_kv(k, v)
 
-        return k, v
+    def project_imagination(
+        self,
+        imagined_features: torch.Tensor,  # (B, S, d_model) from ImaginationModule
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Project imagined features to K, V using SAME shared projection.
+
+        This ensures imagination competes in the same attention space as
+        real perception. The query (shaped by personality, intention, etc.)
+        decides what to attend to.
+
+        Args:
+            imagined_features: Features from ImaginationModule
+
+        Returns:
+            k: (B, S, n_heads, head_dim) keys
+            v: (B, S, n_heads, head_dim) values
+        """
+        # Normalize in d_model space (imagination is already d_model)
+        x = self.imagination_norm(imagined_features)
+
+        # Project through SAME SHARED K, V as perception
+        k = self.k_proj(x)  # Same weights as perception!
+        v = self.v_proj(x)  # Same weights as perception!
+
+        return self._reshape_kv(k, v)
 
 
 class OscillationQueryBuilder(nn.Module):
@@ -598,13 +669,19 @@ class PerceptionSynapse(nn.Module):
 
 class PerceptionAttention(nn.Module):
     """
-    Complete perception attention module.
+    Complete perception attention module with unified real + imagined attention pool.
 
     Combines:
-    1. KV Cache from Qwen (perception features)
-    2. Query Builder (from personality, intention, sync oscillations)
-    3. Cross-Attention (query attends to KV)
-    4. Synapse (integrates observation with state)
+    1. KV Cache from Qwen (real perception features)
+    2. KV Cache from Imagination (imagined features) - SAME K,V projections
+    3. Query Builder (from personality, intention, sync oscillations)
+    4. Cross-Attention (query attends to unified [real + imagined] pool)
+    5. Synapse (integrates observation with state)
+
+    The key insight: both real and imagined features go through the SAME K, V
+    projections, so they compete in the same attention space. The query
+    (shaped by personality, intention, surprise, etc.) naturally learns when
+    to attend to real perception vs imagination.
 
     Usage:
         # Initialize
@@ -613,7 +690,8 @@ class PerceptionAttention(nn.Module):
         # Cache Qwen features (once at start)
         perception.cache_perception(qwen_features)
 
-        # Each tick: attend based on current mental state
+        # Each tick: optionally add imagination, then attend
+        perception.add_imagination(imagined_features)  # optional
         observation = perception(
             state, personality_signal, intention_signal, sync, tick
         )
@@ -623,7 +701,7 @@ class PerceptionAttention(nn.Module):
         super().__init__()
         self.config = config
 
-        # KV Cache
+        # KV Cache (handles both perception and imagination)
         self.kv_cache = PerceptionKVCache(
             d_perception=config.d_perception,
             d_model=config.d_model,
@@ -653,31 +731,85 @@ class PerceptionAttention(nn.Module):
             dropout=config.dropout,
         )
 
-        # Cached KV (populated by cache_perception)
-        self._cached_k: Optional[torch.Tensor] = None
-        self._cached_v: Optional[torch.Tensor] = None
+        # Cached KV for REAL perception (populated by cache_perception)
+        self._cached_k_real: Optional[torch.Tensor] = None
+        self._cached_v_real: Optional[torch.Tensor] = None
+
+        # Cached KV for IMAGINATION (populated by add_imagination)
+        self._cached_k_imag: Optional[torch.Tensor] = None
+        self._cached_v_imag: Optional[torch.Tensor] = None
 
     def cache_perception(
         self,
         perception_features: torch.Tensor,  # (B, S, d_perception) from Qwen
     ) -> None:
         """
-        Cache perception KV at the start. Called once per input.
+        Cache real perception KV at the start. Called once per input.
 
         Args:
             perception_features: Hidden states from Qwen feature extractor
         """
-        self._cached_k, self._cached_v = self.kv_cache(perception_features)
+        self._cached_k_real, self._cached_v_real = self.kv_cache.project_perception(
+            perception_features
+        )
+
+    def add_imagination(
+        self,
+        imagined_features: torch.Tensor,  # (B, S_imag, d_model) from ImaginationModule
+    ) -> None:
+        """
+        Add imagined features to the attention pool.
+
+        Uses the SAME K, V projections as real perception, ensuring imagination
+        competes in the same attention space. Can be called each tick with
+        updated imagination.
+
+        Args:
+            imagined_features: Features from ImaginationModule
+        """
+        self._cached_k_imag, self._cached_v_imag = self.kv_cache.project_imagination(
+            imagined_features
+        )
+
+    def clear_imagination(self) -> None:
+        """Clear only the imagination cache (keep real perception)."""
+        self._cached_k_imag = None
+        self._cached_v_imag = None
 
     def clear_cache(self) -> None:
-        """Clear the KV cache."""
-        self._cached_k = None
-        self._cached_v = None
+        """Clear all KV caches (both real and imagined)."""
+        self._cached_k_real = None
+        self._cached_v_real = None
+        self._cached_k_imag = None
+        self._cached_v_imag = None
 
     @property
     def has_cache(self) -> bool:
-        """Check if perception is cached."""
-        return self._cached_k is not None
+        """Check if real perception is cached."""
+        return self._cached_k_real is not None
+
+    @property
+    def has_imagination(self) -> bool:
+        """Check if imagination is in the pool."""
+        return self._cached_k_imag is not None
+
+    def _get_unified_kv(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Get unified K, V by concatenating real + imagined.
+
+        Returns:
+            k: (B, S_real + S_imag, n_heads, head_dim)
+            v: (B, S_real + S_imag, n_heads, head_dim)
+        """
+        if self._cached_k_imag is not None:
+            # Concatenate real + imagined along sequence dimension
+            k = torch.cat([self._cached_k_real, self._cached_k_imag], dim=1)
+            v = torch.cat([self._cached_v_real, self._cached_v_imag], dim=1)
+        else:
+            k = self._cached_k_real
+            v = self._cached_v_real
+
+        return k, v
 
     def forward(
         self,
@@ -686,7 +818,7 @@ class PerceptionAttention(nn.Module):
         intention_signal: torch.Tensor,   # (B, S, D) from IntentionModule
         sync: torch.Tensor,               # (B, S, sync_pairs) from SyncModule
         tick: int,                        # Current tick
-        causal: bool = True,              # Use causal attention
+        causal: bool = False,             # Causal masking (default False for unified pool)
         surprise_magnitude: Optional[torch.Tensor] = None,  # (B, S, 1) or (B, S)
         surprise_direction: Optional[torch.Tensor] = None,  # (B, S, D)
         valence: Optional[torch.Tensor] = None,  # (B, S, 1) or (B, S) good/bad
@@ -694,7 +826,7 @@ class PerceptionAttention(nn.Module):
         attention_temperature: Optional[torch.Tensor] = None,  # (B, S, 1) from ActivationModule
     ) -> PerceptionOutput:
         """
-        Attend to perception based on current mental state.
+        Attend to unified [real + imagined] perception pool.
 
         This is the core of the experience loop:
         - Personality defines WHAT to look for
@@ -704,6 +836,11 @@ class PerceptionAttention(nn.Module):
         - Valence modulates attention FOCUS (positive→sharp, negative→broad)
         - Curiosity drives EXPLORATION of uncertain/novel regions
         - Arousal controls attention SHARPNESS via temperature
+        - Imagination provides WHAT COULD BE for attention to choose from
+
+        The attention pool contains both real perception (from Qwen) and
+        imagined features (from ImaginationModule). Both use the same K, V
+        projections, so the query naturally learns when to attend to each.
 
         Args:
             state: Current hidden state
@@ -711,7 +848,7 @@ class PerceptionAttention(nn.Module):
             intention_signal: Intention modulation
             sync: Neural synchronization patterns
             tick: Current tick for oscillation phase
-            causal: Whether to use causal attention
+            causal: Whether to use causal attention (default False for unified pool)
             surprise_magnitude: How surprising each position was
             surprise_direction: What was unexpected (unit vector in feature space)
             valence: Was the surprise good (+1) or bad (-1)
@@ -722,8 +859,8 @@ class PerceptionAttention(nn.Module):
 
         Returns:
             PerceptionOutput with:
-                - observation: (B, S, D) perceived features
-                - attention_weights: (B, H, S, S_kv) attention pattern
+                - observation: (B, S, D) perceived features (from real + imagined)
+                - attention_weights: (B, H, S, S_kv) attention pattern over unified pool
         """
         if not self.has_cache:
             raise RuntimeError(
@@ -742,16 +879,19 @@ class PerceptionAttention(nn.Module):
             exploration_bonus=exploration_bonus,
         )
 
-        # 2. Cross-attend to perception (with arousal-modulated temperature)
+        # 2. Get unified KV pool (real + imagined)
+        k, v = self._get_unified_kv()
+
+        # 3. Cross-attend to unified pool (with arousal-modulated temperature)
         attended, attn_weights = self.cross_attention(
             query=query,
-            key=self._cached_k,
-            value=self._cached_v,
+            key=k,
+            value=v,
             causal=causal,
             attention_temperature=attention_temperature,
         )
 
-        # 3. Integrate with current state via synapse
+        # 4. Integrate with current state via synapse
         observation = self.synapse(state, attended)
 
         return PerceptionOutput(

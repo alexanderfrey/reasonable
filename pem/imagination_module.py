@@ -45,6 +45,11 @@ class ImaginationConfig:
     use_memory: bool = True  # Draw from memory for richer imagination
     use_personality: bool = True  # Personality colors imagination
 
+    # Shared generative core (optional)
+    # When True, uses shared GenerativeCore instead of separate generators
+    # This allows imagination and prediction to share weights
+    use_shared_generative_core: bool = False
+
     def __post_init__(self):
         if self.hidden_dim is None:
             self.hidden_dim = self.d_model // 2
@@ -568,12 +573,32 @@ class ImaginationModule(nn.Module):
 
     The imagined features are in the same space as perception features,
     allowing them to be processed by existing PEM modules.
+
+    Supports optional shared GenerativeCore:
+        When `use_shared_generative_core=True` or a GenerativeCore is set via
+        `set_generative_core()`, the imagination uses shared weights with
+        prediction. This allows imagination to improve predictions and vice versa.
     """
 
     def __init__(self, config: ImaginationConfig):
         super().__init__()
         self.config = config
         hidden_dim = config.hidden_dim
+
+        # Shared generative core (optional - can be set later)
+        self._generative_core = None
+        self._use_shared_core = config.use_shared_generative_core
+
+        # If using shared core, create it
+        if config.use_shared_generative_core:
+            from .generative_core import GenerativeCore, GenerativeCoreConfig
+            core_config = GenerativeCoreConfig(
+                d_model=config.d_model,
+                hidden_dim=hidden_dim * 2,  # More capacity for shared core
+                n_layers=2,
+                dropout=config.dropout,
+            )
+            self._generative_core = GenerativeCore(core_config)
 
         # Trigger detection: when should imagination be active?
         self.trigger_detector = ImaginationTriggerDetector(
@@ -582,8 +607,8 @@ class ImaginationModule(nn.Module):
             dropout=config.dropout,
         )
 
-        # Scene generation
-        if config.use_scene_generation:
+        # Scene generation (used when not using shared core)
+        if config.use_scene_generation and not config.use_shared_generative_core:
             self.scene_generator = SceneGenerator(
                 d_model=config.d_model,
                 hidden_dim=hidden_dim,
@@ -593,8 +618,8 @@ class ImaginationModule(nn.Module):
         else:
             self.scene_generator = None
 
-        # Mind modeling (theory of mind)
-        if config.use_mind_modeling:
+        # Mind modeling (theory of mind) - used when not using shared core
+        if config.use_mind_modeling and not config.use_shared_generative_core:
             self.mind_modeler = MindModeler(
                 d_model=config.d_model,
                 hidden_dim=hidden_dim,
@@ -605,7 +630,8 @@ class ImaginationModule(nn.Module):
         else:
             self.mind_modeler = None
 
-        # Counterfactual generation
+        # Counterfactual generation - always use dedicated module
+        # (counterfactuals need multiple diverse outputs)
         if config.use_counterfactuals:
             self.counterfactual_generator = CounterfactualGenerator(
                 d_model=config.d_model,
@@ -616,12 +642,43 @@ class ImaginationModule(nn.Module):
         else:
             self.counterfactual_generator = None
 
+        # Vividness estimator (used with shared core)
+        self.vividness_net = nn.Sequential(
+            nn.Linear(config.d_model, hidden_dim // 2),
+            nn.GELU(),
+            nn.Linear(hidden_dim // 2, 1),
+            nn.Sigmoid(),
+        )
+
         # Integration
         self.integrator = ImaginationIntegrator(
             d_model=config.d_model,
             hidden_dim=hidden_dim,
             dropout=config.dropout,
         )
+
+    def set_generative_core(self, core: 'GenerativeCore') -> None:
+        """
+        Set a shared GenerativeCore for imagination.
+
+        This allows imagination and prediction to share weights.
+        The same core can be passed to PredictionModule.
+
+        Args:
+            core: GenerativeCore instance to use
+        """
+        self._generative_core = core
+        self._use_shared_core = True
+
+    @property
+    def generative_core(self):
+        """Get the generative core (if any)."""
+        return self._generative_core
+
+    @property
+    def uses_shared_core(self) -> bool:
+        """Check if using shared generative core."""
+        return self._use_shared_core and self._generative_core is not None
 
     def forward(
         self,
@@ -647,24 +704,45 @@ class ImaginationModule(nn.Module):
         # 1. Detect imagination triggers
         trigger_probs = self.trigger_detector(features)  # (B, S, 1)
 
-        # 2. Generate scene imagery
-        if self.scene_generator is not None:
-            scene, vividness = self.scene_generator(
+        # 2. Generate scene imagery and mind states
+        if self.uses_shared_core:
+            # Use shared GenerativeCore for scene and mind
+            scene = self._generative_core(
                 features,
+                mode="scene",
                 memory=memory if self.config.use_memory else None,
                 personality=personality if self.config.use_personality else None,
             )
-        else:
-            scene = features
-            vividness = torch.ones(B, S, 1, device=features.device)
+            vividness = self.vividness_net(scene)
 
-        # 3. Model minds (theory of mind)
-        if self.mind_modeler is not None:
-            mind_states = self.mind_modeler(features, context=context)
+            if self.config.use_mind_modeling:
+                mind_states = self._generative_core(
+                    features,
+                    mode="mind",
+                    memory=memory,
+                    personality=personality,
+                )
+            else:
+                mind_states = None
         else:
-            mind_states = None
+            # Use dedicated generators
+            if self.scene_generator is not None:
+                scene, vividness = self.scene_generator(
+                    features,
+                    memory=memory if self.config.use_memory else None,
+                    personality=personality if self.config.use_personality else None,
+                )
+            else:
+                scene = features
+                vividness = torch.ones(B, S, 1, device=features.device)
 
-        # 4. Generate counterfactuals
+            # 3. Model minds (theory of mind)
+            if self.mind_modeler is not None:
+                mind_states = self.mind_modeler(features, context=context)
+            else:
+                mind_states = None
+
+        # 4. Generate counterfactuals (always uses dedicated generator)
         if self.counterfactual_generator is not None:
             counterfactuals, plausibilities = self.counterfactual_generator(features, context=context)
         else:

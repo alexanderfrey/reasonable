@@ -41,6 +41,11 @@ class PredictionConfig:
     use_flash_attn: bool = True
     use_rope: bool = False       # RoPE for prediction attention
 
+    # Shared generative core (optional)
+    # When True, uses shared GenerativeCore instead of separate prediction heads
+    # This allows prediction and imagination to share weights
+    use_shared_generative_core: bool = False
+
 
 class CausalCrossAttention(nn.Module):
     """
@@ -191,17 +196,39 @@ class PredictionModule(nn.Module):
     Architecture:
         1. Project sync to query space (sync_pairs → d_model)
         2. Cross-attend to context features (causal)
-        3. Apply scale-specific prediction heads
+        3. Apply scale-specific prediction heads (or shared GenerativeCore)
 
     Multi-scale predictions:
         - immediate: Next token features (t+1)
         - shortterm: Average of next N tokens (t+1 to t+N)
         - longterm:  Average of remaining document
+
+    Supports optional shared GenerativeCore:
+        When `use_shared_generative_core=True` or a GenerativeCore is set via
+        `set_generative_core()`, the prediction uses shared weights with
+        imagination. This allows predictions to benefit from imagination and
+        vice versa.
     """
 
     def __init__(self, config: PredictionConfig):
         super().__init__()
         self.config = config
+
+        # Shared generative core (optional - can be set later)
+        self._generative_core = None
+        self._use_shared_core = config.use_shared_generative_core
+
+        # If using shared core, create it
+        if config.use_shared_generative_core:
+            from .generative_core import GenerativeCore, GenerativeCoreConfig
+            core_config = GenerativeCoreConfig(
+                d_model=config.d_model,
+                hidden_dim=config.d_model,
+                n_layers=2,
+                n_heads=config.n_head,
+                dropout=config.dropout,
+            )
+            self._generative_core = GenerativeCore(core_config)
 
         # Sync → query projection
         self.sync_to_query = nn.Sequential(
@@ -220,10 +247,15 @@ class PredictionModule(nn.Module):
         # Layer norm after attention
         self.attn_norm = nn.LayerNorm(config.d_model)
 
-        # Scale-specific prediction heads
-        self.immediate_head = PredictionHead(config.d_model, use_mlp=True)
-        self.shortterm_head = PredictionHead(config.d_model, use_mlp=True)
-        self.longterm_head = PredictionHead(config.d_model, use_mlp=True)
+        # Scale-specific prediction heads (used when not using shared core)
+        if not config.use_shared_generative_core:
+            self.immediate_head = PredictionHead(config.d_model, use_mlp=True)
+            self.shortterm_head = PredictionHead(config.d_model, use_mlp=True)
+            self.longterm_head = PredictionHead(config.d_model, use_mlp=True)
+        else:
+            self.immediate_head = None
+            self.shortterm_head = None
+            self.longterm_head = None
 
         self._init_weights()
 
@@ -232,6 +264,29 @@ class PredictionModule(nn.Module):
         for module in self.sync_to_query.modules():
             if isinstance(module, nn.Linear):
                 nn.init.normal_(module.weight, std=0.02)
+
+    def set_generative_core(self, core: 'GenerativeCore') -> None:
+        """
+        Set a shared GenerativeCore for prediction.
+
+        This allows prediction and imagination to share weights.
+        The same core can be passed to ImaginationModule.
+
+        Args:
+            core: GenerativeCore instance to use
+        """
+        self._generative_core = core
+        self._use_shared_core = True
+
+    @property
+    def generative_core(self):
+        """Get the generative core (if any)."""
+        return self._generative_core
+
+    @property
+    def uses_shared_core(self) -> bool:
+        """Check if using shared generative core."""
+        return self._use_shared_core and self._generative_core is not None
 
     def forward(
         self,
@@ -263,15 +318,27 @@ class PredictionModule(nn.Module):
         # Residual + norm
         pred_basis = self.attn_norm(query + attn_out)  # (B, S, d_model)
 
-        # 3. Apply prediction heads
-        # Each head predicts from every position (during training)
-        # During inference, typically only use last position
-        predictions = {
-            'immediate': self.immediate_head(pred_basis),   # (B, S, D)
-            'shortterm': self.shortterm_head(pred_basis),   # (B, S, D)
-            'longterm': self.longterm_head(pred_basis),     # (B, S, D)
-            'basis': pred_basis,                            # For analysis/debugging
-        }
+        # 3. Apply prediction heads (or shared core)
+        if self.uses_shared_core:
+            # Use shared GenerativeCore for all predictions
+            # The "predict" mode generates next-token predictions
+            generated = self._generative_core(pred_basis, mode="predict")
+            predictions = {
+                'immediate': generated,   # (B, S, D)
+                'shortterm': generated,   # Same base, different target
+                'longterm': generated,    # Same base, different target
+                'basis': pred_basis,
+            }
+        else:
+            # Use dedicated prediction heads
+            # Each head predicts from every position (during training)
+            # During inference, typically only use last position
+            predictions = {
+                'immediate': self.immediate_head(pred_basis),   # (B, S, D)
+                'shortterm': self.shortterm_head(pred_basis),   # (B, S, D)
+                'longterm': self.longterm_head(pred_basis),     # (B, S, D)
+                'basis': pred_basis,                            # For analysis/debugging
+            }
 
         return predictions
 

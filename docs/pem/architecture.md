@@ -960,13 +960,102 @@ minds = imagination_module.imagine_minds(features)
 
 4. **Multiple counterfactuals**: Generate several alternatives, not just one, to represent uncertainty about "what could have been."
 
-### Future Integration Points
+### Integration: Imagination in Attention Pool
 
-Imagination outputs could:
-- **Feed into Prediction**: Predict consequences of imagined scenarios
-- **Affect Valence**: Feel emotions about imagined events (anticipation, dread)
-- **Modulate Curiosity**: Imagined scenarios could drive exploration
-- **Store in Memory**: Particularly vivid imaginations could become memories
+Imagination feeds back into the system through the **unified attention pool**:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                  Unified Attention Pool                      │
+│                                                             │
+│  ┌───────────────────┐       ┌───────────────────────┐      │
+│  │    K_real, V_real │       │    K_imag, V_imag     │      │
+│  │   (from Qwen)     │       │  (from Imagination)   │      │
+│  └─────────┬─────────┘       └──────────┬────────────┘      │
+│            │                            │                    │
+│            └────────────┬───────────────┘                    │
+│                         │                                    │
+│                    Same K, V projections!                    │
+│                         │                                    │
+│                         ▼                                    │
+│         Query ──────► Attention ──────► Observation          │
+│    (personality,      (choose real      (blended             │
+│     intention,         OR imagined)      perception)         │
+│     surprise...)                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Key design decisions:**
+1. **Shared K, V projections**: Both real and imagined features go through the same K/V projection layers, ensuring they compete in the same attention space.
+
+2. **Attention decides**: The query (shaped by personality, intention, surprise, etc.) naturally learns when to attend to real vs. imagined content.
+
+3. **No explicit source tagging**: The system doesn't need to "know" which is real vs. imagined - attention learns this implicitly.
+
+**Usage:**
+```python
+# Cache real perception
+perception.cache_perception(qwen_features)
+
+# Add imagination to the pool
+perception.add_imagination(imagination_output.imagined_features)
+
+# Forward - attention can now choose from [real + imagined]
+output = perception(state, personality, intention, sync, tick)
+
+# The attention_weights now span both real and imagined positions
+```
+
+### Shared Generative Core
+
+Imagination and Prediction can optionally share the same generative model:
+
+```
+                    ┌─────────────────────────┐
+                    │     GenerativeCore      │
+                    │                         │
+                    │  ┌─────────────────┐    │
+    context ──────▶ │  │    Encoder      │    │
+                    │  │  (shared)       │    │
+                    │  └────────┬────────┘    │
+                    │           │             │
+    mode ──────────▶│  ┌────────▼────────┐    │
+    (predict/scene/ │  │  Mode Fusion    │    │
+     mind/counter)  │  │                 │    │
+                    │  └────────┬────────┘    │
+                    │           │             │
+                    │  ┌────────▼────────┐    │
+                    │  │    Decoder      │    │ ──────▶ generated
+                    │  │  (shared)       │    │         features
+                    │  └─────────────────┘    │
+                    │                         │
+                    └─────────────────────────┘
+```
+
+**Modes:**
+- `"predict"`: Prediction (what comes next)
+- `"scene"`: Scene imagination (mental imagery)
+- `"mind"`: Mind modeling (theory of mind)
+- `"counter"`: Counterfactual generation
+
+**Benefits of sharing:**
+- Imagination improves predictions (imagined scenarios inform expectations)
+- Predictions ground imagination (predictions constrain what's plausible)
+- Unified world model for all generation
+
+**Usage:**
+```python
+from pem import GenerativeCore, create_generative_core
+
+# Create shared core
+core = create_generative_core(d_model=1536)
+
+# Set it on both modules
+imagination_module.set_generative_core(core)
+prediction_module.set_generative_core(core)
+
+# Now both share the same generative weights!
+```
 
 ---
 
@@ -980,8 +1069,9 @@ Imagination outputs could:
 | `pem/curiosity_module.py` | Curiosity module (epistemic drive) |
 | `pem/activation_module.py` | Activation/Arousal module (engagement intensity) |
 | `pem/imagination_module.py` | Imagination module (mental simulation) |
+| `pem/generative_core.py` | Shared generative model for prediction/imagination |
 | `pem/sync_module.py` | SyncModule with Memory, Personality, Intention |
-| `pem/perception_attention.py` | Perception attention with oscillation query builder |
+| `pem/perception_attention.py` | Perception attention with unified real+imagined pool |
 | `pem/__init__.py` | Package exports |
 
 ---

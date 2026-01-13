@@ -65,6 +65,15 @@ from .imagination_module import (
     create_imagination_module,
 )
 
+from .generative_core import (
+    GenerativeCoreConfig,
+    GenerativeCore,
+    GenerativeEncoder,
+    GenerativeDecoder,
+    ModeFusion,
+    create_generative_core,
+)
+
 from .sync_module import (
     SyncModuleConfig,
     SyncModule,
@@ -136,6 +145,13 @@ __all__ = [
     "MindModeler",
     "CounterfactualGenerator",
     "create_imagination_module",
+    # Generative Core (shared prediction/imagination)
+    "GenerativeCoreConfig",
+    "GenerativeCore",
+    "GenerativeEncoder",
+    "GenerativeDecoder",
+    "ModeFusion",
+    "create_generative_core",
     # Sync
     "SyncModuleConfig",
     "SyncModule",
