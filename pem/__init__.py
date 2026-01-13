@@ -21,6 +21,13 @@ from .prediction_module import (
     create_prediction_module,
 )
 
+from .surprise_module import (
+    SurpriseConfig,
+    SurpriseModule,
+    SurpriseLoss,
+    create_surprise_module,
+)
+
 __all__ = [
     # Feature extraction
     "FeatureExtractorConfig",
@@ -34,4 +41,9 @@ __all__ = [
     "PredictionTargets",
     "PredictionLoss",
     "create_prediction_module",
+    # Surprise
+    "SurpriseConfig",
+    "SurpriseModule",
+    "SurpriseLoss",
+    "create_surprise_module",
 ]
