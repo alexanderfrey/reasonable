@@ -65,6 +65,11 @@ class CTMConfig:
     pem_use_intention: bool = False # Enable intention (oscillating goal-directed drive)
     pem_intention_oscillators: int = 16  # Number of oscillator frequency components
 
+    # PEM Perception Attention (closes the experience loop)
+    use_pem_perception: bool = False  # Use PerceptionAttention to close experience loop
+    pem_perception_dim: int = 1536    # Dimension of perception features (Qwen hidden size)
+    pem_perception_weight: float = 0.5  # Weight for blending observation into state
+
     # Enhanced NLM parameters
     use_enhanced_nlm: bool = True   # Use enhanced NLM with temporal attention + gating
 
@@ -1040,6 +1045,43 @@ class CTMCore(nn.Module):
                 sync_pairs=config.sync_pairs
             )
 
+        # Perception Attention (closes the experience loop)
+        # This allows CTM to attend to perception (Qwen features) based on mental state
+        # The observation feeds back into state, closing: Perception → Sync → Attention → State
+        self.use_pem_perception = config.use_pem_perception
+        if config.use_pem_perception:
+            from pem.perception_attention import PerceptionAttention, PerceptionConfig
+            perception_config = PerceptionConfig(
+                d_model=config.d_model,
+                d_perception=config.pem_perception_dim,
+                n_heads=config.n_head,
+                sync_pairs=config.sync_pairs,
+                num_oscillators=32,
+                use_flash_attention=True,
+            )
+            self.perception_attention = PerceptionAttention(perception_config)
+            self.perception_weight = config.pem_perception_weight
+        else:
+            self.perception_attention = None
+            self.perception_weight = 0.0
+
+    def cache_perception(self, perception_features: torch.Tensor) -> None:
+        """
+        Cache perception features (from Qwen) for use during CTM iterations.
+
+        Must be called before forward() if use_pem_perception=True.
+
+        Args:
+            perception_features: (B, S, d_perception) from Qwen feature extractor
+        """
+        if self.perception_attention is not None:
+            self.perception_attention.cache_perception(perception_features)
+
+    def clear_perception_cache(self) -> None:
+        """Clear the cached perception features."""
+        if self.perception_attention is not None:
+            self.perception_attention.clear_cache()
+
     def forward(
         self,
         initial_state: torch.Tensor,      # (B, S, D)
@@ -1048,6 +1090,8 @@ class CTMCore(nn.Module):
         cos: torch.Tensor,
         sin: torch.Tensor,
         num_ticks: Optional[int] = None,  # Override for adaptive compute
+        surprise_magnitude: Optional[torch.Tensor] = None,  # (B, S, 1) for attention steering
+        surprise_direction: Optional[torch.Tensor] = None,  # (B, S, D) for attention steering
     ) -> Tuple[torch.Tensor, List[torch.Tensor], torch.Tensor, List[torch.Tensor]]:
         """
         CTM forward pass with sync computed ONLY at tick boundaries.
@@ -1056,6 +1100,17 @@ class CTMCore(nn.Module):
         This maintains clean separation: layers process within a tick using
         the sync from the PREVIOUS tick's end. Sync captures the state of
         thinking at discrete time points, not continuously during processing.
+
+        If use_pem_perception=True, perception attention is applied at each tick
+        boundary to close the experience loop: Perception → Sync → Attention → State
+
+        Args:
+            initial_state: Starting state
+            static_k, static_v: Cached KV from input encoder
+            cos, sin: RoPE embeddings
+            num_ticks: Override number of ticks
+            surprise_magnitude: How surprising each position (for attention steering)
+            surprise_direction: What was unexpected (for attention steering)
 
         Returns:
             final_state: (B, S, D)
@@ -1118,7 +1173,47 @@ class CTMCore(nn.Module):
             # Compute sync ONLY at tick boundary (after all layers processed)
             # This is THE representation per the CTM paper
             tick_global_hist = torch.stack(history_list, dim=2)
-            tick_sync = self.global_sync(tick_global_hist)
+
+            # Pass surprise to sync module for memory weighting (if PEM sync)
+            # This closes the loop: Surprise → Memory (surprising experiences persist longer)
+            if hasattr(self.global_sync, 'memory'):
+                # PEM SyncModule: pass surprise for memory importance weighting
+                tick_sync = self.global_sync(tick_global_hist, surprise=surprise_magnitude)
+            else:
+                # Correlation-based sync: doesn't use surprise
+                tick_sync = self.global_sync(tick_global_hist)
+
+            # === PERCEPTION ATTENTION: Close the experience loop ===
+            # After computing sync, use it to attend to perception (Qwen features)
+            # and blend the observation back into state
+            if self.perception_attention is not None and self.perception_attention.has_cache:
+                # Get personality and intention signals from sync module (if PEM sync)
+                if hasattr(self.global_sync, 'personality'):
+                    context = state  # Use current state as context
+                    personality_signal = self.global_sync.personality(context)
+                    if hasattr(self.global_sync, 'intention') and self.global_sync.intention is not None:
+                        intention_signal, _ = self.global_sync.intention(context)
+                    else:
+                        intention_signal = personality_signal  # Fallback
+                else:
+                    # No PEM sync: use state as both personality and intention
+                    personality_signal = state
+                    intention_signal = state
+
+                # Call perception attention with surprise (if provided)
+                perception_output = self.perception_attention(
+                    state=state,
+                    personality_signal=personality_signal,
+                    intention_signal=intention_signal,
+                    sync=tick_sync,
+                    tick=tick,
+                    surprise_magnitude=surprise_magnitude,
+                    surprise_direction=surprise_direction,
+                )
+
+                # Blend observation into state (closes the loop!)
+                # This is the key feedback: what we perceive changes what we think
+                state = state + self.perception_weight * perception_output.observation
 
             # Store for next tick's layers to use
             prev_tick_sync = tick_sync

@@ -39,6 +39,17 @@ from .sync_module import (
     create_sync_module,
 )
 
+from .perception_attention import (
+    PerceptionConfig,
+    PerceptionAttention,
+    PerceptionKVCache,
+    OscillationQueryBuilder,
+    PerceptionCrossAttention,
+    PerceptionSynapse,
+    PerceptionOutput,
+    create_perception_attention,
+)
+
 __all__ = [
     # Feature extraction
     "FeatureExtractorConfig",
@@ -66,4 +77,13 @@ __all__ = [
     "IntentionConfig",
     "IntentionModule",
     "create_sync_module",
+    # Perception Attention
+    "PerceptionConfig",
+    "PerceptionAttention",
+    "PerceptionKVCache",
+    "OscillationQueryBuilder",
+    "PerceptionCrossAttention",
+    "PerceptionSynapse",
+    "PerceptionOutput",
+    "create_perception_attention",
 ]
