@@ -50,9 +50,9 @@ class ImaginationConfig:
     # This allows imagination and prediction to share weights
     use_shared_generative_core: bool = False
 
-    # Show-o2 native generation (optional)
-    # When True and a Show-o2 extractor is provided, uses its native imagine()
-    # This enables true generative imagination with discrete diffusion
+    # Native generation (optional)
+    # When True and a generative extractor is provided (Janus Pro),
+    # uses its native imagine() for true generative imagination
     use_native_generation: bool = True
 
     def __post_init__(self):
@@ -580,8 +580,8 @@ class ImaginationModule(nn.Module):
     allowing them to be processed by existing PEM modules.
 
     Generation modes (in order of preference):
-        1. **Native generation** (Show-o2): Uses Show-o2's discrete diffusion for
-           true generative imagination. Set via `set_feature_extractor()`.
+        1. **Native generation** (Janus Pro): Uses the feature extractor's
+           native generation for true generative imagination. Set via `set_feature_extractor()`.
         2. **Shared GenerativeCore**: Uses shared weights with prediction for
            faster, learned imagination. Set via `set_generative_core()`.
         3. **Dedicated generators**: Independent scene/mind generators (default).
@@ -592,7 +592,7 @@ class ImaginationModule(nn.Module):
         self.config = config
         hidden_dim = config.hidden_dim
 
-        # Show-o2 feature extractor for native generation (optional - can be set later)
+        # Feature extractor for native generation (Janus Pro - can be set later)
         self._feature_extractor = None
         self._use_native_generation = config.use_native_generation
 
@@ -670,10 +670,11 @@ class ImaginationModule(nn.Module):
 
     def set_feature_extractor(self, extractor: nn.Module) -> None:
         """
-        Set a feature extractor for native generation (Show-o2).
+        Set a feature extractor for native generation.
 
-        If the extractor has an `imagine()` method (like Showo2FeatureExtractor),
-        it will be used for true generative imagination.
+        If the extractor has an `imagine_from_features()` method (like
+        JanusProFeatureExtractor), it will be used for true generative
+        imagination.
 
         Args:
             extractor: Feature extractor with optional imagine() capability
@@ -710,7 +711,7 @@ class ImaginationModule(nn.Module):
 
     @property
     def uses_native_generation(self) -> bool:
-        """Check if using native generation (Show-o2)."""
+        """Check if using native generation (Janus Pro)."""
         return (
             self._use_native_generation
             and self._feature_extractor is not None
@@ -749,7 +750,7 @@ class ImaginationModule(nn.Module):
         # 2. Generate scene imagery and mind states
         # Priority: native generation > shared core > dedicated generators
         if self.uses_native_generation:
-            # Use Show-o2's native generation (discrete diffusion)
+            # Use Janus Pro's native CFG-based generation
             scene = self._feature_extractor.imagine_from_features(
                 features, mode="scene"
             )

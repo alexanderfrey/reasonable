@@ -34,8 +34,8 @@ class PredictionConfig:
     # Prediction horizons (all in tokens)
     immediate_horizon: int = 8    # ~2-3 words - next phrase fragment
     shortterm_horizon: int = 64   # ~1-2 sentences
-    longterm_horizon: Optional[int] = 2048  # ~few paragraphs
-                                            # None = rest of sequence
+    longterm_horizon: Optional[int] = 256  # ~few paragraphs
+                                           # None = rest of sequence
 
     # Architecture options
     use_flash_attn: bool = True
@@ -378,7 +378,7 @@ class PredictionTargets:
         self,
         immediate_horizon: int = 8,
         shortterm_horizon: int = 64,
-        longterm_horizon: Optional[int] = 2048,
+        longterm_horizon: Optional[int] = 256,
     ):
         """
         Args:
@@ -479,10 +479,21 @@ class PredictionTargets:
         B, S, D = features.shape
         device = features.device
 
-        # Use cumulative sums for efficient mean computation
-        # cumsum[i] = sum of features[0:i+1]
-        # mean(features[a:b]) = (cumsum[b-1] - cumsum[a-1]) / (b - a)
-        cumsum = torch.cumsum(features, dim=1)  # (B, S, D)
+        if padding_mask is not None:
+            padding_mask = padding_mask.to(device=device).bool()
+            mask_f = padding_mask.to(features.dtype)
+            masked_features = features * mask_f.unsqueeze(-1)
+
+            # Use cumulative sums for efficient mean computation
+            # cumsum[i] = sum of features[0:i+1] (masked)
+            cumsum = torch.cumsum(masked_features, dim=1)  # (B, S, D)
+            counts = torch.cumsum(mask_f, dim=1)  # (B, S)
+            counts_padded = F.pad(counts, (1, 0))  # (B, S+1)
+        else:
+            # Use cumulative sums for efficient mean computation
+            # cumsum[i] = sum of features[0:i+1]
+            cumsum = torch.cumsum(features, dim=1)  # (B, S, D)
+            counts_padded = None
 
         # Prepend zeros for easier indexing
         cumsum_padded = F.pad(cumsum, (0, 0, 1, 0))  # (B, S+1, D)
@@ -493,10 +504,19 @@ class PredictionTargets:
 
         for t in range(S - 1):
             end_idx = min(t + 1 + self.immediate_horizon, S)
-            count = end_idx - (t + 1)
-            if count > 0:
-                immediate_targets[:, t] = (cumsum_padded[:, end_idx] - cumsum_padded[:, t + 1]) / count
-                immediate_valid[:, t] = True
+            if padding_mask is None:
+                count = end_idx - (t + 1)
+                if count > 0:
+                    immediate_targets[:, t] = (cumsum_padded[:, end_idx] - cumsum_padded[:, t + 1]) / count
+                    immediate_valid[:, t] = True
+            else:
+                window_counts = counts_padded[:, end_idx] - counts_padded[:, t + 1]
+                denom = window_counts.clamp_min(1).unsqueeze(-1)
+                window_sum = cumsum_padded[:, end_idx] - cumsum_padded[:, t + 1]
+                mean = window_sum / denom
+                valid = (window_counts > 0) & padding_mask[:, t]
+                immediate_targets[:, t] = mean * valid.unsqueeze(-1)
+                immediate_valid[:, t] = valid
 
         # Short-term targets: mean of next `shortterm_horizon` tokens (~1-2 sentences)
         shortterm_targets = torch.zeros_like(features)
@@ -504,11 +524,20 @@ class PredictionTargets:
 
         for t in range(S - 1):
             end_idx = min(t + 1 + self.shortterm_horizon, S)
-            count = end_idx - (t + 1)
-            if count > 0:
-                # mean = (cumsum[end_idx-1] - cumsum[t]) / count
-                shortterm_targets[:, t] = (cumsum_padded[:, end_idx] - cumsum_padded[:, t + 1]) / count
-                shortterm_valid[:, t] = True
+            if padding_mask is None:
+                count = end_idx - (t + 1)
+                if count > 0:
+                    # mean = (cumsum[end_idx-1] - cumsum[t]) / count
+                    shortterm_targets[:, t] = (cumsum_padded[:, end_idx] - cumsum_padded[:, t + 1]) / count
+                    shortterm_valid[:, t] = True
+            else:
+                window_counts = counts_padded[:, end_idx] - counts_padded[:, t + 1]
+                denom = window_counts.clamp_min(1).unsqueeze(-1)
+                window_sum = cumsum_padded[:, end_idx] - cumsum_padded[:, t + 1]
+                mean = window_sum / denom
+                valid = (window_counts > 0) & padding_mask[:, t]
+                shortterm_targets[:, t] = mean * valid.unsqueeze(-1)
+                shortterm_valid[:, t] = valid
 
         # Long-term targets: mean of features[t+1:t+1+longterm_horizon] or rest of seq
         longterm_targets = torch.zeros_like(features)
@@ -522,11 +551,20 @@ class PredictionTargets:
                 # Fixed horizon
                 end_idx = min(t + 1 + self.longterm_horizon, S)
 
-            count = end_idx - (t + 1)
-            if count > 0:
-                # mean = (cumsum[end_idx] - cumsum[t+1]) / count
-                longterm_targets[:, t] = (cumsum_padded[:, end_idx] - cumsum_padded[:, t + 1]) / count
-                longterm_valid[:, t] = True
+            if padding_mask is None:
+                count = end_idx - (t + 1)
+                if count > 0:
+                    # mean = (cumsum[end_idx] - cumsum[t+1]) / count
+                    longterm_targets[:, t] = (cumsum_padded[:, end_idx] - cumsum_padded[:, t + 1]) / count
+                    longterm_valid[:, t] = True
+            else:
+                window_counts = counts_padded[:, end_idx] - counts_padded[:, t + 1]
+                denom = window_counts.clamp_min(1).unsqueeze(-1)
+                window_sum = cumsum_padded[:, end_idx] - cumsum_padded[:, t + 1]
+                mean = window_sum / denom
+                valid = (window_counts > 0) & padding_mask[:, t]
+                longterm_targets[:, t] = mean * valid.unsqueeze(-1)
+                longterm_valid[:, t] = valid
 
         # Apply padding mask if provided
         if padding_mask is not None:
@@ -637,7 +675,7 @@ def create_prediction_module(
     n_head: int = 8,
     immediate_horizon: int = 8,
     shortterm_horizon: int = 64,
-    longterm_horizon: Optional[int] = 2048,
+    longterm_horizon: Optional[int] = 256,
     **kwargs,
 ) -> PredictionModule:
     """Factory function to create a prediction module.
@@ -648,7 +686,7 @@ def create_prediction_module(
         n_head: Number of attention heads
         immediate_horizon: Tokens ahead for immediate prediction (default: 8, ~2-3 words)
         shortterm_horizon: Tokens ahead for short-term prediction (default: 64, ~1-2 sentences)
-        longterm_horizon: Tokens ahead for long-term prediction (default: 2048, ~paragraphs)
+        longterm_horizon: Tokens ahead for long-term prediction (default: 256, ~paragraphs)
                          Set to None for "rest of sequence" behavior
     """
     config = PredictionConfig(

@@ -35,9 +35,9 @@ def run_with_mock_features(text: str = "The quick brown fox jumps over the lazy 
         sync_pairs=sync_pairs,
         d_model=D,
         n_head=4,
-        immediate_horizon=4,
-        shortterm_horizon=8,
-        longterm_horizon=16,
+        immediate_horizon=8,
+        shortterm_horizon=64,
+        longterm_horizon=256,
     )
     pred_module = PredictionModule(pred_config)
 
@@ -87,8 +87,8 @@ def run_with_mock_features(text: str = "The quick brown fox jumps over the lazy 
     return predictions, targets, surprises
 
 
-def run_with_real_features(text: str, device: str = "cuda", model: str = "showlab/show-o2-1.5B"):
-    """Run pipeline with real features from Show-o2 (or legacy Qwen3-VL)."""
+def run_with_real_features(text: str, device: str = "cuda", model: str = "deepseek-ai/Janus-Pro-1B"):
+    """Run pipeline with real features from Janus Pro (or legacy Qwen3-VL)."""
     from pem import (
         create_feature_extractor,
         PredictionModule, PredictionConfig, PredictionTargets,
@@ -98,7 +98,7 @@ def run_with_real_features(text: str, device: str = "cuda", model: str = "showla
     logger.info("Running PEM pipeline with REAL features")
     logger.info("=" * 60)
 
-    # Load feature extractor (Show-o2 by default)
+    # Load feature extractor (Janus Pro by default)
     logger.info(f"Loading feature extractor: {model}...")
     feature_extractor = create_feature_extractor(
         model_name_or_path=model,
@@ -185,8 +185,8 @@ def main():
     parser.add_argument("--text", type=str, default="The quick brown fox jumps over the lazy dog. It was a sunny day in the forest.")
     parser.add_argument("--mock", action="store_true", help="Use mock features instead of real model")
     parser.add_argument("--device", type=str, default="cuda", help="Device for real features")
-    parser.add_argument("--model", type=str, default="showlab/show-o2-1.5B",
-                       help="Model to use (default: showlab/show-o2-1.5B, legacy: Qwen/Qwen3-VL-2B-Instruct)")
+    parser.add_argument("--model", type=str, default="deepseek-ai/Janus-Pro-1B",
+                       help="Model to use (default: deepseek-ai/Janus-Pro-1B, legacy: Qwen/Qwen3-VL-2B-Instruct)")
     args = parser.parse_args()
 
     if args.mock:

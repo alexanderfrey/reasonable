@@ -20,7 +20,7 @@ PEM is built on the principle that experience requires:
 The key insight is that these components form a closed feedback loop:
 
 ```
-Perception (Show-o2) → Prediction → Surprise → Valence
+Perception (Janus Pro) → Prediction → Surprise → Valence
        ↑    ↑               ↓           ↓         ↓
        │    │         Uncertainty   Curiosity    │
        │    │               │           │         │
@@ -51,7 +51,7 @@ Six critical connections close this loop:
 
 ```
                          ┌─────────────────────────────────────┐
-                         │    SHOW-O2 (Unified Perception)     │
+                         │    JANUS PRO (Unified Perception)     │
                          │                                     │
                          │   text/image → hidden_states        │
                          │          (B, S, 1536)               │
@@ -508,7 +508,7 @@ PersonalityModule.base_personality
 from pem import ValenceModule, ValenceConfig
 
 config = ValenceConfig(
-    d_model=1536,           # Same as Show-o2/Qwen hidden dim
+    d_model=1536,           # Janus Pro projected dimension
     personality_dim=512,    # Personality embedding size
     hidden_dim=768,
     use_context=True,       # Context-dependent valence
@@ -976,7 +976,7 @@ Imagination feeds back into the system through the **unified attention pool**:
 │                                                             │
 │  ┌───────────────────┐       ┌───────────────────────┐      │
 │  │    K_real, V_real │       │    K_imag, V_imag     │      │
-│  │   (from Show-o2)  │       │  (from Imagination)   │      │
+│  │   (from Janus Pro)  │       │  (from Imagination)   │      │
 │  └─────────┬─────────┘       └──────────┬────────────┘      │
 │            │                            │                    │
 │            └────────────┬───────────────┘                    │
@@ -1070,7 +1070,7 @@ prediction_module.set_generative_core(core)
 | File | Description |
 |------|-------------|
 | `pem/feature_extractor.py` | Base classes and factory for feature extractors |
-| `pem/showo2_feature_extractor.py` | **Show-o2 unified feature extraction + generation** |
+| `pem/janus_pro_feature_extractor.py` | **Janus Pro 1B unified feature extraction + generation** |
 | `pem/prediction_module.py` | Multi-scale prediction heads |
 | `pem/surprise_module.py` | Surprise and Valence modules (affective dimension) |
 | `pem/curiosity_module.py` | Curiosity module (epistemic drive) |
@@ -1083,49 +1083,50 @@ prediction_module.set_generative_core(core)
 
 ---
 
-## Show-o2 (Unified Backbone)
+## Janus Pro (Unified Backbone)
 
-Show-o2 is the **preferred backbone** for PEM because it provides both understanding AND generation in a unified model.
+Janus Pro 1B is the **preferred backbone** for PEM because it provides both understanding AND generation in a unified, compact model.
 
-### Why Show-o2?
+### Why Janus Pro?
 
-| Feature | Qwen3-VL (legacy) | Show-o2 |
-|---------|------------------|---------|
+| Feature | Qwen3-VL (legacy) | Janus Pro 1B |
+|---------|------------------|--------------|
 | Understanding | ✓ | ✓ |
-| Generation | ✗ (need separate model) | ✓ (native discrete diffusion) |
+| Generation | ✗ (need separate model) | ✓ (CFG-based) |
 | Image generation | ✗ | ✓ |
 | Text-to-image | ✗ | ✓ |
-| Hidden dimension | 1536 (2B) | 1536 (1.5B), 3584 (7B) |
+| Model size | 2B | 1B/7B |
+| Hidden dimension | 1536 | 2048 (projected to 1536) |
 
 ### Architecture
 
-Show-o2 uses:
-- **Qwen2.5** as the LLM backbone (same architecture)
-- **MAGVITv2** for image tokenization
-- **Discrete diffusion** for image generation (MaskGIT-style)
-- **Unified multimodal tokens** for both understanding and generation
+Janus Pro uses:
+- **DeepSeek** architecture as the LLM backbone
+- **Vision encoder** for image understanding
+- **Autoregressive generation** with classifier-free guidance (CFG)
+- **Discrete image tokens** for both understanding and generation
 
 ### Integration with Imagination
 
-When Show-o2 is used, the ImaginationModule can leverage **native generation**:
+When Janus Pro is used, the ImaginationModule can leverage **native generation**:
 
 ```python
 # Feature extractor with native generation
 extractor = create_feature_extractor(
-    model_name_or_path="showlab/show-o2-1.5B"
+    model_name_or_path="deepseek-ai/Janus-Pro-1B"
 )
 
 # Imagination can use native generation
 imagination_module.set_feature_extractor(extractor)
 
-# Now imagination uses discrete diffusion!
+# Now imagination uses CFG-based generation!
 output = imagination_module(features)
 ```
 
 ### Modes of Imagination
 
-With Show-o2, imagination has three modes (in order of preference):
-1. **Native generation**: Show-o2's discrete diffusion for true generative imagination
+With Janus Pro, imagination has three modes (in order of preference):
+1. **Native generation**: Janus Pro's CFG-based generation for true generative imagination
 2. **Shared GenerativeCore**: Learned transformation shared with prediction
 3. **Dedicated generators**: Independent scene/mind generators
 
@@ -1140,7 +1141,7 @@ from pem import (
     create_feature_extractor,
 )
 
-# Create feature extractor (Show-o2 by default)
+# Create feature extractor (Janus Pro by default)
 extractor = create_feature_extractor()
 
 # Create modules
@@ -1153,7 +1154,7 @@ sync_module = SyncModule(sync_config)
 
 perception_config = PerceptionConfig(
     d_model=512,
-    d_perception=1536,  # Show-o2/Qwen hidden size
+    d_perception=1536,  # Janus Pro hidden size (projected)
     sync_pairs=512,
 )
 perception = PerceptionAttention(perception_config)
@@ -1203,7 +1204,7 @@ config = CTMConfig(
     pem_use_intention=True,
     # PEM perception (closes the loop)
     use_pem_perception=True,
-    pem_perception_dim=1536,  # Show-o2/Qwen hidden size
+    pem_perception_dim=1536,  # Janus Pro hidden size (projected)
     pem_perception_weight=0.5,
 )
 
