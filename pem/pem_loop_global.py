@@ -70,6 +70,7 @@ from .prediction_module import PredictionTargets
 class PEMLoopGlobalOutput(NamedTuple):
     """Output from PEM loop with global sync."""
     predictions: Dict[str, torch.Tensor]  # {immediate, shortterm, longterm}
+    prediction_output: PredictionCTMOutput # Full prediction output with activations
     surprise: SurpriseCTMOutput           # Surprise with post-activations
     global_sync: GlobalSyncOutput          # Cross-module sync
     observation: torch.Tensor              # (B, S, D) attended observation
@@ -365,6 +366,7 @@ class PEMLoopGlobal(nn.Module):
         # Build output and new state
         output = PEMLoopGlobalOutput(
             predictions=predictions,
+            prediction_output=pred_output,
             surprise=surp_output,
             global_sync=global_sync_output,
             observation=observation,

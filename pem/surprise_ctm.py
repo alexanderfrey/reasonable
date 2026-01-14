@@ -27,6 +27,7 @@ class SurpriseCTMOutput(NamedTuple):
     sync_matrix: torch.Tensor         # (B, S, D_n, D_n)
     all_tick_outputs: List[torch.Tensor]
     certainty: torch.Tensor
+    all_tick_activations: List[torch.Tensor]  # NLM activations at each tick
 
 
 @dataclass
@@ -162,7 +163,7 @@ class SurpriseCTM(CTMModule):
         input_features = self.input_projection(predicted, actual)
 
         # 3. Run core CTM loop
-        post_activations, sync_matrix, output, all_outputs = self.core(input_features)
+        post_activations, sync_matrix, output, all_outputs, all_activations = self.core(input_features)
 
         # 4. Generate magnitude and direction
         surprise_outputs = self.output_projection(output)
@@ -186,6 +187,7 @@ class SurpriseCTM(CTMModule):
             sync_matrix=sync_matrix,
             all_tick_outputs=all_outputs,
             certainty=certainty,
+            all_tick_activations=all_activations,
         )
 
     def forward_multiscale(

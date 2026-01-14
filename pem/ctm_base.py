@@ -39,6 +39,7 @@ class CTMModuleOutput(NamedTuple):
     sync_matrix: torch.Tensor           # (B, S, D_n, D_n) internal sync matrix
     all_tick_outputs: List[torch.Tensor]  # Outputs at each tick (for CTM loss)
     certainty: torch.Tensor             # (B,) confidence in result
+    all_tick_activations: List[torch.Tensor]  # (B, S, D_neurons) NLM activations at each tick
 
 
 @dataclass
@@ -325,7 +326,7 @@ class CTMCore(nn.Module):
     def forward(
         self,
         input_features: torch.Tensor,  # (B, S, d_input)
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[torch.Tensor]]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[torch.Tensor], List[torch.Tensor]]:
         """
         Run the CTM core loop.
 
@@ -337,6 +338,7 @@ class CTMCore(nn.Module):
             sync_matrix: (B, S, d_neurons, d_neurons) final sync matrix
             output: (B, S, d_output) final tick output
             all_outputs: List of outputs at each tick
+            all_activations: List of NLM post-activations at each tick
         """
         B, S, D = input_features.shape
         device = input_features.device
@@ -393,7 +395,7 @@ class CTMCore(nn.Module):
             # Update for next tick
             z_t = z_t_new
 
-        return z_t, S_full, all_outputs[-1], all_outputs
+        return z_t, S_full, all_outputs[-1], all_outputs, Z_history
 
     def compute_certainty(
         self,
@@ -470,7 +472,7 @@ class CTMModule(nn.Module):
         input_features = self.input_projection(*args, **kwargs)
 
         # 2. Run core CTM loop
-        post_activations, sync_matrix, output, all_outputs = self.core(input_features)
+        post_activations, sync_matrix, output, all_outputs, all_activations = self.core(input_features)
 
         # 3. Output projection (module-specific)
         result = self.output_projection(output)
@@ -484,4 +486,5 @@ class CTMModule(nn.Module):
             sync_matrix=sync_matrix,
             all_tick_outputs=all_outputs,
             certainty=certainty,
+            all_tick_activations=all_activations,
         )

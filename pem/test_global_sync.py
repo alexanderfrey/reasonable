@@ -32,18 +32,20 @@ def test_ctm_base():
 
     # Test forward
     x = torch.randn(2, 16, 512)  # (B, S, d_input)
-    post_act, sync_matrix, output, all_outputs = core(x)
+    post_act, sync_matrix, output, all_outputs, all_activations = core(x)
 
     print(f"Input: {x.shape}")
     print(f"Post-activations: {post_act.shape}")
     print(f"Sync matrix: {sync_matrix.shape}")
     print(f"Output: {output.shape}")
     print(f"All outputs: {len(all_outputs)} ticks")
+    print(f"All activations: {len(all_activations)} ticks")
 
     assert post_act.shape == (2, 16, 64), f"Expected (2,16,64), got {post_act.shape}"
     assert sync_matrix.shape == (2, 16, 64, 64), f"Expected (2,16,64,64), got {sync_matrix.shape}"
     assert output.shape == (2, 16, 512), f"Expected (2,16,512), got {output.shape}"
     assert len(all_outputs) == 4, f"Expected 4 ticks, got {len(all_outputs)}"
+    assert len(all_activations) == 4, f"Expected 4 activations, got {len(all_activations)}"
 
     print("CTM Base: PASSED")
 
