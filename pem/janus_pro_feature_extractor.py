@@ -617,15 +617,16 @@ class JanusProFeatureExtractor(nn.Module):
                 if "pixel_values" not in all_inputs and "pixel_values" in inputs:
                     all_inputs["pixel_values"] = inputs["pixel_values"]
             else:
-                # Text-only input
-                conversation = [
-                    {"role": "<|User|>", "content": text},
-                    {"role": "<|Assistant|>", "content": ""},
-                ]
-                inputs = self._processor(
-                    conversations=conversation,
+                # Text-only input - use tokenizer directly to avoid image processor issues
+                tokenized = self.tokenizer(
+                    text,
                     return_tensors="pt",
+                    add_special_tokens=True,
                 )
+                inputs = {
+                    "input_ids": tokenized["input_ids"],
+                    "attention_mask": tokenized["attention_mask"],
+                }
 
             input_ids_list.append(inputs["input_ids"])
 

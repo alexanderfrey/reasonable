@@ -102,6 +102,22 @@ from .perception_attention import (
     create_perception_attention,
 )
 
+from .ctm_prediction_module import (
+    CTMPredictionConfig,
+    CTMPrediction,
+    CTMPredictionOutput,
+    CTMLoss,
+    create_ctm_prediction,
+)
+
+from .pem_loop import (
+    PEMLoopConfig,
+    PEMLoop,
+    PEMLoopOutput,
+    PEMLoopState,
+    create_pem_loop,
+)
+
 __all__ = [
     # Feature extraction
     "FeatureExtractorConfig",
@@ -180,4 +196,16 @@ __all__ = [
     "PerceptionSynapse",
     "PerceptionOutput",
     "create_perception_attention",
+    # CTM Prediction
+    "CTMPredictionConfig",
+    "CTMPrediction",
+    "CTMPredictionOutput",
+    "CTMLoss",
+    "create_ctm_prediction",
+    # PEM Loop
+    "PEMLoopConfig",
+    "PEMLoop",
+    "PEMLoopOutput",
+    "PEMLoopState",
+    "create_pem_loop",
 ]

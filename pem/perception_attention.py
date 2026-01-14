@@ -536,8 +536,8 @@ class PerceptionCrossAttention(nn.Module):
         q = self.q_proj(query)
         q = q.view(B, S, self.n_heads, self.head_dim)
 
-        # Use flash attention if available
-        if self._has_flash_attn and self.training:
+        # Use flash attention if available and on CUDA
+        if self._has_flash_attn and self.training and query.is_cuda:
             # Flash attention requires specific dtype
             target_dtype = q.dtype
             if target_dtype not in (torch.float16, torch.bfloat16):
