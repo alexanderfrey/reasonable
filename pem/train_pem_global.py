@@ -67,11 +67,37 @@ def create_nlm_activation_grid(
 
     module_names = ['Prediction', 'Surprise']
 
-    for step_idx, output in enumerate(outputs):
-        # Get activations for each module
-        pred_activations = output.prediction_output.all_tick_activations  # List of (B, S, D_neurons)
-        surp_activations = output.surprise.all_tick_activations  # List of (B, S, D_neurons)
+    # First pass: collect all data to find global min/max for colorbar
+    all_values = []
 
+    for step_idx, output in enumerate(outputs):
+        pred_activations = output.prediction_output.all_tick_activations
+        surp_activations = output.surprise.all_tick_activations
+
+        for activations in [pred_activations, surp_activations]:
+            if not activations:
+                continue
+            stacked = torch.stack(activations, dim=0)
+            T, B, S, D = stacked.shape
+            pos_subset = min(S, max_positions)
+            neuron_subset = min(D, max_neurons)
+            neuron_indices = torch.linspace(0, D-1, neuron_subset).long()
+            averaged = stacked[:, 0, :pos_subset, :][:, :, neuron_indices].mean(dim=1)
+            all_values.extend(averaged.detach().cpu().numpy().flatten().tolist())
+
+    # Compute symmetric color limits centered at 0
+    if all_values:
+        abs_max = max(abs(min(all_values)), abs(max(all_values)))
+        if abs_max < 1e-6:
+            abs_max = 0.1  # Minimum range for visibility
+        vmin, vmax = -abs_max, abs_max
+    else:
+        vmin, vmax = -1, 1
+
+    # Second pass: plot
+    for step_idx, output in enumerate(outputs):
+        pred_activations = output.prediction_output.all_tick_activations
+        surp_activations = output.surprise.all_tick_activations
         module_activations = [pred_activations, surp_activations]
 
         for mod_idx, (name, activations) in enumerate(zip(module_names, module_activations)):
@@ -82,40 +108,34 @@ def create_nlm_activation_grid(
                 ax.set_title(f'{name} (Step {step_idx})')
                 continue
 
-            # Stack: (T, B, S, D_neurons) -> average over B, S -> (T, D_neurons)
-            stacked = torch.stack(activations, dim=0)  # (T, B, S, D)
+            stacked = torch.stack(activations, dim=0)
             T, B, S, D = stacked.shape
 
-            # Average over batch and positions (take subset of positions)
             pos_subset = min(S, max_positions)
-            averaged = stacked[:, 0, :pos_subset, :].mean(dim=1)  # (T, D)
+            averaged = stacked[:, 0, :pos_subset, :].mean(dim=1)
 
-            # Subsample neurons if needed
             neuron_subset = min(D, max_neurons)
             neuron_indices = torch.linspace(0, D-1, neuron_subset).long()
-            averaged = averaged[:, neuron_indices]  # (T, neuron_subset)
+            averaged = averaged[:, neuron_indices]
 
-            # Convert to numpy for plotting
-            data = averaged.detach().cpu().numpy()  # (T, neurons)
+            data = averaged.detach().cpu().numpy()
 
-            # Plot heatmap: x=ticks, y=neurons
             im = ax.imshow(
-                data.T,  # (neurons, T)
+                data.T,
                 aspect='auto',
                 cmap='RdBu_r',
-                vmin=-2, vmax=2,
+                vmin=vmin, vmax=vmax,
             )
 
             ax.set_xlabel('Tick')
             ax.set_ylabel('Neuron')
             ax.set_title(f'{name} (Step {step_idx})')
 
-            # Add tick labels
             ax.set_xticks(range(T))
             ax.set_xticklabels([f't{t}' for t in range(T)])
 
-    # Add colorbar
-    fig.colorbar(im, ax=axes, shrink=0.6, label='Activation')
+    # Add colorbar with actual range info
+    cbar = fig.colorbar(im, ax=axes, shrink=0.6, label=f'Activation (range: ±{vmax:.4f})')
 
     plt.tight_layout()
     return fig
@@ -161,8 +181,10 @@ def create_nlm_neuron_lines(
     module_names = ['Prediction', 'Surprise']
     colors = plt.cm.viridis(np.linspace(0, 1, num_steps))
 
+    # First pass: collect all data to determine y-axis range per module
+    all_data = {0: [], 1: []}  # mod_idx -> list of values
+
     for mod_idx, name in enumerate(module_names):
-        # Get activations from first output to determine neuron count
         if mod_idx == 0:
             sample_activations = outputs[0].prediction_output.all_tick_activations
         else:
@@ -171,7 +193,53 @@ def create_nlm_neuron_lines(
         if not sample_activations:
             continue
 
-        # Get total neuron count
+        total_neurons = sample_activations[0].shape[-1]
+        neuron_indices = torch.linspace(0, total_neurons - 1, num_neurons).long()
+
+        for neuron_plot_idx in range(num_neurons):
+            neuron_idx = neuron_indices[neuron_plot_idx].item()
+
+            for step_idx, output in enumerate(outputs):
+                if mod_idx == 0:
+                    activations = output.prediction_output.all_tick_activations
+                else:
+                    activations = output.surprise.all_tick_activations
+
+                if not activations:
+                    continue
+
+                stacked = torch.stack(activations, dim=0)
+                T, B, S, D = stacked.shape
+                pos_subset = min(S, max_positions)
+                neuron_activation = stacked[:, 0, :pos_subset, neuron_idx].mean(dim=1)
+                all_data[mod_idx].extend(neuron_activation.detach().cpu().numpy().tolist())
+
+    # Compute y-axis limits per module (with padding)
+    y_limits = {}
+    for mod_idx in range(num_modules):
+        if all_data[mod_idx]:
+            data_min = min(all_data[mod_idx])
+            data_max = max(all_data[mod_idx])
+            data_range = data_max - data_min
+            if data_range < 1e-6:  # Nearly flat - use small fixed range
+                mid = (data_min + data_max) / 2
+                y_limits[mod_idx] = (mid - 0.1, mid + 0.1)
+            else:
+                padding = data_range * 0.15
+                y_limits[mod_idx] = (data_min - padding, data_max + padding)
+        else:
+            y_limits[mod_idx] = (-1, 1)
+
+    # Second pass: plot with proper y-limits
+    for mod_idx, name in enumerate(module_names):
+        if mod_idx == 0:
+            sample_activations = outputs[0].prediction_output.all_tick_activations
+        else:
+            sample_activations = outputs[0].surprise.all_tick_activations
+
+        if not sample_activations:
+            continue
+
         total_neurons = sample_activations[0].shape[-1]
         neuron_indices = torch.linspace(0, total_neurons - 1, num_neurons).long()
 
@@ -182,7 +250,6 @@ def create_nlm_neuron_lines(
 
             neuron_idx = neuron_indices[neuron_plot_idx].item()
 
-            # Plot each loop step as a different colored line
             for step_idx, output in enumerate(outputs):
                 if mod_idx == 0:
                     activations = output.prediction_output.all_tick_activations
@@ -192,15 +259,11 @@ def create_nlm_neuron_lines(
                 if not activations:
                     continue
 
-                # Stack: (T, B, S, D_neurons)
                 stacked = torch.stack(activations, dim=0)
                 T, B, S, D = stacked.shape
-
-                # Average over batch and positions, get single neuron
                 pos_subset = min(S, max_positions)
-                neuron_activation = stacked[:, 0, :pos_subset, neuron_idx].mean(dim=1)  # (T,)
+                neuron_activation = stacked[:, 0, :pos_subset, neuron_idx].mean(dim=1)
 
-                # Convert to numpy and plot
                 data = neuron_activation.detach().cpu().numpy()
                 ax.plot(range(T), data, 'o-', color=colors[step_idx],
                        label=f'Step {step_idx}' if neuron_plot_idx == 0 else None,
@@ -212,16 +275,20 @@ def create_nlm_neuron_lines(
             ax.tick_params(axis='both', labelsize=6)
             ax.grid(True, alpha=0.3)
 
-            # Set consistent y-axis limits
-            ax.set_ylim(-3, 3)
+            # Auto-scaled y-axis per module
+            ax.set_ylim(y_limits[mod_idx])
 
     # Add legend to first subplot
     if num_steps > 1:
         axes[0, 0].legend(fontsize=6, loc='upper right')
 
-    # Add module labels
-    fig.text(0.25, 0.98, 'Prediction Module', ha='center', fontsize=12, fontweight='bold')
-    fig.text(0.75, 0.98, 'Surprise Module', ha='center', fontsize=12, fontweight='bold')
+    # Add module labels with y-range info
+    pred_range = y_limits.get(0, (-1, 1))
+    surp_range = y_limits.get(1, (-1, 1))
+    fig.text(0.25, 0.98, f'Prediction Module (y: {pred_range[0]:.3f} to {pred_range[1]:.3f})',
+             ha='center', fontsize=10, fontweight='bold')
+    fig.text(0.75, 0.98, f'Surprise Module (y: {surp_range[0]:.3f} to {surp_range[1]:.3f})',
+             ha='center', fontsize=10, fontweight='bold')
 
     plt.tight_layout(rect=[0, 0, 1, 0.96])
     return fig
