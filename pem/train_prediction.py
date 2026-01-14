@@ -30,6 +30,16 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader, IterableDataset
 from transformers import AutoTokenizer
 
+try:
+    import wandb
+    import matplotlib.pyplot as plt
+    import matplotlib
+    matplotlib.use('Agg')  # Non-interactive backend
+    import numpy as np
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
@@ -87,6 +97,13 @@ class TrainingConfig:
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     mixed_precision: bool = True
     num_workers: int = 4
+
+    # Wandb logging
+    use_wandb: bool = True
+    wandb_project: str = "pem-ctm-prediction"
+    wandb_run_name: Optional[str] = None
+    wandb_log_activations_every: int = 100  # Log activation grid every N steps
+    wandb_activation_grid_size: int = 64    # Number of neurons to show in grid (8x8)
 
 
 def find_text_files(data_dir: str, num_files: int, seed: int = 42) -> List[Path]:
@@ -212,6 +229,114 @@ def collate_fn(batch: List[object]) -> dict:
         progress = max(item[1] for item in batch)
         return {"texts": texts, "progress": progress}
     return {"texts": batch, "progress": None}
+
+
+def create_neuron_activation_grid(
+    post_activation_history: torch.Tensor,
+    n_neurons: int = 64,
+    seq_idx: int = 0,
+    batch_idx: int = 0,
+) -> plt.Figure:
+    """
+    Create a grid visualization of neuron activations over internal ticks.
+
+    Args:
+        post_activation_history: (B, S, D, T) tensor where:
+            - B = batch size
+            - S = sequence length
+            - D = number of neurons
+            - T = internal ticks
+        n_neurons: Number of neurons to display (should be a perfect square)
+        seq_idx: Which sequence position to visualize
+        batch_idx: Which batch item to visualize
+
+    Returns:
+        matplotlib Figure with grid of line plots
+    """
+    if not WANDB_AVAILABLE:
+        return None
+
+    # Get data for one sequence position from one batch item
+    # Shape: (D, T)
+    data = post_activation_history[batch_idx, seq_idx].detach().cpu().numpy()
+    D, T = data.shape
+
+    # Limit to n_neurons
+    n_neurons = min(n_neurons, D)
+    grid_size = int(np.sqrt(n_neurons))
+    n_neurons = grid_size * grid_size  # Make it a perfect square
+
+    # Sample neurons evenly across the range
+    neuron_indices = np.linspace(0, D - 1, n_neurons, dtype=int)
+
+    # Create figure
+    fig, axes = plt.subplots(
+        grid_size, grid_size,
+        figsize=(12, 12),
+        sharex=True,
+        sharey=True,
+    )
+    fig.suptitle(f'Neuron Activations over {T} Internal Ticks\n(seq_pos={seq_idx})', fontsize=14)
+
+    # Time axis
+    t = np.arange(T)
+
+    # Plot each neuron
+    for idx, (ax, neuron_idx) in enumerate(zip(axes.flat, neuron_indices)):
+        activation = data[neuron_idx]
+        ax.plot(t, activation, linewidth=1.0, color='steelblue')
+        ax.fill_between(t, 0, activation, alpha=0.3, color='steelblue')
+        ax.set_title(f'N{neuron_idx}', fontsize=8, pad=2)
+        ax.tick_params(axis='both', which='both', labelsize=6)
+        ax.set_xlim(0, T - 1)
+
+        # Add subtle grid
+        ax.grid(True, alpha=0.3, linewidth=0.5)
+
+        # Only show y-axis label on leftmost
+        if idx % grid_size != 0:
+            ax.set_yticklabels([])
+
+    # Common labels
+    fig.text(0.5, 0.02, 'Internal Tick (t)', ha='center', fontsize=10)
+    fig.text(0.02, 0.5, 'Activation', va='center', rotation='vertical', fontsize=10)
+
+    plt.tight_layout(rect=[0.03, 0.03, 1, 0.96])
+
+    return fig
+
+
+def create_sync_matrix_heatmap(
+    sync_matrix: torch.Tensor,
+    seq_idx: int = 0,
+    batch_idx: int = 0,
+) -> plt.Figure:
+    """
+    Create a heatmap visualization of the synchronization matrix.
+
+    Args:
+        sync_matrix: (B, S, D, D) tensor
+        seq_idx: Which sequence position to visualize
+        batch_idx: Which batch item to visualize
+
+    Returns:
+        matplotlib Figure with heatmap
+    """
+    if not WANDB_AVAILABLE:
+        return None
+
+    # Get data for one sequence position
+    data = sync_matrix[batch_idx, seq_idx].detach().cpu().numpy()
+
+    fig, ax = plt.subplots(figsize=(10, 10))
+    im = ax.imshow(data, cmap='RdBu_r', aspect='auto')
+    ax.set_title(f'Synchronization Matrix S_t (seq_pos={seq_idx})', fontsize=12)
+    ax.set_xlabel('Neuron j')
+    ax.set_ylabel('Neuron i')
+    plt.colorbar(im, ax=ax, label='Sync strength')
+
+    plt.tight_layout()
+    return fig
 
 
 class PredictionTrainer:
@@ -368,9 +493,9 @@ class PredictionTrainer:
         return (context_features, targets), S
 
     def _setup_loss_fn(self):
-        """Setup the prediction loss function."""
-        from pem.prediction_module import PredictionLoss
-        self.loss_fn = PredictionLoss(
+        """Setup the CTM loss function following the paper."""
+        from pem.ctm_prediction_module import CTMLoss
+        self.loss_fn = CTMLoss(
             immediate_weight=1.0,
             shortterm_weight=0.5,
             longterm_weight=0.3,
@@ -381,14 +506,32 @@ class PredictionTrainer:
 
     def compute_loss(
         self,
-        predictions: dict,
+        all_outputs: list,  # List of y_t at each tick
         targets: dict,
     ) -> Tuple[torch.Tensor, dict]:
-        """Compute prediction loss at all horizons."""
-        return self.loss_fn(predictions, targets)
+        """
+        Compute CTM loss across all internal ticks.
 
-    def train_step(self, batch: object) -> dict:
-        """Single training step."""
+        Following the paper:
+        - Compute loss at each tick
+        - Find t1 = argmin(loss), t2 = argmax(certainty)
+        - Final loss = (L_t1 + L_t2) / 2
+        """
+        return self.loss_fn(
+            all_outputs,
+            targets,
+            self.prediction_module.readout_immediate,
+            self.prediction_module.readout_shortterm,
+            self.prediction_module.readout_longterm,
+        )
+
+    def train_step(self, batch: object, return_activations: bool = False) -> dict:
+        """Single training step.
+
+        Args:
+            batch: Input batch
+            return_activations: If True, include CTM activations in output for visualization
+        """
         texts, progress = self._unpack_batch(batch)
         prepared, seq_len = self._prepare_batch(texts)
         if prepared is None:
@@ -399,15 +542,17 @@ class PredictionTrainer:
                 "batch_tokens": 0,
                 "seq_len": seq_len,
                 "progress": progress,
+                "ctm_output": None,
             }
 
         context_features, targets = prepared
         autocast_ctx = torch.amp.autocast('cuda') if self.config.mixed_precision else nullcontext()
         with autocast_ctx:
-            # CTM prediction: features → evolved state → predictions
-            output = self.prediction_module(context_features)
-            predictions = output.predictions
-            loss, loss_dict = self.compute_loss(predictions, targets)
+            # CTM prediction with all tick outputs for proper CTM loss
+            output = self.prediction_module(context_features, return_all_ticks=True)
+
+            # CTM loss: compute at each tick, aggregate via min-loss and max-certainty
+            loss, loss_dict = self.compute_loss(output.all_outputs, targets)
 
         # Scale loss for gradient accumulation
         loss = loss / self.config.gradient_accumulation_steps
@@ -418,14 +563,28 @@ class PredictionTrainer:
         else:
             loss.backward()
 
-        return {
+        # Extract scalar values from loss_dict (some might be int tensors like t1, t2)
+        loss_values = {}
+        for k, v in loss_dict.items():
+            if torch.is_tensor(v):
+                loss_values[k] = v.item()
+            else:
+                loss_values[k] = v
+
+        result = {
             "loss": loss.item() * self.config.gradient_accumulation_steps,
-            **{k: v.item() for k, v in loss_dict.items()},
+            **loss_values,
             "skipped": 0,
             "batch_tokens": len(texts) * self.config.context_size,
             "seq_len": seq_len,
             "progress": progress,
         }
+
+        # Include CTM output for visualization if requested
+        if return_activations:
+            result["ctm_output"] = output
+
+        return result
 
     def eval_step(self, batch: object) -> dict:
         """Single evaluation step (no gradients)."""
@@ -444,13 +603,20 @@ class PredictionTrainer:
         autocast_ctx = torch.amp.autocast('cuda') if self.config.mixed_precision else nullcontext()
         with torch.no_grad():
             with autocast_ctx:
-                output = self.prediction_module(context_features)
-                predictions = output.predictions
-                loss, loss_dict = self.compute_loss(predictions, targets)
+                output = self.prediction_module(context_features, return_all_ticks=True)
+                loss, loss_dict = self.compute_loss(output.all_outputs, targets)
+
+        # Extract scalar values from loss_dict
+        loss_values = {}
+        for k, v in loss_dict.items():
+            if torch.is_tensor(v):
+                loss_values[k] = v.item()
+            else:
+                loss_values[k] = v
 
         return {
             "loss": loss.item(),
-            **{k: v.item() for k, v in loss_dict.items()},
+            **loss_values,
             "skipped": 0,
             "batch_tokens": len(texts) * self.config.context_size,
             "seq_len": seq_len,
@@ -476,12 +642,21 @@ class PredictionTrainer:
         seq_len_count = 0
 
         for batch_idx, batch in enumerate(dataloader):
+            # Determine if we should capture activations for visualization
+            should_log_activations = (
+                self.config.use_wandb and
+                WANDB_AVAILABLE and
+                self.config.wandb_log_activations_every > 0 and
+                (self.global_step + 1) % self.config.wandb_log_activations_every == 0
+            )
+
             # Training step
-            loss_dict = self.train_step(batch)
+            loss_dict = self.train_step(batch, return_activations=should_log_activations)
             skipped = loss_dict.pop("skipped", 0)
             batch_tokens = loss_dict.pop("batch_tokens", 0)
             seq_len = loss_dict.pop("seq_len", 0)
             progress = loss_dict.pop("progress", None)
+            ctm_output = loss_dict.pop("ctm_output", None)
 
             # Accumulate losses for logging
             for k, v in loss_dict.items():
@@ -528,25 +703,102 @@ class PredictionTrainer:
                     lr = self.optimizer.param_groups[0]["lr"]
                     grad_norm_value = float(grad_norm) if torch.is_tensor(grad_norm) else float(grad_norm)
                     progress_text = f"Progress: {progress * 100:.1f}% | " if progress is not None else ""
+                    # CTM-specific metrics
+                    avg_t1 = avg_loss.get('t1', 0)  # Average tick selected by min-loss
+                    avg_t2 = avg_loss.get('t2', 0)  # Average tick selected by max-certainty
+                    certainty = avg_loss.get('certainty_mean', 0)
+                    loss_final = avg_loss.get('loss_final', avg_loss['loss'])
+
                     logger.info(
                         f"Epoch {epoch} | Step {self.global_step} | "
                         f"Loss: {avg_loss['loss']:.4f} | "
-                        f"Immediate: {avg_loss.get('immediate_loss', 0):.4f} | "
-                        f"ShortTerm: {avg_loss.get('shortterm_loss', 0):.4f} | "
-                        f"LongTerm: {avg_loss.get('longterm_loss', 0):.4f} | "
+                        f"Loss_final: {loss_final:.4f} | "
+                        f"AvgTick: t1={avg_t1:.1f}, t2={avg_t2:.1f} | "
+                        f"Certainty: {certainty:.3f} | "
                         f"LR: {lr:.2e} | "
                         f"GradNorm: {grad_norm_value:.2f} | "
-                        f"SeqLen: {avg_seq_len:.1f} | "
-                        f"Throughput: {examples_per_sec:.2f} ex/s, {tokens_per_sec:.0f} tok/s | "
+                        f"Throughput: {tokens_per_sec:.0f} tok/s | "
                         f"{progress_text}"
-                        f"Batches: {batches_since_log} (skipped {skipped_since_log}) | "
                         f"Time: {elapsed:.1f}s"
                     )
+
+                    # Wandb logging
+                    if self.config.use_wandb and WANDB_AVAILABLE:
+                        wandb_log = {
+                            "train/loss": avg_loss['loss'],
+                            "train/loss_t1": avg_loss.get('loss_t1', 0),
+                            "train/loss_t2": avg_loss.get('loss_t2', 0),
+                            "train/loss_final": loss_final,
+                            "train/avg_t1": avg_t1,  # Average tick selected by min-loss
+                            "train/avg_t2": avg_t2,  # Average tick selected by max-certainty
+                            "train/certainty_mean": certainty,
+                            "train/certainty_final": avg_loss.get('certainty_final', 0),
+                            "train/lr": lr,
+                            "train/grad_norm": grad_norm_value,
+                            "train/tokens_per_sec": tokens_per_sec,
+                            "train/examples_per_sec": examples_per_sec,
+                            "train/epoch": epoch,
+                        }
+
+                        # Log per-tick losses
+                        for t in range(self.config.T):
+                            tick_loss = avg_loss.get(f'loss_tick_{t}', None)
+                            if tick_loss is not None:
+                                wandb_log[f"train/loss_tick_{t}"] = tick_loss
+
+                        if progress is not None:
+                            wandb_log["train/progress"] = progress
+
+                        # Log activation visualizations if we captured them
+                        if ctm_output is not None:
+                            try:
+                                # Create neuron activation grid
+                                activation_fig = create_neuron_activation_grid(
+                                    ctm_output.post_activation_history,
+                                    n_neurons=self.config.wandb_activation_grid_size,
+                                    seq_idx=0,  # First sequence position
+                                    batch_idx=0,
+                                )
+                                if activation_fig is not None:
+                                    wandb_log["activations/neuron_grid"] = wandb.Image(activation_fig)
+                                    plt.close(activation_fig)
+
+                                # Create sync matrix heatmap
+                                sync_fig = create_sync_matrix_heatmap(
+                                    ctm_output.sync_matrix,
+                                    seq_idx=0,
+                                    batch_idx=0,
+                                )
+                                if sync_fig is not None:
+                                    wandb_log["activations/sync_matrix"] = wandb.Image(sync_fig)
+                                    plt.close(sync_fig)
+
+                                # Log activation statistics
+                                Z = ctm_output.post_activation_history
+                                wandb_log["activations/mean"] = Z.mean().item()
+                                wandb_log["activations/std"] = Z.std().item()
+                                wandb_log["activations/max"] = Z.max().item()
+                                wandb_log["activations/min"] = Z.min().item()
+
+                            except Exception as e:
+                                logger.warning(f"Failed to log activations: {e}")
+
+                        wandb.log(wandb_log, step=self.global_step)
 
                 # Evaluation
                 if val_loader is not None and self.config.eval_every_n_steps > 0:
                     if self.global_step % self.config.eval_every_n_steps == 0:
                         eval_loss = self.evaluate_steps(val_loader, f"step {self.global_step}")
+
+                        # Log eval to wandb
+                        if self.config.use_wandb and WANDB_AVAILABLE:
+                            wandb.log({
+                                "eval/loss": eval_loss['loss'],
+                                "eval/immediate_loss": eval_loss.get('immediate_loss', 0),
+                                "eval/shortterm_loss": eval_loss.get('shortterm_loss', 0),
+                                "eval/longterm_loss": eval_loss.get('longterm_loss', 0),
+                            }, step=self.global_step)
+
                         if eval_loss['loss'] < self.best_loss:
                             self.best_loss = eval_loss['loss']
                             self.save_checkpoint("best")
@@ -694,6 +946,38 @@ class PredictionTrainer:
             seed=self.config.seed,
         )
 
+        # Initialize wandb
+        if self.config.use_wandb and WANDB_AVAILABLE:
+            wandb_config = {
+                "d_neurons": self.config.d_neurons,
+                "M": self.config.M,
+                "T": self.config.T,
+                "d_sync_out": self.config.d_sync_out,
+                "d_sync_action": self.config.d_sync_action,
+                "synapse_hidden": self.config.synapse_hidden,
+                "nlm_hidden": self.config.nlm_hidden,
+                "feature_dim": self.config.feature_dim,
+                "context_size": self.config.context_size,
+                "immediate_horizon": self.config.immediate_horizon,
+                "shortterm_horizon": self.config.shortterm_horizon,
+                "longterm_horizon": self.config.longterm_horizon,
+                "batch_size": self.config.batch_size,
+                "learning_rate": self.config.learning_rate,
+                "num_epochs": self.config.num_epochs,
+                "num_train_files": len(train_files),
+                "num_val_files": len(val_files),
+            }
+            wandb.init(
+                project=self.config.wandb_project,
+                name=self.config.wandb_run_name,
+                config=wandb_config,
+            )
+            # Watch model for gradient logging
+            wandb.watch(self.prediction_module, log="gradients", log_freq=100)
+            logger.info(f"Wandb initialized: {wandb.run.name}")
+        elif self.config.use_wandb and not WANDB_AVAILABLE:
+            logger.warning("Wandb requested but not available. Install with: pip install wandb matplotlib")
+
         logger.info("=" * 60)
         logger.info("Starting Training")
         logger.info("=" * 60)
@@ -702,6 +986,7 @@ class PredictionTrainer:
         logger.info(f"Epochs: {self.config.num_epochs}")
         logger.info(f"Batch size: {self.config.batch_size}")
         logger.info(f"Context size: {self.config.context_size}")
+        logger.info(f"CTM: D={self.config.d_neurons}, M={self.config.M}, T={self.config.T}")
         logger.info(f"Horizons: immediate={self.config.immediate_horizon}, "
                    f"shortterm={self.config.shortterm_horizon}, "
                    f"longterm={self.config.longterm_horizon}")
@@ -773,6 +1058,10 @@ class PredictionTrainer:
         self.save_checkpoint("final")
         logger.info("\nTraining complete!")
 
+        # Finish wandb
+        if self.config.use_wandb and WANDB_AVAILABLE:
+            wandb.finish()
+
 
 def main():
     parser = argparse.ArgumentParser(description="Train PEM CTM Prediction Module")
@@ -808,7 +1097,7 @@ def main():
                        help="Number of neurons (D in paper)")
     parser.add_argument("--M", type=int, default=16,
                        help="Pre-activation history length")
-    parser.add_argument("--T", type=int, default=8,
+    parser.add_argument("--T", type=int, default=20,
                        help="Number of internal thinking ticks")
     parser.add_argument("--d_sync_out", type=int, default=256,
                        help="Number of sync pairs for output")
@@ -844,6 +1133,18 @@ def main():
     parser.add_argument("--no_mixed_precision", action="store_true",
                        help="Disable mixed precision training")
 
+    # Wandb arguments
+    parser.add_argument("--no_wandb", action="store_true",
+                       help="Disable wandb logging")
+    parser.add_argument("--wandb_project", type=str, default="pem-ctm-prediction",
+                       help="Wandb project name")
+    parser.add_argument("--wandb_run_name", type=str, default=None,
+                       help="Wandb run name (auto-generated if not specified)")
+    parser.add_argument("--wandb_log_activations_every", type=int, default=100,
+                       help="Log activation visualizations every N steps (0 to disable)")
+    parser.add_argument("--wandb_activation_grid_size", type=int, default=64,
+                       help="Number of neurons to show in activation grid (must be perfect square)")
+
     args = parser.parse_args()
 
     # Create config
@@ -875,6 +1176,12 @@ def main():
         eval_every_n_epochs=args.eval_every,
         eval_every_n_steps=args.eval_every_steps,
         eval_log_every_n_batches=args.eval_log_every,
+        # Wandb
+        use_wandb=not args.no_wandb,
+        wandb_project=args.wandb_project,
+        wandb_run_name=args.wandb_run_name,
+        wandb_log_activations_every=args.wandb_log_activations_every,
+        wandb_activation_grid_size=args.wandb_activation_grid_size,
     )
 
     # Find text files

@@ -549,3 +549,311 @@ def create_ctm_prediction(
         **kwargs,
     )
     return CTMPrediction(config)
+
+
+class CTMLoss(nn.Module):
+    """
+    CTM Loss Function following the paper.
+
+    The CTM produces outputs at each internal tick t. Instead of only using
+    the last tick, we dynamically aggregate from:
+    - t_1 = argmin(L) : tick with minimum loss
+    - t_2 = argmax(C) : tick with maximum certainty
+
+    Final loss = (L_{t_1} + L_{t_2}) / 2
+
+    For feature prediction (vs classification), we adapt certainty:
+    - Paper uses: C_t = 1 - normalized_entropy(logits)
+    - We use: C_t = prediction_confidence (based on prediction consistency)
+    """
+
+    def __init__(
+        self,
+        immediate_weight: float = 1.0,
+        shortterm_weight: float = 0.5,
+        longterm_weight: float = 0.3,
+        use_cosine: bool = True,
+        use_mse: bool = True,
+        mse_weight: float = 0.1,
+    ):
+        super().__init__()
+        self.immediate_weight = immediate_weight
+        self.shortterm_weight = shortterm_weight
+        self.longterm_weight = longterm_weight
+        self.use_cosine = use_cosine
+        self.use_mse = use_mse
+        self.mse_weight = mse_weight
+
+    def compute_scale_loss(
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        valid: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute loss for a single scale."""
+        if not valid.any():
+            return torch.tensor(0.0, device=pred.device)
+
+        pred_valid = pred[valid]
+        target_valid = target[valid]
+
+        loss = 0.0
+
+        if self.use_cosine:
+            cos_sim = F.cosine_similarity(pred_valid, target_valid, dim=-1)
+            loss = loss + (1 - cos_sim).mean()
+
+        if self.use_mse:
+            pred_norm = F.normalize(pred_valid, dim=-1)
+            target_norm = F.normalize(target_valid, dim=-1)
+            loss = loss + self.mse_weight * F.mse_loss(pred_norm, target_norm)
+
+        return loss
+
+    def compute_tick_loss(
+        self,
+        y_t: torch.Tensor,  # (B, S, d_model) output at tick t
+        targets: Dict[str, torch.Tensor],
+        readout_immediate: nn.Module,
+        readout_shortterm: nn.Module,
+        readout_longterm: nn.Module,
+        return_breakdown: bool = False,
+    ) -> torch.Tensor:
+        """Compute loss at a single internal tick."""
+        # Generate predictions from tick output
+        pred_immediate = readout_immediate(y_t)
+        pred_shortterm = readout_shortterm(y_t)
+        pred_longterm = readout_longterm(y_t)
+
+        # Compute loss for each scale
+        loss_immediate = self.compute_scale_loss(
+            pred_immediate, targets['immediate'], targets['immediate_valid']
+        )
+        loss_shortterm = self.compute_scale_loss(
+            pred_shortterm, targets['shortterm'], targets['shortterm_valid']
+        )
+        loss_longterm = self.compute_scale_loss(
+            pred_longterm, targets['longterm'], targets['longterm_valid']
+        )
+
+        # Weighted sum
+        total = (
+            self.immediate_weight * loss_immediate +
+            self.shortterm_weight * loss_shortterm +
+            self.longterm_weight * loss_longterm
+        )
+
+        if return_breakdown:
+            return total, {
+                'immediate_loss': loss_immediate,
+                'shortterm_loss': loss_shortterm,
+                'longterm_loss': loss_longterm,
+            }
+        return total
+
+    def compute_certainty(
+        self,
+        y_t: torch.Tensor,  # (B, S, d_model)
+        all_outputs_so_far: List[torch.Tensor],  # All outputs up to and including y_t
+    ) -> torch.Tensor:
+        """
+        Compute certainty for feature predictions.
+
+        For classification, certainty = 1 - normalized_entropy.
+        For feature prediction, we measure how much the predictions have "settled":
+        - Low variance across recent ticks = high certainty
+        - High variance = low certainty (still exploring)
+
+        This is better than just consecutive similarity because it captures
+        whether the model has truly converged vs oscillating.
+        """
+        n_outputs = len(all_outputs_so_far)
+
+        if n_outputs < 2:
+            # First tick: low certainty (haven't explored yet)
+            return torch.tensor(0.1, device=y_t.device)
+
+        # Use last few ticks to measure stability
+        window = min(n_outputs, 4)  # Look at last 4 ticks
+        recent = torch.stack(all_outputs_so_far[-window:], dim=0)  # (window, B, S, d_model)
+
+        # Compute variance across ticks
+        # High variance = still changing = low certainty
+        mean_output = recent.mean(dim=0)  # (B, S, d_model)
+        variance = ((recent - mean_output) ** 2).mean()  # scalar
+
+        # Also measure rate of change (derivative)
+        if n_outputs >= 2:
+            y_prev = all_outputs_so_far[-2]
+            change = (y_t - y_prev).norm(dim=-1).mean()
+        else:
+            change = torch.tensor(1.0, device=y_t.device)
+
+        # Combine: low variance + low change = high certainty
+        # Use exponential scaling so certainty stays in [0, 1]
+        # Scale factors tuned so early ticks have low certainty
+        variance_certainty = torch.exp(-variance * 10.0)  # High variance -> low certainty
+        change_certainty = torch.exp(-change * 5.0)  # High change -> low certainty
+
+        certainty = 0.5 * variance_certainty + 0.5 * change_certainty
+
+        return certainty
+
+    def forward(
+        self,
+        all_outputs: List[torch.Tensor],  # [y_1, y_2, ..., y_T] each (B, S, d_model)
+        targets: Dict[str, torch.Tensor],
+        readout_immediate: nn.Module,
+        readout_shortterm: nn.Module,
+        readout_longterm: nn.Module,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """
+        Compute CTM loss across all internal ticks.
+
+        Returns:
+            total_loss: Scalar loss
+            loss_dict: Breakdown for logging
+        """
+        T = len(all_outputs)
+        device = all_outputs[0].device
+
+        # Compute loss and certainty at each tick
+        losses = []
+        certainties = []
+
+        for t, y_t in enumerate(all_outputs):
+            # Loss at tick t
+            L_t = self.compute_tick_loss(
+                y_t, targets,
+                readout_immediate, readout_shortterm, readout_longterm
+            )
+            losses.append(L_t)
+
+            # Certainty at tick t (based on all outputs so far)
+            outputs_so_far = all_outputs[:t + 1]
+            C_t = self.compute_certainty(y_t, outputs_so_far)
+            certainties.append(C_t)
+
+        losses = torch.stack(losses)  # (T,)
+        certainties = torch.stack(certainties)  # (T,)
+
+        # Find t_1 = argmin(L) and t_2 = argmax(C)
+        t1 = losses.argmin()
+        t2 = certainties.argmax()
+
+        # Final loss = (L_{t1} + L_{t2}) / 2
+        L_t1 = losses[t1]
+        L_t2 = losses[t2]
+        total_loss = (L_t1 + L_t2) / 2
+
+        # Also compute final tick loss for comparison
+        L_final = losses[-1]
+
+        # Get per-scale breakdown for final tick (for logging)
+        _, scale_breakdown = self.compute_tick_loss(
+            all_outputs[-1], targets,
+            readout_immediate, readout_shortterm, readout_longterm,
+            return_breakdown=True,
+        )
+
+        # Build loss dict for logging
+        loss_dict = {
+            'loss': total_loss.detach(),
+            'loss_t1': L_t1.detach(),
+            'loss_t2': L_t2.detach(),
+            'loss_final': L_final.detach(),
+            't1': t1.detach(),
+            't2': t2.detach(),
+            'certainty_mean': certainties.mean().detach(),
+            'certainty_final': certainties[-1].detach(),
+            # Per-scale losses (from final tick)
+            'immediate_loss': scale_breakdown['immediate_loss'].detach(),
+            'shortterm_loss': scale_breakdown['shortterm_loss'].detach(),
+            'longterm_loss': scale_breakdown['longterm_loss'].detach(),
+        }
+
+        # Add per-tick losses for analysis
+        for t in range(T):
+            loss_dict[f'loss_tick_{t}'] = losses[t].detach()
+
+        return total_loss, loss_dict
+
+
+class CTMLossSimple(nn.Module):
+    """
+    Simplified CTM loss that works with final predictions dict.
+
+    Uses the paper's min-loss / max-certainty approach but computes
+    from the final predictions dictionary (not all tick outputs).
+
+    For training when you don't need full tick-by-tick analysis.
+    """
+
+    def __init__(
+        self,
+        immediate_weight: float = 1.0,
+        shortterm_weight: float = 0.5,
+        longterm_weight: float = 0.3,
+        use_cosine: bool = True,
+        use_mse: bool = True,
+        mse_weight: float = 0.1,
+    ):
+        super().__init__()
+        self.immediate_weight = immediate_weight
+        self.shortterm_weight = shortterm_weight
+        self.longterm_weight = longterm_weight
+        self.use_cosine = use_cosine
+        self.use_mse = use_mse
+        self.mse_weight = mse_weight
+
+    def forward(
+        self,
+        predictions: Dict[str, torch.Tensor],
+        targets: Dict[str, torch.Tensor],
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """
+        Compute prediction loss from final predictions.
+
+        This is the simple version that just uses the final tick's predictions.
+        For full CTM loss with all ticks, use CTMLoss instead.
+        """
+        loss_dict = {}
+        total_loss = 0.0
+
+        scales = [
+            ('immediate', self.immediate_weight),
+            ('shortterm', self.shortterm_weight),
+            ('longterm', self.longterm_weight),
+        ]
+
+        for scale_name, weight in scales:
+            pred = predictions[scale_name]
+            target = targets[scale_name]
+            valid = targets[f'{scale_name}_valid']
+
+            if not valid.any():
+                loss_dict[f'{scale_name}_loss'] = torch.tensor(0.0, device=pred.device)
+                continue
+
+            pred_valid = pred[valid]
+            target_valid = target[valid]
+
+            scale_loss = 0.0
+
+            if self.use_cosine:
+                cos_sim = F.cosine_similarity(pred_valid, target_valid, dim=-1)
+                cosine_loss = (1 - cos_sim).mean()
+                scale_loss = scale_loss + cosine_loss
+                loss_dict[f'{scale_name}_cosine'] = cosine_loss.detach()
+
+            if self.use_mse:
+                pred_norm = F.normalize(pred_valid, dim=-1)
+                target_norm = F.normalize(target_valid, dim=-1)
+                mse_loss = F.mse_loss(pred_norm, target_norm)
+                scale_loss = scale_loss + self.mse_weight * mse_loss
+                loss_dict[f'{scale_name}_mse'] = mse_loss.detach()
+
+            loss_dict[f'{scale_name}_loss'] = scale_loss.detach()
+            total_loss = total_loss + weight * scale_loss
+
+        return total_loss, loss_dict
