@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 """
-Training script for the PEM Prediction Module.
+Training script for the PEM CTM Prediction Module.
 
-This script trains the prediction module to predict future token features
-at multiple time horizons (immediate, short-term, long-term).
+This script trains the CTM-based prediction module to predict future token features
+at multiple time horizons (immediate, short-term, long-term) using continuous
+state evolution.
 
 Usage:
     python -m pem.train_prediction --data_dir /path/to/text/files --num_books 1000
 
 Requirements:
     - torch
-    - transformers (for Llama tokenizer)
+    - transformers (for tokenizer)
     - Janus Pro model (for feature extraction)
 """
 
@@ -38,7 +39,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class TrainingConfig:
-    """Configuration for prediction module training."""
+    """Configuration for CTM prediction module training."""
     # Data
     data_dir: str = "/media/alexander/Tank1/text_files/text_files/"
     num_books: int = 1000
@@ -46,11 +47,18 @@ class TrainingConfig:
     seed: int = 42
     val_fraction: float = 0.05
 
-    # Model
-    tokenizer_name: str = "meta-llama/Meta-Llama-3-8B"
+    # Model - use same tokenizer as feature extractor for consistency
     feature_extractor: str = "deepseek-ai/Janus-Pro-1B"
     feature_dim: int = 1536
-    sync_dim: int = 512  # Mock sync dimension (would come from CTM)
+
+    # CTM architecture (faithful to original paper)
+    d_neurons: int = 512              # D - number of neurons
+    M: int = 16                       # Pre-activation history length
+    T: int = 8                        # Number of internal thinking ticks
+    d_sync_out: int = 256             # Sync pairs for output
+    d_sync_action: int = 256          # Sync pairs for attention
+    synapse_hidden: int = 1024        # Hidden dim in synapse U-NET
+    nlm_hidden: int = 64              # Hidden dim in per-neuron MLPs
 
     # Prediction horizons
     immediate_horizon: int = 8
@@ -71,7 +79,9 @@ class TrainingConfig:
     save_every_n_steps: int = 500
     log_every_n_steps: int = 1
     eval_max_batches: int = 200
-    eval_every_n_epochs: int = 1
+    eval_every_n_epochs: int = 0
+    eval_every_n_steps: int = 100
+    eval_log_every_n_batches: int = 10
 
     # Hardware
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
@@ -146,8 +156,9 @@ class BookDataset(IterableDataset):
     """
     Iterable dataset that streams text chunks from text files.
 
-    Uses Llama tokenizer for consistent chunking, yields text strings
-    that will be re-tokenized by Janus for feature extraction.
+    Uses tokenizer for consistent chunking, yields text strings
+    for feature extraction. Using the same tokenizer throughout
+    ensures consistent token boundaries.
     """
 
     def __init__(
@@ -160,6 +171,7 @@ class BookDataset(IterableDataset):
         shuffle: bool = True,
     ):
         self.file_paths = file_paths
+        self.total_files = max(1, len(file_paths))
         self.tokenizer = tokenizer
         self.context_size = context_size
         self.longterm_horizon = longterm_horizon
@@ -173,7 +185,7 @@ class BookDataset(IterableDataset):
         if self.shuffle:
             random.shuffle(file_paths)
 
-        for file_path in file_paths:
+        for file_idx, file_path in enumerate(file_paths):
             text = load_and_clean_text(file_path, self.min_text_length)
             if text is None:
                 continue
@@ -189,12 +201,17 @@ class BookDataset(IterableDataset):
                 chunk_tokens = tokens[i:i + required_length]
                 # Decode back to text for Janus to re-tokenize
                 chunk_text = self.tokenizer.decode(chunk_tokens, skip_special_tokens=True)
-                yield chunk_text
+                progress = (file_idx + 1) / self.total_files
+                yield chunk_text, progress
 
 
-def collate_fn(batch: List[str]) -> List[str]:
+def collate_fn(batch: List[object]) -> dict:
     """Collate text chunks into a batch."""
-    return batch
+    if batch and isinstance(batch[0], tuple):
+        texts = [item[0] for item in batch]
+        progress = max(item[1] for item in batch)
+        return {"texts": texts, "progress": progress}
+    return {"texts": batch, "progress": None}
 
 
 class PredictionTrainer:
@@ -217,10 +234,10 @@ class PredictionTrainer:
         self.scaler = torch.amp.GradScaler('cuda') if config.mixed_precision else None
 
     def _setup_tokenizer(self):
-        """Load tokenizer."""
-        logger.info(f"Loading tokenizer: {self.config.tokenizer_name}")
+        """Load tokenizer from the same model as feature extractor for consistency."""
+        logger.info(f"Loading tokenizer from: {self.config.feature_extractor}")
         self.tokenizer = AutoTokenizer.from_pretrained(
-            self.config.tokenizer_name,
+            self.config.feature_extractor,
             trust_remote_code=True,
         )
         if self.tokenizer.pad_token is None:
@@ -242,20 +259,27 @@ class PredictionTrainer:
         logger.info("Feature extractor loaded and frozen")
 
     def _setup_prediction_module(self):
-        """Initialize prediction module."""
-        logger.info("Initializing prediction module")
-        from pem import PredictionModule, PredictionConfig, PredictionTargets
+        """Initialize CTM prediction module (faithful to original paper)."""
+        logger.info("Initializing CTM prediction module")
+        from pem.ctm_prediction_module import CTMPrediction, CTMPredictionConfig
+        from pem import PredictionTargets
 
-        pred_config = PredictionConfig(
-            sync_pairs=self.config.sync_dim,
+        ctm_config = CTMPredictionConfig(
             d_model=self.config.feature_dim,
-            n_head=8,
+            d_neurons=self.config.d_neurons,
+            d_sync_out=self.config.d_sync_out,
+            d_sync_action=self.config.d_sync_action,
+            M=self.config.M,
+            T=self.config.T,
+            synapse_hidden=self.config.synapse_hidden,
+            nlm_hidden=self.config.nlm_hidden,
+            # Horizons
             immediate_horizon=self.config.immediate_horizon,
             shortterm_horizon=self.config.shortterm_horizon,
             longterm_horizon=self.config.longterm_horizon,
         )
 
-        self.prediction_module = PredictionModule(pred_config).to(self.device)
+        self.prediction_module = CTMPrediction(ctm_config).to(self.device)
         self.target_computer = PredictionTargets(
             immediate_horizon=self.config.immediate_horizon,
             shortterm_horizon=self.config.shortterm_horizon,
@@ -265,7 +289,9 @@ class PredictionTrainer:
         # Count parameters
         num_params = sum(p.numel() for p in self.prediction_module.parameters())
         trainable = sum(p.numel() for p in self.prediction_module.parameters() if p.requires_grad)
-        logger.info(f"Prediction module: {num_params:,} params ({trainable:,} trainable)")
+        logger.info(f"CTM Prediction module: {num_params:,} params ({trainable:,} trainable)")
+        logger.info(f"  Neurons: {self.config.d_neurons}, M: {self.config.M}, T: {self.config.T}")
+        logger.info(f"  Sync pairs: out={self.config.d_sync_out}, action={self.config.d_sync_action}")
 
     def _setup_optimizer(self):
         """Setup optimizer and scheduler."""
@@ -276,11 +302,7 @@ class PredictionTrainer:
         )
 
     def extract_features_from_text(self, texts: List[str]) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Extract features and padding mask using frozen feature extractor.
-
-        We decode Llama tokens back to text and re-encode with Janus tokenizer
-        to ensure proper feature extraction.
-        """
+        """Extract features and padding mask using frozen feature extractor."""
         with torch.no_grad():
             self.feature_extractor._ensure_loaded()
             janus_tokenizer = self.feature_extractor.tokenizer
@@ -306,8 +328,20 @@ class PredictionTrainer:
 
         return features, attention_mask
 
-    def _prepare_batch(self, batch: List[str]) -> Tuple[Optional[Tuple[torch.Tensor, torch.Tensor, dict]], int]:
-        """Prepare inputs and targets for a batch."""
+    def _unpack_batch(self, batch: object) -> Tuple[List[str], Optional[float]]:
+        """Extract text and progress from a collated batch."""
+        if isinstance(batch, dict):
+            texts = batch.get("texts", [])
+            progress = batch.get("progress")
+            return texts, progress
+        return batch, None
+
+    def _prepare_batch(self, batch: List[str]) -> Tuple[Optional[Tuple[torch.Tensor, dict]], int]:
+        """Prepare inputs and targets for a batch.
+
+        CTM prediction doesn't need external sync - it generates its own
+        internal state from features.
+        """
         B = len(batch)
         features, padding_mask = self.extract_features_from_text(batch)
         _, S, _ = features.shape
@@ -316,11 +350,6 @@ class PredictionTrainer:
             return None, S
 
         context_features = features[:, :self.config.context_size]
-
-        sync = torch.randn(
-            B, self.config.context_size, self.config.sync_dim,
-            device=self.device, dtype=torch.float32
-        )
 
         targets_full = self.target_computer.compute_targets_efficient(
             features,
@@ -336,7 +365,7 @@ class PredictionTrainer:
             'longterm_valid': targets_full['longterm_valid'][:, :self.config.context_size],
         }
 
-        return (context_features, sync, targets), S
+        return (context_features, targets), S
 
     def _setup_loss_fn(self):
         """Setup the prediction loss function."""
@@ -358,17 +387,26 @@ class PredictionTrainer:
         """Compute prediction loss at all horizons."""
         return self.loss_fn(predictions, targets)
 
-    def train_step(self, batch: List[str]) -> dict:
+    def train_step(self, batch: object) -> dict:
         """Single training step."""
-        prepared, seq_len = self._prepare_batch(batch)
+        texts, progress = self._unpack_batch(batch)
+        prepared, seq_len = self._prepare_batch(texts)
         if prepared is None:
             logger.warning(f"Sequence too short: {seq_len} tokens, skipping batch")
-            return {"loss": 0.0, "skipped": 1, "batch_tokens": 0, "seq_len": seq_len}
+            return {
+                "loss": 0.0,
+                "skipped": 1,
+                "batch_tokens": 0,
+                "seq_len": seq_len,
+                "progress": progress,
+            }
 
-        context_features, sync, targets = prepared
+        context_features, targets = prepared
         autocast_ctx = torch.amp.autocast('cuda') if self.config.mixed_precision else nullcontext()
         with autocast_ctx:
-            predictions = self.prediction_module(sync, context_features)
+            # CTM prediction: features → evolved state → predictions
+            output = self.prediction_module(context_features)
+            predictions = output.predictions
             loss, loss_dict = self.compute_loss(predictions, targets)
 
         # Scale loss for gradient accumulation
@@ -384,32 +422,42 @@ class PredictionTrainer:
             "loss": loss.item() * self.config.gradient_accumulation_steps,
             **{k: v.item() for k, v in loss_dict.items()},
             "skipped": 0,
-            "batch_tokens": len(batch) * self.config.context_size,
+            "batch_tokens": len(texts) * self.config.context_size,
             "seq_len": seq_len,
+            "progress": progress,
         }
 
-    def eval_step(self, batch: List[str]) -> dict:
+    def eval_step(self, batch: object) -> dict:
         """Single evaluation step (no gradients)."""
-        prepared, seq_len = self._prepare_batch(batch)
+        texts, progress = self._unpack_batch(batch)
+        prepared, seq_len = self._prepare_batch(texts)
         if prepared is None:
-            return {"loss": 0.0, "skipped": 1, "batch_tokens": 0, "seq_len": seq_len}
+            return {
+                "loss": 0.0,
+                "skipped": 1,
+                "batch_tokens": 0,
+                "seq_len": seq_len,
+                "progress": progress,
+            }
 
-        context_features, sync, targets = prepared
+        context_features, targets = prepared
         autocast_ctx = torch.amp.autocast('cuda') if self.config.mixed_precision else nullcontext()
         with torch.no_grad():
             with autocast_ctx:
-                predictions = self.prediction_module(sync, context_features)
+                output = self.prediction_module(context_features)
+                predictions = output.predictions
                 loss, loss_dict = self.compute_loss(predictions, targets)
 
         return {
             "loss": loss.item(),
             **{k: v.item() for k, v in loss_dict.items()},
             "skipped": 0,
-            "batch_tokens": len(batch) * self.config.context_size,
+            "batch_tokens": len(texts) * self.config.context_size,
             "seq_len": seq_len,
+            "progress": progress,
         }
 
-    def train_epoch(self, dataloader: DataLoader, epoch: int) -> dict:
+    def train_epoch(self, dataloader: DataLoader, epoch: int, val_loader: Optional[DataLoader] = None) -> dict:
         """Train for one epoch."""
         self.prediction_module.train()
 
@@ -433,6 +481,7 @@ class PredictionTrainer:
             skipped = loss_dict.pop("skipped", 0)
             batch_tokens = loss_dict.pop("batch_tokens", 0)
             seq_len = loss_dict.pop("seq_len", 0)
+            progress = loss_dict.pop("progress", None)
 
             # Accumulate losses for logging
             for k, v in loss_dict.items():
@@ -478,6 +527,7 @@ class PredictionTrainer:
                     avg_seq_len = seq_len_sum / max(seq_len_count, 1)
                     lr = self.optimizer.param_groups[0]["lr"]
                     grad_norm_value = float(grad_norm) if torch.is_tensor(grad_norm) else float(grad_norm)
+                    progress_text = f"Progress: {progress * 100:.1f}% | " if progress is not None else ""
                     logger.info(
                         f"Epoch {epoch} | Step {self.global_step} | "
                         f"Loss: {avg_loss['loss']:.4f} | "
@@ -488,9 +538,19 @@ class PredictionTrainer:
                         f"GradNorm: {grad_norm_value:.2f} | "
                         f"SeqLen: {avg_seq_len:.1f} | "
                         f"Throughput: {examples_per_sec:.2f} ex/s, {tokens_per_sec:.0f} tok/s | "
+                        f"{progress_text}"
                         f"Batches: {batches_since_log} (skipped {skipped_since_log}) | "
                         f"Time: {elapsed:.1f}s"
                     )
+
+                # Evaluation
+                if val_loader is not None and self.config.eval_every_n_steps > 0:
+                    if self.global_step % self.config.eval_every_n_steps == 0:
+                        eval_loss = self.evaluate_steps(val_loader, f"step {self.global_step}")
+                        if eval_loss['loss'] < self.best_loss:
+                            self.best_loss = eval_loss['loss']
+                            self.save_checkpoint("best")
+                            logger.info("New best model saved!")
                     last_log_time = time.time()
                     last_log_step = self.global_step
                     examples_since_log = 0
@@ -521,6 +581,11 @@ class PredictionTrainer:
 
     def evaluate_epoch(self, dataloader: DataLoader, epoch: int) -> dict:
         """Evaluate for one epoch."""
+        return self.evaluate_steps(dataloader, f"epoch {epoch}")
+
+    def evaluate_steps(self, dataloader: DataLoader, step_label: str) -> dict:
+        """Evaluate for a fixed number of steps."""
+        was_training = self.prediction_module.training
         self.prediction_module.eval()
         accumulated_loss = {}
         accumulation_count = 0
@@ -528,6 +593,7 @@ class PredictionTrainer:
         start_time = time.time()
         skipped = 0
         batches = 0
+        eval_target = self.config.eval_max_batches if self.config.eval_max_batches else None
 
         for batch_idx, batch in enumerate(dataloader):
             if self.config.eval_max_batches and batch_idx >= self.config.eval_max_batches:
@@ -537,11 +603,36 @@ class PredictionTrainer:
             skipped += loss_dict.pop("skipped", 0)
             loss_dict.pop("batch_tokens", None)
             loss_dict.pop("seq_len", None)
+            loss_dict.pop("progress", None)
 
             for k, v in loss_dict.items():
                 accumulated_loss[k] = accumulated_loss.get(k, 0) + v
             accumulation_count += 1
             batches += 1
+
+            if self.config.eval_log_every_n_batches > 0:
+                if (batch_idx + 1) % self.config.eval_log_every_n_batches == 0:
+                    if accumulation_count > 0:
+                        avg_loss = {k: v / accumulation_count for k, v in accumulated_loss.items()}
+                    else:
+                        avg_loss = {"loss": float('inf')}
+                    elapsed = time.time() - start_time
+                    if eval_target:
+                        progress = (batch_idx + 1) / eval_target * 100
+                        progress_text = f"Progress: {progress:.1f}% | "
+                        batch_text = f"Batch {batch_idx + 1}/{eval_target}"
+                    else:
+                        progress_text = ""
+                        batch_text = f"Batch {batch_idx + 1}"
+                    logger.info(
+                        f"Eval {step_label} | {batch_text} | "
+                        f"Loss: {avg_loss['loss']:.4f} | "
+                        f"Immediate: {avg_loss.get('immediate_loss', 0):.4f} | "
+                        f"ShortTerm: {avg_loss.get('shortterm_loss', 0):.4f} | "
+                        f"LongTerm: {avg_loss.get('longterm_loss', 0):.4f} | "
+                        f"{progress_text}"
+                        f"Time: {elapsed:.1f}s"
+                    )
 
         if accumulation_count > 0:
             avg_eval_loss = {
@@ -552,7 +643,7 @@ class PredictionTrainer:
 
         elapsed = time.time() - start_time
         logger.info(
-            f"Eval epoch {epoch} | "
+            f"Eval {step_label} | "
             f"Loss: {avg_eval_loss['loss']:.4f} | "
             f"Immediate: {avg_eval_loss.get('immediate_loss', 0):.4f} | "
             f"ShortTerm: {avg_eval_loss.get('shortterm_loss', 0):.4f} | "
@@ -560,6 +651,9 @@ class PredictionTrainer:
             f"Batches: {batches} (skipped {skipped}) | "
             f"Time: {elapsed:.1f}s"
         )
+
+        if was_training:
+            self.prediction_module.train()
 
         return avg_eval_loss
 
@@ -636,7 +730,7 @@ class PredictionTrainer:
                 tokenizer=self.tokenizer,
                 context_size=self.config.context_size,
                 longterm_horizon=self.config.longterm_horizon,
-                shuffle=False,
+                shuffle=True,
             )
             val_loader = DataLoader(
                 val_dataset,
@@ -655,14 +749,14 @@ class PredictionTrainer:
             logger.info("=" * 60)
 
             epoch_start = time.time()
-            avg_loss = self.train_epoch(dataloader, epoch)
+            avg_loss = self.train_epoch(dataloader, epoch, val_loader=val_loader)
             epoch_time = time.time() - epoch_start
 
             logger.info(f"\nEpoch {epoch} complete in {epoch_time:.1f}s")
             logger.info(f"Average loss: {avg_loss['loss']:.4f}")
 
             eval_loss = None
-            if val_loader and (epoch % self.config.eval_every_n_epochs == 0):
+            if val_loader is not None and self.config.eval_every_n_epochs > 0 and (epoch % self.config.eval_every_n_epochs == 0):
                 eval_loss = self.evaluate_epoch(val_loader, epoch)
 
             # Save best model (prefer eval loss if available)
@@ -681,7 +775,7 @@ class PredictionTrainer:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train PEM Prediction Module")
+    parser = argparse.ArgumentParser(description="Train PEM CTM Prediction Module")
 
     # Data arguments
     parser.add_argument("--data_dir", type=str,
@@ -697,16 +791,33 @@ def main():
                        help="Max number of eval batches per epoch (0 = no limit)")
     parser.add_argument("--eval_every", type=int, default=1,
                        help="Run evaluation every N epochs")
+    parser.add_argument("--eval_every_steps", type=int, default=100,
+                       help="Run evaluation every N optimizer steps")
+    parser.add_argument("--eval_log_every", type=int, default=10,
+                       help="Log evaluation progress every N eval batches")
     parser.add_argument("--seed", type=int, default=42,
                        help="Random seed for sampling/splitting")
 
     # Model arguments
-    parser.add_argument("--tokenizer", type=str,
-                       default="meta-llama/Meta-Llama-3-8B",
-                       help="Tokenizer to use")
     parser.add_argument("--feature_extractor", type=str,
                        default="deepseek-ai/Janus-Pro-1B",
-                       help="Feature extractor model")
+                       help="Feature extractor model (tokenizer derived from same model)")
+
+    # CTM architecture arguments (faithful to original paper)
+    parser.add_argument("--d_neurons", type=int, default=512,
+                       help="Number of neurons (D in paper)")
+    parser.add_argument("--M", type=int, default=16,
+                       help="Pre-activation history length")
+    parser.add_argument("--T", type=int, default=8,
+                       help="Number of internal thinking ticks")
+    parser.add_argument("--d_sync_out", type=int, default=256,
+                       help="Number of sync pairs for output")
+    parser.add_argument("--d_sync_action", type=int, default=256,
+                       help="Number of sync pairs for attention")
+    parser.add_argument("--synapse_hidden", type=int, default=1024,
+                       help="Hidden dim in synapse U-NET")
+    parser.add_argument("--nlm_hidden", type=int, default=64,
+                       help="Hidden dim in per-neuron MLPs")
 
     # Training arguments
     parser.add_argument("--batch_size", type=int, default=4,
@@ -742,8 +853,16 @@ def main():
         context_size=args.context_size,
         seed=args.seed,
         val_fraction=args.val_fraction,
-        tokenizer_name=args.tokenizer,
         feature_extractor=args.feature_extractor,
+        # CTM architecture
+        d_neurons=args.d_neurons,
+        M=args.M,
+        T=args.T,
+        d_sync_out=args.d_sync_out,
+        d_sync_action=args.d_sync_action,
+        synapse_hidden=args.synapse_hidden,
+        nlm_hidden=args.nlm_hidden,
+        # Training
         batch_size=args.batch_size,
         learning_rate=args.lr,
         num_epochs=args.epochs,
@@ -754,6 +873,8 @@ def main():
         mixed_precision=not args.no_mixed_precision,
         eval_max_batches=args.eval_max_batches,
         eval_every_n_epochs=args.eval_every,
+        eval_every_n_steps=args.eval_every_steps,
+        eval_log_every_n_batches=args.eval_log_every,
     )
 
     # Find text files

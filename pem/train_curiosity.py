@@ -46,8 +46,7 @@ class CuriosityTrainingConfig:
     num_books: int = 1000
     context_size: int = 256
 
-    # Models
-    tokenizer_name: str = "meta-llama/Meta-Llama-3-8B"
+    # Models - use same tokenizer as feature extractor for consistency
     feature_extractor: str = "deepseek-ai/Janus-Pro-1B"
     prediction_checkpoint: str = "checkpoints/prediction/best.pt"
     feature_dim: int = 1536
@@ -174,10 +173,10 @@ class CuriosityTrainer:
         self.scaler = torch.amp.GradScaler('cuda') if config.mixed_precision else None
 
     def _setup_tokenizer(self):
-        """Load tokenizer."""
-        logger.info(f"Loading tokenizer: {self.config.tokenizer_name}")
+        """Load tokenizer from the same model as feature extractor for consistency."""
+        logger.info(f"Loading tokenizer from: {self.config.feature_extractor}")
         self.tokenizer = AutoTokenizer.from_pretrained(
-            self.config.tokenizer_name,
+            self.config.feature_extractor,
             trust_remote_code=True,
         )
         if self.tokenizer.pad_token is None:
