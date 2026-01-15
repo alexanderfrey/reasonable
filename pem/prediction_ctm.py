@@ -20,12 +20,9 @@ class PredictionCTMOutput(NamedTuple):
     predictions: Dict[str, torch.Tensor]  # {immediate, shortterm, longterm} from final tick
     post_activations: torch.Tensor        # (B, S, D_neurons) for global sync
     sync_matrix: torch.Tensor             # (B, S, D_n, D_n)
-    all_tick_outputs: List[torch.Tensor]  # Raw CTM outputs at each tick
+    all_tick_outputs: List[torch.Tensor]  # Raw CTM outputs (y_t) at each tick - used for CTM loss
     certainty: torch.Tensor               # Confidence at final tick
     all_tick_activations: List[torch.Tensor]  # NLM activations at each tick
-    # CTM loss support: predictions at each internal tick
-    all_tick_predictions: List[Dict[str, torch.Tensor]]  # [{immediate, shortterm, longterm}, ...] per tick
-    all_tick_certainties: List[torch.Tensor]  # Certainty at each tick
 
 
 @dataclass
@@ -103,6 +100,12 @@ class PredictionCTM(CTMModule):
         """
         Generate predictions from features.
 
+        CTM Loss Note:
+            all_tick_outputs contains y_t (raw sync-derived outputs) at each tick.
+            These are used directly for CTM loss computation - no need to run
+            readout heads at every tick. The readouts are only applied to the
+            final tick to produce the actual predictions.
+
         Args:
             features: (B, S, d_model) from backbone
 
@@ -113,31 +116,23 @@ class PredictionCTM(CTMModule):
         input_features = self.input_projection(features)
 
         # 2. Run core CTM loop
+        # all_outputs contains y_t at each tick - used for CTM loss
         post_activations, sync_matrix, output, all_outputs, all_activations = self.core(input_features)
 
-        # 3. Generate multi-scale predictions at EACH tick (for CTM loss)
-        all_tick_predictions = []
-        all_tick_certainties = []
-        for t, tick_output in enumerate(all_outputs):
-            tick_preds = self.output_projection(tick_output)
-            all_tick_predictions.append(tick_preds)
-            # Compute certainty up to this tick
-            tick_certainty = self.core.compute_certainty(all_outputs[:t+1])
-            all_tick_certainties.append(tick_certainty)
+        # 3. Generate predictions from FINAL tick only
+        # Readout heads are task-specific projections, not part of CTM core
+        predictions = self.output_projection(output)
 
-        # Final predictions (from last tick)
-        predictions = all_tick_predictions[-1] if all_tick_predictions else self.output_projection(output)
-        certainty = all_tick_certainties[-1] if all_tick_certainties else self.core.compute_certainty(all_outputs)
+        # 4. Compute certainty from full output history
+        certainty = self.core.compute_certainty(all_outputs)
 
         return PredictionCTMOutput(
             predictions=predictions,
             post_activations=post_activations,
             sync_matrix=sync_matrix,
-            all_tick_outputs=all_outputs,
+            all_tick_outputs=all_outputs,  # y_t values for CTM loss
             certainty=certainty,
             all_tick_activations=all_activations,
-            all_tick_predictions=all_tick_predictions,
-            all_tick_certainties=all_tick_certainties,
         )
 
 

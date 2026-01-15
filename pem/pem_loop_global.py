@@ -68,6 +68,51 @@ from .global_sync import GlobalSyncModule, GlobalSyncConfig, GlobalSyncOutput
 from .prediction_module import PredictionTargets
 
 
+def compute_tick_certainties(
+    all_tick_outputs: List[torch.Tensor],
+    window: int = 4,
+) -> List[torch.Tensor]:
+    """
+    Compute certainty at each tick based on output stability.
+
+    Certainty is based on how stable the outputs are - low variance
+    and small changes indicate high certainty.
+
+    Args:
+        all_tick_outputs: List of y_t tensors at each tick
+        window: Number of recent ticks to consider for variance
+
+    Returns:
+        List of certainty values (scalar tensors) for each tick
+    """
+    certainties = []
+    for t in range(len(all_tick_outputs)):
+        if t == 0:
+            # First tick - low certainty (no history)
+            certainties.append(torch.tensor(0.1, device=all_tick_outputs[0].device))
+            continue
+
+        # Use recent outputs for stability measure
+        start = max(0, t - window + 1)
+        recent = torch.stack(all_tick_outputs[start:t+1], dim=0)
+
+        # Variance-based certainty
+        mean_output = recent.mean(dim=0)
+        variance = ((recent - mean_output) ** 2).mean()
+
+        # Change from previous tick
+        change = (all_tick_outputs[t] - all_tick_outputs[t-1]).norm(dim=-1).mean()
+
+        # Convert to certainty (high stability = high certainty)
+        variance_certainty = torch.exp(-variance * 10.0)
+        change_certainty = torch.exp(-change * 5.0)
+        certainty = 0.5 * variance_certainty + 0.5 * change_certainty
+
+        certainties.append(certainty)
+
+    return certainties
+
+
 def compute_ctm_loss(
     all_tick_losses: List[torch.Tensor],
     all_tick_certainties: List[torch.Tensor],
@@ -486,15 +531,12 @@ class PEMLoopGlobal(nn.Module):
         pred_out = output.prediction_output
         surp_out = output.surprise
 
-        # Stack all-tick predictions for each scale
-        pred_imm_stacked = torch.stack([p['immediate'] for p in pred_out.all_tick_predictions], dim=0)
-        pred_short_stacked = torch.stack([p['shortterm'] for p in pred_out.all_tick_predictions], dim=0)
-        pred_long_stacked = torch.stack([p['longterm'] for p in pred_out.all_tick_predictions], dim=0)
-        pred_cert_stacked = torch.stack(pred_out.all_tick_certainties, dim=0)
-
-        # Stack surprise all-tick data
+        # Stack all-tick data for CTM loss
+        # Prediction: all_tick_outputs (y_t) used directly for CTM loss
+        pred_outputs_stacked = torch.stack(pred_out.all_tick_outputs, dim=0)
+        # Surprise: all_tick_magnitudes (cheap scalar per tick)
         surp_mag_stacked = torch.stack(surp_out.all_tick_magnitudes, dim=0)
-        surp_cert_stacked = torch.stack(surp_out.all_tick_certainties, dim=0)
+        surp_outputs_stacked = torch.stack(surp_out.all_tick_outputs, dim=0)
 
         return (
             output.predictions['immediate'],
@@ -511,16 +553,13 @@ class PEMLoopGlobal(nn.Module):
             output.attention_weights,
             new_state.observation,
             new_state.cumulative_sync,
-            # Pass through activations for later reconstruction
+            # Pass through activations for global sync reconstruction
             torch.stack(pred_out.all_tick_activations, dim=0),
             torch.stack(surp_out.all_tick_activations, dim=0),
             # CTM loss data
-            pred_imm_stacked,
-            pred_short_stacked,
-            pred_long_stacked,
-            pred_cert_stacked,
-            surp_mag_stacked,
-            surp_cert_stacked,
+            pred_outputs_stacked,      # y_t at each tick (for prediction CTM loss)
+            surp_mag_stacked,          # magnitude at each tick (for surprise CTM loss)
+            surp_outputs_stacked,      # y_t at each tick (for surprise certainty)
         )
 
     def forward(
@@ -588,37 +627,26 @@ class PEMLoopGlobal(nn.Module):
                 (pred_imm, pred_short, pred_long, pred_cert, surp_mag, surp_raw, surp_cert,
                  sync, cross_sync, contrib, obs, attn_w, new_obs, new_cum_sync,
                  pred_acts_stacked, surp_acts_stacked,
-                 pred_imm_stacked, pred_short_stacked, pred_long_stacked, pred_cert_stacked,
-                 surp_mag_stacked, surp_cert_stacked) = ckpt_result
+                 pred_outputs_stacked, surp_mag_stacked, surp_outputs_stacked) = ckpt_result
 
-                # Reconstruct all-tick predictions for CTM loss
-                num_ticks = pred_imm_stacked.shape[0]
-                all_tick_predictions = [
-                    {
-                        'immediate': pred_imm_stacked[t],
-                        'shortterm': pred_short_stacked[t],
-                        'longterm': pred_long_stacked[t],
-                    }
-                    for t in range(num_ticks)
-                ]
-                all_tick_pred_certainties = [pred_cert_stacked[t] for t in range(num_ticks)]
+                # Reconstruct prediction output
+                # all_tick_outputs (y_t) used directly for CTM loss
+                num_pred_ticks = pred_outputs_stacked.shape[0]
+                all_tick_outputs = [pred_outputs_stacked[t] for t in range(num_pred_ticks)]
 
-                # Reconstruct prediction output with CTM loss data
                 pred_output = PredictionCTMOutput(
                     predictions={'immediate': pred_imm, 'shortterm': pred_short, 'longterm': pred_long},
                     post_activations=pred_acts_stacked[-1],  # Final tick
                     sync_matrix=torch.zeros(1, device=pred_imm.device),  # Placeholder
                     certainty=pred_cert,
-                    all_tick_outputs=[],  # Not needed for loss
+                    all_tick_outputs=all_tick_outputs,  # y_t at each tick for CTM loss
                     all_tick_activations=[pred_acts_stacked[i] for i in range(pred_acts_stacked.shape[0])],
-                    all_tick_predictions=all_tick_predictions,
-                    all_tick_certainties=all_tick_pred_certainties,
                 )
 
-                # Reconstruct surprise output with CTM loss data
+                # Reconstruct surprise output
                 num_surp_ticks = surp_mag_stacked.shape[0]
                 all_tick_magnitudes = [surp_mag_stacked[t] for t in range(num_surp_ticks)]
-                all_tick_surp_certainties = [surp_cert_stacked[t] for t in range(num_surp_ticks)]
+                surp_all_tick_outputs = [surp_outputs_stacked[t] for t in range(surp_outputs_stacked.shape[0])]
 
                 surp_output = SurpriseCTMOutput(
                     magnitude=surp_mag,
@@ -627,10 +655,9 @@ class PEMLoopGlobal(nn.Module):
                     post_activations=surp_acts_stacked[-1],
                     sync_matrix=torch.zeros(1, device=surp_mag.device),
                     certainty=surp_cert,
-                    all_tick_outputs=[],
+                    all_tick_outputs=surp_all_tick_outputs,  # For certainty computation
                     all_tick_activations=[surp_acts_stacked[i] for i in range(surp_acts_stacked.shape[0])],
                     all_tick_magnitudes=all_tick_magnitudes,
-                    all_tick_certainties=all_tick_surp_certainties,
                 )
 
                 # Reconstruct global sync output
@@ -674,12 +701,15 @@ class PEMLoopGlobal(nn.Module):
             t2 = argmax(C)  - tick with maximum certainty
             L = (L_t1 + L_t2) / 2
 
-        This encourages the model to:
-        1. Produce the best answer at SOME tick (iterative refinement)
-        2. Be confident when it has the right answer (calibration)
+        For Prediction:
+            - Uses all_tick_outputs (y_t) directly - no readout heads per tick
+            - Compares y_t to immediate target (primary prediction task)
+
+        For Surprise:
+            - Uses all_tick_magnitudes (cheap scalar output per tick)
+            - Calibration: magnitude should track raw_surprise
 
         Also includes:
-        - Surprise calibration loss
         - Cross-module sync variance (encourages meaningful synchronization)
         """
         device = outputs[0].predictions['immediate'].device
@@ -691,30 +721,27 @@ class PEMLoopGlobal(nn.Module):
             surp_output = output.surprise
 
             # ========== 1. PREDICTION CTM LOSS ==========
-            # Compute loss at each internal tick
+            # Use y_t (all_tick_outputs) directly - no per-tick readouts needed
+            # Compare to immediate target (primary task)
+            all_tick_outputs = pred_output.all_tick_outputs
+            target = targets['immediate']
+            valid = targets.get('immediate_valid', None)
+
+            # Compute loss at each tick using raw y_t
             all_tick_pred_losses = []
-            all_tick_pred_certainties = pred_output.all_tick_certainties
-
-            for t, tick_preds in enumerate(pred_output.all_tick_predictions):
-                tick_loss = torch.tensor(0.0, device=device)
-                for scale in ['immediate', 'shortterm', 'longterm']:
-                    pred = tick_preds[scale]
-                    target = targets[scale]
-                    valid = targets.get(f'{scale}_valid', None)
-
-                    if valid is not None and valid.any():
-                        pred_valid = pred[valid]
-                        target_valid = target[valid]
-                        cos_sim = F.cosine_similarity(pred_valid, target_valid, dim=-1)
-                        scale_loss = (1 - cos_sim).mean()
-                    else:
-                        scale_loss = torch.tensor(0.0, device=device)
-                    tick_loss = tick_loss + scale_loss
-
+            for y_t in all_tick_outputs:
+                if valid is not None and valid.any():
+                    cos_sim = F.cosine_similarity(y_t[valid], target[valid], dim=-1)
+                    tick_loss = (1 - cos_sim).mean()
+                else:
+                    tick_loss = torch.tensor(0.0, device=device)
                 all_tick_pred_losses.append(tick_loss)
 
+            # Compute certainties from output stability
+            all_tick_pred_certainties = compute_tick_certainties(all_tick_outputs)
+
             # Apply CTM loss formula: L = (L_t1 + L_t2) / 2
-            if len(all_tick_pred_losses) > 0 and len(all_tick_pred_certainties) > 0:
+            if len(all_tick_pred_losses) > 0:
                 pred_ctm_loss, pred_t1, pred_t2 = compute_ctm_loss(
                     all_tick_pred_losses,
                     all_tick_pred_certainties,
@@ -723,25 +750,17 @@ class PEMLoopGlobal(nn.Module):
                 loss_dict[f'step{step_idx}_pred_best_tick'] = float(pred_t1)
                 loss_dict[f'step{step_idx}_pred_certain_tick'] = float(pred_t2)
                 total_loss = total_loss + pred_ctm_loss
-            else:
-                # Fallback to final tick loss if CTM data not available
-                for scale in ['immediate', 'shortterm', 'longterm']:
-                    pred = output.predictions[scale]
-                    target = targets[scale]
-                    valid = targets.get(f'{scale}_valid', None)
-                    if valid is not None and valid.any():
-                        cos_sim = F.cosine_similarity(pred[valid], target[valid], dim=-1)
-                        total_loss = total_loss + (1 - cos_sim).mean()
 
             # ========== 2. SURPRISE CTM LOSS ==========
-            # Compute calibration loss at each internal tick
+            # Use all_tick_magnitudes (cheap - just scalar per tick)
             all_tick_surp_losses = []
-            all_tick_surp_certainties = surp_output.all_tick_certainties
-
-            for t, tick_mag in enumerate(surp_output.all_tick_magnitudes):
+            for tick_mag in surp_output.all_tick_magnitudes:
                 # Surprise calibration: magnitude should track raw surprise
                 surp_cal_loss = F.mse_loss(tick_mag, surp_output.raw)
                 all_tick_surp_losses.append(surp_cal_loss)
+
+            # Compute certainties from surprise outputs
+            all_tick_surp_certainties = compute_tick_certainties(surp_output.all_tick_outputs)
 
             # Apply CTM loss formula
             if len(all_tick_surp_losses) > 0 and len(all_tick_surp_certainties) > 0:

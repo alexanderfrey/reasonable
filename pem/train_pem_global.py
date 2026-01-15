@@ -497,26 +497,33 @@ def compute_detailed_metrics(
         # Find which internal ticks were selected by CTM loss
         pred_out = output.prediction_output
 
-        # Prediction: compute loss at each internal tick
-        if hasattr(pred_out, 'all_tick_predictions') and pred_out.all_tick_predictions:
+        # Prediction: compute loss at each internal tick using y_t directly
+        if hasattr(pred_out, 'all_tick_outputs') and pred_out.all_tick_outputs:
             tick_losses = []
-            for tick_preds in pred_out.all_tick_predictions:
-                tick_loss = 0.0
-                for scale in ['immediate', 'shortterm', 'longterm']:
-                    pred_t = tick_preds[scale]
-                    target = targets[scale]
-                    valid = targets.get(f'{scale}_valid', None)
-                    if valid is not None and valid.any():
-                        cos_sim = F.cosine_similarity(pred_t[valid], target[valid], dim=-1).mean()
-                        tick_loss += (1 - cos_sim).item()
+            target = targets['immediate']  # Use immediate target for y_t comparison
+            valid = targets.get('immediate_valid', None)
+
+            for y_t in pred_out.all_tick_outputs:
+                if valid is not None and valid.any():
+                    cos_sim = F.cosine_similarity(y_t[valid], target[valid], dim=-1).mean()
+                    tick_loss = (1 - cos_sim).item()
+                else:
+                    tick_loss = 0.0
                 tick_losses.append(tick_loss)
 
             pred_best_ticks.append(int(np.argmin(tick_losses)))
 
-        if hasattr(pred_out, 'all_tick_certainties') and pred_out.all_tick_certainties:
-            tick_certs = [c.item() if isinstance(c, torch.Tensor) else c
-                          for c in pred_out.all_tick_certainties]
-            pred_certain_ticks.append(int(np.argmax(tick_certs)))
+            # Compute certainties from output stability
+            if len(pred_out.all_tick_outputs) > 1:
+                tick_certs = []
+                for t in range(len(pred_out.all_tick_outputs)):
+                    if t == 0:
+                        tick_certs.append(0.1)
+                    else:
+                        # Simple stability measure
+                        change = (pred_out.all_tick_outputs[t] - pred_out.all_tick_outputs[t-1]).norm().item()
+                        tick_certs.append(np.exp(-change * 5.0))
+                pred_certain_ticks.append(int(np.argmax(tick_certs)))
 
         # Surprise: find best internal ticks
         surp_out = output.surprise
@@ -527,10 +534,16 @@ def compute_detailed_metrics(
                 tick_losses.append(surp_loss)
             surp_best_ticks.append(int(np.argmin(tick_losses)))
 
-        if hasattr(surp_out, 'all_tick_certainties') and surp_out.all_tick_certainties:
-            tick_certs = [c.item() if isinstance(c, torch.Tensor) else c
-                          for c in surp_out.all_tick_certainties]
-            surp_certain_ticks.append(int(np.argmax(tick_certs)))
+            # Compute certainties from output stability
+            if hasattr(surp_out, 'all_tick_outputs') and len(surp_out.all_tick_outputs) > 1:
+                tick_certs = []
+                for t in range(len(surp_out.all_tick_outputs)):
+                    if t == 0:
+                        tick_certs.append(0.1)
+                    else:
+                        change = (surp_out.all_tick_outputs[t] - surp_out.all_tick_outputs[t-1]).norm().item()
+                        tick_certs.append(np.exp(-change * 5.0))
+                surp_certain_ticks.append(int(np.argmax(tick_certs)))
 
     # Find best steps for this batch (LOOP level)
     if len(outputs) > 0:

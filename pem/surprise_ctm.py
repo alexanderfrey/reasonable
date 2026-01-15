@@ -22,15 +22,14 @@ class SurpriseCTMOutput(NamedTuple):
     """Output from SurpriseCTM."""
     magnitude: torch.Tensor           # (B, S, 1) learned surprise magnitude from final tick
     direction: torch.Tensor           # (B, S, D) what was unexpected (unit vector)
-    raw: torch.Tensor                 # (B, S, 1) raw cosine distance
+    raw: torch.Tensor                 # (B, S, 1) raw cosine distance (target for calibration)
     post_activations: torch.Tensor    # (B, S, D_neurons) for global sync
     sync_matrix: torch.Tensor         # (B, S, D_n, D_n)
-    all_tick_outputs: List[torch.Tensor]
-    certainty: torch.Tensor
+    all_tick_outputs: List[torch.Tensor]  # Raw CTM outputs (y_t) at each tick
+    certainty: torch.Tensor           # Confidence at final tick
     all_tick_activations: List[torch.Tensor]  # NLM activations at each tick
-    # CTM loss support: outputs at each internal tick
-    all_tick_magnitudes: List[torch.Tensor]  # Magnitude at each tick
-    all_tick_certainties: List[torch.Tensor]  # Certainty at each tick
+    # CTM loss: magnitude at each tick (cheap - just a small MLP to scalar)
+    all_tick_magnitudes: List[torch.Tensor]  # (B, S, 1) magnitude at each tick
 
 
 @dataclass
@@ -150,6 +149,11 @@ class SurpriseCTM(CTMModule):
         """
         Compute surprise from prediction error.
 
+        CTM Loss Note:
+            For surprise calibration, we need magnitude at each tick to find
+            which tick best matches raw_surprise. The magnitude_head is cheap
+            (small MLP → scalar), so we compute it at each tick.
+
         Args:
             predicted: (B, S, D) predictions from PredictionCTM
             actual: (B, S, D) actual features (targets)
@@ -158,7 +162,7 @@ class SurpriseCTM(CTMModule):
         Returns:
             SurpriseCTMOutput with magnitude, direction, and post-activations
         """
-        # 1. Compute raw surprise (cosine distance)
+        # 1. Compute raw surprise (cosine distance) - this is the calibration target
         cos_sim = F.cosine_similarity(predicted, actual, dim=-1, eps=1e-8)
         raw_surprise = (1 - cos_sim).unsqueeze(-1)  # (B, S, 1)
 
@@ -168,34 +172,25 @@ class SurpriseCTM(CTMModule):
         # 3. Run core CTM loop
         post_activations, sync_matrix, output, all_outputs, all_activations = self.core(input_features)
 
-        # 4. Generate magnitude and direction at EACH tick (for CTM loss)
+        # 4. Compute magnitude at each tick for CTM loss (cheap operation)
         all_tick_magnitudes = []
-        all_tick_certainties = []
-        for t, tick_output in enumerate(all_outputs):
-            tick_surprise = self.output_projection(tick_output)
-            tick_mag = tick_surprise['magnitude']
-            # Apply validity mask if provided
+        for tick_output in all_outputs:
+            tick_mag = self.magnitude_head(tick_output)  # (B, S, 1)
             if valid_mask is not None:
-                mask = valid_mask.unsqueeze(-1)
-                tick_mag = tick_mag * mask
+                tick_mag = tick_mag * valid_mask.unsqueeze(-1)
             all_tick_magnitudes.append(tick_mag)
-            # Compute certainty up to this tick
-            tick_certainty = self.core.compute_certainty(all_outputs[:t+1])
-            all_tick_certainties.append(tick_certainty)
 
-        # Final outputs (from last tick)
-        surprise_outputs = self.output_projection(output)
-        magnitude = surprise_outputs['magnitude']
-        direction = surprise_outputs['direction']
+        # 5. Final outputs from last tick
+        magnitude = all_tick_magnitudes[-1]
+        direction = self.direction_head(output)
+        direction = F.normalize(direction, dim=-1)
 
-        # Apply validity mask to final outputs
+        # Apply validity mask to raw_surprise
         if valid_mask is not None:
-            mask = valid_mask.unsqueeze(-1)  # (B, S, 1)
-            magnitude = magnitude * mask
-            raw_surprise = raw_surprise * mask
+            raw_surprise = raw_surprise * valid_mask.unsqueeze(-1)
 
-        # Final certainty
-        certainty = all_tick_certainties[-1] if all_tick_certainties else self.core.compute_certainty(all_outputs)
+        # 6. Compute certainty from full output history
+        certainty = self.core.compute_certainty(all_outputs)
 
         return SurpriseCTMOutput(
             magnitude=magnitude,
@@ -207,7 +202,6 @@ class SurpriseCTM(CTMModule):
             certainty=certainty,
             all_tick_activations=all_activations,
             all_tick_magnitudes=all_tick_magnitudes,
-            all_tick_certainties=all_tick_certainties,
         )
 
     def forward_multiscale(
