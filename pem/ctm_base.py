@@ -82,6 +82,10 @@ class CTMBaseConfig:
     use_cross_attention: bool = True   # Can disable for ablation
     cross_attn_heads: int = 4          # Number of attention heads
 
+    # Internal observation residual (prevents fixed-point convergence within tick loop)
+    # Higher = more blending with previous observation, prevents premature convergence
+    internal_obs_residual: float = 0.2
+
 
 class RMSNorm(nn.Module):
     """Root Mean Square Layer Normalization."""
@@ -543,7 +547,11 @@ class CTMCore(nn.Module):
             # 6. Per-tick cross-attention: sync-derived queries attend to features
             # Paper: q_t = W_in · S_action_t, o_t = Attention(Q=q_t, KV=features)
             if self.cross_attn is not None:
-                o_t = self.cross_attn(S_internal, input_features)
+                o_t_new = self.cross_attn(S_internal, input_features)
+                # Internal observation residual: blend old/new to prevent fixed-point convergence
+                # This ensures activations continue to evolve even after sync stabilizes
+                alpha = self.config.internal_obs_residual
+                o_t = alpha * o_t + (1 - alpha) * o_t_new
 
             # 7. Generate output from sync
             y_t = self.sync_to_output(S_out)

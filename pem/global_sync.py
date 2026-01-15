@@ -69,6 +69,10 @@ class GlobalSyncConfig:
     dropout: float = 0.0
     attention_temperature: float = 1.0  # Higher = softer attention (1.0 = standard)
 
+    # Cross-residual: inject signal from OTHER modules even when attention is weak
+    # 0.0 = no cross-residual (standard), 0.1-0.3 = moderate cross-module signal
+    cross_residual_strength: float = 0.0
+
     # Output
     sync_pairs: int = 256          # Output sync dimension
 
@@ -188,6 +192,11 @@ class SyncCrossModuleAttention(nn.Module):
 
     Each module's sync representation generates queries that attend to
     other modules' sync representations.
+
+    Cross-residual mechanism:
+        When cross_residual_strength > 0, each module receives a residual
+        signal from OTHER modules, ensuring cross-module information flow
+        even when learned attention is weak/collapsed.
     """
 
     def __init__(
@@ -197,6 +206,7 @@ class SyncCrossModuleAttention(nn.Module):
         n_heads: int = 4,
         dropout: float = 0.0,
         temperature: float = 1.0,
+        cross_residual_strength: float = 0.0,
     ):
         super().__init__()
         self.d_sync_space = d_sync_space
@@ -204,6 +214,7 @@ class SyncCrossModuleAttention(nn.Module):
         self.n_heads = n_heads
         self.head_dim = d_sync_space // n_heads
         self.temperature = temperature
+        self.cross_residual_strength = cross_residual_strength
 
         assert d_sync_space % n_heads == 0
 
@@ -278,10 +289,29 @@ class SyncCrossModuleAttention(nn.Module):
         attended = torch.matmul(attn_weights, v)  # (B*S, n_heads, num_modules, head_dim)
         attended = attended.transpose(1, 2).reshape(B * S, num_modules, D)
 
-        # Output projection with residual
+        # Output projection
         attended = self.o_proj(attended)
         attended = attended.view(B, S, num_modules, D).permute(2, 0, 1, 3)
-        attended = self.norm(attended + module_syncs)  # Residual connection
+
+        # Residual connection with optional cross-residual
+        # Standard residual: add back own module's sync
+        # Cross-residual: also add signal from OTHER modules
+        if self.cross_residual_strength > 0 and num_modules > 1:
+            # Compute mean of all other modules for each module
+            # For module i: cross_signal_i = mean(module_sync_j for j != i)
+            # Efficient: (sum_all - self) / (n-1) = (n*mean - self) / (n-1)
+            all_mean = module_syncs.mean(dim=0, keepdim=True)  # (1, B, S, D)
+            # For each module, compute mean of others
+            # cross_signal_i = (n * all_mean - module_syncs_i) / (n - 1)
+            cross_signal = (num_modules * all_mean - module_syncs) / (num_modules - 1)
+
+            # Blend: (1 - alpha) * self_residual + alpha * cross_residual
+            alpha = self.cross_residual_strength
+            residual = (1 - alpha) * module_syncs + alpha * cross_signal
+            attended = self.norm(attended + residual)
+        else:
+            # Standard self-residual only
+            attended = self.norm(attended + module_syncs)
 
         # Get cross-module sync matrix (average over heads)
         cross_module_sync = attn_weights.mean(dim=1)  # (B*S, num_modules, num_modules)
@@ -440,6 +470,7 @@ class GlobalSyncModule(nn.Module):
             n_heads=self.config.n_heads,
             dropout=self.config.dropout,
             temperature=self.config.attention_temperature,
+            cross_residual_strength=self.config.cross_residual_strength,
         )
 
         self._sync_integrator = SyncIntegrator(

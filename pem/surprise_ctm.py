@@ -77,11 +77,14 @@ class SurpriseCTM(CTMModule):
         )
 
         # Magnitude head: core output -> scalar
+        # Note: Using Softplus instead of Sigmoid to avoid vanishing gradients
+        # Softplus is smooth, non-saturating, and outputs [0, inf)
+        # We scale it to roughly match [0, 1] range for raw_surprise calibration
         self.magnitude_head = nn.Sequential(
             nn.Linear(config.d_output, config.d_output // 4),
             nn.GELU(),
             nn.Linear(config.d_output // 4, 1),
-            nn.Sigmoid(),  # Output in [0, 1]
+            nn.Softplus(beta=2.0),  # Smooth ReLU, beta=2 makes it steeper near 0
         )
 
         # Direction head: core output -> unit vector

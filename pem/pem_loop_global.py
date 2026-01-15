@@ -206,6 +206,7 @@ class PEMLoopGlobalConfig:
     sync_pairs: int = 256
     sync_n_heads: int = 4
     sync_attention_temperature: float = 2.0  # Higher = softer cross-module attention
+    sync_cross_residual_strength: float = 0.0  # Cross-module residual (0=off, 0.1-0.3=moderate)
 
     # Prediction horizons
     immediate_horizon: int = 8
@@ -219,9 +220,15 @@ class PEMLoopGlobalConfig:
     sync_decay: float = 0.9      # Decay for cumulative sync
     observation_residual: float = 0.3  # Blend factor for observation update (0=replace, 1=keep)
 
+    # Internal tick config (within CTM modules)
+    internal_obs_residual: float = 0.2  # Blend factor within CTM tick loop (prevents fixed-point)
+
     # Memory optimization
     gradient_checkpointing: bool = False  # Recompute activations in backward (saves VRAM)
     backprop_steps: int = -1              # Only backprop through last N steps (-1 = all)
+
+    # Loss weights
+    surprise_loss_weight: float = 0.1     # Weight for surprise calibration loss
 
     dropout: float = 0.0
 
@@ -348,6 +355,7 @@ class PEMLoopGlobal(nn.Module):
             shortterm_horizon=config.shortterm_horizon,
             longterm_horizon=config.longterm_horizon,
             dropout=config.dropout,
+            internal_obs_residual=config.internal_obs_residual,
         )
         self.prediction = PredictionCTM(pred_config)
 
@@ -360,6 +368,7 @@ class PEMLoopGlobal(nn.Module):
             T=config.surp_T,
             M=config.surp_M,
             dropout=config.dropout,
+            internal_obs_residual=config.internal_obs_residual,
         )
         self.surprise = SurpriseCTM(surp_config)
 
@@ -370,6 +379,7 @@ class PEMLoopGlobal(nn.Module):
             n_heads=config.sync_n_heads,
             dropout=config.dropout,
             attention_temperature=config.sync_attention_temperature,
+            cross_residual_strength=config.sync_cross_residual_strength,
         )
         self.global_sync = GlobalSyncModule(sync_config)
 
@@ -779,11 +789,11 @@ class PEMLoopGlobal(nn.Module):
                 loss_dict[f'step{step_idx}_surp_ctm_loss'] = surp_ctm_loss.detach()
                 loss_dict[f'step{step_idx}_surp_best_tick'] = float(surp_t1)
                 loss_dict[f'step{step_idx}_surp_certain_tick'] = float(surp_t2)
-                total_loss = total_loss + 0.1 * surp_ctm_loss
+                total_loss = total_loss + self.config.surprise_loss_weight * surp_ctm_loss
             else:
                 # Fallback
                 surp_cal_loss = F.mse_loss(surp_output.magnitude, surp_output.raw)
-                total_loss = total_loss + 0.1 * surp_cal_loss
+                total_loss = total_loss + self.config.surprise_loss_weight * surp_cal_loss
 
             # ========== 3. CROSS-MODULE SYNC VARIANCE ==========
             # Encourage meaningful cross-module synchronization

@@ -595,6 +595,36 @@ def compute_detailed_metrics(
         metrics['loss_improvement'] = step_losses[0] - step_losses[-1]  # Positive = improved
         metrics['certainty_improvement'] = step_certainties[-1] - step_certainties[0]  # Positive = improved
 
+    # ===== TICK EVOLUTION METRICS (for internal obs residual monitoring) =====
+    # Compute how much activations change across internal ticks
+    if len(outputs) > 0:
+        final_out = outputs[-1]  # Use final step for monitoring
+        pred_acts = final_out.prediction_output.all_tick_activations
+        surp_acts = final_out.surprise.all_tick_activations
+
+        # Prediction tick evolution
+        if len(pred_acts) > 1:
+            pred_deltas = []
+            for t in range(1, len(pred_acts)):
+                delta = (pred_acts[t] - pred_acts[t-1]).norm().item() / pred_acts[t].numel() ** 0.5
+                pred_deltas.append(delta)
+            metrics['tick_pred_total_delta'] = sum(pred_deltas)
+            metrics['tick_pred_late_delta'] = sum(pred_deltas[-2:]) if len(pred_deltas) >= 2 else pred_deltas[-1]
+            metrics['tick_pred_first_delta'] = pred_deltas[0] if pred_deltas else 0
+            # Detect plateau (last delta < 10% of first)
+            metrics['tick_pred_plateau'] = 1.0 if (pred_deltas and pred_deltas[-1] < pred_deltas[0] * 0.1) else 0.0
+
+        # Surprise tick evolution
+        if len(surp_acts) > 1:
+            surp_deltas = []
+            for t in range(1, len(surp_acts)):
+                delta = (surp_acts[t] - surp_acts[t-1]).norm().item() / surp_acts[t].numel() ** 0.5
+                surp_deltas.append(delta)
+            metrics['tick_surp_total_delta'] = sum(surp_deltas)
+            metrics['tick_surp_late_delta'] = sum(surp_deltas[-2:]) if len(surp_deltas) >= 2 else surp_deltas[-1]
+            metrics['tick_surp_first_delta'] = surp_deltas[0] if surp_deltas else 0
+            metrics['tick_surp_plateau'] = 1.0 if (surp_deltas and surp_deltas[-1] < surp_deltas[0] * 0.1) else 0.0
+
     return metrics
 
 
@@ -604,254 +634,195 @@ def print_diagnostic_report(
     step: int,
 ):
     """
-    Print comprehensive diagnostic report to terminal.
-
-    Metrics to understand:
-    1. Global loop effectiveness - Are more steps helping?
-    2. Neuron synchronization - Are neurons within modules syncing?
-    3. Cross-module synchronization - Are modules syncing with each other?
-    4. Internal tick dynamics - Is CTM "thinking" across ticks?
-    5. Activation health - Are neurons alive and changing?
+    Print compact diagnostic report to terminal.
+    Shows key health indicators without verbose per-tick/per-step output.
     """
-    print("\n" + "="*80)
-    print(f"DIAGNOSTIC REPORT - Step {step}")
-    print("="*80)
+    print("\n" + "="*70)
+    print(f"DIAGNOSTIC - Step {step}")
+    print("="*70)
 
     num_steps = len(outputs)
 
-    # ========== 1. GLOBAL LOOP STEP EFFECTIVENESS ==========
-    print("\n[1] GLOBAL LOOP STEP EFFECTIVENESS")
-    print("-" * 40)
+    # Helper for tick evolution visualization
+    def tick_bar(deltas: list, threshold: float = 0.001) -> str:
+        if not deltas:
+            return "?"
+        chars = []
+        for d in deltas:
+            if d > threshold * 10:
+                chars.append("█")
+            elif d > threshold:
+                chars.append("▓")
+            elif d > threshold * 0.1:
+                chars.append("░")
+            else:
+                chars.append("·")
+        return "".join(chars)
 
+    def find_plateau(deltas: list, threshold: float = 0.0001) -> int:
+        for t, d in enumerate(deltas):
+            if d < threshold:
+                return t + 1
+        return -1
+
+    # ===== 1. GLOBAL LOOP: Loss per step (compact) =====
     step_losses = []
-    for i, out in enumerate(outputs):
-        # Compute prediction loss at this step
+    for out in outputs:
         pred = out.predictions['immediate']
         target = targets['immediate']
         valid = targets.get('immediate_valid', None)
         if valid is not None and valid.any():
             cos_sim = F.cosine_similarity(pred[valid], target[valid], dim=-1).mean()
-            loss = (1 - cos_sim).item()
+            step_losses.append((1 - cos_sim).item())
         else:
-            loss = 0.0
-        step_losses.append(loss)
-
-        improvement = ""
-        if i > 0:
-            delta = step_losses[i-1] - step_losses[i]
-            improvement = f"  (Δ={delta:+.4f} {'✓' if delta > 0 else '✗'})"
-        print(f"  Step {i}: loss={loss:.4f}{improvement}")
+            step_losses.append(0.0)
 
     best_step = int(np.argmin(step_losses))
-    print(f"  → Best step: {best_step} (loss={step_losses[best_step]:.4f})")
-    print(f"  → Final step improvement: {step_losses[0] - step_losses[-1]:+.4f}")
+    improvement = step_losses[0] - step_losses[-1]
 
-    # ========== 2. NEURON ACTIVATION HEALTH ==========
-    print("\n[2] NEURON ACTIVATION HEALTH")
-    print("-" * 40)
+    # Compact loss display
+    loss_str = " → ".join([f"{l:.3f}" for l in step_losses[:4]])
+    if num_steps > 4:
+        loss_str += f" → ... → {step_losses[-1]:.3f}"
 
-    for i, out in enumerate(outputs):
-        pred_acts = out.prediction_output.all_tick_activations
-        surp_acts = out.surprise.all_tick_activations
+    print(f"\n[Loop] {loss_str}")
+    print(f"       Best: step {best_step} ({step_losses[best_step]:.4f}) | Δ: {improvement:+.4f} {'✓' if improvement > 0 else '✗'}")
 
-        print(f"  Step {i} - PredictionCTM:")
-        for t, z in enumerate(pred_acts):
-            std = z.std().item()
-            mean = z.mean().item()
-            change = ""
-            if t > 0:
-                delta = (z - pred_acts[t-1]).norm().item() / z.numel() ** 0.5
-                change = f"  Δ={delta:.4f}"
-            print(f"    Tick {t}: std={std:.4f}, mean={mean:.4f}{change}")
+    # ===== 2. TICK EVOLUTION (final step only) =====
+    final_out = outputs[-1]
+    pred_acts = final_out.prediction_output.all_tick_activations
+    surp_acts = final_out.surprise.all_tick_activations
 
-        print(f"  Step {i} - SurpriseCTM:")
-        for t, z in enumerate(surp_acts):
-            std = z.std().item()
-            mean = z.mean().item()
-            change = ""
-            if t > 0:
-                delta = (z - surp_acts[t-1]).norm().item() / z.numel() ** 0.5
-                change = f"  Δ={delta:.4f}"
-            print(f"    Tick {t}: std={std:.4f}, mean={mean:.4f}{change}")
+    # Compute deltas
+    pred_deltas = [(pred_acts[t] - pred_acts[t-1]).norm().item() / pred_acts[t].numel() ** 0.5
+                   for t in range(1, len(pred_acts))]
+    surp_deltas = [(surp_acts[t] - surp_acts[t-1]).norm().item() / surp_acts[t].numel() ** 0.5
+                   for t in range(1, len(surp_acts))]
 
-    # ========== 3. INTERNAL SYNC (within modules) ==========
-    print("\n[3] INTERNAL SYNC (within modules)")
-    print("-" * 40)
+    pred_plateau = find_plateau(pred_deltas)
+    surp_plateau = find_plateau(surp_deltas)
 
-    for i, out in enumerate(outputs):
-        pred_acts = out.prediction_output.all_tick_activations
-        surp_acts = out.surprise.all_tick_activations
+    pred_status = f"⚠plateau@{pred_plateau}" if pred_plateau > 0 else "✓"
+    surp_status = f"⚠plateau@{surp_plateau}" if surp_plateau > 0 else "✓"
 
-        # Compute sync matrix S = Z @ Z^T for final tick
-        if pred_acts:
-            z_pred = pred_acts[-1]  # (B, S, D)
-            S_pred = torch.matmul(z_pred, z_pred.transpose(-1, -2))  # (B, S, D, D)
-            S_pred = S_pred / (z_pred.shape[-1] ** 0.5)
+    print(f"\n[Ticks] Pred({len(pred_acts)}): [{tick_bar(pred_deltas)}] {pred_status}")
+    print(f"        Surp({len(surp_acts)}): [{tick_bar(surp_deltas)}] {surp_status}")
 
-            # Diagonal = self-sync, off-diagonal = cross-neuron sync
-            diag_mean = S_pred.diagonal(dim1=-2, dim2=-1).mean().item()
-            off_diag = S_pred - torch.diag_embed(S_pred.diagonal(dim1=-2, dim2=-1))
-            off_diag_mean = off_diag.abs().mean().item()
-            off_diag_std = off_diag.std().item()
+    # ===== 3. ACTIVATION HEALTH (final step only) =====
+    pred_z = pred_acts[-1]
+    surp_z = surp_acts[-1]
+    print(f"\n[Health] Pred: std={pred_z.std():.3f} mean={pred_z.mean():.3f} | "
+          f"Surp: std={surp_z.std():.3f} mean={surp_z.mean():.3f}")
 
-            print(f"  Step {i} - PredictionCTM sync matrix:")
-            print(f"    Diagonal (self-sync): {diag_mean:.4f}")
-            print(f"    Off-diagonal mean: {off_diag_mean:.4f}, std: {off_diag_std:.4f}")
-            print(f"    Ratio (cross/self): {off_diag_mean/max(diag_mean, 1e-6):.4f}")
+    # ===== 4. CROSS-MODULE SYNC (final step only) =====
+    cross_sync = final_out.global_sync.cross_module_sync
+    p2s = cross_sync[0, 1].mean().item()
+    s2p = cross_sync[1, 0].mean().item()
+    contrib = final_out.global_sync.module_contributions
+    p_contrib = contrib[..., 0].mean().item()
 
-        if surp_acts:
-            z_surp = surp_acts[-1]
-            S_surp = torch.matmul(z_surp, z_surp.transpose(-1, -2))
-            S_surp = S_surp / (z_surp.shape[-1] ** 0.5)
+    attn_status = "⚠degenerate" if (p2s > 0.95 or s2p > 0.95) else "✓"
+    print(f"\n[CrossSync] P→S: {p2s:.2f} S→P: {s2p:.2f} | Contrib: P={p_contrib:.2f} S={1-p_contrib:.2f} {attn_status}")
 
-            diag_mean = S_surp.diagonal(dim1=-2, dim2=-1).mean().item()
-            off_diag = S_surp - torch.diag_embed(S_surp.diagonal(dim1=-2, dim2=-1))
-            off_diag_mean = off_diag.abs().mean().item()
-            off_diag_std = off_diag.std().item()
+    # ===== 5. BEST TICK (final step only) =====
+    pred_out = final_out.prediction_output
+    surp_out = final_out.surprise
 
-            print(f"  Step {i} - SurpriseCTM sync matrix:")
-            print(f"    Diagonal (self-sync): {diag_mean:.4f}")
-            print(f"    Off-diagonal mean: {off_diag_mean:.4f}, std: {off_diag_std:.4f}")
-            print(f"    Ratio (cross/self): {off_diag_mean/max(diag_mean, 1e-6):.4f}")
+    if hasattr(pred_out, 'all_tick_outputs') and pred_out.all_tick_outputs:
+        target = targets['immediate']
+        valid = targets.get('immediate_valid', None)
+        tick_losses = []
+        for y_t in pred_out.all_tick_outputs:
+            if valid is not None and valid.any():
+                cos_sim = F.cosine_similarity(y_t[valid], target[valid], dim=-1).mean()
+                tick_losses.append((1 - cos_sim).item())
+            else:
+                tick_losses.append(0.0)
+        pred_best_tick = int(np.argmin(tick_losses))
+        pred_tick_improve = tick_losses[0] - tick_losses[-1]
+    else:
+        pred_best_tick = 0
+        pred_tick_improve = 0
 
-    # ========== 4. CROSS-MODULE SYNCHRONIZATION ==========
-    print("\n[4] CROSS-MODULE SYNCHRONIZATION")
-    print("-" * 40)
+    if hasattr(surp_out, 'all_tick_magnitudes') and surp_out.all_tick_magnitudes:
+        surp_tick_losses = [F.mse_loss(m, surp_out.raw).item() for m in surp_out.all_tick_magnitudes]
+        surp_best_tick = int(np.argmin(surp_tick_losses))
+    else:
+        surp_best_tick = 0
 
-    for i, out in enumerate(outputs):
-        cross_sync = out.global_sync.cross_module_sync  # (2, 2, B, S)
-        contrib = out.global_sync.module_contributions  # (B, S, 2)
+    print(f"\n[BestTick] Pred: {pred_best_tick}/{len(pred_acts)-1} (Δ={pred_tick_improve:+.3f}) | Surp: {surp_best_tick}/{len(surp_acts)-1}")
 
-        # Cross-sync values
-        pred_to_pred = cross_sync[0, 0].mean().item()
-        pred_to_surp = cross_sync[0, 1].mean().item()
-        surp_to_pred = cross_sync[1, 0].mean().item()
-        surp_to_surp = cross_sync[1, 1].mean().item()
+    # ===== 6. OBSERVATION CONVERGENCE =====
+    if num_steps >= 2:
+        obs_0 = outputs[0].observation
+        obs_f = outputs[-1].observation
+        obs_delta = (obs_f - obs_0).norm().item() / obs_0.numel() ** 0.5
+        obs_cos = F.cosine_similarity(obs_0.reshape(1, -1), obs_f.reshape(1, -1)).item()
+        conv_status = "⚠fixed-point" if obs_cos > 0.9999 else "✓"
+        print(f"\n[Obs] Δ(0→{num_steps-1}): {obs_delta:.4f} | cos: {obs_cos:.6f} {conv_status}")
 
-        # Module contributions
-        pred_contrib = contrib[..., 0].mean().item()
-        surp_contrib = contrib[..., 1].mean().item()
+    # ===== SUMMARY =====
+    issues = []
+    if improvement <= 0:
+        issues.append("loop not helping")
+    if pred_plateau > 0 and pred_plateau < len(pred_acts) - 2:
+        issues.append(f"pred plateau@{pred_plateau}")
+    if surp_plateau > 0 and surp_plateau < len(surp_acts) - 2:
+        issues.append(f"surp plateau@{surp_plateau}")
+    if p2s > 0.95 or s2p > 0.95:
+        issues.append("degenerate cross-attn")
+    if num_steps >= 2 and obs_cos > 0.9999:
+        issues.append("obs fixed-point")
 
-        print(f"  Step {i}:")
-        print(f"    Cross-module attention:")
-        print(f"      Pred→Pred: {pred_to_pred:.4f}  Pred→Surp: {pred_to_surp:.4f}")
-        print(f"      Surp→Pred: {surp_to_pred:.4f}  Surp→Surp: {surp_to_surp:.4f}")
-        print(f"    Module contributions: Pred={pred_contrib:.4f}, Surp={surp_contrib:.4f}")
+    print("\n" + "-"*70)
+    if issues:
+        print(f"⚠ Issues: {', '.join(issues)}")
+    else:
+        print("✓ All systems nominal")
+    print("="*70 + "\n")
 
-        # Check if cross-module sync is meaningful (not just 0.5/0.5)
-        cross_deviation = abs(pred_to_surp - 0.5) + abs(surp_to_pred - 0.5)
-        print(f"    Cross-sync deviation from uniform: {cross_deviation:.4f}")
 
-    # ========== 5. INTERNAL TICK SELECTION (CTM Loss) ==========
-    print("\n[5] INTERNAL TICK SELECTION (which tick is best?)")
-    print("-" * 40)
+def compute_nlm_metrics(model: PEMLoopGlobal) -> Dict[str, float]:
+    """
+    Compute NLM (Neuron Level Model) specific metrics for debugging.
 
-    for i, out in enumerate(outputs):
-        pred_out = out.prediction_output
-        surp_out = out.surprise
+    Tracks:
+    - Weight norms (are weights changing?)
+    - Gradient norms (are gradients flowing?)
+    """
+    metrics = {}
 
-        # Prediction: which tick has best loss?
-        if hasattr(pred_out, 'all_tick_outputs') and pred_out.all_tick_outputs:
-            target = targets['immediate']
-            valid = targets.get('immediate_valid', None)
+    # PredictionCTM NLM
+    pred_nlm = model.prediction.core.nlm
+    metrics['nlm_pred/w1_norm'] = pred_nlm.w1.norm().item()
+    metrics['nlm_pred/w2_norm'] = pred_nlm.w2.norm().item()
+    if pred_nlm.w1.grad is not None:
+        metrics['nlm_pred/w1_grad_norm'] = pred_nlm.w1.grad.norm().item()
+        metrics['nlm_pred/w2_grad_norm'] = pred_nlm.w2.grad.norm().item()
+    else:
+        metrics['nlm_pred/w1_grad_norm'] = 0.0
+        metrics['nlm_pred/w2_grad_norm'] = 0.0
 
-            tick_losses = []
-            for y_t in pred_out.all_tick_outputs:
-                if valid is not None and valid.any():
-                    cos_sim = F.cosine_similarity(y_t[valid], target[valid], dim=-1).mean()
-                    tick_losses.append((1 - cos_sim).item())
-                else:
-                    tick_losses.append(0.0)
+    # SurpriseCTM NLM
+    surp_nlm = model.surprise.core.nlm
+    metrics['nlm_surp/w1_norm'] = surp_nlm.w1.norm().item()
+    metrics['nlm_surp/w2_norm'] = surp_nlm.w2.norm().item()
+    if surp_nlm.w1.grad is not None:
+        metrics['nlm_surp/w1_grad_norm'] = surp_nlm.w1.grad.norm().item()
+        metrics['nlm_surp/w2_grad_norm'] = surp_nlm.w2.grad.norm().item()
+    else:
+        metrics['nlm_surp/w1_grad_norm'] = 0.0
+        metrics['nlm_surp/w2_grad_norm'] = 0.0
 
-            best_tick = int(np.argmin(tick_losses))
-            print(f"  Step {i} - PredictionCTM tick losses: {[f'{l:.4f}' for l in tick_losses]}")
-            print(f"    → Best tick: {best_tick}")
+    # Synapse gradients (upstream of NLM)
+    pred_synapse = model.prediction.core.synapse
+    surp_synapse = model.surprise.core.synapse
+    if hasattr(pred_synapse, 'out') and pred_synapse.out.weight.grad is not None:
+        metrics['synapse_pred/out_grad_norm'] = pred_synapse.out.weight.grad.norm().item()
+    if hasattr(surp_synapse, 'out') and surp_synapse.out.weight.grad is not None:
+        metrics['synapse_surp/out_grad_norm'] = surp_synapse.out.weight.grad.norm().item()
 
-        # Surprise: which tick has best calibration?
-        if hasattr(surp_out, 'all_tick_magnitudes') and surp_out.all_tick_magnitudes:
-            tick_losses = []
-            for tick_mag in surp_out.all_tick_magnitudes:
-                surp_loss = F.mse_loss(tick_mag, surp_out.raw).item()
-                tick_losses.append(surp_loss)
-
-            best_tick = int(np.argmin(tick_losses))
-            print(f"  Step {i} - SurpriseCTM tick losses: {[f'{l:.4f}' for l in tick_losses]}")
-            print(f"    → Best tick: {best_tick}")
-
-    # ========== 6. ACTIVATION CORRELATION ACROSS MODULES ==========
-    print("\n[6] ACTIVATION CORRELATION (do modules agree?)")
-    print("-" * 40)
-
-    for i, out in enumerate(outputs):
-        pred_z = out.prediction_output.post_activations  # (B, S, D_pred)
-        surp_z = out.surprise.post_activations  # (B, S, D_surp)
-
-        # Project to same dimension for comparison (use smaller)
-        d_min = min(pred_z.shape[-1], surp_z.shape[-1])
-        pred_proj = pred_z[..., :d_min].reshape(-1, d_min)
-        surp_proj = surp_z[..., :d_min].reshape(-1, d_min)
-
-        # Compute correlation
-        pred_norm = (pred_proj - pred_proj.mean(dim=0)) / (pred_proj.std(dim=0) + 1e-6)
-        surp_norm = (surp_proj - surp_proj.mean(dim=0)) / (surp_proj.std(dim=0) + 1e-6)
-        correlation = (pred_norm * surp_norm).mean().item()
-
-        # Cosine similarity between flattened activations
-        cos_sim = F.cosine_similarity(
-            pred_z.reshape(pred_z.shape[0], -1),
-            surp_z[..., :pred_z.shape[-1]].reshape(surp_z.shape[0], -1) if surp_z.shape[-1] >= pred_z.shape[-1]
-            else F.pad(surp_z, (0, pred_z.shape[-1] - surp_z.shape[-1])).reshape(surp_z.shape[0], -1),
-            dim=-1
-        ).mean().item()
-
-        print(f"  Step {i}:")
-        print(f"    Activation correlation: {correlation:.4f}")
-        print(f"    Cosine similarity: {cos_sim:.4f}")
-
-    # ========== 7. SYNC EVOLUTION ACROSS STEPS ==========
-    print("\n[7] SYNC EVOLUTION ACROSS GLOBAL STEPS")
-    print("-" * 40)
-
-    sync_values = []
-    for i, out in enumerate(outputs):
-        sync_std = out.global_sync.sync.std().item()
-        sync_mean = out.global_sync.sync.mean().item()
-        sync_values.append((sync_mean, sync_std))
-
-        change = ""
-        if i > 0:
-            delta_std = sync_values[i][1] - sync_values[i-1][1]
-            change = f"  Δstd={delta_std:+.4f}"
-        print(f"  Step {i}: mean={sync_mean:.4f}, std={sync_std:.4f}{change}")
-
-    # ========== 8. OBSERVATION CHANGE ACROSS STEPS ==========
-    print("\n[8] OBSERVATION CHANGE ACROSS STEPS")
-    print("-" * 40)
-
-    prev_obs = None
-    for i, out in enumerate(outputs):
-        obs = out.observation
-        obs_std = obs.std().item()
-        obs_mean = obs.mean().item()
-        obs_norm = obs.norm().item()
-
-        if prev_obs is not None:
-            # How much did observation change?
-            delta = (obs - prev_obs).norm().item()
-            delta_per_elem = delta / (obs.numel() ** 0.5)
-            cos_sim = F.cosine_similarity(
-                obs.reshape(1, -1), prev_obs.reshape(1, -1)
-            ).item()
-            print(f"  Step {i}: std={obs_std:.4f}, mean={obs_mean:.4f}, "
-                  f"Δ={delta:.4f}, Δ/√n={delta_per_elem:.6f}, cos_sim={cos_sim:.6f}")
-        else:
-            print(f"  Step {i}: std={obs_std:.4f}, mean={obs_mean:.4f}, norm={obs_norm:.4f}")
-
-        prev_obs = obs
-
-    print("\n" + "="*80)
-    print("END DIAGNOSTIC REPORT")
-    print("="*80 + "\n")
+    return metrics
 
 
 def train_step(
@@ -881,6 +852,9 @@ def train_step(
     # Backward pass
     loss.backward()
 
+    # Compute NLM metrics BEFORE optimizer step (to capture gradients)
+    nlm_metrics = compute_nlm_metrics(model)
+
     # Gradient clipping
     grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
 
@@ -894,6 +868,9 @@ def train_step(
     # Add loss and grad norm
     metrics['loss'] = loss.item()
     metrics['grad_norm'] = grad_norm.item()
+
+    # Add NLM metrics
+    metrics.update(nlm_metrics)
 
     for k, v in loss_dict.items():
         if isinstance(v, torch.Tensor):
@@ -983,9 +960,15 @@ def main():
     parser.add_argument('--grad_clip', type=float, default=1.0)
     parser.add_argument('--num_loop_steps', type=int, default=2)
     parser.add_argument('--observation_residual', type=float, default=0.3,
-                        help='Observation blend factor (0=replace, 0.3=default, 1=keep)')
+                        help='Global loop observation blend factor (0=replace, 0.3=default, 1=keep)')
+    parser.add_argument('--internal_obs_residual', type=float, default=0.2,
+                        help='Internal tick observation blend factor (0=replace, 0.2=default, 1=keep)')
     parser.add_argument('--attention_temperature', type=float, default=2.0,
                         help='Cross-module attention temperature (higher=softer, default=2.0)')
+    parser.add_argument('--cross_residual_strength', type=float, default=0.0,
+                        help='Cross-module residual strength (0=off, 0.1-0.3=moderate, forces cross-module info flow)')
+    parser.add_argument('--surprise_loss_weight', type=float, default=0.1,
+                        help='Weight for surprise calibration loss (default=0.1, try 0.5-1.0 if surprise gradients vanish)')
     parser.add_argument('--max_length', type=int, default=512)
 
     # Memory optimization args
@@ -1062,16 +1045,25 @@ def main():
         surp_T=config.surp_T,
         sync_pairs=config.sync_pairs,
         sync_attention_temperature=args.attention_temperature,
+        sync_cross_residual_strength=args.cross_residual_strength,
         observation_residual=args.observation_residual,
+        internal_obs_residual=args.internal_obs_residual,
         gradient_checkpointing=args.gradient_checkpointing,
         backprop_steps=args.backprop_steps,
+        surprise_loss_weight=args.surprise_loss_weight,
     )
     model = PEMLoopGlobal(pem_config).to(device)
     print(f"PEM Loop created: {sum(p.numel() for p in model.parameters()):,} params")
     if args.observation_residual > 0:
         print(f"  [Loop] Observation residual: {args.observation_residual}")
+    if args.internal_obs_residual > 0:
+        print(f"  [CTM] Internal observation residual: {args.internal_obs_residual}")
     if args.attention_temperature != 1.0:
         print(f"  [Sync] Attention temperature: {args.attention_temperature}")
+    if args.cross_residual_strength > 0:
+        print(f"  [Sync] Cross-residual strength: {args.cross_residual_strength}")
+    if args.surprise_loss_weight != 0.1:
+        print(f"  [Loss] Surprise loss weight: {args.surprise_loss_weight}")
     if args.gradient_checkpointing:
         print("  [Memory] Gradient checkpointing ENABLED")
     if args.backprop_steps > 0:
@@ -1212,6 +1204,26 @@ def main():
                   f"AvgBest: L{avg_best_loss_step:.1f} C{avg_best_cert_step:.1f} | "
                   f"{steps_per_sec:.2f} it/s")
 
+            # Compact tick evolution monitoring (internal obs residual check)
+            pred_total = metrics.get('tick_pred_total_delta', 0)
+            pred_late = metrics.get('tick_pred_late_delta', 0)
+            surp_total = metrics.get('tick_surp_total_delta', 0)
+            surp_late = metrics.get('tick_surp_late_delta', 0)
+            pred_plateau = "⚠PLATEAU" if metrics.get('tick_pred_plateau', 0) > 0.5 else "✓"
+            surp_plateau = "⚠PLATEAU" if metrics.get('tick_surp_plateau', 0) > 0.5 else "✓"
+            print(f"         Ticks | Pred: Δ={pred_total:.4f} (late={pred_late:.4f}) {pred_plateau} | "
+                  f"Surp: Δ={surp_total:.4f} (late={surp_late:.4f}) {surp_plateau}")
+
+            # NLM gradient health monitoring
+            pred_w1_grad = metrics.get('nlm_pred/w1_grad_norm', 0)
+            pred_w2_grad = metrics.get('nlm_pred/w2_grad_norm', 0)
+            surp_w1_grad = metrics.get('nlm_surp/w1_grad_norm', 0)
+            surp_w2_grad = metrics.get('nlm_surp/w2_grad_norm', 0)
+            pred_grad_status = "⚠VANISH" if pred_w1_grad < 1e-6 else "✓"
+            surp_grad_status = "⚠VANISH" if surp_w1_grad < 1e-6 else "✓"
+            print(f"          NLM | Pred: ∇w1={pred_w1_grad:.2e} ∇w2={pred_w2_grad:.2e} {pred_grad_status} | "
+                  f"Surp: ∇w1={surp_w1_grad:.2e} ∇w2={surp_w2_grad:.2e} {surp_grad_status}")
+
             # WandB logging (consolidated - only essential metrics)
             if config.wandb_project:
                 log_dict = {
@@ -1267,6 +1279,24 @@ def main():
                     'ctm_ticks/surp_best': metrics.get('ctm_surp_avg_best_tick', 0),
                     'ctm_ticks/surp_certain': metrics.get('ctm_surp_avg_certain_tick', 0),
                     'sync/surp_to_pred': metrics.get('cross_sync_surp_pred', 0.5),
+
+                    # === TICK EVOLUTION (internal obs residual monitoring) ===
+                    'tick_evolution/pred_total_delta': metrics.get('tick_pred_total_delta', 0),
+                    'tick_evolution/pred_late_delta': metrics.get('tick_pred_late_delta', 0),
+                    'tick_evolution/pred_plateau': metrics.get('tick_pred_plateau', 0),
+                    'tick_evolution/surp_total_delta': metrics.get('tick_surp_total_delta', 0),
+                    'tick_evolution/surp_late_delta': metrics.get('tick_surp_late_delta', 0),
+                    'tick_evolution/surp_plateau': metrics.get('tick_surp_plateau', 0),
+
+                    # === NLM GRADIENT/WEIGHT MONITORING ===
+                    'nlm/pred_w1_norm': metrics.get('nlm_pred/w1_norm', 0),
+                    'nlm/pred_w2_norm': metrics.get('nlm_pred/w2_norm', 0),
+                    'nlm/pred_w1_grad': metrics.get('nlm_pred/w1_grad_norm', 0),
+                    'nlm/pred_w2_grad': metrics.get('nlm_pred/w2_grad_norm', 0),
+                    'nlm/surp_w1_norm': metrics.get('nlm_surp/w1_norm', 0),
+                    'nlm/surp_w2_norm': metrics.get('nlm_surp/w2_norm', 0),
+                    'nlm/surp_w1_grad': metrics.get('nlm_surp/w1_grad_norm', 0),
+                    'nlm/surp_w2_grad': metrics.get('nlm_surp/w2_grad_norm', 0),
                 }
                 wandb.log(log_dict, step=global_step)
 
