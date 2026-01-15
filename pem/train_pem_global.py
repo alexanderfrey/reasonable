@@ -898,6 +898,8 @@ def train_step(
     for k, v in loss_dict.items():
         if isinstance(v, torch.Tensor):
             metrics[f'loss/{k}'] = v.item()
+        elif isinstance(v, (int, float)):
+            metrics[f'loss/{k}'] = v
 
     # Cumulative sync stats
     metrics['cumulative_sync_mean'] = final_state.cumulative_sync.mean().item()
@@ -927,6 +929,8 @@ def eval_step(
     for k, v in loss_dict.items():
         if isinstance(v, torch.Tensor):
             metrics[f'eval/loss/{k}'] = v.item()
+        elif isinstance(v, (int, float)):
+            metrics[f'eval/loss/{k}'] = v
 
     return metrics
 
