@@ -205,6 +205,7 @@ class PEMLoopGlobalConfig:
     d_sync_space: int = 128
     sync_pairs: int = 256
     sync_n_heads: int = 4
+    sync_attention_temperature: float = 2.0  # Higher = softer cross-module attention
 
     # Prediction horizons
     immediate_horizon: int = 8
@@ -216,6 +217,7 @@ class PEMLoopGlobalConfig:
 
     # Loop config
     sync_decay: float = 0.9      # Decay for cumulative sync
+    observation_residual: float = 0.3  # Blend factor for observation update (0=replace, 1=keep)
 
     # Memory optimization
     gradient_checkpointing: bool = False  # Recompute activations in backward (saves VRAM)
@@ -367,6 +369,7 @@ class PEMLoopGlobal(nn.Module):
             sync_pairs=config.sync_pairs,
             n_heads=config.sync_n_heads,
             dropout=config.dropout,
+            attention_temperature=config.sync_attention_temperature,
         )
         self.global_sync = GlobalSyncModule(sync_config)
 
@@ -463,11 +466,16 @@ class PEMLoopGlobal(nn.Module):
         )
 
         # 6. Attention: use global sync to attend to features
-        observation, attn_weights = self.attention(
+        attended_obs, attn_weights = self.attention(
             sync=global_sync_output.sync,
             features=features,
             state=state.observation,
         )
+
+        # 7. Observation residual connection (prevents fixed points)
+        # Blend new attended observation with previous observation
+        alpha = self.config.observation_residual
+        observation = alpha * state.observation + (1 - alpha) * attended_obs
 
         # Build output and new state
         output = PEMLoopGlobalOutput(

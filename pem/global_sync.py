@@ -67,6 +67,7 @@ class GlobalSyncConfig:
     # Cross-module attention
     n_heads: int = 4
     dropout: float = 0.0
+    attention_temperature: float = 1.0  # Higher = softer attention (1.0 = standard)
 
     # Output
     sync_pairs: int = 256          # Output sync dimension
@@ -195,12 +196,14 @@ class SyncCrossModuleAttention(nn.Module):
         num_modules: int,
         n_heads: int = 4,
         dropout: float = 0.0,
+        temperature: float = 1.0,
     ):
         super().__init__()
         self.d_sync_space = d_sync_space
         self.num_modules = num_modules
         self.n_heads = n_heads
         self.head_dim = d_sync_space // n_heads
+        self.temperature = temperature
 
         assert d_sync_space % n_heads == 0
 
@@ -263,9 +266,11 @@ class SyncCrossModuleAttention(nn.Module):
         v = v.view(B * S, num_modules, self.n_heads, self.head_dim).transpose(1, 2)
         # Now: (B*S, n_heads, num_modules, head_dim)
 
-        # Attention
+        # Attention with temperature scaling
+        # Higher temperature = softer attention (more uniform)
         scale = self.head_dim ** -0.5
         scores = torch.matmul(q, k.transpose(-2, -1)) * scale
+        scores = scores / self.temperature  # Temperature scaling
         attn_weights = F.softmax(scores, dim=-1)  # (B*S, n_heads, num_modules, num_modules)
         attn_weights = self.dropout(attn_weights)
 
@@ -434,6 +439,7 @@ class GlobalSyncModule(nn.Module):
             num_modules=num_modules,
             n_heads=self.config.n_heads,
             dropout=self.config.dropout,
+            temperature=self.config.attention_temperature,
         )
 
         self._sync_integrator = SyncIntegrator(

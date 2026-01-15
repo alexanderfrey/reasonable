@@ -598,6 +598,262 @@ def compute_detailed_metrics(
     return metrics
 
 
+def print_diagnostic_report(
+    outputs: List,
+    targets: Dict[str, torch.Tensor],
+    step: int,
+):
+    """
+    Print comprehensive diagnostic report to terminal.
+
+    Metrics to understand:
+    1. Global loop effectiveness - Are more steps helping?
+    2. Neuron synchronization - Are neurons within modules syncing?
+    3. Cross-module synchronization - Are modules syncing with each other?
+    4. Internal tick dynamics - Is CTM "thinking" across ticks?
+    5. Activation health - Are neurons alive and changing?
+    """
+    print("\n" + "="*80)
+    print(f"DIAGNOSTIC REPORT - Step {step}")
+    print("="*80)
+
+    num_steps = len(outputs)
+
+    # ========== 1. GLOBAL LOOP STEP EFFECTIVENESS ==========
+    print("\n[1] GLOBAL LOOP STEP EFFECTIVENESS")
+    print("-" * 40)
+
+    step_losses = []
+    for i, out in enumerate(outputs):
+        # Compute prediction loss at this step
+        pred = out.predictions['immediate']
+        target = targets['immediate']
+        valid = targets.get('immediate_valid', None)
+        if valid is not None and valid.any():
+            cos_sim = F.cosine_similarity(pred[valid], target[valid], dim=-1).mean()
+            loss = (1 - cos_sim).item()
+        else:
+            loss = 0.0
+        step_losses.append(loss)
+
+        improvement = ""
+        if i > 0:
+            delta = step_losses[i-1] - step_losses[i]
+            improvement = f"  (Δ={delta:+.4f} {'✓' if delta > 0 else '✗'})"
+        print(f"  Step {i}: loss={loss:.4f}{improvement}")
+
+    best_step = int(np.argmin(step_losses))
+    print(f"  → Best step: {best_step} (loss={step_losses[best_step]:.4f})")
+    print(f"  → Final step improvement: {step_losses[0] - step_losses[-1]:+.4f}")
+
+    # ========== 2. NEURON ACTIVATION HEALTH ==========
+    print("\n[2] NEURON ACTIVATION HEALTH")
+    print("-" * 40)
+
+    for i, out in enumerate(outputs):
+        pred_acts = out.prediction_output.all_tick_activations
+        surp_acts = out.surprise.all_tick_activations
+
+        print(f"  Step {i} - PredictionCTM:")
+        for t, z in enumerate(pred_acts):
+            std = z.std().item()
+            mean = z.mean().item()
+            change = ""
+            if t > 0:
+                delta = (z - pred_acts[t-1]).norm().item() / z.numel() ** 0.5
+                change = f"  Δ={delta:.4f}"
+            print(f"    Tick {t}: std={std:.4f}, mean={mean:.4f}{change}")
+
+        print(f"  Step {i} - SurpriseCTM:")
+        for t, z in enumerate(surp_acts):
+            std = z.std().item()
+            mean = z.mean().item()
+            change = ""
+            if t > 0:
+                delta = (z - surp_acts[t-1]).norm().item() / z.numel() ** 0.5
+                change = f"  Δ={delta:.4f}"
+            print(f"    Tick {t}: std={std:.4f}, mean={mean:.4f}{change}")
+
+    # ========== 3. INTERNAL SYNC (within modules) ==========
+    print("\n[3] INTERNAL SYNC (within modules)")
+    print("-" * 40)
+
+    for i, out in enumerate(outputs):
+        pred_acts = out.prediction_output.all_tick_activations
+        surp_acts = out.surprise.all_tick_activations
+
+        # Compute sync matrix S = Z @ Z^T for final tick
+        if pred_acts:
+            z_pred = pred_acts[-1]  # (B, S, D)
+            S_pred = torch.matmul(z_pred, z_pred.transpose(-1, -2))  # (B, S, D, D)
+            S_pred = S_pred / (z_pred.shape[-1] ** 0.5)
+
+            # Diagonal = self-sync, off-diagonal = cross-neuron sync
+            diag_mean = S_pred.diagonal(dim1=-2, dim2=-1).mean().item()
+            off_diag = S_pred - torch.diag_embed(S_pred.diagonal(dim1=-2, dim2=-1))
+            off_diag_mean = off_diag.abs().mean().item()
+            off_diag_std = off_diag.std().item()
+
+            print(f"  Step {i} - PredictionCTM sync matrix:")
+            print(f"    Diagonal (self-sync): {diag_mean:.4f}")
+            print(f"    Off-diagonal mean: {off_diag_mean:.4f}, std: {off_diag_std:.4f}")
+            print(f"    Ratio (cross/self): {off_diag_mean/max(diag_mean, 1e-6):.4f}")
+
+        if surp_acts:
+            z_surp = surp_acts[-1]
+            S_surp = torch.matmul(z_surp, z_surp.transpose(-1, -2))
+            S_surp = S_surp / (z_surp.shape[-1] ** 0.5)
+
+            diag_mean = S_surp.diagonal(dim1=-2, dim2=-1).mean().item()
+            off_diag = S_surp - torch.diag_embed(S_surp.diagonal(dim1=-2, dim2=-1))
+            off_diag_mean = off_diag.abs().mean().item()
+            off_diag_std = off_diag.std().item()
+
+            print(f"  Step {i} - SurpriseCTM sync matrix:")
+            print(f"    Diagonal (self-sync): {diag_mean:.4f}")
+            print(f"    Off-diagonal mean: {off_diag_mean:.4f}, std: {off_diag_std:.4f}")
+            print(f"    Ratio (cross/self): {off_diag_mean/max(diag_mean, 1e-6):.4f}")
+
+    # ========== 4. CROSS-MODULE SYNCHRONIZATION ==========
+    print("\n[4] CROSS-MODULE SYNCHRONIZATION")
+    print("-" * 40)
+
+    for i, out in enumerate(outputs):
+        cross_sync = out.global_sync.cross_module_sync  # (2, 2, B, S)
+        contrib = out.global_sync.module_contributions  # (B, S, 2)
+
+        # Cross-sync values
+        pred_to_pred = cross_sync[0, 0].mean().item()
+        pred_to_surp = cross_sync[0, 1].mean().item()
+        surp_to_pred = cross_sync[1, 0].mean().item()
+        surp_to_surp = cross_sync[1, 1].mean().item()
+
+        # Module contributions
+        pred_contrib = contrib[..., 0].mean().item()
+        surp_contrib = contrib[..., 1].mean().item()
+
+        print(f"  Step {i}:")
+        print(f"    Cross-module attention:")
+        print(f"      Pred→Pred: {pred_to_pred:.4f}  Pred→Surp: {pred_to_surp:.4f}")
+        print(f"      Surp→Pred: {surp_to_pred:.4f}  Surp→Surp: {surp_to_surp:.4f}")
+        print(f"    Module contributions: Pred={pred_contrib:.4f}, Surp={surp_contrib:.4f}")
+
+        # Check if cross-module sync is meaningful (not just 0.5/0.5)
+        cross_deviation = abs(pred_to_surp - 0.5) + abs(surp_to_pred - 0.5)
+        print(f"    Cross-sync deviation from uniform: {cross_deviation:.4f}")
+
+    # ========== 5. INTERNAL TICK SELECTION (CTM Loss) ==========
+    print("\n[5] INTERNAL TICK SELECTION (which tick is best?)")
+    print("-" * 40)
+
+    for i, out in enumerate(outputs):
+        pred_out = out.prediction_output
+        surp_out = out.surprise
+
+        # Prediction: which tick has best loss?
+        if hasattr(pred_out, 'all_tick_outputs') and pred_out.all_tick_outputs:
+            target = targets['immediate']
+            valid = targets.get('immediate_valid', None)
+
+            tick_losses = []
+            for y_t in pred_out.all_tick_outputs:
+                if valid is not None and valid.any():
+                    cos_sim = F.cosine_similarity(y_t[valid], target[valid], dim=-1).mean()
+                    tick_losses.append((1 - cos_sim).item())
+                else:
+                    tick_losses.append(0.0)
+
+            best_tick = int(np.argmin(tick_losses))
+            print(f"  Step {i} - PredictionCTM tick losses: {[f'{l:.4f}' for l in tick_losses]}")
+            print(f"    → Best tick: {best_tick}")
+
+        # Surprise: which tick has best calibration?
+        if hasattr(surp_out, 'all_tick_magnitudes') and surp_out.all_tick_magnitudes:
+            tick_losses = []
+            for tick_mag in surp_out.all_tick_magnitudes:
+                surp_loss = F.mse_loss(tick_mag, surp_out.raw).item()
+                tick_losses.append(surp_loss)
+
+            best_tick = int(np.argmin(tick_losses))
+            print(f"  Step {i} - SurpriseCTM tick losses: {[f'{l:.4f}' for l in tick_losses]}")
+            print(f"    → Best tick: {best_tick}")
+
+    # ========== 6. ACTIVATION CORRELATION ACROSS MODULES ==========
+    print("\n[6] ACTIVATION CORRELATION (do modules agree?)")
+    print("-" * 40)
+
+    for i, out in enumerate(outputs):
+        pred_z = out.prediction_output.post_activations  # (B, S, D_pred)
+        surp_z = out.surprise.post_activations  # (B, S, D_surp)
+
+        # Project to same dimension for comparison (use smaller)
+        d_min = min(pred_z.shape[-1], surp_z.shape[-1])
+        pred_proj = pred_z[..., :d_min].reshape(-1, d_min)
+        surp_proj = surp_z[..., :d_min].reshape(-1, d_min)
+
+        # Compute correlation
+        pred_norm = (pred_proj - pred_proj.mean(dim=0)) / (pred_proj.std(dim=0) + 1e-6)
+        surp_norm = (surp_proj - surp_proj.mean(dim=0)) / (surp_proj.std(dim=0) + 1e-6)
+        correlation = (pred_norm * surp_norm).mean().item()
+
+        # Cosine similarity between flattened activations
+        cos_sim = F.cosine_similarity(
+            pred_z.reshape(pred_z.shape[0], -1),
+            surp_z[..., :pred_z.shape[-1]].reshape(surp_z.shape[0], -1) if surp_z.shape[-1] >= pred_z.shape[-1]
+            else F.pad(surp_z, (0, pred_z.shape[-1] - surp_z.shape[-1])).reshape(surp_z.shape[0], -1),
+            dim=-1
+        ).mean().item()
+
+        print(f"  Step {i}:")
+        print(f"    Activation correlation: {correlation:.4f}")
+        print(f"    Cosine similarity: {cos_sim:.4f}")
+
+    # ========== 7. SYNC EVOLUTION ACROSS STEPS ==========
+    print("\n[7] SYNC EVOLUTION ACROSS GLOBAL STEPS")
+    print("-" * 40)
+
+    sync_values = []
+    for i, out in enumerate(outputs):
+        sync_std = out.global_sync.sync.std().item()
+        sync_mean = out.global_sync.sync.mean().item()
+        sync_values.append((sync_mean, sync_std))
+
+        change = ""
+        if i > 0:
+            delta_std = sync_values[i][1] - sync_values[i-1][1]
+            change = f"  Δstd={delta_std:+.4f}"
+        print(f"  Step {i}: mean={sync_mean:.4f}, std={sync_std:.4f}{change}")
+
+    # ========== 8. OBSERVATION CHANGE ACROSS STEPS ==========
+    print("\n[8] OBSERVATION CHANGE ACROSS STEPS")
+    print("-" * 40)
+
+    prev_obs = None
+    for i, out in enumerate(outputs):
+        obs = out.observation
+        obs_std = obs.std().item()
+        obs_mean = obs.mean().item()
+        obs_norm = obs.norm().item()
+
+        if prev_obs is not None:
+            # How much did observation change?
+            delta = (obs - prev_obs).norm().item()
+            delta_per_elem = delta / (obs.numel() ** 0.5)
+            cos_sim = F.cosine_similarity(
+                obs.reshape(1, -1), prev_obs.reshape(1, -1)
+            ).item()
+            print(f"  Step {i}: std={obs_std:.4f}, mean={obs_mean:.4f}, "
+                  f"Δ={delta:.4f}, Δ/√n={delta_per_elem:.6f}, cos_sim={cos_sim:.6f}")
+        else:
+            print(f"  Step {i}: std={obs_std:.4f}, mean={obs_mean:.4f}, norm={obs_norm:.4f}")
+
+        prev_obs = obs
+
+    print("\n" + "="*80)
+    print("END DIAGNOSTIC REPORT")
+    print("="*80 + "\n")
+
+
 def train_step(
     model: PEMLoopGlobal,
     features: torch.Tensor,
@@ -610,6 +866,7 @@ def train_step(
     Returns:
         metrics: Dict of scalar metrics
         outputs: (optional) List of PEMLoopGlobalOutput for visualization
+        targets: (optional) Dict of target tensors (returned with outputs)
     """
     model.train()
     optimizer.zero_grad()
@@ -647,7 +904,7 @@ def train_step(
     metrics['cumulative_sync_std'] = final_state.cumulative_sync.std().item()
 
     if return_outputs:
-        return metrics, outputs
+        return metrics, outputs, targets
     return metrics
 
 
@@ -721,6 +978,10 @@ def main():
     parser.add_argument('--warmup_steps', type=int, default=100)
     parser.add_argument('--grad_clip', type=float, default=1.0)
     parser.add_argument('--num_loop_steps', type=int, default=2)
+    parser.add_argument('--observation_residual', type=float, default=0.3,
+                        help='Observation blend factor (0=replace, 0.3=default, 1=keep)')
+    parser.add_argument('--attention_temperature', type=float, default=2.0,
+                        help='Cross-module attention temperature (higher=softer, default=2.0)')
     parser.add_argument('--max_length', type=int, default=512)
 
     # Memory optimization args
@@ -732,6 +993,8 @@ def main():
     # Logging args
     parser.add_argument('--log_every', type=int, default=10)
     parser.add_argument('--eval_every', type=int, default=100)
+    parser.add_argument('--diagnostic_every', type=int, default=0,
+                        help='Print diagnostic report every N steps (0=disabled, 1=every step)')
     parser.add_argument('--wandb_project', type=str, default=None)
     parser.add_argument('--wandb_run_name', type=str, default=None)
 
@@ -794,11 +1057,17 @@ def main():
         pred_T=config.pred_T,
         surp_T=config.surp_T,
         sync_pairs=config.sync_pairs,
+        sync_attention_temperature=args.attention_temperature,
+        observation_residual=args.observation_residual,
         gradient_checkpointing=args.gradient_checkpointing,
         backprop_steps=args.backprop_steps,
     )
     model = PEMLoopGlobal(pem_config).to(device)
     print(f"PEM Loop created: {sum(p.numel() for p in model.parameters()):,} params")
+    if args.observation_residual > 0:
+        print(f"  [Loop] Observation residual: {args.observation_residual}")
+    if args.attention_temperature != 1.0:
+        print(f"  [Sync] Attention temperature: {args.attention_temperature}")
     if args.gradient_checkpointing:
         print("  [Memory] Gradient checkpointing ENABLED")
     if args.backprop_steps > 0:
@@ -820,6 +1089,8 @@ def main():
     print(f"  Pred neurons: {config.pred_d_neurons}, T={config.pred_T}")
     print(f"  Surp neurons: {config.surp_d_neurons}, T={config.surp_T}")
     print(f"  Sync pairs: {config.sync_pairs}")
+    if args.diagnostic_every > 0:
+        print(f"  [Diagnostic] Report every {args.diagnostic_every} steps")
     print()
 
     global_step = 0
@@ -866,15 +1137,24 @@ def main():
         if features.shape[1] < 32:
             continue
 
-        # Training step (return outputs periodically for visualization)
+        # Training step (return outputs periodically for visualization and diagnostics)
         should_visualize = config.wandb_project and (global_step + 1) % (config.log_every * 10) == 0
-        result = train_step(model, features, optimizer, config, return_outputs=should_visualize)
+        should_diagnose = args.diagnostic_every > 0 and (
+            global_step == 0 or (global_step + 1) % args.diagnostic_every == 0
+        )
+        need_outputs = should_visualize or should_diagnose
+        result = train_step(model, features, optimizer, config, return_outputs=need_outputs)
 
-        if should_visualize:
-            metrics, outputs_for_viz = result
+        if need_outputs:
+            metrics, outputs_for_diag, targets_for_diag = result
         else:
             metrics = result
-            outputs_for_viz = None
+            outputs_for_diag = None
+            targets_for_diag = None
+
+        # Print diagnostic report if requested
+        if should_diagnose and outputs_for_diag is not None:
+            print_diagnostic_report(outputs_for_diag, targets_for_diag, global_step + 1)
 
         scheduler.step()
 
@@ -987,22 +1267,22 @@ def main():
                 wandb.log(log_dict, step=global_step)
 
                 # NLM activation visualization (less frequent)
-                if outputs_for_viz is not None:
+                if should_visualize and outputs_for_diag is not None:
                     try:
                         # Create NLM activation heatmap grid
-                        fig_nlm = create_nlm_activation_grid(outputs_for_viz)
+                        fig_nlm = create_nlm_activation_grid(outputs_for_diag)
                         wandb.log({
                             "visualizations/nlm_activations_heatmap": wandb.Image(fig_to_image(fig_nlm))
                         }, step=global_step)
 
                         # Create NLM neuron line plots
-                        fig_lines = create_nlm_neuron_lines(outputs_for_viz)
+                        fig_lines = create_nlm_neuron_lines(outputs_for_diag)
                         wandb.log({
                             "visualizations/nlm_neuron_lines": wandb.Image(fig_to_image(fig_lines))
                         }, step=global_step)
 
                         # Create cross-module sync plot
-                        fig_sync = create_cross_module_sync_plot(outputs_for_viz)
+                        fig_sync = create_cross_module_sync_plot(outputs_for_diag)
                         wandb.log({
                             "visualizations/cross_module_sync": wandb.Image(fig_to_image(fig_sync))
                         }, step=global_step)
