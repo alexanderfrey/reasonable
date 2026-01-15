@@ -2,23 +2,33 @@
 CTM Base Module - Shared infrastructure for all CTM-based modules.
 
 Every specialized module (Prediction, Surprise, Valence, etc.) uses the same
-core CTM architecture:
+core CTM architecture with per-tick cross-attention:
 
     ┌─────────────────────────────────────────────────────────────────────┐
     │                    CTM Core (shared by all modules)                 │
     │                                                                     │
+    │  o_0 = init_observation(input_features)                            │
+    │                                                                     │
     │  for t in 1..T:                                                    │
-    │      a_t = Synapse(concat(z_t, input_t))     [pre-activations]    │
+    │      a_t = Synapse(concat(z_t, o_t))         [pre-activations]    │
     │      A_t = update_history(A_{t-1}, a_t)      [history buffer]     │
     │      z_t = NLM(A_t)                          [post-activations]   │
     │      S_t = Sync(Z_t)                         [synchronization]    │
+    │      q_t = W_in · S_action_t                 [sync → query]       │
+    │      o_t = Attention(Q=q_t, KV=features)    [cross-attention]    │
     │                                                                     │
     │  Output: z_T (post-activations), S_T (sync matrix)                 │
     └─────────────────────────────────────────────────────────────────────┘
 
+Per-tick cross-attention (paper: "Modulating input data"):
+- S_action (S_internal) generates attention queries
+- Queries attend to input features (KV cache)
+- Attended features o_t feed into next tick's Synapse
+- This allows the CTM to dynamically modulate its perception of data
+
 Each specialized module:
 - Has its own input projection
-- Shares the core CTM loop
+- Shares the core CTM loop with cross-attention
 - Has its own output readout
 - Exposes post-activations for global sync
 """
@@ -66,6 +76,11 @@ class CTMBaseConfig:
     nlm_hidden: int = 32         # Hidden dim in per-neuron MLPs
 
     dropout: float = 0.0
+
+    # Cross-attention (per-tick attention to features using S_internal)
+    # Paper: "q_t = W_in · S_action_t" then "o_t = Attention(Q=q_t, KV=features)"
+    use_cross_attention: bool = True   # Can disable for ablation
+    cross_attn_heads: int = 4          # Number of attention heads
 
 
 class RMSNorm(nn.Module):
@@ -272,6 +287,107 @@ class SynchronizationModule(nn.Module):
         return S_full, S_out, S_internal
 
 
+class SyncCrossAttention(nn.Module):
+    """
+    Cross-attention using sync-derived queries (paper: "Modulating input data").
+
+    From the CTM paper:
+        q_t = W_in · S_action_t
+        o_t = Attention(Q=q_t, KV=FeatureExtractor(data))
+
+    This allows the CTM to dynamically attend to different parts of the input
+    based on its evolving synchronization state. The attention output o_t
+    feeds into the next tick of recurrence.
+    """
+
+    def __init__(
+        self,
+        d_sync_internal: int,   # S_action dimension (e.g., 128)
+        d_features: int,        # Input features dimension (e.g., 1536)
+        d_output: int,          # Output dimension (same as d_features)
+        n_heads: int = 4,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        self.d_features = d_features
+        self.d_output = d_output
+        self.n_heads = n_heads
+        self.head_dim = d_features // n_heads
+
+        assert d_features % n_heads == 0, f"d_features ({d_features}) must be divisible by n_heads ({n_heads})"
+
+        # S_internal -> Query projection (paper: W_in)
+        self.sync_to_query = nn.Sequential(
+            nn.Linear(d_sync_internal, d_features),
+            nn.GELU(),
+            nn.Linear(d_features, d_features),
+        )
+
+        # Feature -> K, V projections
+        self.k_proj = nn.Linear(d_features, d_features, bias=False)
+        self.v_proj = nn.Linear(d_features, d_features, bias=False)
+
+        # Output projection
+        self.o_proj = nn.Linear(d_features, d_output, bias=False)
+
+        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+        self.norm = RMSNorm(d_output)
+
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, std=0.02)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def forward(
+        self,
+        S_internal: torch.Tensor,  # (B, S, d_sync_internal) sync-based action signal
+        features: torch.Tensor,    # (B, S, d_features) input features to attend to
+    ) -> torch.Tensor:
+        """
+        Generate sync-derived queries and attend to input features.
+
+        Args:
+            S_internal: Subsampled sync matrix (S_action in paper)
+            features: Input features from backbone (KV cache)
+
+        Returns:
+            o_t: (B, S, d_output) attended features for next tick
+        """
+        B, S, _ = features.shape
+
+        # Generate query from sync (paper: q_t = W_in · S_action_t)
+        q = self.sync_to_query(S_internal)  # (B, S, d_features)
+
+        # K, V from input features
+        k = self.k_proj(features)
+        v = self.v_proj(features)
+
+        # Reshape for multi-head attention
+        q = q.view(B, S, self.n_heads, self.head_dim).transpose(1, 2)
+        k = k.view(B, S, self.n_heads, self.head_dim).transpose(1, 2)
+        v = v.view(B, S, self.n_heads, self.head_dim).transpose(1, 2)
+
+        # Scaled dot-product attention
+        scale = self.head_dim ** -0.5
+        scores = torch.matmul(q, k.transpose(-2, -1)) * scale
+        attn_weights = F.softmax(scores, dim=-1)
+        attn_weights = self.dropout(attn_weights)
+
+        # Apply attention and reshape
+        attended = torch.matmul(attn_weights, v)
+        attended = attended.transpose(1, 2).reshape(B, S, self.d_features)
+
+        # Output projection with residual and norm
+        o_t = self.o_proj(attended)
+        o_t = self.norm(o_t + features)  # Residual connection to features
+
+        return o_t
+
+
 class CTMCore(nn.Module):
     """
     Core CTM loop shared by all specialized modules.
@@ -311,6 +427,22 @@ class CTMCore(nn.Module):
         # Initial state
         self.init_z = nn.Linear(config.d_input, config.d_neurons)
 
+        # Per-tick cross-attention (paper: "Modulating input data")
+        # Uses S_internal (S_action) to generate queries that attend to features
+        if config.use_cross_attention:
+            self.cross_attn = SyncCrossAttention(
+                d_sync_internal=config.d_sync_internal,
+                d_features=config.d_input,
+                d_output=config.d_input,  # Same as input for clean interface
+                n_heads=config.cross_attn_heads,
+                dropout=config.dropout,
+            )
+            # Initial observation projection (used before first sync is available)
+            self.init_observation = nn.Linear(config.d_input, config.d_input)
+        else:
+            self.cross_attn = None
+            self.init_observation = None
+
         self.norm_out = RMSNorm(config.d_output)
 
         self._init_weights()
@@ -328,10 +460,19 @@ class CTMCore(nn.Module):
         input_features: torch.Tensor,  # (B, S, d_input)
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[torch.Tensor], List[torch.Tensor]]:
         """
-        Run the CTM core loop.
+        Run the CTM core loop with per-tick cross-attention.
+
+        From the CTM paper:
+            q_t = W_in · S_action_t
+            o_t = Attention(Q=q_t, KV=features)
+            o_t is concatenated with z_{t+1} for the next cycle
+
+        The Synapse receives the dynamically attended features (o_t) rather than
+        the raw input_features, allowing the CTM to modulate its perception of
+        data based on its evolving synchronization state.
 
         Args:
-            input_features: Input to process
+            input_features: Input to process (used as KV cache for attention)
 
         Returns:
             post_activations: (B, S, d_neurons) final post-activations
@@ -349,6 +490,13 @@ class CTMCore(nn.Module):
         # Initialize post-activations from input
         z_t = self.init_z(input_features)  # (B, S, d_neurons)
 
+        # Initialize observation (attended features) for first tick
+        # Before sync is available, use projected input features
+        if self.cross_attn is not None:
+            o_t = self.init_observation(input_features)  # (B, S, d_input)
+        else:
+            o_t = input_features  # Fallback: use raw features
+
         # Pre-activation history as list (avoids in-place ops)
         A_history_list: List[torch.Tensor] = []
 
@@ -361,7 +509,8 @@ class CTMCore(nn.Module):
         # ===== CTM Tick Loop =====
         for t in range(T):
             # 1. Synapse: produce pre-activations
-            a_t = self.synapse(z_t, input_features)
+            # Uses o_t (attended features) instead of raw input_features
+            a_t = self.synapse(z_t, o_t)
 
             # 2. Update pre-activation history (no in-place ops)
             A_history_list.append(a_t)
@@ -386,7 +535,12 @@ class CTMCore(nn.Module):
             # 5. Compute synchronization
             S_full, S_out, S_internal = self.sync(Z_t)
 
-            # 6. Generate output from sync
+            # 6. Per-tick cross-attention: sync-derived queries attend to features
+            # Paper: q_t = W_in · S_action_t, o_t = Attention(Q=q_t, KV=features)
+            if self.cross_attn is not None:
+                o_t = self.cross_attn(S_internal, input_features)
+
+            # 7. Generate output from sync
             y_t = self.sync_to_output(S_out)
             y_t = self.norm_out(y_t)
 

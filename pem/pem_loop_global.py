@@ -60,6 +60,7 @@ from typing import Optional, Dict, List, Tuple, NamedTuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 from .prediction_ctm import PredictionCTM, PredictionCTMConfig, PredictionCTMOutput
 from .surprise_ctm import SurpriseCTM, SurpriseCTMConfig, SurpriseCTMOutput
@@ -115,6 +116,10 @@ class PEMLoopGlobalConfig:
 
     # Loop config
     sync_decay: float = 0.9      # Decay for cumulative sync
+
+    # Memory optimization
+    gradient_checkpointing: bool = False  # Recompute activations in backward (saves VRAM)
+    backprop_steps: int = -1              # Only backprop through last N steps (-1 = all)
 
     dropout: float = 0.0
 
@@ -345,9 +350,10 @@ class PEMLoopGlobal(nn.Module):
         )
 
         # 4. GlobalSyncModule: cross-module synchronization
+        # Pass Z_history (all tick activations) for true sync computation (S = Z·Z^T)
         global_sync_output = self.global_sync({
-            'prediction': pred_output.post_activations,
-            'surprise': surp_output.post_activations,
+            'prediction': pred_output.all_tick_activations,  # List[(B, S, pred_d_neurons)]
+            'surprise': surp_output.all_tick_activations,    # List[(B, S, surp_d_neurons)]
         })
 
         # 5. Update cumulative sync
@@ -380,6 +386,67 @@ class PEMLoopGlobal(nn.Module):
 
         return output, new_state
 
+    def _step_for_checkpoint(
+        self,
+        features: torch.Tensor,
+        targets_immediate: torch.Tensor,
+        targets_shortterm: torch.Tensor,
+        targets_longterm: torch.Tensor,
+        targets_immediate_valid: Optional[torch.Tensor],
+        targets_shortterm_valid: Optional[torch.Tensor],
+        targets_longterm_valid: Optional[torch.Tensor],
+        observation: torch.Tensor,
+        cumulative_sync: torch.Tensor,
+    ) -> Tuple[torch.Tensor, ...]:
+        """
+        Wrapper for step() that works with gradient checkpointing.
+
+        Gradient checkpointing requires all inputs/outputs to be tensors,
+        so we flatten the Dict/NamedTuple structures.
+        """
+        # Reconstruct targets dict
+        targets = {
+            'immediate': targets_immediate,
+            'shortterm': targets_shortterm,
+            'longterm': targets_longterm,
+        }
+        if targets_immediate_valid is not None:
+            targets['immediate_valid'] = targets_immediate_valid
+        if targets_shortterm_valid is not None:
+            targets['shortterm_valid'] = targets_shortterm_valid
+        if targets_longterm_valid is not None:
+            targets['longterm_valid'] = targets_longterm_valid
+
+        # Reconstruct state
+        state = PEMLoopGlobalState(
+            observation=observation,
+            cumulative_sync=cumulative_sync,
+        )
+
+        # Run actual step
+        output, new_state = self.step(features, targets, state)
+
+        # Return flattened tensors (checkpointing needs tensor outputs)
+        # We'll reconstruct the NamedTuple after
+        return (
+            output.predictions['immediate'],
+            output.predictions['shortterm'],
+            output.predictions['longterm'],
+            output.prediction_output.certainty,
+            output.surprise.magnitude,
+            output.surprise.certainty,
+            output.global_sync.sync,
+            output.global_sync.cross_module_sync,
+            output.global_sync.module_contributions,
+            output.observation,
+            output.attention_weights,
+            new_state.observation,
+            new_state.cumulative_sync,
+            # Pass through activations for later reconstruction
+            torch.stack(output.prediction_output.all_tick_activations, dim=0),
+            torch.stack(output.surprise.all_tick_activations, dim=0),
+        )
+
     def forward(
         self,
         features: torch.Tensor,
@@ -397,6 +464,12 @@ class PEMLoopGlobal(nn.Module):
         Returns:
             outputs: List of outputs for each step
             final_state: Final loop state
+
+        Memory optimization options (set in config):
+            - gradient_checkpointing: Recompute activations during backward pass
+              (reduces VRAM ~2-3x at cost of ~30% slower training)
+            - backprop_steps: Only backprop through last N steps (-1 = all)
+              (reduces VRAM linearly with steps, but may affect learning)
         """
         if targets is None:
             targets = self.target_computer.compute_targets_efficient(features)
@@ -404,8 +477,88 @@ class PEMLoopGlobal(nn.Module):
         state = self.init_state(features)
         outputs = []
 
+        # Determine which steps need gradients
+        backprop_steps = self.config.backprop_steps
+        if backprop_steps < 0:
+            backprop_steps = num_steps  # All steps
+        first_grad_step = max(0, num_steps - backprop_steps)
+
         for step in range(num_steps):
-            output, state = self.step(features, targets, state)
+            # Truncated backprop: detach state for early steps
+            if step < first_grad_step:
+                state = PEMLoopGlobalState(
+                    observation=state.observation.detach(),
+                    cumulative_sync=state.cumulative_sync.detach(),
+                )
+
+            # Use gradient checkpointing if enabled
+            if self.config.gradient_checkpointing and self.training and step >= first_grad_step:
+                # Flatten inputs for checkpoint (needs all tensor args)
+                ckpt_result = checkpoint(
+                    self._step_for_checkpoint,
+                    features,
+                    targets['immediate'],
+                    targets['shortterm'],
+                    targets['longterm'],
+                    targets.get('immediate_valid'),
+                    targets.get('shortterm_valid'),
+                    targets.get('longterm_valid'),
+                    state.observation,
+                    state.cumulative_sync,
+                    use_reentrant=False,
+                )
+
+                # Reconstruct output from checkpoint result
+                (pred_imm, pred_short, pred_long, pred_cert, surp_mag, surp_cert,
+                 sync, cross_sync, contrib, obs, attn_w, new_obs, new_cum_sync,
+                 pred_acts_stacked, surp_acts_stacked) = ckpt_result
+
+                # Reconstruct prediction output (minimal for loss computation)
+                pred_output = PredictionCTMOutput(
+                    predictions={'immediate': pred_imm, 'shortterm': pred_short, 'longterm': pred_long},
+                    post_activations=pred_acts_stacked[-1],  # Final tick
+                    sync_matrix=torch.zeros(1),  # Placeholder
+                    certainty=pred_cert,
+                    all_tick_outputs=[],  # Not needed for loss
+                    all_tick_activations=[pred_acts_stacked[i] for i in range(pred_acts_stacked.shape[0])],
+                )
+
+                # Reconstruct surprise output (minimal)
+                surp_output = SurpriseCTMOutput(
+                    magnitude=surp_mag,
+                    direction=torch.zeros(1),  # Placeholder
+                    raw=surp_mag,  # Placeholder
+                    post_activations=surp_acts_stacked[-1],
+                    sync_matrix=torch.zeros(1),
+                    certainty=surp_cert,
+                    all_tick_outputs=[],
+                    all_tick_activations=[surp_acts_stacked[i] for i in range(surp_acts_stacked.shape[0])],
+                )
+
+                # Reconstruct global sync output
+                global_sync_output = GlobalSyncOutput(
+                    sync=sync,
+                    cross_module_sync=cross_sync,
+                    module_contributions=contrib,
+                )
+
+                output = PEMLoopGlobalOutput(
+                    predictions={'immediate': pred_imm, 'shortterm': pred_short, 'longterm': pred_long},
+                    prediction_output=pred_output,
+                    surprise=surp_output,
+                    global_sync=global_sync_output,
+                    observation=obs,
+                    attention_weights=attn_w,
+                )
+
+                state = PEMLoopGlobalState(
+                    observation=new_obs,
+                    cumulative_sync=new_cum_sync,
+                )
+            else:
+                # Normal forward pass
+                output, state = self.step(features, targets, state)
+
             outputs.append(output)
 
         return outputs, state

@@ -431,18 +431,30 @@ def compute_detailed_metrics(
     outputs: List,
     targets: Dict[str, torch.Tensor],
 ) -> Dict[str, float]:
-    """Compute detailed metrics for logging."""
+    """
+    Compute consolidated metrics for logging.
+
+    Returns:
+    - Overall best loss/certainty step
+    - Per-module best steps (PredictionCTM, SurpriseCTM)
+    - Key summary metrics (surprise, sync)
+    """
     metrics = {}
 
     # Track per-step metrics for finding best step
-    step_losses = []
-    step_certainties = []
+    step_losses = []           # Overall prediction loss
+    step_certainties = []      # Combined certainty
+
+    # Per-module tracking
+    step_pred_losses = []      # PredictionCTM loss only
+    step_pred_certainties = [] # PredictionCTM certainty
+    step_surp_losses = []      # SurpriseCTM calibration loss
+    step_surp_certainties = [] # SurpriseCTM certainty
 
     for step_idx, output in enumerate(outputs):
-        prefix = f"step{step_idx}"
         step_loss = 0.0
 
-        # Prediction metrics
+        # Prediction loss (cosine similarity)
         for scale in ['immediate', 'shortterm', 'longterm']:
             pred = output.predictions[scale]
             target = targets[scale]
@@ -452,55 +464,27 @@ def compute_detailed_metrics(
                 pred_valid = pred[valid]
                 target_valid = target[valid]
                 cos_sim = F.cosine_similarity(pred_valid, target_valid, dim=-1).mean()
-                metrics[f'{prefix}/{scale}_cos_sim'] = cos_sim.item()
                 step_loss += (1 - cos_sim).item()
 
-        # Surprise metrics
-        metrics[f'{prefix}/surprise_magnitude_mean'] = output.surprise.magnitude.mean().item()
-        metrics[f'{prefix}/surprise_magnitude_std'] = output.surprise.magnitude.std().item()
-        metrics[f'{prefix}/surprise_raw_mean'] = output.surprise.raw.mean().item()
-        metrics[f'{prefix}/surprise_certainty'] = output.surprise.certainty.item()
+        # Module-specific metrics
+        pred_certainty = output.prediction_output.certainty.item()
+        surp_certainty = output.surprise.certainty.item()
 
-        # Prediction certainty
-        metrics[f'{prefix}/prediction_certainty'] = output.prediction_output.certainty.item()
+        # Surprise calibration loss (how well magnitude tracks raw)
+        surp_cal_loss = F.mse_loss(output.surprise.magnitude, output.surprise.raw).item()
 
-        # Combined certainty (average of prediction and surprise)
-        combined_certainty = (output.prediction_output.certainty.item() + output.surprise.certainty.item()) / 2
-        metrics[f'{prefix}/combined_certainty'] = combined_certainty
-
-        # Global sync metrics
-        sync = output.global_sync
-        metrics[f'{prefix}/global_sync_mean'] = sync.sync.mean().item()
-        metrics[f'{prefix}/global_sync_std'] = sync.sync.std().item()
-
-        # Cross-module sync (2x2 matrix for pred-surp)
-        cross_sync = sync.cross_module_sync  # (2, 2, B, S)
-        metrics[f'{prefix}/cross_sync_pred_pred'] = cross_sync[0, 0].mean().item()
-        metrics[f'{prefix}/cross_sync_pred_surp'] = cross_sync[0, 1].mean().item()
-        metrics[f'{prefix}/cross_sync_surp_pred'] = cross_sync[1, 0].mean().item()
-        metrics[f'{prefix}/cross_sync_surp_surp'] = cross_sync[1, 1].mean().item()
-
-        # Module contributions
-        contrib = sync.module_contributions  # (B, S, 2)
-        metrics[f'{prefix}/contrib_prediction'] = contrib[..., 0].mean().item()
-        metrics[f'{prefix}/contrib_surprise'] = contrib[..., 1].mean().item()
-
-        # Attention metrics
-        attn = output.attention_weights  # (B, H, S, S)
-        attn_entropy = -(attn * (attn + 1e-8).log()).sum(dim=-1).mean()
-        metrics[f'{prefix}/attention_entropy'] = attn_entropy.item()
-
-        # Attention focus (how peaked is attention?)
-        attn_max = attn.max(dim=-1).values.mean()
-        metrics[f'{prefix}/attention_max'] = attn_max.item()
-
-        # Store per-step loss
-        metrics[f'{prefix}/step_loss'] = step_loss
+        # Store per-step values
         step_losses.append(step_loss)
-        step_certainties.append(combined_certainty)
+        step_certainties.append((pred_certainty + surp_certainty) / 2)
 
-    # Find best steps
+        step_pred_losses.append(step_loss)  # Prediction module's loss
+        step_pred_certainties.append(pred_certainty)
+        step_surp_losses.append(surp_cal_loss)
+        step_surp_certainties.append(surp_certainty)
+
+    # Find best steps for this batch
     if len(outputs) > 0:
+        # Overall best steps
         best_loss_step = int(np.argmin(step_losses))
         best_certainty_step = int(np.argmax(step_certainties))
 
@@ -509,20 +493,33 @@ def compute_detailed_metrics(
         metrics['best_certainty_step'] = best_certainty_step
         metrics['best_certainty_value'] = step_certainties[best_certainty_step]
 
-    # Cross-step metrics
+        # PredictionCTM best steps
+        metrics['pred_best_loss_step'] = int(np.argmin(step_pred_losses))
+        metrics['pred_best_loss_value'] = step_pred_losses[metrics['pred_best_loss_step']]
+        metrics['pred_best_cert_step'] = int(np.argmax(step_pred_certainties))
+        metrics['pred_best_cert_value'] = step_pred_certainties[metrics['pred_best_cert_step']]
+
+        # SurpriseCTM best steps
+        metrics['surp_best_loss_step'] = int(np.argmin(step_surp_losses))
+        metrics['surp_best_loss_value'] = step_surp_losses[metrics['surp_best_loss_step']]
+        metrics['surp_best_cert_step'] = int(np.argmax(step_surp_certainties))
+        metrics['surp_best_cert_value'] = step_surp_certainties[metrics['surp_best_cert_step']]
+
+        # Final step metrics (for monitoring convergence)
+        metrics['final_step_loss'] = step_losses[-1]
+        metrics['final_step_certainty'] = step_certainties[-1]
+        metrics['final_step_surprise'] = step_surp_losses[-1]
+
+        # Cross-module sync (from final step)
+        final_sync = outputs[-1].global_sync
+        cross_sync = final_sync.cross_module_sync  # (2, 2, B, S)
+        metrics['cross_sync_pred_surp'] = cross_sync[0, 1].mean().item()
+        metrics['cross_sync_surp_pred'] = cross_sync[1, 0].mean().item()
+
+    # Improvement across steps (did iterating help?)
     if len(outputs) > 1:
-        # Surprise change across steps
-        first_surp = outputs[0].surprise.magnitude.mean()
-        last_surp = outputs[-1].surprise.magnitude.mean()
-        metrics['surprise_change'] = (last_surp - first_surp).item()
-
-        # Attention entropy change
-        first_entropy = -(outputs[0].attention_weights * (outputs[0].attention_weights + 1e-8).log()).sum(dim=-1).mean()
-        last_entropy = -(outputs[-1].attention_weights * (outputs[-1].attention_weights + 1e-8).log()).sum(dim=-1).mean()
-        metrics['attention_entropy_change'] = (last_entropy - first_entropy).item()
-
-        # Certainty change
-        metrics['certainty_change'] = step_certainties[-1] - step_certainties[0]
+        metrics['loss_improvement'] = step_losses[0] - step_losses[-1]  # Positive = improved
+        metrics['certainty_improvement'] = step_certainties[-1] - step_certainties[0]  # Positive = improved
 
     return metrics
 
@@ -652,6 +649,12 @@ def main():
     parser.add_argument('--num_loop_steps', type=int, default=2)
     parser.add_argument('--max_length', type=int, default=512)
 
+    # Memory optimization args
+    parser.add_argument('--gradient_checkpointing', action='store_true',
+                        help='Recompute activations during backward (saves ~2-3x VRAM, ~30%% slower)')
+    parser.add_argument('--backprop_steps', type=int, default=-1,
+                        help='Only backprop through last N loop steps (-1 = all)')
+
     # Logging args
     parser.add_argument('--log_every', type=int, default=10)
     parser.add_argument('--eval_every', type=int, default=100)
@@ -717,9 +720,15 @@ def main():
         pred_T=config.pred_T,
         surp_T=config.surp_T,
         sync_pairs=config.sync_pairs,
+        gradient_checkpointing=args.gradient_checkpointing,
+        backprop_steps=args.backprop_steps,
     )
     model = PEMLoopGlobal(pem_config).to(device)
     print(f"PEM Loop created: {sum(p.numel() for p in model.parameters()):,} params")
+    if args.gradient_checkpointing:
+        print("  [Memory] Gradient checkpointing ENABLED")
+    if args.backprop_steps > 0:
+        print(f"  [Memory] Truncated backprop: last {args.backprop_steps} steps")
 
     # Create optimizer and scheduler
     optimizer = create_optimizer(model, config)
@@ -742,6 +751,17 @@ def main():
     global_step = 0
     running_loss = 0.0
     start_time = time.time()
+
+    # Track average best steps across training (overall and per-module)
+    best_loss_step_sum = 0
+    best_certainty_step_sum = 0
+    # PredictionCTM
+    pred_best_loss_step_sum = 0
+    pred_best_cert_step_sum = 0
+    # SurpriseCTM
+    surp_best_loss_step_sum = 0
+    surp_best_cert_step_sum = 0
+    num_logged = 0
 
     while global_step < config.max_steps:
         # Get batch
@@ -793,27 +813,96 @@ def main():
             elapsed = time.time() - start_time
             steps_per_sec = global_step / elapsed
 
-            # Console output
+            # Track best steps for averaging (overall)
             best_loss_step = int(metrics.get('best_loss_step', 0))
             best_cert_step = int(metrics.get('best_certainty_step', 0))
+            best_loss_step_sum += best_loss_step
+            best_certainty_step_sum += best_cert_step
+
+            # Track per-module best steps
+            pred_best_loss_step = int(metrics.get('pred_best_loss_step', 0))
+            pred_best_cert_step = int(metrics.get('pred_best_cert_step', 0))
+            surp_best_loss_step = int(metrics.get('surp_best_loss_step', 0))
+            surp_best_cert_step = int(metrics.get('surp_best_cert_step', 0))
+
+            pred_best_loss_step_sum += pred_best_loss_step
+            pred_best_cert_step_sum += pred_best_cert_step
+            surp_best_loss_step_sum += surp_best_loss_step
+            surp_best_cert_step_sum += surp_best_cert_step
+
+            num_logged += 1
+
+            # Compute running averages (overall)
+            avg_best_loss_step = best_loss_step_sum / num_logged
+            avg_best_cert_step = best_certainty_step_sum / num_logged
+
+            # Compute running averages (per-module)
+            avg_pred_best_loss_step = pred_best_loss_step_sum / num_logged
+            avg_pred_best_cert_step = pred_best_cert_step_sum / num_logged
+            avg_surp_best_loss_step = surp_best_loss_step_sum / num_logged
+            avg_surp_best_cert_step = surp_best_cert_step_sum / num_logged
+
+            # Console output (consolidated)
+            best_loss_val = metrics.get('best_loss_value', 0)
             best_cert_val = metrics.get('best_certainty_value', 0)
+            loss_impr = metrics.get('loss_improvement', 0)
 
             print(f"Step {global_step:5d} | "
-                  f"Loss: {avg_loss:.4f} | "
-                  f"Surp: {metrics['step0/surprise_magnitude_mean']:.3f}→{metrics.get('step1/surprise_magnitude_mean', metrics['step0/surprise_magnitude_mean']):.3f} | "
-                  f"CrossSync: {metrics['step0/cross_sync_pred_surp']:.3f} | "
-                  f"Best: L{best_loss_step} C{best_cert_step}({best_cert_val:.2f}) | "
-                  f"LR: {scheduler.get_last_lr()[0]:.2e} | "
-                  f"{steps_per_sec:.2f} steps/s")
+                  f"Loss: {avg_loss:.4f} (best: {best_loss_val:.3f} @step{best_loss_step}) | "
+                  f"Cert: {best_cert_val:.2f} @step{best_cert_step} | "
+                  f"ΔLoss: {loss_impr:+.3f} | "
+                  f"AvgBest: L{avg_best_loss_step:.1f} C{avg_best_cert_step:.1f} | "
+                  f"{steps_per_sec:.2f} it/s")
 
-            # WandB logging
+            # WandB logging (consolidated - only essential metrics)
             if config.wandb_project:
                 log_dict = {
-                    'train/loss': avg_loss,
-                    'train/learning_rate': scheduler.get_last_lr()[0],
-                    'train/steps_per_sec': steps_per_sec,
+                    # Training basics
+                    'loss': avg_loss,
+                    'learning_rate': scheduler.get_last_lr()[0],
+                    'steps_per_sec': steps_per_sec,
+
+                    # === OVERALL BEST STEPS ===
+                    'best/loss_value': metrics.get('best_loss_value', 0),
+                    'best/loss_step': best_loss_step,
+                    'best/certainty_value': metrics.get('best_certainty_value', 0),
+                    'best/certainty_step': best_cert_step,
+
+                    # Running averages (overall - which step is best ON AVERAGE)
+                    'avg_best/loss_step': avg_best_loss_step,
+                    'avg_best/certainty_step': avg_best_cert_step,
+
+                    # === PREDICTION MODULE BEST STEPS ===
+                    'pred/best_loss_step': pred_best_loss_step,
+                    'pred/best_loss_value': metrics.get('pred_best_loss_value', 0),
+                    'pred/best_cert_step': pred_best_cert_step,
+                    'pred/best_cert_value': metrics.get('pred_best_cert_value', 0),
+                    # Running averages for PredictionCTM
+                    'pred/avg_best_loss_step': avg_pred_best_loss_step,
+                    'pred/avg_best_cert_step': avg_pred_best_cert_step,
+
+                    # === SURPRISE MODULE BEST STEPS ===
+                    'surp/best_loss_step': surp_best_loss_step,
+                    'surp/best_loss_value': metrics.get('surp_best_loss_value', 0),
+                    'surp/best_cert_step': surp_best_cert_step,
+                    'surp/best_cert_value': metrics.get('surp_best_cert_value', 0),
+                    # Running averages for SurpriseCTM
+                    'surp/avg_best_loss_step': avg_surp_best_loss_step,
+                    'surp/avg_best_cert_step': avg_surp_best_cert_step,
+
+                    # Final step metrics
+                    'final/loss': metrics.get('final_step_loss', 0),
+                    'final/certainty': metrics.get('final_step_certainty', 0),
+                    'final/surprise': metrics.get('final_step_surprise', 0),
+
+                    # Improvement from iterating
+                    'improvement/loss': metrics.get('loss_improvement', 0),
+                    'improvement/certainty': metrics.get('certainty_improvement', 0),
+
+                    # Cross-module sync
+                    'sync/pred_to_surp': metrics.get('cross_sync_pred_surp', 0.5),
+                    'sync/surp_to_pred': metrics.get('cross_sync_surp_pred', 0.5),
                 }
-                log_dict.update({f'train/{k}': v for k, v in metrics.items()})
                 wandb.log(log_dict, step=global_step)
 
                 # NLM activation visualization (less frequent)
@@ -853,9 +942,36 @@ def main():
             if config.wandb_project:
                 wandb.log(eval_metrics, step=global_step)
 
-    print("\nTraining complete!")
+    # Final summary
+    print("\n" + "="*60)
+    print("TRAINING COMPLETE")
+    print("="*60)
+    if num_logged > 0:
+        print(f"\nOverall (Global Loop):")
+        print(f"  Average best loss step:      {best_loss_step_sum / num_logged:.2f}")
+        print(f"  Average best certainty step: {best_certainty_step_sum / num_logged:.2f}")
+        print(f"\nPredictionCTM Module:")
+        print(f"  Average best loss step:      {pred_best_loss_step_sum / num_logged:.2f}")
+        print(f"  Average best certainty step: {pred_best_cert_step_sum / num_logged:.2f}")
+        print(f"\nSurpriseCTM Module:")
+        print(f"  Average best loss step:      {surp_best_loss_step_sum / num_logged:.2f}")
+        print(f"  Average best certainty step: {surp_best_cert_step_sum / num_logged:.2f}")
+        print(f"\n(out of {config.num_loop_steps} loop steps, 0-indexed)")
+    print("="*60)
 
     if config.wandb_project:
+        # Log final summary
+        wandb.log({
+            # Overall
+            'summary/avg_best_loss_step': best_loss_step_sum / num_logged if num_logged > 0 else 0,
+            'summary/avg_best_certainty_step': best_certainty_step_sum / num_logged if num_logged > 0 else 0,
+            # PredictionCTM
+            'summary/pred_avg_best_loss_step': pred_best_loss_step_sum / num_logged if num_logged > 0 else 0,
+            'summary/pred_avg_best_cert_step': pred_best_cert_step_sum / num_logged if num_logged > 0 else 0,
+            # SurpriseCTM
+            'summary/surp_avg_best_loss_step': surp_best_loss_step_sum / num_logged if num_logged > 0 else 0,
+            'summary/surp_avg_best_cert_step': surp_best_cert_step_sum / num_logged if num_logged > 0 else 0,
+        })
         wandb.finish()
 
 

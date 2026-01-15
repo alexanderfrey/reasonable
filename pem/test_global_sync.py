@@ -148,17 +148,19 @@ def test_global_sync():
     print(f"GlobalSyncModule params: {sum(p.numel() for p in model.parameters()):,}")
     print(f"Registered modules: {model.module_names}")
 
-    # Test forward
-    h_pred = torch.randn(2, 16, 64)
-    h_surp = torch.randn(2, 16, 32)
+    # Test forward with Z_history (list of activations per tick)
+    # Simulating 4 ticks for prediction, 3 ticks for surprise
+    pred_T, surp_T = 4, 3
+    h_pred_history = [torch.randn(2, 16, 64) for _ in range(pred_T)]  # List of tick activations
+    h_surp_history = [torch.randn(2, 16, 32) for _ in range(surp_T)]  # List of tick activations
 
     output = model({
-        'prediction': h_pred,
-        'surprise': h_surp,
+        'prediction': h_pred_history,  # List[(B, S, d_neurons)]
+        'surprise': h_surp_history,    # List[(B, S, d_neurons)]
     })
 
-    print(f"Prediction activations: {h_pred.shape}")
-    print(f"Surprise activations: {h_surp.shape}")
+    print(f"Prediction Z_history: {len(h_pred_history)} ticks, each {h_pred_history[0].shape}")
+    print(f"Surprise Z_history: {len(h_surp_history)} ticks, each {h_surp_history[0].shape}")
     print(f"Global sync: {output.sync.shape}")
     print(f"Cross-module sync: {output.cross_module_sync.shape}")
     print(f"Module contributions: {output.module_contributions.shape}")
