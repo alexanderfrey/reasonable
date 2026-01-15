@@ -434,27 +434,38 @@ def compute_detailed_metrics(
     """
     Compute consolidated metrics for logging.
 
+    Now tracks TWO levels of iteration:
+    1. Loop steps (outer PEM loop iterations)
+    2. Internal ticks (within each CTM module) - used by CTM loss
+
     Returns:
-    - Overall best loss/certainty step
-    - Per-module best steps (PredictionCTM, SurpriseCTM)
+    - Overall best loss/certainty step (loop level)
+    - Per-module best steps (loop level)
+    - Internal tick selection by CTM loss (tick level)
     - Key summary metrics (surprise, sync)
     """
     metrics = {}
 
-    # Track per-step metrics for finding best step
+    # Track per-step metrics for finding best step (LOOP level)
     step_losses = []           # Overall prediction loss
     step_certainties = []      # Combined certainty
 
-    # Per-module tracking
+    # Per-module tracking (LOOP level)
     step_pred_losses = []      # PredictionCTM loss only
     step_pred_certainties = [] # PredictionCTM certainty
     step_surp_losses = []      # SurpriseCTM calibration loss
     step_surp_certainties = [] # SurpriseCTM certainty
 
+    # Internal TICK tracking (for CTM loss monitoring)
+    pred_best_ticks = []       # Which internal tick was best for prediction
+    pred_certain_ticks = []    # Which internal tick was most certain
+    surp_best_ticks = []       # Which internal tick was best for surprise
+    surp_certain_ticks = []    # Which internal tick was most certain
+
     for step_idx, output in enumerate(outputs):
         step_loss = 0.0
 
-        # Prediction loss (cosine similarity)
+        # Prediction loss (cosine similarity) - from FINAL tick
         for scale in ['immediate', 'shortterm', 'longterm']:
             pred = output.predictions[scale]
             target = targets[scale]
@@ -473,16 +484,55 @@ def compute_detailed_metrics(
         # Surprise calibration loss (how well magnitude tracks raw)
         surp_cal_loss = F.mse_loss(output.surprise.magnitude, output.surprise.raw).item()
 
-        # Store per-step values
+        # Store per-step values (LOOP level)
         step_losses.append(step_loss)
         step_certainties.append((pred_certainty + surp_certainty) / 2)
 
-        step_pred_losses.append(step_loss)  # Prediction module's loss
+        step_pred_losses.append(step_loss)
         step_pred_certainties.append(pred_certainty)
         step_surp_losses.append(surp_cal_loss)
         step_surp_certainties.append(surp_certainty)
 
-    # Find best steps for this batch
+        # ===== CTM INTERNAL TICK ANALYSIS =====
+        # Find which internal ticks were selected by CTM loss
+        pred_out = output.prediction_output
+
+        # Prediction: compute loss at each internal tick
+        if hasattr(pred_out, 'all_tick_predictions') and pred_out.all_tick_predictions:
+            tick_losses = []
+            for tick_preds in pred_out.all_tick_predictions:
+                tick_loss = 0.0
+                for scale in ['immediate', 'shortterm', 'longterm']:
+                    pred_t = tick_preds[scale]
+                    target = targets[scale]
+                    valid = targets.get(f'{scale}_valid', None)
+                    if valid is not None and valid.any():
+                        cos_sim = F.cosine_similarity(pred_t[valid], target[valid], dim=-1).mean()
+                        tick_loss += (1 - cos_sim).item()
+                tick_losses.append(tick_loss)
+
+            pred_best_ticks.append(int(np.argmin(tick_losses)))
+
+        if hasattr(pred_out, 'all_tick_certainties') and pred_out.all_tick_certainties:
+            tick_certs = [c.item() if isinstance(c, torch.Tensor) else c
+                          for c in pred_out.all_tick_certainties]
+            pred_certain_ticks.append(int(np.argmax(tick_certs)))
+
+        # Surprise: find best internal ticks
+        surp_out = output.surprise
+        if hasattr(surp_out, 'all_tick_magnitudes') and surp_out.all_tick_magnitudes:
+            tick_losses = []
+            for tick_mag in surp_out.all_tick_magnitudes:
+                surp_loss = F.mse_loss(tick_mag, surp_out.raw).item()
+                tick_losses.append(surp_loss)
+            surp_best_ticks.append(int(np.argmin(tick_losses)))
+
+        if hasattr(surp_out, 'all_tick_certainties') and surp_out.all_tick_certainties:
+            tick_certs = [c.item() if isinstance(c, torch.Tensor) else c
+                          for c in surp_out.all_tick_certainties]
+            surp_certain_ticks.append(int(np.argmax(tick_certs)))
+
+    # Find best steps for this batch (LOOP level)
     if len(outputs) > 0:
         # Overall best steps
         best_loss_step = int(np.argmin(step_losses))
@@ -493,17 +543,28 @@ def compute_detailed_metrics(
         metrics['best_certainty_step'] = best_certainty_step
         metrics['best_certainty_value'] = step_certainties[best_certainty_step]
 
-        # PredictionCTM best steps
+        # PredictionCTM best steps (LOOP level)
         metrics['pred_best_loss_step'] = int(np.argmin(step_pred_losses))
         metrics['pred_best_loss_value'] = step_pred_losses[metrics['pred_best_loss_step']]
         metrics['pred_best_cert_step'] = int(np.argmax(step_pred_certainties))
         metrics['pred_best_cert_value'] = step_pred_certainties[metrics['pred_best_cert_step']]
 
-        # SurpriseCTM best steps
+        # SurpriseCTM best steps (LOOP level)
         metrics['surp_best_loss_step'] = int(np.argmin(step_surp_losses))
         metrics['surp_best_loss_value'] = step_surp_losses[metrics['surp_best_loss_step']]
         metrics['surp_best_cert_step'] = int(np.argmax(step_surp_certainties))
         metrics['surp_best_cert_value'] = step_surp_certainties[metrics['surp_best_cert_step']]
+
+        # ===== CTM INTERNAL TICK METRICS =====
+        # Average which internal ticks are being selected
+        if pred_best_ticks:
+            metrics['ctm_pred_avg_best_tick'] = float(np.mean(pred_best_ticks))
+        if pred_certain_ticks:
+            metrics['ctm_pred_avg_certain_tick'] = float(np.mean(pred_certain_ticks))
+        if surp_best_ticks:
+            metrics['ctm_surp_avg_best_tick'] = float(np.mean(surp_best_ticks))
+        if surp_certain_ticks:
+            metrics['ctm_surp_avg_certain_tick'] = float(np.mean(surp_certain_ticks))
 
         # Final step metrics (for monitoring convergence)
         metrics['final_step_loss'] = step_losses[-1]
@@ -901,6 +962,13 @@ def main():
 
                     # Cross-module sync
                     'sync/pred_to_surp': metrics.get('cross_sync_pred_surp', 0.5),
+
+                    # === CTM INTERNAL TICK SELECTION ===
+                    # Which internal tick the CTM loss selects (within each module)
+                    'ctm_ticks/pred_best': metrics.get('ctm_pred_avg_best_tick', 0),
+                    'ctm_ticks/pred_certain': metrics.get('ctm_pred_avg_certain_tick', 0),
+                    'ctm_ticks/surp_best': metrics.get('ctm_surp_avg_best_tick', 0),
+                    'ctm_ticks/surp_certain': metrics.get('ctm_surp_avg_certain_tick', 0),
                     'sync/surp_to_pred': metrics.get('cross_sync_surp_pred', 0.5),
                 }
                 wandb.log(log_dict, step=global_step)

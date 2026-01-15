@@ -20,7 +20,7 @@ from .ctm_base import CTMBaseConfig, CTMModule, CTMModuleOutput, RMSNorm
 
 class SurpriseCTMOutput(NamedTuple):
     """Output from SurpriseCTM."""
-    magnitude: torch.Tensor           # (B, S, 1) learned surprise magnitude
+    magnitude: torch.Tensor           # (B, S, 1) learned surprise magnitude from final tick
     direction: torch.Tensor           # (B, S, D) what was unexpected (unit vector)
     raw: torch.Tensor                 # (B, S, 1) raw cosine distance
     post_activations: torch.Tensor    # (B, S, D_neurons) for global sync
@@ -28,6 +28,9 @@ class SurpriseCTMOutput(NamedTuple):
     all_tick_outputs: List[torch.Tensor]
     certainty: torch.Tensor
     all_tick_activations: List[torch.Tensor]  # NLM activations at each tick
+    # CTM loss support: outputs at each internal tick
+    all_tick_magnitudes: List[torch.Tensor]  # Magnitude at each tick
+    all_tick_certainties: List[torch.Tensor]  # Certainty at each tick
 
 
 @dataclass
@@ -165,19 +168,34 @@ class SurpriseCTM(CTMModule):
         # 3. Run core CTM loop
         post_activations, sync_matrix, output, all_outputs, all_activations = self.core(input_features)
 
-        # 4. Generate magnitude and direction
+        # 4. Generate magnitude and direction at EACH tick (for CTM loss)
+        all_tick_magnitudes = []
+        all_tick_certainties = []
+        for t, tick_output in enumerate(all_outputs):
+            tick_surprise = self.output_projection(tick_output)
+            tick_mag = tick_surprise['magnitude']
+            # Apply validity mask if provided
+            if valid_mask is not None:
+                mask = valid_mask.unsqueeze(-1)
+                tick_mag = tick_mag * mask
+            all_tick_magnitudes.append(tick_mag)
+            # Compute certainty up to this tick
+            tick_certainty = self.core.compute_certainty(all_outputs[:t+1])
+            all_tick_certainties.append(tick_certainty)
+
+        # Final outputs (from last tick)
         surprise_outputs = self.output_projection(output)
         magnitude = surprise_outputs['magnitude']
         direction = surprise_outputs['direction']
 
-        # 5. Apply validity mask if provided
+        # Apply validity mask to final outputs
         if valid_mask is not None:
             mask = valid_mask.unsqueeze(-1)  # (B, S, 1)
             magnitude = magnitude * mask
             raw_surprise = raw_surprise * mask
 
-        # 6. Compute certainty
-        certainty = self.core.compute_certainty(all_outputs)
+        # Final certainty
+        certainty = all_tick_certainties[-1] if all_tick_certainties else self.core.compute_certainty(all_outputs)
 
         return SurpriseCTMOutput(
             magnitude=magnitude,
@@ -188,6 +206,8 @@ class SurpriseCTM(CTMModule):
             all_tick_outputs=all_outputs,
             certainty=certainty,
             all_tick_activations=all_activations,
+            all_tick_magnitudes=all_tick_magnitudes,
+            all_tick_certainties=all_tick_certainties,
         )
 
     def forward_multiscale(

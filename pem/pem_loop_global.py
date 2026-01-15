@@ -68,6 +68,61 @@ from .global_sync import GlobalSyncModule, GlobalSyncConfig, GlobalSyncOutput
 from .prediction_module import PredictionTargets
 
 
+def compute_ctm_loss(
+    all_tick_losses: List[torch.Tensor],
+    all_tick_certainties: List[torch.Tensor],
+) -> Tuple[torch.Tensor, int, int]:
+    """
+    Compute CTM paper loss: L = (L_t1 + L_t2) / 2
+
+    Where:
+        t1 = argmin(L) - tick with minimum loss
+        t2 = argmax(C) - tick with maximum certainty
+
+    This loss function encourages the model to:
+    1. Produce the best answer at SOME tick (not necessarily the last)
+    2. Be confident when it has the right answer
+
+    Args:
+        all_tick_losses: List of loss tensors, one per tick
+        all_tick_certainties: List of certainty tensors, one per tick
+
+    Returns:
+        loss: The CTM loss (L_t1 + L_t2) / 2
+        t1: Index of minimum loss tick
+        t2: Index of maximum certainty tick
+    """
+    if len(all_tick_losses) == 0:
+        raise ValueError("No tick losses provided")
+
+    device = all_tick_losses[0].device
+
+    # Stack losses and certainties
+    losses = torch.stack(all_tick_losses)  # (T,) or (T, ...)
+    certainties = torch.stack(all_tick_certainties)  # (T,) or (T, ...)
+
+    # Find t1 = argmin(losses) and t2 = argmax(certainties)
+    # Handle case where losses/certainties might have extra dimensions
+    if losses.dim() > 1:
+        # Average over batch/spatial dims for argmin/argmax
+        losses_for_argmin = losses.view(losses.shape[0], -1).mean(dim=-1)
+        certainties_for_argmax = certainties.view(certainties.shape[0], -1).mean(dim=-1)
+    else:
+        losses_for_argmin = losses
+        certainties_for_argmax = certainties
+
+    t1 = torch.argmin(losses_for_argmin).item()
+    t2 = torch.argmax(certainties_for_argmax).item()
+
+    # CTM loss: average of loss at best tick and loss at most certain tick
+    L_t1 = all_tick_losses[t1]
+    L_t2 = all_tick_losses[t2]
+
+    ctm_loss = (L_t1 + L_t2) / 2
+
+    return ctm_loss, t1, t2
+
+
 class PEMLoopGlobalOutput(NamedTuple):
     """Output from PEM loop with global sync."""
     predictions: Dict[str, torch.Tensor]  # {immediate, shortterm, longterm}
@@ -428,13 +483,27 @@ class PEMLoopGlobal(nn.Module):
 
         # Return flattened tensors (checkpointing needs tensor outputs)
         # We'll reconstruct the NamedTuple after
+        pred_out = output.prediction_output
+        surp_out = output.surprise
+
+        # Stack all-tick predictions for each scale
+        pred_imm_stacked = torch.stack([p['immediate'] for p in pred_out.all_tick_predictions], dim=0)
+        pred_short_stacked = torch.stack([p['shortterm'] for p in pred_out.all_tick_predictions], dim=0)
+        pred_long_stacked = torch.stack([p['longterm'] for p in pred_out.all_tick_predictions], dim=0)
+        pred_cert_stacked = torch.stack(pred_out.all_tick_certainties, dim=0)
+
+        # Stack surprise all-tick data
+        surp_mag_stacked = torch.stack(surp_out.all_tick_magnitudes, dim=0)
+        surp_cert_stacked = torch.stack(surp_out.all_tick_certainties, dim=0)
+
         return (
             output.predictions['immediate'],
             output.predictions['shortterm'],
             output.predictions['longterm'],
-            output.prediction_output.certainty,
-            output.surprise.magnitude,
-            output.surprise.certainty,
+            pred_out.certainty,
+            surp_out.magnitude,
+            surp_out.raw,
+            surp_out.certainty,
             output.global_sync.sync,
             output.global_sync.cross_module_sync,
             output.global_sync.module_contributions,
@@ -443,8 +512,15 @@ class PEMLoopGlobal(nn.Module):
             new_state.observation,
             new_state.cumulative_sync,
             # Pass through activations for later reconstruction
-            torch.stack(output.prediction_output.all_tick_activations, dim=0),
-            torch.stack(output.surprise.all_tick_activations, dim=0),
+            torch.stack(pred_out.all_tick_activations, dim=0),
+            torch.stack(surp_out.all_tick_activations, dim=0),
+            # CTM loss data
+            pred_imm_stacked,
+            pred_short_stacked,
+            pred_long_stacked,
+            pred_cert_stacked,
+            surp_mag_stacked,
+            surp_cert_stacked,
         )
 
     def forward(
@@ -509,30 +585,52 @@ class PEMLoopGlobal(nn.Module):
                 )
 
                 # Reconstruct output from checkpoint result
-                (pred_imm, pred_short, pred_long, pred_cert, surp_mag, surp_cert,
+                (pred_imm, pred_short, pred_long, pred_cert, surp_mag, surp_raw, surp_cert,
                  sync, cross_sync, contrib, obs, attn_w, new_obs, new_cum_sync,
-                 pred_acts_stacked, surp_acts_stacked) = ckpt_result
+                 pred_acts_stacked, surp_acts_stacked,
+                 pred_imm_stacked, pred_short_stacked, pred_long_stacked, pred_cert_stacked,
+                 surp_mag_stacked, surp_cert_stacked) = ckpt_result
 
-                # Reconstruct prediction output (minimal for loss computation)
+                # Reconstruct all-tick predictions for CTM loss
+                num_ticks = pred_imm_stacked.shape[0]
+                all_tick_predictions = [
+                    {
+                        'immediate': pred_imm_stacked[t],
+                        'shortterm': pred_short_stacked[t],
+                        'longterm': pred_long_stacked[t],
+                    }
+                    for t in range(num_ticks)
+                ]
+                all_tick_pred_certainties = [pred_cert_stacked[t] for t in range(num_ticks)]
+
+                # Reconstruct prediction output with CTM loss data
                 pred_output = PredictionCTMOutput(
                     predictions={'immediate': pred_imm, 'shortterm': pred_short, 'longterm': pred_long},
                     post_activations=pred_acts_stacked[-1],  # Final tick
-                    sync_matrix=torch.zeros(1),  # Placeholder
+                    sync_matrix=torch.zeros(1, device=pred_imm.device),  # Placeholder
                     certainty=pred_cert,
                     all_tick_outputs=[],  # Not needed for loss
                     all_tick_activations=[pred_acts_stacked[i] for i in range(pred_acts_stacked.shape[0])],
+                    all_tick_predictions=all_tick_predictions,
+                    all_tick_certainties=all_tick_pred_certainties,
                 )
 
-                # Reconstruct surprise output (minimal)
+                # Reconstruct surprise output with CTM loss data
+                num_surp_ticks = surp_mag_stacked.shape[0]
+                all_tick_magnitudes = [surp_mag_stacked[t] for t in range(num_surp_ticks)]
+                all_tick_surp_certainties = [surp_cert_stacked[t] for t in range(num_surp_ticks)]
+
                 surp_output = SurpriseCTMOutput(
                     magnitude=surp_mag,
-                    direction=torch.zeros(1),  # Placeholder
-                    raw=surp_mag,  # Placeholder
+                    direction=torch.zeros(1, device=surp_mag.device),  # Placeholder
+                    raw=surp_raw,
                     post_activations=surp_acts_stacked[-1],
-                    sync_matrix=torch.zeros(1),
+                    sync_matrix=torch.zeros(1, device=surp_mag.device),
                     certainty=surp_cert,
                     all_tick_outputs=[],
                     all_tick_activations=[surp_acts_stacked[i] for i in range(surp_acts_stacked.shape[0])],
+                    all_tick_magnitudes=all_tick_magnitudes,
+                    all_tick_certainties=all_tick_surp_certainties,
                 )
 
                 # Reconstruct global sync output
@@ -569,51 +667,106 @@ class PEMLoopGlobal(nn.Module):
         targets: Dict[str, torch.Tensor],
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """
-        Compute loss for training.
+        Compute CTM paper loss for training.
 
-        Combines:
-        1. Prediction loss (cosine similarity to targets)
-        2. Surprise calibration (magnitude tracks raw)
-        3. Global sync coherence (modules should synchronize)
+        CTM Loss Formula (per module):
+            t1 = argmin(L)  - tick with minimum loss
+            t2 = argmax(C)  - tick with maximum certainty
+            L = (L_t1 + L_t2) / 2
+
+        This encourages the model to:
+        1. Produce the best answer at SOME tick (iterative refinement)
+        2. Be confident when it has the right answer (calibration)
+
+        Also includes:
+        - Surprise calibration loss
+        - Cross-module sync variance (encourages meaningful synchronization)
         """
         device = outputs[0].predictions['immediate'].device
         total_loss = torch.tensor(0.0, device=device)
         loss_dict = {}
 
         for step_idx, output in enumerate(outputs):
-            # 1. Prediction loss
-            for scale in ['immediate', 'shortterm', 'longterm']:
-                pred = output.predictions[scale]
-                target = targets[scale]
-                valid = targets.get(f'{scale}_valid', None)
+            pred_output = output.prediction_output
+            surp_output = output.surprise
 
-                if valid is not None and valid.any():
-                    pred_valid = pred[valid]
-                    target_valid = target[valid]
-                    cos_sim = F.cosine_similarity(pred_valid, target_valid, dim=-1)
-                    pred_loss = (1 - cos_sim).mean()
-                else:
-                    pred_loss = torch.tensor(0.0, device=device)
+            # ========== 1. PREDICTION CTM LOSS ==========
+            # Compute loss at each internal tick
+            all_tick_pred_losses = []
+            all_tick_pred_certainties = pred_output.all_tick_certainties
 
-                loss_dict[f'step{step_idx}_{scale}_loss'] = pred_loss.detach()
-                total_loss = total_loss + pred_loss
+            for t, tick_preds in enumerate(pred_output.all_tick_predictions):
+                tick_loss = torch.tensor(0.0, device=device)
+                for scale in ['immediate', 'shortterm', 'longterm']:
+                    pred = tick_preds[scale]
+                    target = targets[scale]
+                    valid = targets.get(f'{scale}_valid', None)
 
-            # 2. Surprise calibration
-            mag = output.surprise.magnitude
-            raw = output.surprise.raw
-            surp_cal_loss = F.mse_loss(mag, raw)
-            loss_dict[f'step{step_idx}_surprise_cal'] = surp_cal_loss.detach()
-            total_loss = total_loss + 0.1 * surp_cal_loss
+                    if valid is not None and valid.any():
+                        pred_valid = pred[valid]
+                        target_valid = target[valid]
+                        cos_sim = F.cosine_similarity(pred_valid, target_valid, dim=-1)
+                        scale_loss = (1 - cos_sim).mean()
+                    else:
+                        scale_loss = torch.tensor(0.0, device=device)
+                    tick_loss = tick_loss + scale_loss
 
-            # 3. Cross-module sync should be meaningful
-            # Encourage some variance in cross-module sync (not all 0.5)
-            cross_sync = output.global_sync.cross_module_sync  # (num_modules, num_modules, B, S)
+                all_tick_pred_losses.append(tick_loss)
+
+            # Apply CTM loss formula: L = (L_t1 + L_t2) / 2
+            if len(all_tick_pred_losses) > 0 and len(all_tick_pred_certainties) > 0:
+                pred_ctm_loss, pred_t1, pred_t2 = compute_ctm_loss(
+                    all_tick_pred_losses,
+                    all_tick_pred_certainties,
+                )
+                loss_dict[f'step{step_idx}_pred_ctm_loss'] = pred_ctm_loss.detach()
+                loss_dict[f'step{step_idx}_pred_best_tick'] = float(pred_t1)
+                loss_dict[f'step{step_idx}_pred_certain_tick'] = float(pred_t2)
+                total_loss = total_loss + pred_ctm_loss
+            else:
+                # Fallback to final tick loss if CTM data not available
+                for scale in ['immediate', 'shortterm', 'longterm']:
+                    pred = output.predictions[scale]
+                    target = targets[scale]
+                    valid = targets.get(f'{scale}_valid', None)
+                    if valid is not None and valid.any():
+                        cos_sim = F.cosine_similarity(pred[valid], target[valid], dim=-1)
+                        total_loss = total_loss + (1 - cos_sim).mean()
+
+            # ========== 2. SURPRISE CTM LOSS ==========
+            # Compute calibration loss at each internal tick
+            all_tick_surp_losses = []
+            all_tick_surp_certainties = surp_output.all_tick_certainties
+
+            for t, tick_mag in enumerate(surp_output.all_tick_magnitudes):
+                # Surprise calibration: magnitude should track raw surprise
+                surp_cal_loss = F.mse_loss(tick_mag, surp_output.raw)
+                all_tick_surp_losses.append(surp_cal_loss)
+
+            # Apply CTM loss formula
+            if len(all_tick_surp_losses) > 0 and len(all_tick_surp_certainties) > 0:
+                surp_ctm_loss, surp_t1, surp_t2 = compute_ctm_loss(
+                    all_tick_surp_losses,
+                    all_tick_surp_certainties,
+                )
+                loss_dict[f'step{step_idx}_surp_ctm_loss'] = surp_ctm_loss.detach()
+                loss_dict[f'step{step_idx}_surp_best_tick'] = float(surp_t1)
+                loss_dict[f'step{step_idx}_surp_certain_tick'] = float(surp_t2)
+                total_loss = total_loss + 0.1 * surp_ctm_loss
+            else:
+                # Fallback
+                surp_cal_loss = F.mse_loss(surp_output.magnitude, surp_output.raw)
+                total_loss = total_loss + 0.1 * surp_cal_loss
+
+            # ========== 3. CROSS-MODULE SYNC VARIANCE ==========
+            # Encourage meaningful cross-module synchronization
+            cross_sync = output.global_sync.cross_module_sync
             sync_var = cross_sync.var()
-            sync_var_loss = -sync_var * 0.01  # Negative because we want MORE variance
+            sync_var_loss = -sync_var * 0.01  # Negative = want MORE variance
             loss_dict[f'step{step_idx}_sync_var'] = sync_var.detach()
             total_loss = total_loss + sync_var_loss
 
-        # Average across steps
+        # Average across loop steps
         num_steps = len(outputs)
         total_loss = total_loss / num_steps
         loss_dict['loss'] = total_loss.detach()

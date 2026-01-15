@@ -186,10 +186,14 @@ class NeuronLevelModels(nn.Module):
         self.hidden_dim = hidden_dim
 
         # Each neuron has its own MLP: M -> hidden -> 1
-        self.w1 = nn.Parameter(torch.randn(d_neurons, M, hidden_dim) * 0.02)
+        # Use proper Xavier/He initialization for healthy gradient flow
+        w1_std = math.sqrt(2.0 / (M + hidden_dim))  # Xavier for first layer
+        w2_std = math.sqrt(2.0 / hidden_dim)         # He for output layer (after GELU)
+
+        self.w1 = nn.Parameter(torch.randn(d_neurons, M, hidden_dim) * w1_std)
         self.b1 = nn.Parameter(torch.zeros(d_neurons, hidden_dim))
 
-        self.w2 = nn.Parameter(torch.randn(d_neurons, hidden_dim, 1) * 0.02)
+        self.w2 = nn.Parameter(torch.randn(d_neurons, hidden_dim, 1) * w2_std)
         self.b2 = nn.Parameter(torch.zeros(d_neurons, 1))
 
         self.act = nn.GELU()
@@ -338,7 +342,8 @@ class SyncCrossAttention(nn.Module):
     def _init_weights(self):
         for m in self.modules():
             if isinstance(m, nn.Linear):
-                nn.init.normal_(m.weight, std=0.02)
+                # Xavier init for proper gradient flow
+                nn.init.xavier_uniform_(m.weight)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
@@ -448,10 +453,10 @@ class CTMCore(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
-        """Initialize weights."""
+        """Initialize weights with Xavier for proper gradient flow."""
         for module in self.modules():
             if isinstance(module, nn.Linear):
-                nn.init.normal_(module.weight, std=0.02)
+                nn.init.xavier_uniform_(module.weight)
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
 

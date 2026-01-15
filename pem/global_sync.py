@@ -139,7 +139,8 @@ class ModuleSyncComputer(nn.Module):
     def _init_weights(self):
         for m in self.sync_proj.modules():
             if isinstance(m, nn.Linear):
-                nn.init.normal_(m.weight, std=0.02)
+                # Xavier init for proper gradient flow
+                nn.init.xavier_uniform_(m.weight)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
@@ -223,11 +224,12 @@ class SyncCrossModuleAttention(nn.Module):
     def _init_weights(self):
         for m in self.sync_to_query.modules():
             if isinstance(m, nn.Linear):
-                nn.init.normal_(m.weight, std=0.02)
+                # Xavier init for proper gradient flow
+                nn.init.xavier_uniform_(m.weight)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
         for proj in [self.k_proj, self.v_proj, self.o_proj]:
-            nn.init.normal_(proj.weight, std=0.02)
+            nn.init.xavier_uniform_(proj.weight)
 
     def forward(
         self,
@@ -318,10 +320,11 @@ class SyncIntegrator(nn.Module):
     def _init_weights(self):
         for m in self.integrator.modules():
             if isinstance(m, nn.Linear):
-                nn.init.normal_(m.weight, std=0.02)
+                # Xavier init for proper gradient flow
+                nn.init.xavier_uniform_(m.weight)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
-        nn.init.normal_(self.module_weights.weight, std=0.02)
+        nn.init.xavier_uniform_(self.module_weights.weight)
 
     def forward(
         self,
