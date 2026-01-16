@@ -66,9 +66,10 @@ class TrainingConfig:
     M: int = 16                       # Pre-activation history length
     T: int = 8                        # Number of internal thinking ticks
     d_sync_out: int = 256             # Sync pairs for output
-    d_sync_action: int = 256          # Sync pairs for attention
+    d_sync_action: int = 256          # Sync pairs for attention/internal
     synapse_hidden: int = 1024        # Hidden dim in synapse U-NET
     nlm_hidden: int = 64              # Hidden dim in per-neuron MLPs
+    internal_obs_residual: float = 0.1  # Blend factor within CTM tick loop (0=replace, 1=keep)
 
     # Prediction horizons
     immediate_horizon: int = 8
@@ -306,6 +307,184 @@ def create_neuron_activation_grid(
     return fig
 
 
+def create_most_active_neurons_grid(
+    post_activation_history: torch.Tensor,
+    n_neurons: int = 64,
+    seq_idx: int = 0,
+    batch_idx: int = 0,
+) -> plt.Figure:
+    """
+    Create an 8x8 grid visualization of the MOST ACTIVE neurons over internal ticks.
+
+    Activity is measured by variance across ticks - neurons that change the most
+    are considered most active and most interesting to visualize.
+
+    Args:
+        post_activation_history: (B, S, D, T) tensor where:
+            - B = batch size
+            - S = sequence length
+            - D = number of neurons
+            - T = internal ticks
+        n_neurons: Number of neurons to display (default 64 for 8x8 grid)
+        seq_idx: Which sequence position to visualize
+        batch_idx: Which batch item to visualize
+
+    Returns:
+        matplotlib Figure with 8x8 grid of line plots for most active neurons
+    """
+    if not WANDB_AVAILABLE:
+        return None
+
+    # Get data for one sequence position from one batch item
+    # Shape: (D, T)
+    data = post_activation_history[batch_idx, seq_idx].detach().cpu().numpy()
+    D, T = data.shape
+
+    # Compute activity score for each neuron (variance across ticks)
+    activity_scores = np.var(data, axis=1)  # (D,)
+
+    # Get indices of top n_neurons most active neurons
+    n_neurons = min(n_neurons, D)
+    grid_size = int(np.sqrt(n_neurons))
+    n_neurons = grid_size * grid_size  # Make it a perfect square
+
+    top_indices = np.argsort(activity_scores)[-n_neurons:][::-1]  # Descending order
+
+    # Create figure
+    fig, axes = plt.subplots(
+        grid_size, grid_size,
+        figsize=(14, 12),
+        sharex=True,
+    )
+    fig.suptitle(
+        f'Top {n_neurons} Most Active Neurons (by variance)\n'
+        f'Post-activations z_t over {T} internal ticks (seq_pos={seq_idx})',
+        fontsize=14
+    )
+
+    # Time axis
+    t = np.arange(T)
+
+    # Color map for activation magnitude
+    cmap = plt.cm.viridis
+
+    # Plot each neuron
+    for idx, (ax, neuron_idx) in enumerate(zip(axes.flat, top_indices)):
+        activation = data[neuron_idx]
+        activity = activity_scores[neuron_idx]
+
+        # Color intensity based on activity rank
+        color_intensity = 1.0 - (idx / n_neurons) * 0.5  # Top neurons are brighter
+        color = cmap(color_intensity)
+
+        ax.plot(t, activation, linewidth=1.5, color=color)
+        ax.fill_between(t, 0, activation, alpha=0.3, color=color)
+
+        # Title shows neuron index and activity score
+        ax.set_title(f'N{neuron_idx} (σ²={activity:.3f})', fontsize=7, pad=2)
+        ax.tick_params(axis='both', which='both', labelsize=5)
+        ax.set_xlim(0, T - 1)
+
+        # Add zero line for reference
+        ax.axhline(y=0, color='gray', linestyle='--', linewidth=0.5, alpha=0.5)
+
+        # Add subtle grid
+        ax.grid(True, alpha=0.2, linewidth=0.5)
+
+        # Only show y-axis label on leftmost column
+        if idx % grid_size != 0:
+            ax.set_yticklabels([])
+
+    # Common labels
+    fig.text(0.5, 0.02, 'Internal Tick (t)', ha='center', fontsize=11)
+    fig.text(0.02, 0.5, 'Post-activation z_t', va='center', rotation='vertical', fontsize=11)
+
+    plt.tight_layout(rect=[0.03, 0.03, 1, 0.94])
+
+    return fig
+
+
+def create_tick_loss_bar_chart(
+    tick_losses: dict,
+    t1: int,
+    t2: int,
+) -> plt.Figure:
+    """
+    Create a bar chart showing loss at each internal tick.
+
+    Args:
+        tick_losses: Dict containing per-tick losses with keys like 'loss_tick_0', 'loss_tick_1', etc.
+        t1: Selected tick for min-loss (highlighted green)
+        t2: Selected tick for max-certainty (highlighted orange)
+
+    Returns:
+        matplotlib Figure with bar chart, or None if dependencies unavailable
+    """
+    if not WANDB_AVAILABLE:
+        return None
+
+    # Extract tick losses from dict
+    tick_indices = []
+    losses = []
+    for key, value in tick_losses.items():
+        if key.startswith('loss_tick_'):
+            try:
+                tick_idx = int(key.split('_')[-1])
+                tick_indices.append(tick_idx)
+                losses.append(value)
+            except (ValueError, IndexError):
+                continue
+
+    if not tick_indices:
+        return None
+
+    # Sort by tick index
+    sorted_pairs = sorted(zip(tick_indices, losses))
+    tick_indices = [p[0] for p in sorted_pairs]
+    losses = [p[1] for p in sorted_pairs]
+
+    # Create figure
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    # Default bar colors
+    colors = ['steelblue'] * len(tick_indices)
+
+    # Create bars
+    bars = ax.bar(tick_indices, losses, color=colors, edgecolor='none', alpha=0.8)
+
+    # Highlight t1 (min-loss tick) with green edge
+    if 0 <= t1 < len(bars):
+        bars[t1].set_edgecolor('green')
+        bars[t1].set_linewidth(3)
+
+    # Highlight t2 (max-certainty tick) with orange edge
+    if 0 <= t2 < len(bars):
+        bars[t2].set_edgecolor('orange')
+        bars[t2].set_linewidth(3)
+
+    # Labels and title
+    ax.set_xlabel('Internal Tick (t)', fontsize=11)
+    ax.set_ylabel('Loss', fontsize=11)
+    ax.set_title('Loss per Internal Tick', fontsize=14)
+
+    # X-axis ticks
+    ax.set_xticks(tick_indices)
+
+    # Add legend for highlighted ticks
+    from matplotlib.patches import Patch
+    legend_elements = [
+        Patch(facecolor='steelblue', edgecolor='green', linewidth=3, label=f't1={t1} (min loss)'),
+        Patch(facecolor='steelblue', edgecolor='orange', linewidth=3, label=f't2={t2} (max certainty)'),
+    ]
+    ax.legend(handles=legend_elements, loc='upper right')
+
+    # Grid for readability
+    ax.grid(True, axis='y', alpha=0.3, linewidth=0.5)
+
+    plt.tight_layout()
+    return fig
+
+
 def create_sync_matrix_heatmap(
     sync_matrix: torch.Tensor,
     seq_idx: int = 0,
@@ -384,27 +563,29 @@ class PredictionTrainer:
         logger.info("Feature extractor loaded and frozen")
 
     def _setup_prediction_module(self):
-        """Initialize CTM prediction module (faithful to original paper)."""
-        logger.info("Initializing CTM prediction module")
-        from pem.ctm_prediction_module import CTMPrediction, CTMPredictionConfig
+        """Initialize PredictionCTM module (same as used in train_pem_global)."""
+        logger.info("Initializing PredictionCTM module (same as global training)")
+        from pem.prediction_ctm import PredictionCTM, PredictionCTMConfig
         from pem import PredictionTargets
 
-        ctm_config = CTMPredictionConfig(
-            d_model=self.config.feature_dim,
+        ctm_config = PredictionCTMConfig(
+            d_input=self.config.feature_dim,
+            d_output=self.config.feature_dim,
             d_neurons=self.config.d_neurons,
             d_sync_out=self.config.d_sync_out,
-            d_sync_action=self.config.d_sync_action,
+            d_sync_internal=self.config.d_sync_action,  # Map d_sync_action -> d_sync_internal
             M=self.config.M,
             T=self.config.T,
             synapse_hidden=self.config.synapse_hidden,
             nlm_hidden=self.config.nlm_hidden,
+            internal_obs_residual=self.config.internal_obs_residual,
             # Horizons
             immediate_horizon=self.config.immediate_horizon,
             shortterm_horizon=self.config.shortterm_horizon,
             longterm_horizon=self.config.longterm_horizon,
         )
 
-        self.prediction_module = CTMPrediction(ctm_config).to(self.device)
+        self.prediction_module = PredictionCTM(ctm_config).to(self.device)
         self.target_computer = PredictionTargets(
             immediate_horizon=self.config.immediate_horizon,
             shortterm_horizon=self.config.shortterm_horizon,
@@ -414,9 +595,10 @@ class PredictionTrainer:
         # Count parameters
         num_params = sum(p.numel() for p in self.prediction_module.parameters())
         trainable = sum(p.numel() for p in self.prediction_module.parameters() if p.requires_grad)
-        logger.info(f"CTM Prediction module: {num_params:,} params ({trainable:,} trainable)")
+        logger.info(f"PredictionCTM module: {num_params:,} params ({trainable:,} trainable)")
         logger.info(f"  Neurons: {self.config.d_neurons}, M: {self.config.M}, T: {self.config.T}")
-        logger.info(f"  Sync pairs: out={self.config.d_sync_out}, action={self.config.d_sync_action}")
+        logger.info(f"  Internal obs residual: {self.config.internal_obs_residual}")
+        logger.info(f"  Sync pairs: out={self.config.d_sync_out}, internal={self.config.d_sync_action}")
 
     def _setup_optimizer(self):
         """Setup optimizer and scheduler."""
@@ -548,11 +730,12 @@ class PredictionTrainer:
         context_features, targets = prepared
         autocast_ctx = torch.amp.autocast('cuda') if self.config.mixed_precision else nullcontext()
         with autocast_ctx:
-            # CTM prediction with all tick outputs for proper CTM loss
-            output = self.prediction_module(context_features, return_all_ticks=True)
+            # PredictionCTM forward - always returns all tick outputs
+            output = self.prediction_module(context_features)
 
             # CTM loss: compute at each tick, aggregate via min-loss and max-certainty
-            loss, loss_dict = self.compute_loss(output.all_outputs, targets)
+            # PredictionCTM uses all_tick_outputs (not all_outputs)
+            loss, loss_dict = self.compute_loss(output.all_tick_outputs, targets)
 
         # Scale loss for gradient accumulation
         loss = loss / self.config.gradient_accumulation_steps
@@ -603,8 +786,8 @@ class PredictionTrainer:
         autocast_ctx = torch.amp.autocast('cuda') if self.config.mixed_precision else nullcontext()
         with torch.no_grad():
             with autocast_ctx:
-                output = self.prediction_module(context_features, return_all_ticks=True)
-                loss, loss_dict = self.compute_loss(output.all_outputs, targets)
+                output = self.prediction_module(context_features)
+                loss, loss_dict = self.compute_loss(output.all_tick_outputs, targets)
 
         # Extract scalar values from loss_dict
         loss_values = {}
@@ -749,12 +932,26 @@ class PredictionTrainer:
                         if progress is not None:
                             wandb_log["train/progress"] = progress
 
+                        # Create per-tick loss bar chart
+                        tick_loss_fig = create_tick_loss_bar_chart(
+                            tick_losses=avg_loss,
+                            t1=int(avg_t1),
+                            t2=int(avg_t2),
+                        )
+                        if tick_loss_fig is not None:
+                            wandb_log["train/tick_loss_chart"] = wandb.Image(tick_loss_fig)
+                            plt.close(tick_loss_fig)
+
                         # Log activation visualizations if we captured them
                         if ctm_output is not None:
                             try:
+                                # Stack all_tick_activations into (B, S, D, T) format for visualization
+                                # all_tick_activations is List[(B, S, D)]
+                                Z_stacked = torch.stack(ctm_output.all_tick_activations, dim=-1)  # (B, S, D, T)
+
                                 # Create neuron activation grid
                                 activation_fig = create_neuron_activation_grid(
-                                    ctm_output.post_activation_history,
+                                    Z_stacked,
                                     n_neurons=self.config.wandb_activation_grid_size,
                                     seq_idx=0,  # First sequence position
                                     batch_idx=0,
@@ -773,12 +970,32 @@ class PredictionTrainer:
                                     wandb_log["activations/sync_matrix"] = wandb.Image(sync_fig)
                                     plt.close(sync_fig)
 
+                                # Create most active neurons grid (8x8 = 64 neurons)
+                                most_active_fig = create_most_active_neurons_grid(
+                                    Z_stacked,
+                                    n_neurons=64,  # 8x8 grid
+                                    seq_idx=0,
+                                    batch_idx=0,
+                                )
+                                if most_active_fig is not None:
+                                    wandb_log["activations/most_active_neurons"] = wandb.Image(most_active_fig)
+                                    plt.close(most_active_fig)
+
                                 # Log activation statistics
-                                Z = ctm_output.post_activation_history
-                                wandb_log["activations/mean"] = Z.mean().item()
-                                wandb_log["activations/std"] = Z.std().item()
-                                wandb_log["activations/max"] = Z.max().item()
-                                wandb_log["activations/min"] = Z.min().item()
+                                wandb_log["activations/mean"] = Z_stacked.mean().item()
+                                wandb_log["activations/std"] = Z_stacked.std().item()
+                                wandb_log["activations/max"] = Z_stacked.max().item()
+                                wandb_log["activations/min"] = Z_stacked.min().item()
+
+                                # Log tick evolution (how much activations change per tick)
+                                if len(ctm_output.all_tick_activations) > 1:
+                                    tick_deltas = []
+                                    for t in range(1, len(ctm_output.all_tick_activations)):
+                                        delta = (ctm_output.all_tick_activations[t] - ctm_output.all_tick_activations[t-1]).norm().item()
+                                        tick_deltas.append(delta)
+                                        wandb_log[f"tick_delta/tick_{t}"] = delta
+                                    wandb_log["tick_delta/total"] = sum(tick_deltas)
+                                    wandb_log["tick_delta/late"] = sum(tick_deltas[-2:]) if len(tick_deltas) >= 2 else tick_deltas[-1]
 
                             except Exception as e:
                                 logger.warning(f"Failed to log activations: {e}")
@@ -1107,6 +1324,8 @@ def main():
                        help="Hidden dim in synapse U-NET")
     parser.add_argument("--nlm_hidden", type=int, default=64,
                        help="Hidden dim in per-neuron MLPs")
+    parser.add_argument("--internal_obs_residual", type=float, default=0.1,
+                       help="Blend factor within CTM tick loop (0=replace, 0.1=default, 1=keep old)")
 
     # Training arguments
     parser.add_argument("--batch_size", type=int, default=4,
@@ -1163,6 +1382,7 @@ def main():
         d_sync_action=args.d_sync_action,
         synapse_hidden=args.synapse_hidden,
         nlm_hidden=args.nlm_hidden,
+        internal_obs_residual=args.internal_obs_residual,
         # Training
         batch_size=args.batch_size,
         learning_rate=args.lr,
