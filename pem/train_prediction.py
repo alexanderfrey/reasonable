@@ -47,6 +47,80 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+class PerformanceContributionTracker:
+    """
+    Tracks gradient w.r.t. module outputs to measure performance contribution.
+
+    Performance contribution = ||∂L/∂(module_output)||
+
+    This tells us "how sensitive is the loss to this module's output",
+    i.e., which modules matter most for the current loss.
+    """
+
+    def __init__(self):
+        self.grad_norms = {}
+        self.handles = []
+        self._gradients = {}
+
+    def register_hooks(self, model):
+        """Register backward hooks on key CTM modules."""
+        self.clear()
+
+        core = model.core
+
+        # Hook for synapse output (a_t)
+        def synapse_hook(module, grad_input, grad_output):
+            if grad_output[0] is not None:
+                self._gradients['synapse'] = grad_output[0].detach().norm().item()
+
+        # Hook for NLM output (z_t)
+        def nlm_hook(module, grad_input, grad_output):
+            if grad_output[0] is not None:
+                self._gradients['nlm'] = grad_output[0].detach().norm().item()
+
+        # Hook for sync_to_output (y_t - the main output path)
+        def sync_to_output_hook(module, grad_input, grad_output):
+            if grad_output[0] is not None:
+                self._gradients['sync_to_output'] = grad_output[0].detach().norm().item()
+
+        # Hook for cross_attn output (o_t)
+        def cross_attn_hook(module, grad_input, grad_output):
+            if grad_output[0] is not None:
+                self._gradients['cross_attn'] = grad_output[0].detach().norm().item()
+
+        self.handles.append(core.synapse.register_full_backward_hook(synapse_hook))
+        self.handles.append(core.nlm.register_full_backward_hook(nlm_hook))
+        self.handles.append(core.sync_to_output.register_full_backward_hook(sync_to_output_hook))
+
+        if core.cross_attn is not None:
+            self.handles.append(core.cross_attn.register_full_backward_hook(cross_attn_hook))
+
+    def get_contributions(self) -> dict:
+        """Get performance contributions as fractions."""
+        total = sum(self._gradients.values()) if self._gradients else 1.0
+        if total > 0:
+            fractions = {k: v / total for k, v in self._gradients.items()}
+        else:
+            fractions = {k: 0.0 for k in self._gradients}
+
+        # Also return raw norms for debugging
+        return {
+            'fractions': fractions,
+            'norms': self._gradients.copy(),
+        }
+
+    def clear(self):
+        """Clear captured gradients."""
+        self._gradients = {}
+
+    def remove_hooks(self):
+        """Remove all registered hooks."""
+        for handle in self.handles:
+            handle.remove()
+        self.handles = []
+        self._gradients = {}
+
+
 @dataclass
 class TrainingConfig:
     """Configuration for CTM prediction module training."""
@@ -75,6 +149,15 @@ class TrainingConfig:
     immediate_horizon: int = 8
     shortterm_horizon: int = 64
     longterm_horizon: int = 256
+
+    # Token prediction (auxiliary task - harder than feature prediction)
+    vocab_size: int = 0  # 0 = disabled, >0 = predict token IDs (e.g., 100000 for Janus)
+    token_prediction_weight: float = 0.5  # Weight for token prediction loss
+    token_bottleneck: int = 256  # Bottleneck dim for token heads
+    token_head_lr_scale: float = 0.1  # LR multiplier for token heads (lower = more NLM learning)
+    nlm_lr_scale: float = 1.0  # LR multiplier for NLM (higher = faster NLM learning vs synapse/sync)
+    freeze_except_nlm: bool = False  # Freeze all weights except NLM (for debugging)
+    freeze_heads_only: bool = False  # Freeze readout + token heads, train NLM + synapse + sync
 
     # Training
     batch_size: int = 4
@@ -537,6 +620,10 @@ class PredictionTrainer:
         # Mixed precision
         self.scaler = torch.amp.GradScaler('cuda') if config.mixed_precision else None
 
+        # Performance contribution tracking (gradient w.r.t. module outputs)
+        self.perf_tracker = PerformanceContributionTracker()
+        self.perf_tracker.register_hooks(self.prediction_module)
+
     def _setup_tokenizer(self):
         """Load tokenizer from the same model as feature extractor for consistency."""
         logger.info(f"Loading tokenizer from: {self.config.feature_extractor}")
@@ -583,6 +670,10 @@ class PredictionTrainer:
             immediate_horizon=self.config.immediate_horizon,
             shortterm_horizon=self.config.shortterm_horizon,
             longterm_horizon=self.config.longterm_horizon,
+            # Token prediction (auxiliary task)
+            vocab_size=self.config.vocab_size,
+            token_prediction_weight=self.config.token_prediction_weight,
+            token_bottleneck=self.config.token_bottleneck,
         )
 
         self.prediction_module = PredictionCTM(ctm_config).to(self.device)
@@ -601,15 +692,84 @@ class PredictionTrainer:
         logger.info(f"  Sync pairs: out={self.config.d_sync_out}, internal={self.config.d_sync_action}")
 
     def _setup_optimizer(self):
-        """Setup optimizer and scheduler."""
+        """Setup optimizer with differential learning rates.
+
+        Token heads get lower LR (token_head_lr_scale) to allow NLM to learn
+        relatively faster and develop meaningful representations.
+        """
+        # Freeze modes for debugging/ablation
+        if self.config.freeze_except_nlm:
+            # Freeze everything except NLM
+            nlm_param_count = 0
+            frozen_count = 0
+            for name, param in self.prediction_module.named_parameters():
+                if 'nlm' in name:
+                    param.requires_grad = True
+                    nlm_param_count += param.numel()
+                else:
+                    param.requires_grad = False
+                    frozen_count += param.numel()
+            logger.info(f"FREEZE MODE: Only NLM trainable ({nlm_param_count:,} params), frozen {frozen_count:,} params")
+
+        elif self.config.freeze_heads_only:
+            # Freeze readout + token heads, train CTM core (NLM + synapse + sync)
+            core_param_count = 0
+            frozen_count = 0
+            for name, param in self.prediction_module.named_parameters():
+                if 'readout' in name or 'token_head' in name:
+                    param.requires_grad = False
+                    frozen_count += param.numel()
+                else:
+                    param.requires_grad = True
+                    core_param_count += param.numel()
+            logger.info(f"FREEZE MODE: CTM core trainable ({core_param_count:,} params), heads frozen ({frozen_count:,} params)")
+
+        # Separate parameters into groups for differential learning rates
+        token_head_params = []
+        nlm_params = []
+        other_params = []
+
+        for name, param in self.prediction_module.named_parameters():
+            if not param.requires_grad:
+                continue
+            if 'token_head' in name:
+                token_head_params.append(param)
+            elif 'nlm' in name:
+                nlm_params.append(param)
+            else:
+                other_params.append(param)
+
+        # Use parameter groups with different LRs
+        param_groups = []
+
+        if other_params:
+            param_groups.append({'params': other_params, 'lr': self.config.learning_rate})
+
+        # NLM gets scaled LR (typically higher to compensate for smaller gradient fraction)
+        if nlm_params:
+            nlm_lr = self.config.learning_rate * self.config.nlm_lr_scale
+            param_groups.append({
+                'params': nlm_params,
+                'lr': nlm_lr,
+            })
+            logger.info(f"NLM LR: {nlm_lr:.2e} ({self.config.nlm_lr_scale}x base)")
+
+        # Only add token head group if token prediction is enabled and not frozen
+        if token_head_params:
+            token_head_lr = self.config.learning_rate * self.config.token_head_lr_scale
+            param_groups.append({
+                'params': token_head_params,
+                'lr': token_head_lr,
+            })
+            logger.info(f"Token head LR: {token_head_lr:.2e} ({self.config.token_head_lr_scale}x base)")
+
         self.optimizer = torch.optim.AdamW(
-            self.prediction_module.parameters(),
-            lr=self.config.learning_rate,
+            param_groups,
             weight_decay=self.config.weight_decay,
         )
 
-    def extract_features_from_text(self, texts: List[str]) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Extract features and padding mask using frozen feature extractor."""
+    def extract_features_from_text(self, texts: List[str]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Extract features, padding mask, and token IDs using frozen feature extractor."""
         with torch.no_grad():
             self.feature_extractor._ensure_loaded()
             janus_tokenizer = self.feature_extractor.tokenizer
@@ -633,7 +793,7 @@ class PredictionTrainer:
             features = self.feature_extractor(input_ids)
             features = features.float()  # Ensure float32
 
-        return features, attention_mask
+        return features, attention_mask, input_ids
 
     def _unpack_batch(self, batch: object) -> Tuple[List[str], Optional[float]]:
         """Extract text and progress from a collated batch."""
@@ -650,7 +810,7 @@ class PredictionTrainer:
         internal state from features.
         """
         B = len(batch)
-        features, padding_mask = self.extract_features_from_text(batch)
+        features, padding_mask, input_ids = self.extract_features_from_text(batch)
         _, S, _ = features.shape
 
         if S < self.config.context_size + self.config.longterm_horizon:
@@ -671,6 +831,17 @@ class PredictionTrainer:
             'shortterm_valid': targets_full['shortterm_valid'][:, :self.config.context_size],
             'longterm_valid': targets_full['longterm_valid'][:, :self.config.context_size],
         }
+
+        # Add token ID targets if token prediction is enabled
+        if self.config.vocab_size > 0:
+            ctx = self.config.context_size
+            # For each position, target is the token at position + horizon
+            # immediate: predict token at pos + immediate_horizon
+            # shortterm: predict token at pos + shortterm_horizon
+            # longterm: predict token at pos + longterm_horizon
+            targets['token_immediate'] = input_ids[:, self.config.immediate_horizon:ctx + self.config.immediate_horizon]
+            targets['token_shortterm'] = input_ids[:, self.config.shortterm_horizon:ctx + self.config.shortterm_horizon]
+            targets['token_longterm'] = input_ids[:, self.config.longterm_horizon:ctx + self.config.longterm_horizon]
 
         return (context_features, targets), S
 
@@ -707,6 +878,104 @@ class PredictionTrainer:
             self.prediction_module.readout_longterm,
         )
 
+    def compute_token_loss_per_tick(
+        self,
+        all_tick_outputs: list,  # List of y_t at each tick
+        targets: dict,
+    ) -> Tuple[torch.Tensor, dict]:
+        """
+        Compute token prediction loss at KEY ticks (not all, to save memory).
+
+        Computing token logits at all T ticks would use too much memory
+        (T × 3 × B × S × vocab_size). Instead, we compute at:
+        - Tick 0 (initial)
+        - Tick T//2 (midpoint)
+        - Tick T-1 (final)
+
+        This still creates gradient flow to NLM at multiple points in the
+        computation while being memory efficient.
+
+        Args:
+            all_tick_outputs: List of (B, S, d_output) tensors, one per tick
+            targets: Dict with token_immediate, token_shortterm, token_longterm
+
+        Returns:
+            Tuple of (aggregated_loss, loss_dict with per-tick metrics)
+        """
+        T = len(all_tick_outputs)
+
+        # Key ticks to compute token loss at (memory efficient)
+        # Only 3 ticks: early, middle, late - to minimize memory while still
+        # providing gradient flow at multiple points in CTM computation
+        key_ticks = [0, T // 2, T - 1]
+        key_ticks = sorted(set(t for t in key_ticks if 0 <= t < T))  # Dedupe and validate
+
+        # Get token heads
+        token_heads = {
+            'immediate': self.prediction_module.token_head_immediate,
+            'shortterm': self.prediction_module.token_head_shortterm,
+            'longterm': self.prediction_module.token_head_longterm,
+        }
+
+        # Compute loss at key ticks only
+        tick_losses = {}  # tick_idx -> loss
+        per_horizon_losses = {h: {} for h in ['immediate', 'shortterm', 'longterm']}
+
+        for t in key_ticks:
+            y_t = all_tick_outputs[t]
+            tick_horizon_losses = []
+
+            for horizon in ['immediate', 'shortterm', 'longterm']:
+                # Apply token head to this tick's output
+                logits = token_heads[horizon](y_t)  # (B, S, vocab_size)
+                target_ids = targets[f'token_{horizon}']  # (B, S)
+
+                # Cross-entropy loss
+                logits_flat = logits.reshape(-1, logits.size(-1))
+                target_flat = target_ids.reshape(-1)
+                ce_loss = nn.functional.cross_entropy(logits_flat, target_flat)
+
+                tick_horizon_losses.append(ce_loss)
+                per_horizon_losses[horizon][t] = ce_loss
+
+            # Average across horizons for this tick
+            tick_losses[t] = sum(tick_horizon_losses) / len(tick_horizon_losses)
+
+        # Weighted average across ALL key ticks (not min-loss selection)
+        # This ensures gradient flows through all key ticks, not just the best one
+        # Weight earlier ticks more to encourage NLM to produce useful representations early
+        tick_loss_list = [tick_losses[t] for t in key_ticks]
+        n_ticks = len(key_ticks)
+
+        # Weights: earlier ticks get higher weight (e.g., [1.0, 0.7, 0.5] for 3 ticks)
+        weights = [1.0 - 0.25 * i for i in range(n_ticks)]  # [1.0, 0.75, 0.5]
+        weight_sum = sum(weights)
+
+        aggregated_loss = sum(w * loss for w, loss in zip(weights, tick_loss_list)) / weight_sum
+
+        # Track which tick had best loss (for logging only, not for loss computation)
+        tick_loss_values = torch.stack(tick_loss_list)
+        best_idx = torch.argmin(tick_loss_values.detach()).item()
+        t1 = key_ticks[best_idx]
+
+        # Build loss dict
+        loss_dict = {
+            'token_loss': aggregated_loss.item(),
+            'token_t1': t1,  # Best tick (for logging only)
+            'token_loss_early': tick_losses[key_ticks[0]].item(),  # Tick 0 loss
+            'token_loss_final': tick_losses[key_ticks[-1]].item(),  # Final tick loss
+        }
+
+        # Per-tick token losses for logging (only key ticks)
+        for t in key_ticks:
+            loss_dict[f'token_loss_tick_{t}'] = tick_losses[t].item()
+
+        # Per-horizon losses at best tick
+        for horizon in ['immediate', 'shortterm', 'longterm']:
+            loss_dict[f'token_loss_{horizon}'] = per_horizon_losses[horizon][t1].item()
+
+        return aggregated_loss, loss_dict
+
     def train_step(self, batch: object, return_activations: bool = False) -> dict:
         """Single training step.
 
@@ -737,14 +1006,29 @@ class PredictionTrainer:
             # PredictionCTM uses all_tick_outputs (not all_outputs)
             loss, loss_dict = self.compute_loss(output.all_tick_outputs, targets)
 
+            # Token prediction loss (auxiliary task) - computed at EVERY tick
+            # This creates gradient flow to NLM at each tick, not just final
+            if self.config.vocab_size > 0 and self.prediction_module.token_head_immediate is not None:
+                token_loss, token_loss_dict = self.compute_token_loss_per_tick(
+                    output.all_tick_outputs, targets
+                )
+                loss_dict.update(token_loss_dict)
+
+                # Add weighted token loss to total
+                loss = loss + self.config.token_prediction_weight * token_loss
+
         # Scale loss for gradient accumulation
         loss = loss / self.config.gradient_accumulation_steps
 
         # Backward pass
+        self.perf_tracker.clear()  # Clear before backward
         if self.scaler:
             self.scaler.scale(loss).backward()
         else:
             loss.backward()
+
+        # Capture performance contributions (gradient w.r.t. module outputs)
+        perf_contributions = self.perf_tracker.get_contributions()
 
         # Extract scalar values from loss_dict (some might be int tensors like t1, t2)
         loss_values = {}
@@ -761,6 +1045,7 @@ class PredictionTrainer:
             "batch_tokens": len(texts) * self.config.context_size,
             "seq_len": seq_len,
             "progress": progress,
+            "perf_contributions": perf_contributions,
         }
 
         # Include CTM output for visualization if requested
@@ -789,6 +1074,14 @@ class PredictionTrainer:
                 output = self.prediction_module(context_features)
                 loss, loss_dict = self.compute_loss(output.all_tick_outputs, targets)
 
+                # Token prediction loss (auxiliary task) - computed at EVERY tick
+                if self.config.vocab_size > 0 and self.prediction_module.token_head_immediate is not None:
+                    token_loss, token_loss_dict = self.compute_token_loss_per_tick(
+                        output.all_tick_outputs, targets
+                    )
+                    loss_dict.update(token_loss_dict)
+                    loss = loss + self.config.token_prediction_weight * token_loss
+
         # Extract scalar values from loss_dict
         loss_values = {}
         for k, v in loss_dict.items():
@@ -806,6 +1099,43 @@ class PredictionTrainer:
             "progress": progress,
         }
 
+    def compute_gradient_fractions(self) -> dict:
+        """Compute what fraction of total gradient comes from each component."""
+        total_grad_sq = 0
+        component_grad_sq = {}
+
+        for name, param in self.prediction_module.named_parameters():
+            if param.grad is not None:
+                grad_sq = (param.grad ** 2).sum().item()
+                total_grad_sq += grad_sq
+
+                # Group by component
+                if 'nlm' in name:
+                    component_grad_sq['nlm'] = component_grad_sq.get('nlm', 0) + grad_sq
+                elif 'synapse' in name:
+                    component_grad_sq['synapse'] = component_grad_sq.get('synapse', 0) + grad_sq
+                elif 'sync_to_output' in name:
+                    component_grad_sq['sync_to_output'] = component_grad_sq.get('sync_to_output', 0) + grad_sq
+                elif 'sync' in name:
+                    component_grad_sq['sync'] = component_grad_sq.get('sync', 0) + grad_sq
+                elif 'readout' in name:
+                    component_grad_sq['readout'] = component_grad_sq.get('readout', 0) + grad_sq
+                elif 'token_head' in name:
+                    component_grad_sq['token_head'] = component_grad_sq.get('token_head', 0) + grad_sq
+                elif 'cross_attn' in name:
+                    component_grad_sq['cross_attn'] = component_grad_sq.get('cross_attn', 0) + grad_sq
+                elif 'init_' in name:
+                    component_grad_sq['init'] = component_grad_sq.get('init', 0) + grad_sq
+                else:
+                    component_grad_sq['other'] = component_grad_sq.get('other', 0) + grad_sq
+
+        # Convert to fractions
+        fractions = {}
+        if total_grad_sq > 0:
+            for comp, grad_sq in component_grad_sq.items():
+                fractions[comp] = grad_sq / total_grad_sq
+        return fractions
+
     def train_epoch(self, dataloader: DataLoader, epoch: int, val_loader: Optional[DataLoader] = None) -> dict:
         """Train for one epoch."""
         self.prediction_module.train()
@@ -813,6 +1143,11 @@ class PredictionTrainer:
         epoch_losses = []
         accumulated_loss = {}
         accumulation_count = 0
+
+        # Track initial NLM weights for change monitoring
+        nlm = self.prediction_module.core.nlm
+        nlm_w1_initial = nlm.w1.data.norm().item()
+        nlm_w2_initial = nlm.w2.data.norm().item()
 
         start_time = time.time()
         last_log_time = start_time
@@ -823,6 +1158,7 @@ class PredictionTrainer:
         skipped_since_log = 0
         seq_len_sum = 0
         seq_len_count = 0
+        latest_perf_contributions = None
 
         for batch_idx, batch in enumerate(dataloader):
             # Determine if we should capture activations for visualization
@@ -840,12 +1176,16 @@ class PredictionTrainer:
             seq_len = loss_dict.pop("seq_len", 0)
             progress = loss_dict.pop("progress", None)
             ctm_output = loss_dict.pop("ctm_output", None)
+            perf_contributions = loss_dict.pop("perf_contributions", None)
 
             # Accumulate losses for logging
             for k, v in loss_dict.items():
                 accumulated_loss[k] = accumulated_loss.get(k, 0) + v
             accumulation_count += 1
             batches_since_log += 1
+
+            # Store latest perf contributions (not averaged, just latest)
+            latest_perf_contributions = perf_contributions
             skipped_since_log += skipped
             if batch_tokens > 0:
                 examples_since_log += len(batch)
@@ -870,6 +1210,16 @@ class PredictionTrainer:
                     )
                     self.optimizer.step()
 
+                # Capture NLM gradients and component fractions BEFORE zero_grad()
+                nlm = self.prediction_module.core.nlm
+                nlm_w1_grad = nlm.w1.grad.norm().item() if nlm.w1.grad is not None else 0.0
+                nlm_w2_grad = nlm.w2.grad.norm().item() if nlm.w2.grad is not None else 0.0
+                grad_fractions = self.compute_gradient_fractions()
+
+                # Compute NLM weight change from epoch start
+                nlm_w1_change = abs(nlm.w1.data.norm().item() - nlm_w1_initial) / max(nlm_w1_initial, 1e-8)
+                nlm_w2_change = abs(nlm.w2.data.norm().item() - nlm_w2_initial) / max(nlm_w2_initial, 1e-8)
+
                 self.optimizer.zero_grad()
                 self.global_step += 1
 
@@ -892,18 +1242,43 @@ class PredictionTrainer:
                     certainty = avg_loss.get('certainty_mean', 0)
                     loss_final = avg_loss.get('loss_final', avg_loss['loss'])
 
+                    # NLM gradient health (captured before zero_grad above)
+
+                    # Format gradient fractions for display
+                    grad_frac_str = " ".join([f"{k}={100*v:.0f}%" for k, v in sorted(grad_fractions.items())])
+
+                    # Format token loss if enabled (per-tick)
+                    token_loss_str = ""
+                    if self.config.vocab_size > 0:
+                        token_loss = avg_loss.get('token_loss', 0)
+                        token_t1 = avg_loss.get('token_t1', 0)
+                        token_loss_str = f"TokenLoss: {token_loss:.4f} (t1={token_t1}) | "
+
                     logger.info(
                         f"Epoch {epoch} | Step {self.global_step} | "
                         f"Loss: {avg_loss['loss']:.4f} | "
                         f"Loss_final: {loss_final:.4f} | "
+                        f"{token_loss_str}"
                         f"AvgTick: t1={avg_t1:.1f}, t2={avg_t2:.1f} | "
                         f"Certainty: {certainty:.3f} | "
                         f"LR: {lr:.2e} | "
                         f"GradNorm: {grad_norm_value:.2f} | "
+                        f"NLM: ∇w1={nlm_w1_grad:.2e} ∇w2={nlm_w2_grad:.2e} | "
                         f"Throughput: {tokens_per_sec:.0f} tok/s | "
                         f"{progress_text}"
                         f"Time: {elapsed:.1f}s"
                     )
+                    # Log gradient diagnostics on separate line
+                    logger.info(
+                        f"         ∇ fractions: {grad_frac_str} | "
+                        f"NLM Δw: w1={100*nlm_w1_change:.2f}% w2={100*nlm_w2_change:.2f}%"
+                    )
+
+                    # Log performance contributions (gradient w.r.t. module outputs)
+                    if latest_perf_contributions is not None:
+                        perf_frac = latest_perf_contributions['fractions']
+                        perf_frac_str = " ".join([f"{k}={100*v:.0f}%" for k, v in sorted(perf_frac.items())])
+                        logger.info(f"         Perf contrib: {perf_frac_str}")
 
                     # Wandb logging
                     if self.config.use_wandb and WANDB_AVAILABLE:
@@ -918,6 +1293,10 @@ class PredictionTrainer:
                             "train/certainty_final": avg_loss.get('certainty_final', 0),
                             "train/lr": lr,
                             "train/grad_norm": grad_norm_value,
+                            "train/nlm_w1_grad": nlm_w1_grad,
+                            "train/nlm_w2_grad": nlm_w2_grad,
+                            "train/nlm_w1_change_pct": 100 * nlm_w1_change,
+                            "train/nlm_w2_change_pct": 100 * nlm_w2_change,
                             "train/tokens_per_sec": tokens_per_sec,
                             "train/examples_per_sec": examples_per_sec,
                             "train/epoch": epoch,
@@ -928,6 +1307,34 @@ class PredictionTrainer:
                             tick_loss = avg_loss.get(f'loss_tick_{t}', None)
                             if tick_loss is not None:
                                 wandb_log[f"train/loss_tick_{t}"] = tick_loss
+
+                        # Log gradient fractions by component
+                        for comp, frac in grad_fractions.items():
+                            wandb_log[f"grad_frac/{comp}"] = 100 * frac
+
+                        # Log performance contributions (gradient w.r.t. module outputs)
+                        if latest_perf_contributions is not None:
+                            for comp, frac in latest_perf_contributions['fractions'].items():
+                                wandb_log[f"perf_contrib/{comp}"] = 100 * frac
+                            for comp, norm in latest_perf_contributions['norms'].items():
+                                wandb_log[f"perf_grad_norm/{comp}"] = norm
+
+                        # Log token prediction loss if enabled (per-tick with weighted average)
+                        if self.config.vocab_size > 0:
+                            wandb_log["train/token_loss"] = avg_loss.get('token_loss', 0)
+                            wandb_log["train/token_loss_early"] = avg_loss.get('token_loss_early', 0)
+                            wandb_log["train/token_loss_final"] = avg_loss.get('token_loss_final', 0)
+                            wandb_log["train/token_t1"] = avg_loss.get('token_t1', 0)  # Best tick (logging only)
+                            wandb_log["train/token_loss_immediate"] = avg_loss.get('token_loss_immediate', 0)
+                            wandb_log["train/token_loss_shortterm"] = avg_loss.get('token_loss_shortterm', 0)
+                            wandb_log["train/token_loss_longterm"] = avg_loss.get('token_loss_longterm', 0)
+                            # Per-tick token losses (key ticks: 0, T//2, T-1)
+                            T = self.config.T
+                            key_ticks = [0, T // 2, T - 1]
+                            for t in key_ticks:
+                                token_tick_loss = avg_loss.get(f'token_loss_tick_{t}', None)
+                                if token_tick_loss is not None:
+                                    wandb_log[f"train/token_loss_tick_{t}"] = token_tick_loss
 
                         if progress is not None:
                             wandb_log["train/progress"] = progress
@@ -1132,12 +1539,18 @@ class PredictionTrainer:
 
         checkpoint_path = os.path.join(self.config.checkpoint_dir, f"{name}.pt")
 
+        # Save feature extractor projection if it exists
+        fe_projection_state = None
+        if hasattr(self.feature_extractor, 'projection') and self.feature_extractor.projection is not None:
+            fe_projection_state = self.feature_extractor.projection.state_dict()
+
         torch.save({
             "global_step": self.global_step,
             "model_state_dict": self.prediction_module.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
             "config": self.config,
             "best_loss": self.best_loss,
+            "fe_projection_state": fe_projection_state,  # Feature extractor projection
         }, checkpoint_path)
 
         logger.info(f"Saved checkpoint: {checkpoint_path}")
@@ -1152,6 +1565,12 @@ class PredictionTrainer:
         self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         self.global_step = checkpoint["global_step"]
         self.best_loss = checkpoint.get("best_loss", float('inf'))
+
+        # Load feature extractor projection if saved
+        if "fe_projection_state" in checkpoint and checkpoint["fe_projection_state"] is not None:
+            if hasattr(self.feature_extractor, 'projection') and self.feature_extractor.projection is not None:
+                self.feature_extractor.projection.load_state_dict(checkpoint["fe_projection_state"])
+                logger.info("Loaded feature extractor projection from checkpoint")
 
         logger.info(f"Resumed from step {self.global_step}")
 
@@ -1183,6 +1602,12 @@ class PredictionTrainer:
                 "num_epochs": self.config.num_epochs,
                 "num_train_files": len(train_files),
                 "num_val_files": len(val_files),
+                # Token prediction
+                "vocab_size": self.config.vocab_size,
+                "token_prediction_weight": self.config.token_prediction_weight,
+                "token_bottleneck": self.config.token_bottleneck,
+                "token_head_lr_scale": self.config.token_head_lr_scale,
+                "nlm_lr_scale": self.config.nlm_lr_scale,
             }
             wandb.init(
                 project=self.config.wandb_project,
@@ -1207,6 +1632,10 @@ class PredictionTrainer:
         logger.info(f"Horizons: immediate={self.config.immediate_horizon}, "
                    f"shortterm={self.config.shortterm_horizon}, "
                    f"longterm={self.config.longterm_horizon}")
+        if self.config.vocab_size > 0:
+            logger.info(f"Token prediction: ENABLED (vocab={self.config.vocab_size}, bottleneck={self.config.token_bottleneck}, weight={self.config.token_prediction_weight})")
+        else:
+            logger.info("Token prediction: disabled")
         logger.info("=" * 60)
 
         # Create dataset
@@ -1327,6 +1756,22 @@ def main():
     parser.add_argument("--internal_obs_residual", type=float, default=0.1,
                        help="Blend factor within CTM tick loop (0=replace, 0.1=default, 1=keep old)")
 
+    # Token prediction arguments (auxiliary task)
+    parser.add_argument("--vocab_size", type=int, default=0,
+                       help="Vocab size for token ID prediction (0=disabled, 100000 for Janus)")
+    parser.add_argument("--token_prediction_weight", type=float, default=0.5,
+                       help="Weight for token prediction loss relative to feature prediction loss")
+    parser.add_argument("--token_bottleneck", type=int, default=256,
+                       help="Bottleneck dim for token heads (reduces params from d_output->vocab to d_output->bottleneck->vocab)")
+    parser.add_argument("--token_head_lr_scale", type=float, default=0.1,
+                       help="LR multiplier for token heads (0.1 = 10%% of base LR, allows NLM to learn faster)")
+    parser.add_argument("--nlm_lr_scale", type=float, default=1.0,
+                       help="LR multiplier for NLM (e.g., 5.0 = 5x base LR, compensates for smaller gradient fraction)")
+    parser.add_argument("--freeze_except_nlm", action="store_true",
+                       help="Freeze all weights except NLM (for debugging NLM learning)")
+    parser.add_argument("--freeze_heads_only", action="store_true",
+                       help="Freeze readout + token heads, train CTM core (NLM + synapse + sync)")
+
     # Training arguments
     parser.add_argument("--batch_size", type=int, default=4,
                        help="Batch size")
@@ -1383,6 +1828,14 @@ def main():
         synapse_hidden=args.synapse_hidden,
         nlm_hidden=args.nlm_hidden,
         internal_obs_residual=args.internal_obs_residual,
+        # Token prediction (auxiliary task)
+        vocab_size=args.vocab_size,
+        token_prediction_weight=args.token_prediction_weight,
+        token_bottleneck=args.token_bottleneck,
+        token_head_lr_scale=args.token_head_lr_scale,
+        nlm_lr_scale=args.nlm_lr_scale,
+        freeze_except_nlm=args.freeze_except_nlm,
+        freeze_heads_only=args.freeze_heads_only,
         # Training
         batch_size=args.batch_size,
         learning_rate=args.lr,
