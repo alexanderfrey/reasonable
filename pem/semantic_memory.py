@@ -38,6 +38,14 @@ class MemoryReadOutput(NamedTuple):
     max_attention: torch.Tensor      # (B, S) max attention weight per position
 
 
+class MemoryTopKOutput(NamedTuple):
+    """Output from top-K memory read operation."""
+    values: torch.Tensor             # (B, S, K, value_dim) top-K retrieved values
+    attention_weights: torch.Tensor  # (B, S, K) attention weights for top-K
+    indices: torch.Tensor            # (B, S, K) indices of top-K slots
+    max_attention: torch.Tensor      # (B, S) max attention weight per position
+
+
 class SemanticMemory(nn.Module):
     """
     Simple episodic memory with importance-based management.
@@ -184,6 +192,91 @@ class SemanticMemory(nn.Module):
         max_attn = attention.max(dim=-1)[0]  # (B, S)
 
         return MemoryReadOutput(retrieved, attention, max_attn)
+
+    def read_top_k(
+        self,
+        features: torch.Tensor,  # (B, S, feature_dim)
+        k: int = 4,
+    ) -> MemoryTopKOutput:
+        """
+        Read top-K memories for each position.
+
+        Instead of weighted average, returns the K highest-attention memories
+        separately. These can be fed to cross-attention for the model to decide
+        how to use them.
+
+        Args:
+            features: Input features to use as query
+            k: Number of top memories to retrieve per position
+
+        Returns:
+            MemoryTopKOutput with top-K values, attention weights, and indices
+        """
+        B, S, _ = features.shape
+        device = features.device
+
+        # If memory is empty, return zeros
+        if not self.occupied.any():
+            values = torch.zeros(B, S, k, self.config.feature_dim, device=device)
+            attention = torch.zeros(B, S, k, device=device)
+            indices = torch.zeros(B, S, k, dtype=torch.long, device=device)
+            max_attn = torch.zeros(B, S, device=device)
+            return MemoryTopKOutput(values, attention, indices, max_attn)
+
+        # Encode query keys WITH context window
+        windowed_features = self._extract_window(features)  # (B, S, D * window_size)
+        query_keys = self.key_encoder(windowed_features)    # (B, S, key_dim)
+
+        # Get occupied keys and values
+        occupied_mask = self.occupied  # (num_slots,)
+        memory_keys = self.keys  # (num_slots, key_dim)
+        memory_values = self.values  # (num_slots, value_dim)
+
+        # Compute attention scores
+        scores = torch.einsum('bsd,nd->bsn', query_keys, memory_keys)  # (B, S, num_slots)
+        scores = scores / (self.config.key_dim ** 0.5)
+
+        # Mask out unoccupied slots
+        mask = ~occupied_mask.unsqueeze(0).unsqueeze(0).expand(B, S, -1)
+        scores = scores.masked_fill(mask, float('-inf'))
+
+        # Softmax with temperature
+        attention_full = F.softmax(scores / self.config.retrieval_temperature, dim=-1)
+        attention_full = torch.nan_to_num(attention_full, nan=0.0)
+
+        # Get top-K indices and attention weights
+        num_occupied = occupied_mask.sum().item()
+        actual_k = min(k, num_occupied)
+
+        if actual_k == 0:
+            values = torch.zeros(B, S, k, self.config.feature_dim, device=device)
+            attention = torch.zeros(B, S, k, device=device)
+            indices = torch.zeros(B, S, k, dtype=torch.long, device=device)
+            max_attn = torch.zeros(B, S, device=device)
+            return MemoryTopKOutput(values, attention, indices, max_attn)
+
+        # Top-K selection
+        top_attn, top_indices = attention_full.topk(actual_k, dim=-1)  # (B, S, actual_k)
+
+        # Pad to k if necessary
+        if actual_k < k:
+            pad_attn = torch.zeros(B, S, k - actual_k, device=device)
+            pad_indices = torch.zeros(B, S, k - actual_k, dtype=torch.long, device=device)
+            top_attn = torch.cat([top_attn, pad_attn], dim=-1)
+            top_indices = torch.cat([top_indices, pad_indices], dim=-1)
+
+        # Gather top-K values
+        # memory_values: (num_slots, value_dim)
+        # top_indices: (B, S, K)
+        top_values = memory_values[top_indices]  # (B, S, K, value_dim)
+
+        # Decode to feature space
+        top_values_decoded = self.value_decoder(top_values)  # (B, S, K, feature_dim)
+
+        # Max attention
+        max_attn = top_attn[:, :, 0]  # (B, S) - top-1 attention
+
+        return MemoryTopKOutput(top_values_decoded, top_attn, top_indices, max_attn)
 
     @torch.no_grad()
     def write(

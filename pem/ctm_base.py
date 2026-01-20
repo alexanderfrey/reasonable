@@ -83,8 +83,9 @@ class CTMBaseConfig:
     cross_attn_heads: int = 4          # Number of attention heads
 
     # Internal observation residual (prevents fixed-point convergence within tick loop)
-    # Higher = more blending with previous observation, prevents premature convergence
-    internal_obs_residual: float = 0.2
+    # Lower values = more responsive ticks. Values >0.3 often cause tick plateau.
+    # Recommended: 0.1-0.15 for healthy tick evolution
+    internal_obs_residual: float = 0.1
 
 
 class RMSNorm(nn.Module):
@@ -353,46 +354,50 @@ class SyncCrossAttention(nn.Module):
 
     def forward(
         self,
-        S_internal: torch.Tensor,  # (B, S, d_sync_internal) sync-based action signal
-        features: torch.Tensor,    # (B, S, d_features) input features to attend to
+        S_internal: torch.Tensor,  # (B, S_q, d_sync_internal) sync-based action signal
+        features: torch.Tensor,    # (B, S_kv, d_features) input features to attend to
     ) -> torch.Tensor:
         """
         Generate sync-derived queries and attend to input features.
 
+        Supports cross-attention where Q and KV have different sequence lengths.
+        This allows attending to [features, memories] when memory_context is provided.
+
         Args:
             S_internal: Subsampled sync matrix (S_action in paper)
-            features: Input features from backbone (KV cache)
+            features: Input features from backbone (KV cache), may include memories
 
         Returns:
-            o_t: (B, S, d_output) attended features for next tick
+            o_t: (B, S_q, d_output) attended features for next tick
         """
-        B, S, _ = features.shape
+        B, S_q, _ = S_internal.shape
+        _, S_kv, _ = features.shape
 
         # Generate query from sync (paper: q_t = W_in · S_action_t)
-        q = self.sync_to_query(S_internal)  # (B, S, d_features)
+        q = self.sync_to_query(S_internal)  # (B, S_q, d_features)
 
-        # K, V from input features
+        # K, V from input features (may be longer if includes memories)
         k = self.k_proj(features)
         v = self.v_proj(features)
 
         # Reshape for multi-head attention
-        q = q.view(B, S, self.n_heads, self.head_dim).transpose(1, 2)
-        k = k.view(B, S, self.n_heads, self.head_dim).transpose(1, 2)
-        v = v.view(B, S, self.n_heads, self.head_dim).transpose(1, 2)
+        q = q.view(B, S_q, self.n_heads, self.head_dim).transpose(1, 2)
+        k = k.view(B, S_kv, self.n_heads, self.head_dim).transpose(1, 2)
+        v = v.view(B, S_kv, self.n_heads, self.head_dim).transpose(1, 2)
 
         # Scaled dot-product attention
         scale = self.head_dim ** -0.5
-        scores = torch.matmul(q, k.transpose(-2, -1)) * scale
+        scores = torch.matmul(q, k.transpose(-2, -1)) * scale  # (B, n_heads, S_q, S_kv)
         attn_weights = F.softmax(scores, dim=-1)
         attn_weights = self.dropout(attn_weights)
 
         # Apply attention and reshape
-        attended = torch.matmul(attn_weights, v)
-        attended = attended.transpose(1, 2).reshape(B, S, self.d_features)
+        attended = torch.matmul(attn_weights, v)  # (B, n_heads, S_q, head_dim)
+        attended = attended.transpose(1, 2).reshape(B, S_q, self.d_features)
 
-        # Output projection with residual and norm
+        # Output projection with norm (no residual to features when shapes differ)
         o_t = self.o_proj(attended)
-        o_t = self.norm(o_t + features)  # Residual connection to features
+        o_t = self.norm(o_t)
 
         return o_t
 
@@ -467,6 +472,7 @@ class CTMCore(nn.Module):
     def forward(
         self,
         input_features: torch.Tensor,  # (B, S, d_input)
+        memory_context: Optional[torch.Tensor] = None,  # (B, S, K, d_input) optional retrieved memories
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[torch.Tensor], List[torch.Tensor]]:
         """
         Run the CTM core loop with per-tick cross-attention.
@@ -482,6 +488,10 @@ class CTMCore(nn.Module):
 
         Args:
             input_features: Input to process (used as KV cache for attention)
+            memory_context: Optional retrieved memories (B, S, K, d_input).
+                           If provided, flattened and concatenated with input_features
+                           for cross-attention KV, allowing CTM to attend to both
+                           current features and retrieved memories.
 
         Returns:
             post_activations: (B, S, d_neurons) final post-activations
@@ -495,6 +505,17 @@ class CTMCore(nn.Module):
         T = self.config.T
         M = self.config.M
         d_neurons = self.config.d_neurons
+
+        # Build KV context for cross-attention
+        # If memory_context provided, concatenate with input_features
+        if memory_context is not None:
+            # memory_context: (B, S, K, D) -> flatten to (B, S*K, D)
+            _, _, K, _ = memory_context.shape
+            memory_flat = memory_context.reshape(B, S * K, D)
+            # kv_context: (B, S + S*K, D) = features + memories
+            kv_context = torch.cat([input_features, memory_flat], dim=1)
+        else:
+            kv_context = input_features
 
         # Initialize post-activations from input
         z_t = self.init_z(input_features)  # (B, S, d_neurons)
@@ -544,18 +565,23 @@ class CTMCore(nn.Module):
             # 5. Compute synchronization
             S_full, S_out, S_internal = self.sync(Z_t)
 
-            # 6. Per-tick cross-attention: sync-derived queries attend to features
+            # 6. Per-tick cross-attention: sync-derived queries attend to features (+ memories)
             # Paper: q_t = W_in · S_action_t, o_t = Attention(Q=q_t, KV=features)
+            # Extended: KV = [features, memories] when memory_context is provided
             if self.cross_attn is not None:
-                o_t_new = self.cross_attn(S_internal, input_features)
+                o_t_new = self.cross_attn(S_internal, kv_context)
                 # Internal observation residual: blend old/new to prevent fixed-point convergence
                 # This ensures activations continue to evolve even after sync stabilizes
                 alpha = self.config.internal_obs_residual
                 o_t = alpha * o_t + (1 - alpha) * o_t_new
 
             # 7. Generate output from sync
+            # NOTE: RMSNorm removed to preserve tick dynamics.
+            # With RMSNorm, late-tick deltas collapsed to ~5% of early ticks.
+            # Without it, dynamics stay healthy (100%+ late/early ratio).
+            # Output magnitude now grows with ticks (0.01 → 0.25 for T=16).
             y_t = self.sync_to_output(S_out)
-            y_t = self.norm_out(y_t)
+            # y_t = self.norm_out(y_t)  # Removed: was suppressing late-tick dynamics
 
             all_outputs.append(y_t)
 

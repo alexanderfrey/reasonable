@@ -15,6 +15,32 @@ import torch.nn.functional as F
 from .ctm_base import CTMBaseConfig, CTMModule, CTMModuleOutput, RMSNorm
 
 
+class TokenHead(nn.Module):
+    """Token prediction head with bottleneck to reduce parameters.
+
+    Instead of d_output -> vocab_size directly (~154M params for 1536->100000),
+    uses d_output -> bottleneck -> vocab_size (~26M params for 1536->256->100000).
+    """
+
+    def __init__(self, d_input: int, vocab_size: int, bottleneck: int = 256):
+        super().__init__()
+        self.proj = nn.Linear(d_input, bottleneck)
+        self.head = nn.Linear(bottleneck, vocab_size)
+        self._init_weights()
+
+    def _init_weights(self):
+        nn.init.normal_(self.proj.weight, std=0.02)
+        nn.init.zeros_(self.proj.bias)
+        nn.init.normal_(self.head.weight, std=0.02)
+        nn.init.zeros_(self.head.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, S, d_input) -> (B, S, vocab_size)
+        x = self.proj(x)
+        x = F.gelu(x)
+        return self.head(x)
+
+
 class PredictionCTMOutput(NamedTuple):
     """Output from PredictionCTM."""
     predictions: Dict[str, torch.Tensor]  # {immediate, shortterm, longterm} from final tick
@@ -23,6 +49,7 @@ class PredictionCTMOutput(NamedTuple):
     all_tick_outputs: List[torch.Tensor]  # Raw CTM outputs (y_t) at each tick - used for CTM loss
     certainty: torch.Tensor               # Confidence at final tick
     all_tick_activations: List[torch.Tensor]  # NLM activations at each tick
+    token_logits: Optional[Dict[str, torch.Tensor]] = None  # {immediate, shortterm, longterm} token logits
 
 
 @dataclass
@@ -33,6 +60,11 @@ class PredictionCTMConfig(CTMBaseConfig):
     immediate_horizon: int = 8
     shortterm_horizon: int = 64
     longterm_horizon: int = 256
+
+    # Token prediction (auxiliary task)
+    vocab_size: int = 0  # 0 = disabled, >0 = predict token IDs
+    token_prediction_weight: float = 0.1  # Weight for token prediction loss
+    token_bottleneck: int = 256  # Bottleneck dim to reduce params (d_output -> bottleneck -> vocab)
 
     # Override defaults for prediction task
     d_input: int = 1536
@@ -63,10 +95,22 @@ class PredictionCTM(CTMModule):
         super().__init__(config)
         self.prediction_config = config
 
-        # Prediction readouts (multi-scale)
+        # Prediction readouts (multi-scale) for feature prediction
         self.readout_immediate = nn.Linear(config.d_output, config.d_output)
         self.readout_shortterm = nn.Linear(config.d_output, config.d_output)
         self.readout_longterm = nn.Linear(config.d_output, config.d_output)
+
+        # Token prediction heads (auxiliary task - harder than feature prediction)
+        # These predict discrete token IDs, forcing more meaningful representations
+        # Uses bottleneck to reduce params: d_output -> bottleneck -> vocab_size
+        if config.vocab_size > 0:
+            self.token_head_immediate = TokenHead(config.d_output, config.vocab_size, config.token_bottleneck)
+            self.token_head_shortterm = TokenHead(config.d_output, config.vocab_size, config.token_bottleneck)
+            self.token_head_longterm = TokenHead(config.d_output, config.vocab_size, config.token_bottleneck)
+        else:
+            self.token_head_immediate = None
+            self.token_head_shortterm = None
+            self.token_head_longterm = None
 
         # Input projection (features -> d_input)
         # Identity if d_input == d_model, otherwise project
@@ -90,13 +134,20 @@ class PredictionCTM(CTMModule):
 
     def output_projection(self, core_output: torch.Tensor) -> Dict[str, torch.Tensor]:
         """Generate multi-scale predictions from core output."""
+        # Normalize before readout for consistency with loss computation.
+        # This ensures train/inference consistency and prevents magnitude bias.
+        core_output_norm = F.normalize(core_output, dim=-1)
         return {
-            'immediate': self.readout_immediate(core_output),
-            'shortterm': self.readout_shortterm(core_output),
-            'longterm': self.readout_longterm(core_output),
+            'immediate': self.readout_immediate(core_output_norm),
+            'shortterm': self.readout_shortterm(core_output_norm),
+            'longterm': self.readout_longterm(core_output_norm),
         }
 
-    def forward(self, features: torch.Tensor) -> PredictionCTMOutput:
+    def forward(
+        self,
+        features: torch.Tensor,
+        memory_context: Optional[torch.Tensor] = None,  # (B, S, K, d_model) retrieved memories
+    ) -> PredictionCTMOutput:
         """
         Generate predictions from features.
 
@@ -108,6 +159,9 @@ class PredictionCTM(CTMModule):
 
         Args:
             features: (B, S, d_model) from backbone
+            memory_context: Optional (B, S, K, d_model) retrieved memories.
+                           If provided, CTM cross-attention KV includes both
+                           features and memories, allowing dynamic attention.
 
         Returns:
             PredictionCTMOutput with predictions and post-activations
@@ -115,15 +169,36 @@ class PredictionCTM(CTMModule):
         # 1. Input projection
         input_features = self.input_projection(features)
 
-        # 2. Run core CTM loop
+        # Project memory context if provided
+        if memory_context is not None:
+            B, S, K, D = memory_context.shape
+            memory_flat = memory_context.reshape(B * S * K, D)
+            memory_proj = self.input_projection(memory_flat)
+            memory_context_proj = memory_proj.reshape(B, S, K, -1)
+        else:
+            memory_context_proj = None
+
+        # 2. Run core CTM loop with optional memory context
         # all_outputs contains y_t at each tick - used for CTM loss
-        post_activations, sync_matrix, output, all_outputs, all_activations = self.core(input_features)
+        post_activations, sync_matrix, output, all_outputs, all_activations = self.core(
+            input_features, memory_context=memory_context_proj
+        )
 
         # 3. Generate predictions from FINAL tick only
         # Readout heads are task-specific projections, not part of CTM core
         predictions = self.output_projection(output)
 
-        # 4. Compute certainty from full output history
+        # 4. Generate token logits if enabled (auxiliary task)
+        if self.token_head_immediate is not None:
+            token_logits = {
+                'immediate': self.token_head_immediate(output),
+                'shortterm': self.token_head_shortterm(output),
+                'longterm': self.token_head_longterm(output),
+            }
+        else:
+            token_logits = None
+
+        # 5. Compute certainty from full output history
         certainty = self.core.compute_certainty(all_outputs)
 
         return PredictionCTMOutput(
@@ -133,6 +208,7 @@ class PredictionCTM(CTMModule):
             all_tick_outputs=all_outputs,  # y_t values for CTM loss
             certainty=certainty,
             all_tick_activations=all_activations,
+            token_logits=token_logits,
         )
 
 

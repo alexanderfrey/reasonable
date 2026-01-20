@@ -32,6 +32,7 @@ from .semantic_memory import (
     SemanticMemoryConfig,
     MemoryIntegrator,
     MemoryReadOutput,
+    MemoryTopKOutput,
 )
 
 
@@ -131,10 +132,10 @@ class MemoryAugmentedPredictionOutput(NamedTuple):
     # Surprise outputs (only present when targets provided)
     surprise: Optional[SurpriseOutput] = None
 
-    # Memory outputs
-    memory_retrieved: Optional[torch.Tensor] = None  # (B, S, feature_dim)
-    memory_attention: Optional[torch.Tensor] = None  # (B, S, num_slots)
-    memory_max_attention: Optional[torch.Tensor] = None  # (B, S)
+    # Memory outputs (top-K retrieval)
+    memory_retrieved: Optional[torch.Tensor] = None  # (B, S, K, feature_dim) top-K values
+    memory_attention: Optional[torch.Tensor] = None  # (B, S, K) top-K attention weights
+    memory_max_attention: Optional[torch.Tensor] = None  # (B, S) max attention per position
 
     # Token logits (if enabled)
     token_logits: Optional[Dict[str, torch.Tensor]] = None
@@ -177,6 +178,7 @@ class MemoryAugmentedPredictionConfig:
 
     # Memory integration
     memory_attention_threshold: float = 0.5  # Higher threshold - only use memory when confident
+    memory_top_k: int = 4  # Number of top memories to retrieve per position for CTM cross-attention
 
     # Surprise config
     surprise_hidden_dim: int = 256
@@ -192,11 +194,14 @@ class MemoryAugmentedPrediction(nn.Module):
     3. SurpriseCompute - surprise computation for memory importance
 
     Flow:
-    1. Read from memory using input features
-    2. If memory has relevant content (high attention), augment features
-    3. Run prediction on (augmented) features
+    1. Read top-K memories for each position
+    2. Pass memories to CTM as additional KV context for cross-attention
+    3. CTM dynamically attends to both features and memories at each tick
     4. If targets provided, compute surprise
     5. Write to memory with importance = surprise magnitude
+
+    Key insight: Instead of blending memories into features, we let the CTM's
+    cross-attention mechanism decide how to use each memory at each tick.
     """
 
     def __init__(self, config: MemoryAugmentedPredictionConfig):
@@ -272,31 +277,24 @@ class MemoryAugmentedPrediction(nn.Module):
         """
         B, S, D = features.shape
 
-        # 1. Read from memory
-        memory_read = self.memory.read(features)  # MemoryReadOutput
+        # 1. Read top-K memories for each position
+        memory_read = self.memory.read_top_k(features, k=self.config.memory_top_k)  # MemoryTopKOutput
 
-        # 2. Augment features if memory has relevant content
+        # 2. Decide whether to use memory based on attention threshold
         max_attn = memory_read.max_attention  # (B, S)
-        use_memory_mask = max_attn > self.config.memory_attention_threshold
+        use_memory = (max_attn > self.config.memory_attention_threshold).any()
 
-        if use_memory_mask.any():
-            # Augment features with memory
-            augmented_features = self.memory_integrator(
-                features,
-                memory_read.retrieved,
-                memory_strength=max_attn,
-            )
-            # Blend: use augmented where memory is strong, original elsewhere
-            augmented_features = torch.where(
-                use_memory_mask.unsqueeze(-1),
-                augmented_features,
-                features,
+        # 3. Run prediction with optional memory context
+        # CTM cross-attention will attend to both features and memories
+        if use_memory:
+            # Pass top-K memories as additional KV context
+            # memory_read.values: (B, S, K, D)
+            pred_output: PredictionCTMOutput = self.prediction(
+                features, memory_context=memory_read.values
             )
         else:
-            augmented_features = features
-
-        # 3. Run prediction
-        pred_output: PredictionCTMOutput = self.prediction(augmented_features)
+            # No relevant memories - run without memory context
+            pred_output: PredictionCTMOutput = self.prediction(features)
 
         # 4. Compute surprise (if targets provided)
         surprise_output = None
@@ -325,9 +323,9 @@ class MemoryAugmentedPrediction(nn.Module):
             certainty=pred_output.certainty,
             all_tick_activations=pred_output.all_tick_activations,
             surprise=surprise_output,
-            memory_retrieved=memory_read.retrieved,
-            memory_attention=memory_read.attention_weights,
-            memory_max_attention=memory_read.max_attention,
+            memory_retrieved=memory_read.values,  # (B, S, K, D) top-K values
+            memory_attention=memory_read.attention_weights,  # (B, S, K) top-K attention
+            memory_max_attention=memory_read.max_attention,  # (B, S)
             token_logits=pred_output.token_logits,
         )
 

@@ -51,6 +51,81 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+class PerformanceContributionTracker:
+    """
+    Tracks gradient w.r.t. module outputs to measure performance contribution.
+
+    Performance contribution = ||∂L/∂(module_output)||
+
+    This tells us "how sensitive is the loss to this module's output",
+    i.e., which modules matter most for the current loss.
+    """
+
+    def __init__(self):
+        self.grad_norms = {}
+        self.handles = []
+        self._gradients = {}
+
+    def register_hooks(self, model):
+        """Register backward hooks on key CTM modules."""
+        self.clear()
+
+        # Access the CTM core through prediction module
+        core = model.prediction.core
+
+        # Hook for synapse output (a_t)
+        def synapse_hook(module, grad_input, grad_output):
+            if grad_output[0] is not None:
+                self._gradients['synapse'] = grad_output[0].detach().norm().item()
+
+        # Hook for NLM output (z_t)
+        def nlm_hook(module, grad_input, grad_output):
+            if grad_output[0] is not None:
+                self._gradients['nlm'] = grad_output[0].detach().norm().item()
+
+        # Hook for sync_to_output (y_t - the main output path)
+        def sync_to_output_hook(module, grad_input, grad_output):
+            if grad_output[0] is not None:
+                self._gradients['sync_to_output'] = grad_output[0].detach().norm().item()
+
+        # Hook for cross_attn output (o_t)
+        def cross_attn_hook(module, grad_input, grad_output):
+            if grad_output[0] is not None:
+                self._gradients['cross_attn'] = grad_output[0].detach().norm().item()
+
+        self.handles.append(core.synapse.register_full_backward_hook(synapse_hook))
+        self.handles.append(core.nlm.register_full_backward_hook(nlm_hook))
+        self.handles.append(core.sync_to_output.register_full_backward_hook(sync_to_output_hook))
+
+        if core.cross_attn is not None:
+            self.handles.append(core.cross_attn.register_full_backward_hook(cross_attn_hook))
+
+    def get_contributions(self) -> dict:
+        """Get performance contributions as fractions."""
+        total = sum(self._gradients.values()) if self._gradients else 1.0
+        if total > 0:
+            fractions = {k: v / total for k, v in self._gradients.items()}
+        else:
+            fractions = {k: 0.0 for k in self._gradients}
+
+        # Also return raw norms for debugging
+        return {
+            'fractions': fractions,
+            'norms': self._gradients.copy(),
+        }
+
+    def clear(self):
+        """Clear captured gradients."""
+        self._gradients = {}
+
+    def remove_hooks(self):
+        """Remove all registered hooks."""
+        for handle in self.handles:
+            handle.remove()
+        self.handles = []
+        self._gradients = {}
+
+
 @dataclass
 class TrainingConfig:
     """Configuration for memory-augmented prediction training."""
@@ -77,7 +152,7 @@ class TrainingConfig:
 
     # Prediction horizons
     immediate_horizon: int = 64
-    shortterm_horizon: int = 128
+    shortterm_horizon: int = 256
     longterm_horizon: int = 512
 
     # Token prediction
@@ -96,6 +171,7 @@ class TrainingConfig:
     memory_importance_decay: float = 0.8   # Faster decay (was 0.95) to evict stale memories
     memory_write_threshold: float = 0.1
     memory_attention_threshold: float = 0.5  # Higher threshold (was 0.3) - only use memory when confident
+    memory_top_k: int = 4  # Number of top memories for CTM cross-attention
 
     # Surprise configuration (NEW)
     surprise_hidden_dim: int = 256
@@ -333,11 +409,17 @@ class MemoryPredictionTrainer:
             memory_importance_decay=self.config.memory_importance_decay,
             memory_write_threshold=self.config.memory_write_threshold,
             memory_attention_threshold=self.config.memory_attention_threshold,
+            memory_top_k=self.config.memory_top_k,
             # Surprise config
             surprise_hidden_dim=self.config.surprise_hidden_dim,
         )
 
         self.prediction_module = MemoryAugmentedPrediction(pred_config).to(self.device)
+
+        # Performance contribution tracker
+        self.perf_tracker = PerformanceContributionTracker()
+        self.perf_tracker.register_hooks(self.prediction_module)
+
         self.target_computer = PredictionTargets(
             immediate_horizon=self.config.immediate_horizon,
             shortterm_horizon=self.config.shortterm_horizon,
@@ -801,6 +883,10 @@ class MemoryPredictionTrainer:
         else:
             loss.backward()
 
+        # Get performance contributions (gradients captured by hooks during backward)
+        perf_contrib = self.perf_tracker.get_contributions()
+        self.perf_tracker.clear()
+
         # Decay memory importance (aging mechanism)
         self.prediction_module.decay_memory_importance()
 
@@ -815,6 +901,10 @@ class MemoryPredictionTrainer:
         # Add memory stats
         memory_stats = self.prediction_module.get_memory_stats()
         loss_values.update({f'memory_{k}': v for k, v in memory_stats.items()})
+
+        # Add performance contribution stats
+        loss_values.update({f'perf_frac_{k}': v for k, v in perf_contrib['fractions'].items()})
+        loss_values.update({f'perf_norm_{k}': v for k, v in perf_contrib['norms'].items()})
 
         # Memory hit rate (positions with high attention)
         if output.memory_max_attention is not None:
@@ -1012,6 +1102,12 @@ class MemoryPredictionTrainer:
                     surp_mag = avg_loss.get('surprise_magnitude_mean', 0)
                     benefit_pct = avg_loss.get('memory_benefit_pct', 0)
 
+                    # Performance contribution (which modules matter for loss)
+                    syn_pct = avg_loss.get('perf_frac_synapse', 0) * 100
+                    nlm_pct = avg_loss.get('perf_frac_nlm', 0) * 100
+                    sync_pct = avg_loss.get('perf_frac_sync_to_output', 0) * 100
+                    xattn_pct = avg_loss.get('perf_frac_cross_attn', 0) * 100
+
                     logger.info(
                         f"Epoch {epoch} | Step {self.global_step} | "
                         f"Loss: {avg_loss['loss']:.4f} | "
@@ -1020,6 +1116,9 @@ class MemoryPredictionTrainer:
                         f"Benefit: {benefit_pct:+.1f}% (EMA: {self.benefit_pct_ema:+.1f}%) | "
                         f"GradNorm: {grad_norm_value:.2f} | "
                         f"Throughput: {tokens_per_sec:.0f} tok/s"
+                    )
+                    logger.info(
+                        f"  [PerfContrib] Syn: {syn_pct:.1f}% | NLM: {nlm_pct:.1f}% | Sync→Out: {sync_pct:.1f}% | XAttn: {xattn_pct:.1f}%"
                     )
 
                     # Wandb logging
@@ -1047,6 +1146,11 @@ class MemoryPredictionTrainer:
                             "memory/benefit_pct_ema": self.benefit_pct_ema,
                             "memory/loss_with_memory": avg_loss.get('memory_loss_with_memory', 0),
                             "memory/loss_without_memory": avg_loss.get('memory_loss_without_memory', 0),
+                            # Performance contribution fractions (which modules matter for loss)
+                            "perf_contrib/synapse": avg_loss.get('perf_frac_synapse', 0),
+                            "perf_contrib/nlm": avg_loss.get('perf_frac_nlm', 0),
+                            "perf_contrib/sync_to_output": avg_loss.get('perf_frac_sync_to_output', 0),
+                            "perf_contrib/cross_attn": avg_loss.get('perf_frac_cross_attn', 0),
                         }
 
                         if progress is not None:
@@ -1238,9 +1342,10 @@ class MemoryPredictionTrainer:
         logger.info("=" * 60)
         logger.info(f"Device: {self.device}")
         logger.info(f"Train files: {len(train_files)} | Val files: {len(val_files)}")
+        logger.info(f"Context: {self.config.context_size} tokens | Horizons: imm={self.config.immediate_horizon}, short={self.config.shortterm_horizon}, long={self.config.longterm_horizon}")
         logger.info(f"CTM: D={self.config.d_neurons}, M={self.config.M}, T={self.config.T}")
-        logger.info(f"Memory: {self.config.memory_slots} slots, context_window={self.config.memory_context_window}")
-        logger.info(f"Surprise weights: cal={self.config.surprise_cal_weight}, benefit={self.config.memory_benefit_weight}")
+        logger.info(f"Memory: {self.config.memory_slots} slots, context_window={self.config.memory_context_window}, top_k={self.config.memory_top_k}")
+        logger.info(f"Training: batch={self.config.batch_size}, grad_accum={self.config.gradient_accumulation_steps}, lr={self.config.learning_rate}")
         logger.info("=" * 60)
 
         # Create datasets
@@ -1373,8 +1478,12 @@ def main():
                        help="Local context window for key encoding (total 2*N+1 positions)")
     parser.add_argument("--memory_importance_decay", type=float, default=0.95,
                        help="Per-batch importance decay")
+    parser.add_argument("--memory_retrieval_temperature", type=float, default=0.1,
+                       help="Softmax temperature for retrieval (lower=sharper attention)")
     parser.add_argument("--memory_attention_threshold", type=float, default=0.3,
                        help="Min attention to use memory")
+    parser.add_argument("--memory_top_k", type=int, default=4,
+                       help="Number of top memories for CTM cross-attention")
 
     # Surprise arguments (NEW)
     parser.add_argument("--surprise_hidden_dim", type=int, default=256,
@@ -1455,7 +1564,9 @@ def main():
         memory_key_dim=args.memory_key_dim,
         memory_context_window=args.memory_context_window,
         memory_importance_decay=args.memory_importance_decay,
+        memory_retrieval_temperature=args.memory_retrieval_temperature,
         memory_attention_threshold=args.memory_attention_threshold,
+        memory_top_k=args.memory_top_k,
         # Surprise (NEW)
         surprise_hidden_dim=args.surprise_hidden_dim,
         surprise_cal_weight=args.surprise_cal_weight,
