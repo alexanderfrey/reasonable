@@ -52,6 +52,18 @@ class CTMModuleOutput(NamedTuple):
     all_tick_activations: List[torch.Tensor]  # (B, S, D_neurons) NLM activations at each tick
 
 
+class CTMCoreOutput(NamedTuple):
+    """Output from CTMCore.forward() with monitoring info."""
+    post_activations: torch.Tensor      # (B, S, d_neurons) final post-activations
+    sync_matrix: torch.Tensor           # (B, S, d_neurons, d_neurons) final sync matrix
+    output: torch.Tensor                # (B, S, d_output) final tick output
+    all_outputs: List[torch.Tensor]     # Outputs at each tick
+    all_activations: List[torch.Tensor] # NLM post-activations at each tick
+    # World state monitoring
+    z_init: Optional[torch.Tensor] = None   # (B, S, d_neurons) z before world state added
+    z_world: Optional[torch.Tensor] = None  # (d_neurons,) world state projection
+
+
 @dataclass
 class CTMBaseConfig:
     """Base configuration shared by all CTM modules."""
@@ -490,7 +502,7 @@ class CTMCore(nn.Module):
         input_features: torch.Tensor,  # (B, S, d_input)
         memory_context: Optional[torch.Tensor] = None,  # (B, S, K, d_input) optional retrieved memories
         world_state: Optional[torch.Tensor] = None,  # (d_world_state,) persistent world state
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[torch.Tensor], List[torch.Tensor]]:
+    ) -> CTMCoreOutput:
         """
         Run the CTM core loop with per-tick cross-attention.
 
@@ -518,11 +530,14 @@ class CTMCore(nn.Module):
                         If provided, biases z_0 initialization via learned projection.
 
         Returns:
-            post_activations: (B, S, d_neurons) final post-activations
-            sync_matrix: (B, S, d_neurons, d_neurons) final sync matrix
-            output: (B, S, d_output) final tick output
-            all_outputs: List of outputs at each tick
-            all_activations: List of NLM post-activations at each tick
+            CTMCoreOutput containing:
+            - post_activations: (B, S, d_neurons) final post-activations
+            - sync_matrix: (B, S, d_neurons, d_neurons) final sync matrix
+            - output: (B, S, d_output) final tick output
+            - all_outputs: List of outputs at each tick
+            - all_activations: List of NLM post-activations at each tick
+            - z_init: (B, S, d_neurons) z before world state added (for monitoring)
+            - z_world: (d_neurons,) world state projection (for monitoring)
         """
         B, S, D = input_features.shape
         device = input_features.device
@@ -544,11 +559,16 @@ class CTMCore(nn.Module):
         # Initialize post-activations from input
         z_t = self.init_z(input_features)  # (B, S, d_neurons)
 
+        # Store z_init for monitoring (before world state is added)
+        z_init_for_monitoring = z_t.clone()
+        z_world_for_monitoring = None
+
         # Add world state bias to z_0 if provided (emergent world model influence)
         # This is the key mechanism: accumulated sync patterns bias initial attention
         if world_state is not None and self.world_to_z0 is not None:
             # world_state: (d_world_state,) -> (d_neurons,)
             z_world = self.world_to_z0(world_state)  # (d_neurons,)
+            z_world_for_monitoring = z_world.clone()
             # Broadcast to all batch items and sequence positions
             z_t = z_t + z_world.unsqueeze(0).unsqueeze(0)  # (B, S, d_neurons)
 
@@ -620,7 +640,15 @@ class CTMCore(nn.Module):
             # Update for next tick
             z_t = z_t_new
 
-        return z_t, S_full, all_outputs[-1], all_outputs, Z_history
+        return CTMCoreOutput(
+            post_activations=z_t,
+            sync_matrix=S_full,
+            output=all_outputs[-1],
+            all_outputs=all_outputs,
+            all_activations=Z_history,
+            z_init=z_init_for_monitoring,
+            z_world=z_world_for_monitoring,
+        )
 
     def compute_certainty(
         self,
@@ -697,19 +725,19 @@ class CTMModule(nn.Module):
         input_features = self.input_projection(*args, **kwargs)
 
         # 2. Run core CTM loop
-        post_activations, sync_matrix, output, all_outputs, all_activations = self.core(input_features)
+        core_output = self.core(input_features)
 
         # 3. Output projection (module-specific)
-        result = self.output_projection(output)
+        result = self.output_projection(core_output.output)
 
         # 4. Compute certainty
-        certainty = self.core.compute_certainty(all_outputs)
+        certainty = self.core.compute_certainty(core_output.all_outputs)
 
         return CTMModuleOutput(
             result=result,
-            post_activations=post_activations,
-            sync_matrix=sync_matrix,
-            all_tick_outputs=all_outputs,
+            post_activations=core_output.post_activations,
+            sync_matrix=core_output.sync_matrix,
+            all_tick_outputs=core_output.all_outputs,
             certainty=certainty,
-            all_tick_activations=all_activations,
+            all_tick_activations=core_output.all_activations,
         )

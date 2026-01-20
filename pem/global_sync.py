@@ -8,6 +8,12 @@ Follows the CTM paper's "Synchronization as a representation" blueprint:
 Each module computes its synchronization matrix from post-activation history,
 then cross-module sync is computed by comparing these sync patterns.
 
+Extended with Oscillatory World Model:
+- Instead of GRU-based persistent state, uses oscillating neurons
+- Oscillators at different frequencies capture different timescales
+- Learned modulation of oscillators gets gradients (solves gradient flow problem)
+- Phase advance happens every forward pass
+
 Architecture:
     ┌─────────────────────────────────────────────────────────────────────────┐
     │                         GLOBAL SYNC MODULE                              │
@@ -29,8 +35,10 @@ Architecture:
     │                              │                                          │
     │                              ▼                                          │
     │   ┌─────────────────────────────────────────────────────────────────┐  │
-    │   │  Sync-Derived Queries: q = W_in · S_action                      │  │
-    │   │  Cross-attention between modules using sync as queries          │  │
+    │   │  Oscillatory World Model (replaces GRU-based state)             │  │
+    │   │  - Phase advance: deterministic evolution                        │  │
+    │   │  - Modulation: learned (gets gradients!)                        │  │
+    │   │  - Read: oscillator amplitudes * sin(phases)                    │  │
     │   └─────────────────────────────────────────────────────────────────┘  │
     │                              │                                          │
     │                              ▼                                          │
@@ -49,14 +57,24 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .oscillatory_world import (
+    OscillatoryWorldState,
+    OscillatoryWorldConfig,
+    OscillatorMetrics,
+    create_oscillatory_world,
+)
+
 
 class GlobalSyncOutput(NamedTuple):
     """Output from GlobalSyncModule."""
     sync: torch.Tensor                 # (B, S, sync_pairs) global sync state
     cross_module_sync: torch.Tensor    # (num_modules, num_modules, B, S) sync matrix
     module_contributions: torch.Tensor # (B, S, num_modules) how much each module contributes
-    world_state: Optional[torch.Tensor] = None  # (d_sync,) updated world state (for commit after backward)
-    update_gate_value: Optional[torch.Tensor] = None  # Average gate value (for logging)
+    world_state: Optional[torch.Tensor] = None  # (d_world_output,) current oscillatory world state
+    # Oscillator-specific monitoring (replaces GRU gate values)
+    oscillator_metrics: Optional[OscillatorMetrics] = None  # Detailed oscillator metrics
+    oscillator_amplitudes: Optional[torch.Tensor] = None    # (num_oscillators,) current amplitudes
+    oscillator_phases: Optional[torch.Tensor] = None        # (num_oscillators,) current phases
 
 
 @dataclass
@@ -81,9 +99,12 @@ class GlobalSyncConfig:
     # Learnable module embeddings
     use_module_embeddings: bool = True
 
-    # Persistent sync state (emergent world model)
-    use_persistent_state: bool = True  # Enable/disable persistent sync
-    d_sync_state: int = 256            # Dimension of persistent world state (S_world)
+    # Oscillatory world model (replaces GRU-based persistent state)
+    use_oscillatory_world: bool = True  # Enable/disable oscillatory world model
+    num_oscillators: int = 64           # Number of oscillators
+    min_period: int = 8                 # Fastest oscillator period
+    max_period: int = 4096              # Slowest oscillator period
+    d_world_output: int = 256           # Output dimension of world state
 
 
 class RMSNorm(nn.Module):
@@ -395,104 +416,6 @@ class SyncIntegrator(nn.Module):
         return sync, contributions
 
 
-class PersistentSyncState(nn.Module):
-    """
-    Maintains sync state across time - the emergent world model.
-
-    This is the core of the "emergent self" architecture:
-    - S_world is a single vector that persists across all forward passes
-    - It is never reset (accumulates knowledge across entire training)
-    - It represents accumulated sync patterns that bias future processing
-    """
-
-    def __init__(self, d_sync: int = 256):
-        super().__init__()
-        self.d_sync = d_sync
-        # Persistent state - single vector, never reset
-        self.register_buffer('S_world', torch.zeros(d_sync))
-        # Track how many updates have been made (for diagnostics)
-        self.register_buffer('update_count', torch.tensor(0, dtype=torch.long))
-
-    def get_state(self) -> torch.Tensor:
-        """Get current world state."""
-        return self.S_world
-
-    @torch.no_grad()
-    def update(self, S_new: torch.Tensor):
-        """
-        Update world state in-place (called after backward pass).
-
-        Args:
-            S_new: New world state tensor (d_sync,)
-        """
-        self.S_world.copy_(S_new)
-        self.update_count.add_(1)
-
-    def reset(self):
-        """Reset world state (mainly for testing/ablation)."""
-        self.S_world.zero_()
-        self.update_count.zero_()
-
-
-class SyncUpdateGate(nn.Module):
-    """
-    GRU-style gated update: decides how much to incorporate new sync vs keep old.
-
-    Following GRU mechanics:
-    - Reset gate (r): what to forget from old state
-    - Update gate (z): how much to update
-    - Candidate: what new information to add
-
-    This allows the model to learn:
-    - What sync patterns are stable/important (keep)
-    - What sync patterns should update (incorporate)
-    """
-
-    def __init__(self, d_sync: int = 256):
-        super().__init__()
-        self.d_sync = d_sync
-
-        # Reset gate: what to forget from old state
-        self.reset_gate = nn.Linear(d_sync * 2, d_sync)
-        # Update gate: how much to update
-        self.update_gate = nn.Linear(d_sync * 2, d_sync)
-        # Candidate: what new information to add
-        self.candidate = nn.Linear(d_sync * 2, d_sync)
-
-        self._init_weights()
-
-    def _init_weights(self):
-        """Initialize weights for stable learning."""
-        for module in [self.reset_gate, self.update_gate, self.candidate]:
-            nn.init.xavier_uniform_(module.weight)
-            nn.init.zeros_(module.bias)
-
-        # Initialize update gate bias negative so initial gate is ~0.1
-        # This means we mostly keep old state early in training
-        with torch.no_grad():
-            self.update_gate.bias.data.fill_(-2.0)  # sigmoid(-2) ≈ 0.12
-
-    def forward(self, S_world: torch.Tensor, S_new: torch.Tensor) -> torch.Tensor:
-        """
-        GRU-style update: S_world' = f(S_world, S_new)
-
-        Args:
-            S_world: Current world state (d_sync,) or (B, d_sync)
-            S_new: New sync observation (d_sync,) or (B, d_sync)
-
-        Returns:
-            Updated world state (same shape as input)
-        """
-        combined = torch.cat([S_world, S_new], dim=-1)
-
-        r = torch.sigmoid(self.reset_gate(combined))    # Reset gate
-        z = torch.sigmoid(self.update_gate(combined))   # Update gate
-
-        reset_combined = torch.cat([r * S_world, S_new], dim=-1)
-        candidate = torch.tanh(self.candidate(reset_combined))
-
-        # GRU update: (1-z) keeps old, z incorporates new
-        return (1 - z) * S_world + z * candidate
 
 
 class GlobalSyncModule(nn.Module):
@@ -506,10 +429,11 @@ class GlobalSyncModule(nn.Module):
     4. Use sync-derived queries for cross-module attention
     5. Integrate into global sync state
 
-    Extended with Persistent Sync State:
-    - Maintains S_world across all forward passes (emergent world model)
-    - Returns updated world state for committing after backward pass
-    - World state biases CTM initial post-activations
+    Extended with Oscillatory World Model:
+    - Uses oscillating neurons at different frequencies instead of GRU-based state
+    - Modulation of oscillators is learned (gets gradients!)
+    - Phase advance happens automatically each forward pass
+    - No need for commit_world_state() - oscillators evolve continuously
 
     Usage:
         global_sync = GlobalSyncModule(config)
@@ -518,7 +442,7 @@ class GlobalSyncModule(nn.Module):
         global_sync.register_module('prediction', d_neurons=256)
         global_sync.register_module('surprise', d_neurons=128)
 
-        # Forward pass - now takes Z_history instead of just z_T
+        # Forward pass
         output = global_sync({
             'prediction': pred_ctm.all_tick_activations,  # List[(B, S, 256)]
             'surprise': surp_ctm.all_tick_activations,    # List[(B, S, 128)]
@@ -526,10 +450,7 @@ class GlobalSyncModule(nn.Module):
 
         # Use global sync for attention
         sync = output.sync  # (B, S, sync_pairs)
-        world_state = output.world_state  # (d_sync,) updated world state
-
-        # After backward pass, commit the new world state
-        global_sync.commit_world_state(output.world_state.detach())
+        world_state = output.world_state  # (d_world_output,) current oscillatory state
     """
 
     def __init__(self, config: GlobalSyncConfig):
@@ -550,30 +471,18 @@ class GlobalSyncModule(nn.Module):
         else:
             self.module_embeddings = None
 
-        # Persistent sync state (emergent world model)
-        if config.use_persistent_state:
-            self.persistent = PersistentSyncState(config.d_sync_state)
-            self.sync_update = SyncUpdateGate(config.d_sync_state)
-            # Project sync output to world state dimension
-            self.sync_to_world = nn.Sequential(
-                nn.Linear(config.sync_pairs, config.d_sync_state),
-                nn.GELU(),
-                nn.Linear(config.d_sync_state, config.d_sync_state),
+        # Oscillatory world model (replaces GRU-based persistent state)
+        if config.use_oscillatory_world:
+            osc_config = OscillatoryWorldConfig(
+                num_oscillators=config.num_oscillators,
+                min_period=config.min_period,
+                max_period=config.max_period,
+                d_sync_input=config.sync_pairs,  # Input from compressed sync
+                d_output=config.d_world_output,
             )
-            self._init_world_projection()
+            self.oscillatory_world = OscillatoryWorldState(osc_config)
         else:
-            self.persistent = None
-            self.sync_update = None
-            self.sync_to_world = None
-
-    def _init_world_projection(self):
-        """Initialize world state projection weights."""
-        if self.sync_to_world is not None:
-            for m in self.sync_to_world.modules():
-                if isinstance(m, nn.Linear):
-                    nn.init.xavier_uniform_(m.weight)
-                    if m.bias is not None:
-                        nn.init.zeros_(m.bias)
+            self.oscillatory_world = None
 
     def register_module(self, name: str, d_neurons: int) -> None:
         """
@@ -675,95 +584,112 @@ class GlobalSyncModule(nn.Module):
         # 4. Integrate into global sync
         sync, contributions = self._sync_integrator(attended)
 
-        # 5. Compute updated world state (if persistent state enabled)
-        world_state_updated = None
-        update_gate_value = None
+        # 5. Oscillatory world model (replaces GRU-based persistent state)
+        world_state = None
+        oscillator_metrics = None
+        oscillator_amplitudes = None
+        oscillator_phases = None
 
-        if self.persistent is not None:
-            # Get current world state
-            S_world = self.persistent.get_state()  # (d_sync_state,)
-
+        if self.oscillatory_world is not None:
             # Compress sync to single vector: mean over batch and sequence
             # sync shape: (B, S, sync_pairs)
-            S_new_compressed = sync.mean(dim=(0, 1))  # (sync_pairs,)
+            sync_compressed = sync.mean(dim=(0, 1))  # (sync_pairs,)
 
-            # Project to world state dimension
-            S_new_world = self.sync_to_world(S_new_compressed)  # (d_sync_state,)
+            # Oscillatory world model:
+            # 1. advance() - deterministic phase evolution
+            # 2. modulate() - learned modulation (THIS GETS GRADIENTS!)
+            # 3. read() - sample oscillator state
+            world_state = self.oscillatory_world(sync_compressed, dt=1.0)
 
-            # Compute gated update
-            world_state_updated = self.sync_update(S_world, S_new_world)
-
-            # Compute update gate value for logging (diagnostic)
-            # Re-compute to get the gate value
-            with torch.no_grad():
-                combined = torch.cat([S_world, S_new_world], dim=-1)
-                z = torch.sigmoid(self.sync_update.update_gate(combined))
-                update_gate_value = z.mean()
+            # Get oscillator state for monitoring
+            osc_state = self.oscillatory_world.get_oscillator_state()
+            oscillator_amplitudes = osc_state['current_amplitudes']
+            oscillator_phases = osc_state['phases']
+            oscillator_metrics = self.oscillatory_world.get_metrics()
 
         return GlobalSyncOutput(
             sync=sync,
             cross_module_sync=cross_module_sync,
             module_contributions=contributions,
-            world_state=world_state_updated,
-            update_gate_value=update_gate_value,
+            world_state=world_state,
+            oscillator_metrics=oscillator_metrics,
+            oscillator_amplitudes=oscillator_amplitudes,
+            oscillator_phases=oscillator_phases,
         )
-
-    @torch.no_grad()
-    def commit_world_state(self, world_state: torch.Tensor):
-        """
-        Commit the updated world state after backward pass.
-
-        Call this AFTER loss.backward() and optimizer.step() to update
-        the persistent world state with the computed update.
-
-        Args:
-            world_state: The world_state tensor from GlobalSyncOutput.
-                        MUST be detached to avoid memory leaks.
-        """
-        if self.persistent is not None and world_state is not None:
-            self.persistent.update(world_state)
 
     def get_world_state(self) -> Optional[torch.Tensor]:
         """
-        Get the current persistent world state.
+        Get the current world state from oscillatory model.
 
         Returns:
-            S_world tensor (d_sync_state,) or None if persistent state disabled.
+            World state tensor (d_world_output,) or None if oscillatory world disabled.
         """
-        if self.persistent is not None:
-            return self.persistent.get_state()
+        if self.oscillatory_world is not None:
+            return self.oscillatory_world.read()
         return None
 
     def get_world_state_stats(self) -> Dict[str, float]:
         """
-        Get statistics about the world state for logging.
+        Get statistics about the oscillatory world state for logging.
 
         Returns:
-            Dict with norm, mean, std, and update_count.
+            Dict with oscillator metrics and basic state statistics.
         """
-        if self.persistent is None:
+        if self.oscillatory_world is None:
             return {}
 
-        S_world = self.persistent.get_state()
+        metrics = self.oscillatory_world.get_metrics()
+        osc_state = self.oscillatory_world.get_oscillator_state()
+
         return {
-            'world_state/norm': S_world.norm().item(),
-            'world_state/mean': S_world.mean().item(),
-            'world_state/std': S_world.std().item(),
-            'world_state/update_count': self.persistent.update_count.item(),
+            # Basic output stats
+            'world_state/norm': metrics.output_norm,
+            'world_state/mean': metrics.output_mean,
+            'world_state/std': metrics.output_std,
+            'world_state/update_count': self.oscillatory_world._update_count.item(),
+            # Oscillator-specific stats
+            'oscillator/phase_mean': metrics.phase_mean,
+            'oscillator/phase_std': metrics.phase_std,
+            'oscillator/phase_entropy': metrics.phase_entropy,
+            'oscillator/amplitude_mean': metrics.amplitude_mean,
+            'oscillator/amplitude_std': metrics.amplitude_std,
+            'oscillator/amplitude_max': metrics.amplitude_max,
+            'oscillator/active_frac': metrics.active_oscillator_frac,
+            'oscillator/freq_weighted_amp': metrics.frequency_weighted_amplitude,
+            'oscillator/amp_mod_mean': metrics.amp_mod_mean,
+            'oscillator/phase_mod_mean': metrics.phase_mod_mean,
         }
+
+    def reset_oscillator_phases(self, random: bool = True):
+        """
+        Reset oscillator phases (mainly for testing/ablation).
+
+        Args:
+            random: If True, randomize phases. If False, set to zero.
+        """
+        if self.oscillatory_world is not None:
+            self.oscillatory_world.reset_phases(random=random)
 
 
 def create_global_sync(
     d_sync_space: int = 128,
     sync_pairs: int = 256,
     n_heads: int = 4,
+    num_oscillators: int = 64,
+    min_period: int = 8,
+    max_period: int = 4096,
+    d_world_output: int = 256,
     **kwargs,
 ) -> GlobalSyncModule:
-    """Factory function to create GlobalSyncModule."""
+    """Factory function to create GlobalSyncModule with oscillatory world model."""
     config = GlobalSyncConfig(
         d_sync_space=d_sync_space,
         sync_pairs=sync_pairs,
         n_heads=n_heads,
+        num_oscillators=num_oscillators,
+        min_period=min_period,
+        max_period=max_period,
+        d_world_output=d_world_output,
         **kwargs,
     )
     return GlobalSyncModule(config)

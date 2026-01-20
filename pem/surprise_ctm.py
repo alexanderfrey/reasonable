@@ -173,7 +173,12 @@ class SurpriseCTM(CTMModule):
         input_features = self.input_projection(predicted, actual)
 
         # 3. Run core CTM loop
-        post_activations, sync_matrix, output, all_outputs, all_activations = self.core(input_features)
+        core_output = self.core(input_features)
+        post_activations = core_output.post_activations
+        sync_matrix = core_output.sync_matrix
+        output = core_output.output
+        all_outputs = core_output.all_outputs
+        all_activations = core_output.all_activations
 
         # 4. Compute magnitude at each tick for CTM loss (cheap operation)
         all_tick_magnitudes = []

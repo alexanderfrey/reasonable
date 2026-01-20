@@ -12,7 +12,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .ctm_base import CTMBaseConfig, CTMModule, CTMModuleOutput, RMSNorm
+from .ctm_base import CTMBaseConfig, CTMModule, CTMModuleOutput, CTMCoreOutput, RMSNorm
 
 
 class TokenHead(nn.Module):
@@ -50,6 +50,9 @@ class PredictionCTMOutput(NamedTuple):
     certainty: torch.Tensor               # Confidence at final tick
     all_tick_activations: List[torch.Tensor]  # NLM activations at each tick
     token_logits: Optional[Dict[str, torch.Tensor]] = None  # {immediate, shortterm, longterm} token logits
+    # World state monitoring
+    z_init: Optional[torch.Tensor] = None   # (B, S, d_neurons) z before world state added
+    z_world: Optional[torch.Tensor] = None  # (d_neurons,) world state projection
 
 
 @dataclass
@@ -189,35 +192,38 @@ class PredictionCTM(CTMModule):
         # 2. Run core CTM loop with optional memory context and world state
         # all_outputs contains y_t at each tick - used for CTM loss
         # world_state biases z_0 to incorporate accumulated sync patterns
-        post_activations, sync_matrix, output, all_outputs, all_activations = self.core(
+        core_output = self.core(
             input_features, memory_context=memory_context_proj, world_state=world_state
         )
 
         # 3. Generate predictions from FINAL tick only
         # Readout heads are task-specific projections, not part of CTM core
-        predictions = self.output_projection(output)
+        predictions = self.output_projection(core_output.output)
 
         # 4. Generate token logits if enabled (auxiliary task)
         if self.token_head_immediate is not None:
             token_logits = {
-                'immediate': self.token_head_immediate(output),
-                'shortterm': self.token_head_shortterm(output),
-                'longterm': self.token_head_longterm(output),
+                'immediate': self.token_head_immediate(core_output.output),
+                'shortterm': self.token_head_shortterm(core_output.output),
+                'longterm': self.token_head_longterm(core_output.output),
             }
         else:
             token_logits = None
 
         # 5. Compute certainty from full output history
-        certainty = self.core.compute_certainty(all_outputs)
+        certainty = self.core.compute_certainty(core_output.all_outputs)
 
         return PredictionCTMOutput(
             predictions=predictions,
-            post_activations=post_activations,
-            sync_matrix=sync_matrix,
-            all_tick_outputs=all_outputs,  # y_t values for CTM loss
+            post_activations=core_output.post_activations,
+            sync_matrix=core_output.sync_matrix,
+            all_tick_outputs=core_output.all_outputs,  # y_t values for CTM loss
             certainty=certainty,
-            all_tick_activations=all_activations,
+            all_tick_activations=core_output.all_activations,
             token_logits=token_logits,
+            # World state monitoring
+            z_init=core_output.z_init,
+            z_world=core_output.z_world,
         )
 
 

@@ -907,11 +907,31 @@ def train_step(
     # Optimizer step
     optimizer.step()
 
-    # Commit updated world state AFTER backward pass (emergent world model)
-    # This is the key step: accumulated sync patterns persist across pages
-    final_output = outputs[-1]  # Use final loop step's world state
-    if final_output.world_state is not None:
-        model.commit_world_state(final_output.world_state.detach())
+    # Get final output for world state processing
+    final_output = outputs[-1]
+
+    # Compute oscillator metrics for monitoring
+    world_state_metrics = {}
+    osc_metrics = final_output.global_sync.oscillator_metrics
+    if osc_metrics is not None:
+        world_state_metrics = {
+            'oscillator/phase_mean': osc_metrics.phase_mean,
+            'oscillator/phase_std': osc_metrics.phase_std,
+            'oscillator/phase_entropy': osc_metrics.phase_entropy,
+            'oscillator/amplitude_mean': osc_metrics.amplitude_mean,
+            'oscillator/amplitude_std': osc_metrics.amplitude_std,
+            'oscillator/amplitude_max': osc_metrics.amplitude_max,
+            'oscillator/active_frac': osc_metrics.active_oscillator_frac,
+            'oscillator/freq_weighted_amp': osc_metrics.frequency_weighted_amplitude,
+            'oscillator/amp_mod_mean': osc_metrics.amp_mod_mean,
+            'oscillator/phase_mod_mean': osc_metrics.phase_mod_mean,
+            'oscillator/output_norm': osc_metrics.output_norm,
+            'oscillator/output_mean': osc_metrics.output_mean,
+            'oscillator/output_std': osc_metrics.output_std,
+        }
+
+    # NOTE: Oscillatory world model evolves continuously during forward pass
+    # No commit_world_state() needed - oscillators advance and modulate automatically
 
     # Compute detailed metrics
     with torch.no_grad():
@@ -934,9 +954,12 @@ def train_step(
     metrics['cumulative_sync_mean'] = final_state.cumulative_sync.mean().item()
     metrics['cumulative_sync_std'] = final_state.cumulative_sync.std().item()
 
-    # World state stats (emergent world model)
+    # World state stats (emergent world model) - basic stats
     world_state_stats = model.get_world_state_stats()
     metrics.update(world_state_stats)
+
+    # Add detailed world state metrics from monitor
+    metrics.update(world_state_metrics)
 
     # Add update gate value if available (how much new info is incorporated)
     if final_output.global_sync.update_gate_value is not None:
@@ -1186,6 +1209,11 @@ def main():
     optimizer = create_optimizer(model, config)
     scheduler = create_scheduler(optimizer, config)
 
+    # Note: WorldStateMonitor is now less relevant with oscillatory world model
+    # The oscillator-specific metrics are computed directly in the forward pass
+    world_state_monitor = None  # Oscillator metrics computed in forward pass
+    print(f"  [Monitor] Oscillatory world model enabled (n_osc={pem_config.num_oscillators})")
+
     # Create dataloader
     print("Creating dataloader...")
     train_loader = create_dataloader(config, split='train')
@@ -1252,7 +1280,10 @@ def main():
             global_step == 0 or (global_step + 1) % args.diagnostic_every == 0
         )
         need_outputs = should_visualize or should_diagnose
-        result = train_step(model, features, optimizer, config, return_outputs=need_outputs)
+        result = train_step(
+            model, features, optimizer, config,
+            return_outputs=need_outputs,
+        )
 
         if need_outputs:
             metrics, outputs_for_diag, targets_for_diag = result
@@ -1337,6 +1368,25 @@ def main():
             print(f"          NLM | Pred: ∇w1={pred_w1_grad:.2e} ∇w2={pred_w2_grad:.2e} {pred_grad_status} | "
                   f"Surp: ∇w1={surp_w1_grad:.2e} ∇w2={surp_w2_grad:.2e} {surp_grad_status}")
 
+            # Oscillator health monitoring
+            osc_amp_mean = metrics.get('oscillator/amplitude_mean', 0)
+            osc_phase_entropy = metrics.get('oscillator/phase_entropy', 0)
+            osc_active_frac = metrics.get('oscillator/active_frac', 0)
+            osc_amp_mod = metrics.get('oscillator/amp_mod_mean', 0)
+            osc_phase_mod = metrics.get('oscillator/phase_mod_mean', 0)
+            osc_out_norm = metrics.get('oscillator/output_norm', 0)
+            osc_health_issues = []
+            if osc_active_frac < 0.1:
+                osc_health_issues.append("FEW_ACTIVE")
+            if osc_amp_mod < 0.001 and osc_phase_mod < 0.001:
+                osc_health_issues.append("NO_MODULATION")
+            if osc_out_norm > 100:
+                osc_health_issues.append("EXPLODING")
+            osc_health_str = " ".join(f"⚠{i}" for i in osc_health_issues) if osc_health_issues else "✓"
+            print(f"   Oscillator | amp={osc_amp_mean:.3f} φH={osc_phase_entropy:.2f} "
+                  f"active={osc_active_frac:.2f} mod(a/φ)={osc_amp_mod:.3f}/{osc_phase_mod:.3f} "
+                  f"out={osc_out_norm:.2f} {osc_health_str}")
+
             # WandB logging (consolidated - only essential metrics)
             if config.wandb_project:
                 log_dict = {
@@ -1411,13 +1461,36 @@ def main():
                     'nlm/surp_w1_grad': metrics.get('nlm_surp/w1_grad_norm', 0),
                     'nlm/surp_w2_grad': metrics.get('nlm_surp/w2_grad_norm', 0),
 
-                    # === WORLD STATE (EMERGENT WORLD MODEL) ===
-                    # Persistent sync state that accumulates across all pages
+                    # === OSCILLATORY WORLD MODEL ===
+                    # Oscillator state that evolves continuously
                     'world_state/norm': metrics.get('world_state/norm', 0),
                     'world_state/mean': metrics.get('world_state/mean', 0),
                     'world_state/std': metrics.get('world_state/std', 0),
                     'world_state/update_count': metrics.get('world_state/update_count', 0),
-                    'world_state/update_gate': metrics.get('world_state/update_gate', 0.5),
+
+                    # === OSCILLATOR METRICS ===
+                    # Phase dynamics
+                    'oscillator/phase_mean': metrics.get('oscillator/phase_mean', 0),
+                    'oscillator/phase_std': metrics.get('oscillator/phase_std', 0),
+                    'oscillator/phase_entropy': metrics.get('oscillator/phase_entropy', 0),
+
+                    # Amplitude dynamics
+                    'oscillator/amplitude_mean': metrics.get('oscillator/amplitude_mean', 0),
+                    'oscillator/amplitude_std': metrics.get('oscillator/amplitude_std', 0),
+                    'oscillator/amplitude_max': metrics.get('oscillator/amplitude_max', 0),
+
+                    # Frequency utilization
+                    'oscillator/active_frac': metrics.get('oscillator/active_frac', 0),
+                    'oscillator/freq_weighted_amp': metrics.get('oscillator/freq_weighted_amp', 0),
+
+                    # Modulation strength (key metric - shows gradients flowing!)
+                    'oscillator/amp_mod_mean': metrics.get('oscillator/amp_mod_mean', 0),
+                    'oscillator/phase_mod_mean': metrics.get('oscillator/phase_mod_mean', 0),
+
+                    # Output statistics
+                    'oscillator/output_norm': metrics.get('oscillator/output_norm', 0),
+                    'oscillator/output_mean': metrics.get('oscillator/output_mean', 0),
+                    'oscillator/output_std': metrics.get('oscillator/output_std', 0),
                 }
                 wandb.log(log_dict, step=global_step)
 
@@ -1442,6 +1515,25 @@ def main():
                             wandb.log({
                                 "visualizations/cross_module_sync": wandb.Image(fig_to_image(fig_sync))
                             }, step=global_step)
+
+                        # Create oscillator visualization
+                        try:
+                            osc_world = model.global_sync.oscillatory_world
+                            if osc_world is not None:
+                                # Log oscillator state as histograms
+                                osc_state = osc_world.get_oscillator_state()
+                                wandb.log({
+                                    "oscillator_viz/frequencies": wandb.Histogram(osc_state['frequencies'].cpu().numpy()),
+                                    "oscillator_viz/amplitudes": wandb.Histogram(osc_state['current_amplitudes'].cpu().numpy()),
+                                    "oscillator_viz/phases": wandb.Histogram(osc_state['phases'].cpu().numpy()),
+                                    "oscillator_viz/amp_modulation": wandb.Histogram(osc_state['last_amp_mod'].cpu().numpy()),
+                                    "oscillator_viz/phase_modulation": wandb.Histogram(osc_state['last_phase_mod'].cpu().numpy()),
+                                }, step=global_step)
+                                print(f"  [Viz] Logged oscillator histograms")
+                        except Exception as e:
+                            print(f"  [Viz] Warning: Failed to create oscillator visualization: {e}")
+
+                        if fig_sync is not None:
                             print(f"  [Viz] Logged NLM heatmap, neuron lines, and cross-module sync plots")
                         else:
                             print(f"  [Viz] Logged NLM heatmap and neuron lines (no cross-module sync in single-module mode)")

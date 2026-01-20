@@ -177,7 +177,7 @@ class PEMLoopGlobalOutput(NamedTuple):
     global_sync: GlobalSyncOutput          # Cross-module sync
     observation: torch.Tensor              # (B, S, D) attended observation
     attention_weights: torch.Tensor        # (B, H, S, S) attention pattern
-    world_state: Optional[torch.Tensor] = None  # (d_sync_state,) updated world state (for commit)
+    world_state: Optional[torch.Tensor] = None  # (d_world_output,) current oscillatory world state (for monitoring)
 
 
 class PEMLoopGlobalState(NamedTuple):
@@ -218,9 +218,12 @@ class PEMLoopGlobalConfig:
     sync_attention_temperature: float = 2.0  # Higher = softer cross-module attention
     sync_cross_residual_strength: float = 0.0  # Cross-module residual (0=off, 0.1-0.3=moderate)
 
-    # Persistent sync state (emergent world model)
-    use_persistent_state: bool = True  # Enable/disable persistent world state
-    d_sync_state: int = 256            # Dimension of persistent world state (S_world)
+    # Oscillatory world model (replaces GRU-based persistent state)
+    use_oscillatory_world: bool = True  # Enable/disable oscillatory world model
+    num_oscillators: int = 64           # Number of oscillators
+    min_period: int = 8                 # Fastest oscillator period
+    max_period: int = 4096              # Slowest oscillator period
+    d_world_output: int = 256           # Output dimension of world state
 
     # Prediction horizons
     immediate_horizon: int = 8
@@ -387,7 +390,7 @@ class PEMLoopGlobal(nn.Module):
         super().__init__()
         self.config = config
 
-        # 1. PredictionCTM (with world state support for emergent world model)
+        # 1. PredictionCTM (with world state support for oscillatory world model)
         pred_config = PredictionCTMConfig(
             d_input=config.d_model,
             d_output=config.d_model,
@@ -403,9 +406,9 @@ class PEMLoopGlobal(nn.Module):
             longterm_horizon=config.longterm_horizon,
             dropout=config.dropout,
             internal_obs_residual=config.internal_obs_residual,
-            # World state config (for emergent world model)
-            d_world_state=config.d_sync_state,
-            use_world_state=config.use_persistent_state,
+            # World state config (for oscillatory world model)
+            d_world_state=config.d_world_output,
+            use_world_state=config.use_oscillatory_world,
         )
         self.prediction = PredictionCTM(pred_config)
 
@@ -426,7 +429,7 @@ class PEMLoopGlobal(nn.Module):
         )
         self.surprise = SurpriseCTM(surp_config)
 
-        # 3. GlobalSyncModule (with persistent sync state for emergent world model)
+        # 3. GlobalSyncModule (with oscillatory world model)
         sync_config = GlobalSyncConfig(
             d_sync_space=config.d_sync_space,
             sync_pairs=config.sync_pairs,
@@ -434,8 +437,11 @@ class PEMLoopGlobal(nn.Module):
             dropout=config.dropout,
             attention_temperature=config.sync_attention_temperature,
             cross_residual_strength=config.sync_cross_residual_strength,
-            use_persistent_state=config.use_persistent_state,
-            d_sync_state=config.d_sync_state,
+            use_oscillatory_world=config.use_oscillatory_world,
+            num_oscillators=config.num_oscillators,
+            min_period=config.min_period,
+            max_period=config.max_period,
+            d_world_output=config.d_world_output,
         )
         self.global_sync = GlobalSyncModule(sync_config)
 
@@ -615,7 +621,7 @@ class PEMLoopGlobal(nn.Module):
         observation = alpha * state.observation + (1 - alpha) * attended_obs
 
         # Build output and new state
-        # Include world_state for committing after backward pass
+        # Include world_state for monitoring (oscillatory world evolves continuously, no commit needed)
         output = PEMLoopGlobalOutput(
             predictions=predictions,
             prediction_output=pred_output,
@@ -623,7 +629,7 @@ class PEMLoopGlobal(nn.Module):
             global_sync=global_sync_output,
             observation=observation,
             attention_weights=attn_weights,
-            world_state=global_sync_output.world_state,  # Updated world state for commit
+            world_state=global_sync_output.world_state,  # Current oscillatory world state for monitoring
         )
 
         new_state = PEMLoopGlobalState(
@@ -632,19 +638,6 @@ class PEMLoopGlobal(nn.Module):
         )
 
         return output, new_state
-
-    def commit_world_state(self, world_state: torch.Tensor):
-        """
-        Commit the updated world state after backward pass.
-
-        Call this AFTER loss.backward() and optimizer.step() to update
-        the persistent world state with the computed update.
-
-        Args:
-            world_state: The world_state tensor from PEMLoopGlobalOutput.
-                        MUST be detached to avoid memory leaks.
-        """
-        self.global_sync.commit_world_state(world_state)
 
     def get_world_state_stats(self) -> Dict[str, float]:
         """Get statistics about the world state for logging."""
@@ -842,11 +835,15 @@ class PEMLoopGlobal(nn.Module):
                         all_tick_magnitudes=all_tick_magnitudes,
                     )
 
-                # Reconstruct global sync output
+                # Reconstruct global sync output (oscillator metrics not available in checkpoint)
                 global_sync_output = GlobalSyncOutput(
                     sync=sync,
                     cross_module_sync=cross_sync,
                     module_contributions=contrib,
+                    world_state=None,  # Not reconstructed from checkpoint
+                    oscillator_metrics=None,
+                    oscillator_amplitudes=None,
+                    oscillator_phases=None,
                 )
 
                 output = PEMLoopGlobalOutput(
