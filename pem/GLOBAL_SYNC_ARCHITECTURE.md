@@ -321,6 +321,176 @@ class GlobalSyncModule(nn.Module):
    - Multi-task loss (each module + global coherence)
    - Curriculum: start with fewer modules, add progressively
 
+## Emergent Self via Persistent Sync Patterns
+
+**Status: IMPLEMENTED** ✅
+
+### Vision
+
+Build toward an emergent "self" by making sync patterns **persistent** across time. The world model isn't a separate module - it **emerges from** accumulated synchronization patterns.
+
+Core principle: **Higher cognition emerges from sync, not alongside it.**
+
+### Key Design Decisions
+
+| Decision | Choice | Rationale |
+|----------|--------|-----------|
+| **Data format** | Continuous stream of pages | No batch complexity, natural reading flow |
+| **Reset policy** | Never reset | Accumulate general world knowledge across all books |
+| **Influence mechanism** | Initialize z_0 | World state biases what CTM attends to from the start |
+
+### Architecture
+
+```
+         Continuous Stream: Book1_p1, Book1_p2, ..., Book2_p1, Book2_p2, ...
+                                          │
+                                          ▼
+┌─────────────────────────────────────────────────────────────┐
+│              PERSISTENT SYNC STATE (S_world)                │
+│                                                             │
+│   Shape: (d_sync_state,) - single vector, never reset       │
+│                                                             │
+│   • Lives across ALL forward passes                         │
+│   • Updated incrementally via GRU-style gated mechanism     │
+│   • IS the world model (emergent, not engineered)          │
+│   • Accumulates knowledge across entire library             │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              │ S_world → z_0 (initial post-activations)
+                              │
+           ┌──────────────────┼──────────────────┐
+           ▼                  ▼                  ▼
+     ┌──────────┐       ┌──────────┐       ┌──────────┐
+     │  Page 1  │       │  Page 2  │       │  Page N  │
+     │          │       │          │       │          │
+     │ z_0=f(Sw)│       │ z_0=f(Sw)│       │ z_0=f(Sw)│
+     │ ↓        │       │ ↓        │       │ ↓        │
+     │ CTM ticks│       │ CTM ticks│       │ CTM ticks│
+     │ ↓        │       │ ↓        │       │ ↓        │
+     │ S_new_1  │       │ S_new_2  │       │ S_new_N  │
+     └────┬─────┘       └────┬─────┘       └────┬─────┘
+          │                  │                  │
+          └─────► update ◄───┴─────► update ◄───┘
+                    │                   │
+                    ▼                   ▼
+              S_world_1 ──────► S_world_2 ──────► ...
+```
+
+### Implementation Components
+
+#### 1. PersistentSyncState (`global_sync.py`)
+```python
+class PersistentSyncState(nn.Module):
+    """Maintains sync state across time - the emergent world model."""
+
+    def __init__(self, d_sync: int = 256):
+        self.register_buffer('S_world', torch.zeros(d_sync))
+        self.register_buffer('update_count', torch.tensor(0))
+
+    def get_state(self) -> torch.Tensor:
+        return self.S_world
+
+    @torch.no_grad()
+    def update(self, S_new: torch.Tensor):
+        self.S_world.copy_(S_new)
+        self.update_count.add_(1)
+```
+
+#### 2. SyncUpdateGate (`global_sync.py`)
+GRU-style gating for selective incorporation of new sync patterns:
+```python
+class SyncUpdateGate(nn.Module):
+    """Decides how much to incorporate new sync vs keep old."""
+
+    def forward(self, S_world, S_new) -> torch.Tensor:
+        # GRU mechanics: reset gate, update gate, candidate
+        r = sigmoid(self.reset_gate([S_world, S_new]))
+        z = sigmoid(self.update_gate([S_world, S_new]))  # ~0.12 initially
+        candidate = tanh(self.candidate([r * S_world, S_new]))
+        return (1 - z) * S_world + z * candidate
+```
+
+#### 3. World State → z_0 Projection (`ctm_base.py`)
+```python
+# In CTMCore.__init__
+self.world_to_z0 = nn.Sequential(
+    nn.Linear(d_world_state, d_neurons),
+    nn.Tanh(),  # Same range as post-activations
+)
+
+# In CTMCore.forward
+if world_state is not None:
+    z_world = self.world_to_z0(world_state)
+    z_t = z_t + z_world.unsqueeze(0).unsqueeze(0)  # Bias initial state
+```
+
+#### 4. Training Loop Integration (`train_pem_global.py`)
+```python
+for page in continuous_stream:
+    # Forward pass - world state influences z_0
+    output, state = model(page)
+
+    # Backward pass
+    loss.backward()
+    optimizer.step()
+
+    # Commit updated world state AFTER backward (detached)
+    model.commit_world_state(output.world_state.detach())
+```
+
+### Configuration
+
+```python
+# GlobalSyncConfig
+use_persistent_state: bool = True   # Enable/disable
+d_sync_state: int = 256             # World state dimension
+
+# CTMBaseConfig
+use_world_state: bool = True        # Enable world state initialization
+d_world_state: int = 256            # Must match d_sync_state
+```
+
+### Metrics & Logging
+
+| Metric | What It Shows |
+|--------|---------------|
+| `world_state/norm` | How much knowledge accumulates |
+| `world_state/update_gate` | How much new info incorporated (0=ignore, 1=replace) |
+| `world_state/update_count` | Number of pages processed |
+| `world_state/mean`, `world_state/std` | Distribution statistics |
+
+### What Emerges
+
+| Level | What It Is | How It Emerges |
+|-------|------------|----------------|
+| **World Model** | S_world captures narrative understanding | Accumulated sync patterns |
+| **Continuity** | Same "reader" across pages | Persistent state carries forward |
+| **Attention Bias** | Focus on what matters | S_world shapes CTM initial state |
+| **Future: Self-Model** | Patterns about own processing | Sync patterns that predict other sync patterns |
+| **Future: Metacognition** | Awareness of own states | Surprise about S_world predictions |
+
+### Files Modified
+
+| File | Changes |
+|------|---------|
+| `pem/global_sync.py` | `PersistentSyncState`, `SyncUpdateGate`, integrated with `GlobalSyncModule` |
+| `pem/ctm_base.py` | `world_to_z0` projection, `world_state` param in `CTMCore.forward()` |
+| `pem/prediction_ctm.py` | Pass `world_state` through to core |
+| `pem/pem_loop_global.py` | Wire world state: read before CTM, update after, new methods |
+| `pem/train_pem_global.py` | `commit_world_state()` after backward, wandb logging |
+| `pem/data/continuous_loader.py` | New continuous streaming data loaders |
+
+### Future Directions
+
+Once persistent sync is working, natural next steps:
+
+1. **Self-prediction**: Predict what S_world will become → metacognition
+2. **Variable thinking**: S_world influences T (how long to think)
+3. **Memory integration**: S_world helps decide what to remember
+4. **Multiple timescales**: Fast S_world (current page) + slow S_world (lifetime)
+
+---
+
 ## Open Questions
 
 1. **Should modules run in parallel or sequence?**

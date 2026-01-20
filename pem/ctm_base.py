@@ -87,6 +87,11 @@ class CTMBaseConfig:
     # Recommended: 0.1-0.15 for healthy tick evolution
     internal_obs_residual: float = 0.1
 
+    # World state (emergent world model from persistent sync)
+    # When world_state is provided, z_0 is initialized from it instead of zeros
+    d_world_state: int = 256     # Dimension of world state (must match GlobalSyncConfig.d_sync_state)
+    use_world_state: bool = True # Enable world state initialization
+
 
 class RMSNorm(nn.Module):
     """Root Mean Square Layer Normalization."""
@@ -457,6 +462,17 @@ class CTMCore(nn.Module):
             self.cross_attn = None
             self.init_observation = None
 
+        # World state -> z_0 projection (emergent world model)
+        # Projects persistent world state to initial post-activations
+        # This allows accumulated sync patterns to bias what CTM attends to from the start
+        if config.use_world_state:
+            self.world_to_z0 = nn.Sequential(
+                nn.Linear(config.d_world_state, config.d_neurons),
+                nn.Tanh(),  # Same range as post-activations
+            )
+        else:
+            self.world_to_z0 = None
+
         self.norm_out = RMSNorm(config.d_output)
 
         self._init_weights()
@@ -473,6 +489,7 @@ class CTMCore(nn.Module):
         self,
         input_features: torch.Tensor,  # (B, S, d_input)
         memory_context: Optional[torch.Tensor] = None,  # (B, S, K, d_input) optional retrieved memories
+        world_state: Optional[torch.Tensor] = None,  # (d_world_state,) persistent world state
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[torch.Tensor], List[torch.Tensor]]:
         """
         Run the CTM core loop with per-tick cross-attention.
@@ -486,12 +503,19 @@ class CTMCore(nn.Module):
         the raw input_features, allowing the CTM to modulate its perception of
         data based on its evolving synchronization state.
 
+        Extended with world state:
+            When world_state is provided, z_0 is initialized by adding a bias
+            from the world state projection. This allows accumulated sync patterns
+            (the emergent world model) to influence what CTM attends to from the start.
+
         Args:
             input_features: Input to process (used as KV cache for attention)
             memory_context: Optional retrieved memories (B, S, K, d_input).
                            If provided, flattened and concatenated with input_features
                            for cross-attention KV, allowing CTM to attend to both
                            current features and retrieved memories.
+            world_state: Optional persistent world state (d_world_state,).
+                        If provided, biases z_0 initialization via learned projection.
 
         Returns:
             post_activations: (B, S, d_neurons) final post-activations
@@ -519,6 +543,14 @@ class CTMCore(nn.Module):
 
         # Initialize post-activations from input
         z_t = self.init_z(input_features)  # (B, S, d_neurons)
+
+        # Add world state bias to z_0 if provided (emergent world model influence)
+        # This is the key mechanism: accumulated sync patterns bias initial attention
+        if world_state is not None and self.world_to_z0 is not None:
+            # world_state: (d_world_state,) -> (d_neurons,)
+            z_world = self.world_to_z0(world_state)  # (d_neurons,)
+            # Broadcast to all batch items and sequence positions
+            z_t = z_t + z_world.unsqueeze(0).unsqueeze(0)  # (B, S, d_neurons)
 
         # Initialize observation (attended features) for first tick
         # Before sync is available, use projected input features

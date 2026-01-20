@@ -77,6 +77,10 @@ class PredictionCTMConfig(CTMBaseConfig):
     synapse_hidden: int = 512
     nlm_hidden: int = 32
 
+    # World state (inherited from CTMBaseConfig, but explicit here for clarity)
+    d_world_state: int = 256     # Dimension of persistent world state
+    use_world_state: bool = True # Enable world state initialization
+
 
 class PredictionCTM(CTMModule):
     """
@@ -147,6 +151,7 @@ class PredictionCTM(CTMModule):
         self,
         features: torch.Tensor,
         memory_context: Optional[torch.Tensor] = None,  # (B, S, K, d_model) retrieved memories
+        world_state: Optional[torch.Tensor] = None,  # (d_world_state,) persistent world state
     ) -> PredictionCTMOutput:
         """
         Generate predictions from features.
@@ -162,6 +167,9 @@ class PredictionCTM(CTMModule):
             memory_context: Optional (B, S, K, d_model) retrieved memories.
                            If provided, CTM cross-attention KV includes both
                            features and memories, allowing dynamic attention.
+            world_state: Optional (d_world_state,) persistent world state.
+                        If provided, biases z_0 initialization via learned projection.
+                        This is the emergent world model influencing initial attention.
 
         Returns:
             PredictionCTMOutput with predictions and post-activations
@@ -178,10 +186,11 @@ class PredictionCTM(CTMModule):
         else:
             memory_context_proj = None
 
-        # 2. Run core CTM loop with optional memory context
+        # 2. Run core CTM loop with optional memory context and world state
         # all_outputs contains y_t at each tick - used for CTM loss
+        # world_state biases z_0 to incorporate accumulated sync patterns
         post_activations, sync_matrix, output, all_outputs, all_activations = self.core(
-            input_features, memory_context=memory_context_proj
+            input_features, memory_context=memory_context_proj, world_state=world_state
         )
 
         # 3. Generate predictions from FINAL tick only

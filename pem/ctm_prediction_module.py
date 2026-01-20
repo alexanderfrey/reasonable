@@ -620,10 +620,16 @@ class CTMLoss(nn.Module):
         return_breakdown: bool = False,
     ) -> torch.Tensor:
         """Compute loss at a single internal tick."""
-        # Generate predictions from tick output
-        pred_immediate = readout_immediate(y_t)
-        pred_shortterm = readout_shortterm(y_t)
-        pred_longterm = readout_longterm(y_t)
+        # Normalize y_t before readout to ensure all ticks have similar input magnitude.
+        # Without this, early ticks (small y_t) dominate learning because:
+        # 1. Readout heads learn to work only with small inputs
+        # 2. Early ticks always have lowest loss, blocking later tick learning
+        y_t_norm = F.normalize(y_t, dim=-1)
+
+        # Generate predictions from NORMALIZED tick output
+        pred_immediate = readout_immediate(y_t_norm)
+        pred_shortterm = readout_shortterm(y_t_norm)
+        pred_longterm = readout_longterm(y_t_norm)
 
         # Compute loss for each scale
         loss_immediate = self.compute_scale_loss(
@@ -661,11 +667,11 @@ class CTMLoss(nn.Module):
 
         For classification, certainty = 1 - normalized_entropy.
         For feature prediction, we measure how much the predictions have "settled":
-        - Low variance across recent ticks = high certainty
-        - High variance = low certainty (still exploring)
+        - Low relative variance across recent ticks = high certainty
+        - Low relative change = high certainty (converged)
 
-        This is better than just consecutive similarity because it captures
-        whether the model has truly converged vs oscillating.
+        Uses RELATIVE metrics (normalized by magnitude) to avoid bias toward
+        early ticks when output magnitudes grow over time.
         """
         n_outputs = len(all_outputs_so_far)
 
@@ -677,23 +683,27 @@ class CTMLoss(nn.Module):
         window = min(n_outputs, 4)  # Look at last 4 ticks
         recent = torch.stack(all_outputs_so_far[-window:], dim=0)  # (window, B, S, d_model)
 
-        # Compute variance across ticks
-        # High variance = still changing = low certainty
+        # Compute RELATIVE variance (coefficient of variation)
+        # This normalizes by magnitude so growing outputs don't artificially inflate variance
         mean_output = recent.mean(dim=0)  # (B, S, d_model)
-        variance = ((recent - mean_output) ** 2).mean()  # scalar
+        mean_magnitude = mean_output.abs().mean() + 1e-8
+        variance = ((recent - mean_output) ** 2).mean()
+        relative_variance = variance / (mean_magnitude ** 2)  # Normalize by squared magnitude
 
-        # Also measure rate of change (derivative)
+        # Compute RELATIVE change (change / current magnitude)
+        # This ensures early ticks (small magnitude) and late ticks are treated fairly
         if n_outputs >= 2:
             y_prev = all_outputs_so_far[-2]
             change = (y_t - y_prev).norm(dim=-1).mean()
+            magnitude = y_t.norm(dim=-1).mean() + 1e-8
+            relative_change = change / magnitude
         else:
-            change = torch.tensor(1.0, device=y_t.device)
+            relative_change = torch.tensor(1.0, device=y_t.device)
 
-        # Combine: low variance + low change = high certainty
-        # Use exponential scaling so certainty stays in [0, 1]
-        # Scale factors tuned so early ticks have low certainty
-        variance_certainty = torch.exp(-variance * 10.0)  # High variance -> low certainty
-        change_certainty = torch.exp(-change * 5.0)  # High change -> low certainty
+        # Combine: low relative variance + low relative change = high certainty
+        # Scale factors tuned for relative metrics (typically 0-2 range)
+        variance_certainty = torch.exp(-relative_variance * 5.0)
+        change_certainty = torch.exp(-relative_change * 3.0)
 
         certainty = 0.5 * variance_certainty + 0.5 * change_certainty
 

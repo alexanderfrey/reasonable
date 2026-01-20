@@ -57,7 +57,9 @@ def create_nlm_activation_grid(
         matplotlib Figure
     """
     num_steps = len(outputs)
-    num_modules = 2  # Prediction, Surprise
+    # Check if surprise is enabled
+    has_surprise = outputs[0].surprise is not None
+    num_modules = 2 if has_surprise else 1
 
     fig, axes = plt.subplots(
         num_steps, num_modules,
@@ -65,16 +67,20 @@ def create_nlm_activation_grid(
         squeeze=False,
     )
 
-    module_names = ['Prediction', 'Surprise']
+    module_names = ['Prediction', 'Surprise'] if has_surprise else ['Prediction']
 
     # First pass: collect all data to find global min/max for colorbar
     all_values = []
 
     for step_idx, output in enumerate(outputs):
         pred_activations = output.prediction_output.all_tick_activations
-        surp_activations = output.surprise.all_tick_activations
+        surp_activations = output.surprise.all_tick_activations if has_surprise else None
 
-        for activations in [pred_activations, surp_activations]:
+        activations_list = [pred_activations]
+        if surp_activations is not None:
+            activations_list.append(surp_activations)
+
+        for activations in activations_list:
             if not activations:
                 continue
             stacked = torch.stack(activations, dim=0)
@@ -97,8 +103,11 @@ def create_nlm_activation_grid(
     # Second pass: plot
     for step_idx, output in enumerate(outputs):
         pred_activations = output.prediction_output.all_tick_activations
-        surp_activations = output.surprise.all_tick_activations
-        module_activations = [pred_activations, surp_activations]
+        surp_activations = output.surprise.all_tick_activations if has_surprise else None
+
+        module_activations = [pred_activations]
+        if surp_activations is not None:
+            module_activations.append(surp_activations)
 
         for mod_idx, (name, activations) in enumerate(zip(module_names, module_activations)):
             ax = axes[step_idx, mod_idx]
@@ -165,7 +174,9 @@ def create_nlm_neuron_lines(
         matplotlib Figure
     """
     num_steps = len(outputs)
-    num_modules = 2  # Prediction, Surprise
+    # Check if surprise is enabled
+    has_surprise = outputs[0].surprise is not None
+    num_modules = 2 if has_surprise else 1
 
     # Calculate grid size (sqrt layout for neurons)
     grid_rows = int(np.ceil(np.sqrt(num_neurons)))
@@ -178,7 +189,7 @@ def create_nlm_neuron_lines(
         squeeze=False,
     )
 
-    module_names = ['Prediction', 'Surprise']
+    module_names = ['Prediction', 'Surprise'] if has_surprise else ['Prediction']
     colors = plt.cm.viridis(np.linspace(0, 1, num_steps))
 
     # First pass: collect all data to determine y-axis range per module
@@ -188,7 +199,7 @@ def create_nlm_neuron_lines(
         if mod_idx == 0:
             sample_activations = outputs[0].prediction_output.all_tick_activations
         else:
-            sample_activations = outputs[0].surprise.all_tick_activations
+            sample_activations = outputs[0].surprise.all_tick_activations if has_surprise else None
 
         if not sample_activations:
             continue
@@ -203,7 +214,7 @@ def create_nlm_neuron_lines(
                 if mod_idx == 0:
                     activations = output.prediction_output.all_tick_activations
                 else:
-                    activations = output.surprise.all_tick_activations
+                    activations = output.surprise.all_tick_activations if has_surprise else None
 
                 if not activations:
                     continue
@@ -235,7 +246,7 @@ def create_nlm_neuron_lines(
         if mod_idx == 0:
             sample_activations = outputs[0].prediction_output.all_tick_activations
         else:
-            sample_activations = outputs[0].surprise.all_tick_activations
+            sample_activations = outputs[0].surprise.all_tick_activations if has_surprise else None
 
         if not sample_activations:
             continue
@@ -254,7 +265,7 @@ def create_nlm_neuron_lines(
                 if mod_idx == 0:
                     activations = output.prediction_output.all_tick_activations
                 else:
-                    activations = output.surprise.all_tick_activations
+                    activations = output.surprise.all_tick_activations if has_surprise else None
 
                 if not activations:
                     continue
@@ -284,11 +295,15 @@ def create_nlm_neuron_lines(
 
     # Add module labels with y-range info
     pred_range = y_limits.get(0, (-1, 1))
-    surp_range = y_limits.get(1, (-1, 1))
-    fig.text(0.25, 0.98, f'Prediction Module (y: {pred_range[0]:.3f} to {pred_range[1]:.3f})',
-             ha='center', fontsize=10, fontweight='bold')
-    fig.text(0.75, 0.98, f'Surprise Module (y: {surp_range[0]:.3f} to {surp_range[1]:.3f})',
-             ha='center', fontsize=10, fontweight='bold')
+    if has_surprise:
+        surp_range = y_limits.get(1, (-1, 1))
+        fig.text(0.25, 0.98, f'Prediction Module (y: {pred_range[0]:.3f} to {pred_range[1]:.3f})',
+                 ha='center', fontsize=10, fontweight='bold')
+        fig.text(0.75, 0.98, f'Surprise Module (y: {surp_range[0]:.3f} to {surp_range[1]:.3f})',
+                 ha='center', fontsize=10, fontweight='bold')
+    else:
+        fig.text(0.5, 0.98, f'Prediction Module (y: {pred_range[0]:.3f} to {pred_range[1]:.3f})',
+                 ha='center', fontsize=10, fontweight='bold')
 
     plt.tight_layout(rect=[0, 0, 1, 0.96])
     return fig
@@ -296,13 +311,20 @@ def create_nlm_neuron_lines(
 
 def create_cross_module_sync_plot(
     outputs: List,
-) -> plt.Figure:
+) -> Optional[plt.Figure]:
     """
     Create a plot showing cross-module synchronization over loop steps.
 
     Shows how Prediction and Surprise modules synchronize over time.
+    Returns None if surprise is disabled (single module mode).
     """
     num_steps = len(outputs)
+
+    # Check if we have 2 modules
+    cross_sync = outputs[0].global_sync.cross_module_sync
+    if cross_sync.shape[0] < 2:
+        # Single module mode - no cross-module sync to plot
+        return None
 
     fig, axes = plt.subplots(1, 2, figsize=(10, 4))
 
@@ -479,14 +501,19 @@ def compute_detailed_metrics(
 
         # Module-specific metrics
         pred_certainty = output.prediction_output.certainty.item()
-        surp_certainty = output.surprise.certainty.item()
+        surp_out = output.surprise
 
-        # Surprise calibration loss (how well magnitude tracks raw)
-        surp_cal_loss = F.mse_loss(output.surprise.magnitude, output.surprise.raw).item()
+        if surp_out is not None:
+            surp_certainty = surp_out.certainty.item()
+            # Surprise calibration loss (how well magnitude tracks raw)
+            surp_cal_loss = F.mse_loss(surp_out.magnitude, surp_out.raw).item()
+        else:
+            surp_certainty = 0.0
+            surp_cal_loss = 0.0
 
         # Store per-step values (LOOP level)
         step_losses.append(step_loss)
-        step_certainties.append((pred_certainty + surp_certainty) / 2)
+        step_certainties.append(pred_certainty if surp_out is None else (pred_certainty + surp_certainty) / 2)
 
         step_pred_losses.append(step_loss)
         step_pred_certainties.append(pred_certainty)
@@ -526,8 +553,7 @@ def compute_detailed_metrics(
                 pred_certain_ticks.append(int(np.argmax(tick_certs)))
 
         # Surprise: find best internal ticks
-        surp_out = output.surprise
-        if hasattr(surp_out, 'all_tick_magnitudes') and surp_out.all_tick_magnitudes:
+        if surp_out is not None and hasattr(surp_out, 'all_tick_magnitudes') and surp_out.all_tick_magnitudes:
             tick_losses = []
             for tick_mag in surp_out.all_tick_magnitudes:
                 surp_loss = F.mse_loss(tick_mag, surp_out.raw).item()
@@ -586,9 +612,14 @@ def compute_detailed_metrics(
 
         # Cross-module sync (from final step)
         final_sync = outputs[-1].global_sync
-        cross_sync = final_sync.cross_module_sync  # (2, 2, B, S)
-        metrics['cross_sync_pred_surp'] = cross_sync[0, 1].mean().item()
-        metrics['cross_sync_surp_pred'] = cross_sync[1, 0].mean().item()
+        cross_sync = final_sync.cross_module_sync  # (num_modules, num_modules, B, S)
+        if cross_sync.shape[0] >= 2:
+            metrics['cross_sync_pred_surp'] = cross_sync[0, 1].mean().item()
+            metrics['cross_sync_surp_pred'] = cross_sync[1, 0].mean().item()
+        else:
+            # Single module mode - no cross-module sync
+            metrics['cross_sync_pred_surp'] = 0.0
+            metrics['cross_sync_surp_pred'] = 0.0
 
     # Improvement across steps (did iterating help?)
     if len(outputs) > 1:
@@ -600,7 +631,8 @@ def compute_detailed_metrics(
     if len(outputs) > 0:
         final_out = outputs[-1]  # Use final step for monitoring
         pred_acts = final_out.prediction_output.all_tick_activations
-        surp_acts = final_out.surprise.all_tick_activations
+        surp_out = final_out.surprise
+        surp_acts = surp_out.all_tick_activations if surp_out is not None else None
 
         # Prediction tick evolution
         if len(pred_acts) > 1:
@@ -615,7 +647,7 @@ def compute_detailed_metrics(
             metrics['tick_pred_plateau'] = 1.0 if (pred_deltas and pred_deltas[-1] < pred_deltas[0] * 0.1) else 0.0
 
         # Surprise tick evolution
-        if len(surp_acts) > 1:
+        if surp_acts is not None and len(surp_acts) > 1:
             surp_deltas = []
             for t in range(1, len(surp_acts)):
                 delta = (surp_acts[t] - surp_acts[t-1]).norm().item() / surp_acts[t].numel() ** 0.5
@@ -691,42 +723,53 @@ def print_diagnostic_report(
     # ===== 2. TICK EVOLUTION (final step only) =====
     final_out = outputs[-1]
     pred_acts = final_out.prediction_output.all_tick_activations
-    surp_acts = final_out.surprise.all_tick_activations
+    surp_out = final_out.surprise
+    surp_acts = surp_out.all_tick_activations if surp_out is not None else None
 
     # Compute deltas
     pred_deltas = [(pred_acts[t] - pred_acts[t-1]).norm().item() / pred_acts[t].numel() ** 0.5
                    for t in range(1, len(pred_acts))]
-    surp_deltas = [(surp_acts[t] - surp_acts[t-1]).norm().item() / surp_acts[t].numel() ** 0.5
-                   for t in range(1, len(surp_acts))]
 
     pred_plateau = find_plateau(pred_deltas)
-    surp_plateau = find_plateau(surp_deltas)
-
     pred_status = f"⚠plateau@{pred_plateau}" if pred_plateau > 0 else "✓"
-    surp_status = f"⚠plateau@{surp_plateau}" if surp_plateau > 0 else "✓"
 
     print(f"\n[Ticks] Pred({len(pred_acts)}): [{tick_bar(pred_deltas)}] {pred_status}")
-    print(f"        Surp({len(surp_acts)}): [{tick_bar(surp_deltas)}] {surp_status}")
+
+    if surp_acts is not None:
+        surp_deltas = [(surp_acts[t] - surp_acts[t-1]).norm().item() / surp_acts[t].numel() ** 0.5
+                       for t in range(1, len(surp_acts))]
+        surp_plateau = find_plateau(surp_deltas)
+        surp_status = f"⚠plateau@{surp_plateau}" if surp_plateau > 0 else "✓"
+        print(f"        Surp({len(surp_acts)}): [{tick_bar(surp_deltas)}] {surp_status}")
+    else:
+        surp_deltas = []
+        surp_plateau = -1
+        print(f"        Surp: DISABLED")
 
     # ===== 3. ACTIVATION HEALTH (final step only) =====
     pred_z = pred_acts[-1]
-    surp_z = surp_acts[-1]
-    print(f"\n[Health] Pred: std={pred_z.std():.3f} mean={pred_z.mean():.3f} | "
-          f"Surp: std={surp_z.std():.3f} mean={surp_z.mean():.3f}")
+    print(f"\n[Health] Pred: std={pred_z.std():.3f} mean={pred_z.mean():.3f}", end="")
+    if surp_acts is not None:
+        surp_z = surp_acts[-1]
+        print(f" | Surp: std={surp_z.std():.3f} mean={surp_z.mean():.3f}")
+    else:
+        print()
 
     # ===== 4. CROSS-MODULE SYNC (final step only) =====
     cross_sync = final_out.global_sync.cross_module_sync
-    p2s = cross_sync[0, 1].mean().item()
-    s2p = cross_sync[1, 0].mean().item()
-    contrib = final_out.global_sync.module_contributions
-    p_contrib = contrib[..., 0].mean().item()
-
-    attn_status = "⚠degenerate" if (p2s > 0.95 or s2p > 0.95) else "✓"
-    print(f"\n[CrossSync] P→S: {p2s:.2f} S→P: {s2p:.2f} | Contrib: P={p_contrib:.2f} S={1-p_contrib:.2f} {attn_status}")
+    if cross_sync.shape[0] >= 2:
+        p2s = cross_sync[0, 1].mean().item()
+        s2p = cross_sync[1, 0].mean().item()
+        contrib = final_out.global_sync.module_contributions
+        p_contrib = contrib[..., 0].mean().item()
+        attn_status = "⚠degenerate" if (p2s > 0.95 or s2p > 0.95) else "✓"
+        print(f"\n[CrossSync] P→S: {p2s:.2f} S→P: {s2p:.2f} | Contrib: P={p_contrib:.2f} S={1-p_contrib:.2f} {attn_status}")
+    else:
+        p2s, s2p = 0.0, 0.0  # For summary section
+        print(f"\n[CrossSync] Single module mode (no cross-module sync)")
 
     # ===== 5. BEST TICK (final step only) =====
     pred_out = final_out.prediction_output
-    surp_out = final_out.surprise
 
     if hasattr(pred_out, 'all_tick_outputs') and pred_out.all_tick_outputs:
         target = targets['immediate']
@@ -744,13 +787,16 @@ def print_diagnostic_report(
         pred_best_tick = 0
         pred_tick_improve = 0
 
-    if hasattr(surp_out, 'all_tick_magnitudes') and surp_out.all_tick_magnitudes:
+    best_tick_str = f"[BestTick] Pred: {pred_best_tick}/{len(pred_acts)-1} (Δ={pred_tick_improve:+.3f})"
+
+    if surp_out is not None and hasattr(surp_out, 'all_tick_magnitudes') and surp_out.all_tick_magnitudes:
         surp_tick_losses = [F.mse_loss(m, surp_out.raw).item() for m in surp_out.all_tick_magnitudes]
         surp_best_tick = int(np.argmin(surp_tick_losses))
+        best_tick_str += f" | Surp: {surp_best_tick}/{len(surp_acts)-1}"
     else:
         surp_best_tick = 0
 
-    print(f"\n[BestTick] Pred: {pred_best_tick}/{len(pred_acts)-1} (Δ={pred_tick_improve:+.3f}) | Surp: {surp_best_tick}/{len(surp_acts)-1}")
+    print(f"\n{best_tick_str}")
 
     # ===== 6. OBSERVATION CONVERGENCE =====
     if num_steps >= 2:
@@ -767,9 +813,9 @@ def print_diagnostic_report(
         issues.append("loop not helping")
     if pred_plateau > 0 and pred_plateau < len(pred_acts) - 2:
         issues.append(f"pred plateau@{pred_plateau}")
-    if surp_plateau > 0 and surp_plateau < len(surp_acts) - 2:
+    if surp_acts is not None and surp_plateau > 0 and surp_plateau < len(surp_acts) - 2:
         issues.append(f"surp plateau@{surp_plateau}")
-    if p2s > 0.95 or s2p > 0.95:
+    if surp_acts is not None and (p2s > 0.95 or s2p > 0.95):
         issues.append("degenerate cross-attn")
     if num_steps >= 2 and obs_cos > 0.9999:
         issues.append("obs fixed-point")
@@ -861,6 +907,12 @@ def train_step(
     # Optimizer step
     optimizer.step()
 
+    # Commit updated world state AFTER backward pass (emergent world model)
+    # This is the key step: accumulated sync patterns persist across pages
+    final_output = outputs[-1]  # Use final loop step's world state
+    if final_output.world_state is not None:
+        model.commit_world_state(final_output.world_state.detach())
+
     # Compute detailed metrics
     with torch.no_grad():
         metrics = compute_detailed_metrics(outputs, targets)
@@ -881,6 +933,14 @@ def train_step(
     # Cumulative sync stats
     metrics['cumulative_sync_mean'] = final_state.cumulative_sync.mean().item()
     metrics['cumulative_sync_std'] = final_state.cumulative_sync.std().item()
+
+    # World state stats (emergent world model)
+    world_state_stats = model.get_world_state_stats()
+    metrics.update(world_state_stats)
+
+    # Add update gate value if available (how much new info is incorporated)
+    if final_output.global_sync.update_gate_value is not None:
+        metrics['world_state/update_gate'] = final_output.global_sync.update_gate_value.item()
 
     if return_outputs:
         return metrics, outputs, targets
@@ -952,6 +1012,26 @@ def main():
     parser.add_argument('--surp_T', type=int, default=3)
     parser.add_argument('--sync_pairs', type=int, default=256)
 
+    # PredictionCTM architecture (matching train_prediction.py defaults)
+    parser.add_argument('--pred_synapse_hidden', type=int, default=1024,
+                        help='Hidden dim in Prediction synapse U-NET')
+    parser.add_argument('--pred_nlm_hidden', type=int, default=64,
+                        help='Hidden dim in Prediction per-neuron MLPs')
+    parser.add_argument('--pred_d_sync_out', type=int, default=256,
+                        help='Prediction sync pairs for output')
+    parser.add_argument('--pred_d_sync_internal', type=int, default=256,
+                        help='Prediction sync pairs for internal')
+
+    # SurpriseCTM architecture
+    parser.add_argument('--surp_synapse_hidden', type=int, default=512,
+                        help='Hidden dim in Surprise synapse U-NET')
+    parser.add_argument('--surp_nlm_hidden', type=int, default=32,
+                        help='Hidden dim in Surprise per-neuron MLPs')
+    parser.add_argument('--surp_d_sync_out', type=int, default=128,
+                        help='Surprise sync pairs for output')
+    parser.add_argument('--surp_d_sync_internal', type=int, default=128,
+                        help='Surprise sync pairs for internal')
+
     # Training args
     parser.add_argument('--batch_size', type=int, default=4)
     parser.add_argument('--learning_rate', type=float, default=1e-4)
@@ -969,6 +1049,10 @@ def main():
                         help='Cross-module residual strength (0=off, 0.1-0.3=moderate, forces cross-module info flow)')
     parser.add_argument('--surprise_loss_weight', type=float, default=0.1,
                         help='Weight for surprise calibration loss (default=0.1, try 0.5-1.0 if surprise gradients vanish)')
+    parser.add_argument('--cross_attn_diversity_weight', type=float, default=0.0,
+                        help='Penalize degenerate cross-attention (0=off, 0.1-0.5=moderate, prevents attention collapse)')
+    parser.add_argument('--loop_improvement_weight', type=float, default=0.1,
+                        help='Penalize loop regression (0=off, 0.1=default, encourages later steps to improve or maintain)')
     parser.add_argument('--max_length', type=int, default=512)
 
     # Memory optimization args
@@ -976,6 +1060,12 @@ def main():
                         help='Recompute activations during backward (saves ~2-3x VRAM, ~30%% slower)')
     parser.add_argument('--backprop_steps', type=int, default=-1,
                         help='Only backprop through last N loop steps (-1 = all)')
+
+    # Ablation/debug args
+    parser.add_argument('--disable_surprise', action='store_true',
+                        help='Disable surprise module (prediction-only mode for debugging)')
+    parser.add_argument('--bypass_state_combiner', action='store_true',
+                        help='Skip state combiner, use raw features (for comparison with train_prediction.py)')
 
     # Logging args
     parser.add_argument('--log_every', type=int, default=10)
@@ -1044,6 +1134,17 @@ def main():
         pred_T=config.pred_T,
         surp_T=config.surp_T,
         sync_pairs=config.sync_pairs,
+        # PredictionCTM architecture
+        pred_synapse_hidden=args.pred_synapse_hidden,
+        pred_nlm_hidden=args.pred_nlm_hidden,
+        pred_d_sync_out=args.pred_d_sync_out,
+        pred_d_sync_internal=args.pred_d_sync_internal,
+        # SurpriseCTM architecture
+        surp_synapse_hidden=args.surp_synapse_hidden,
+        surp_nlm_hidden=args.surp_nlm_hidden,
+        surp_d_sync_out=args.surp_d_sync_out,
+        surp_d_sync_internal=args.surp_d_sync_internal,
+        # Other config
         sync_attention_temperature=args.attention_temperature,
         sync_cross_residual_strength=args.cross_residual_strength,
         observation_residual=args.observation_residual,
@@ -1051,6 +1152,10 @@ def main():
         gradient_checkpointing=args.gradient_checkpointing,
         backprop_steps=args.backprop_steps,
         surprise_loss_weight=args.surprise_loss_weight,
+        cross_attn_diversity_weight=args.cross_attn_diversity_weight,
+        loop_improvement_weight=args.loop_improvement_weight,
+        disable_surprise=args.disable_surprise,
+        bypass_state_combiner=args.bypass_state_combiner,
     )
     model = PEMLoopGlobal(pem_config).to(device)
     print(f"PEM Loop created: {sum(p.numel() for p in model.parameters()):,} params")
@@ -1064,6 +1169,14 @@ def main():
         print(f"  [Sync] Cross-residual strength: {args.cross_residual_strength}")
     if args.surprise_loss_weight != 0.1:
         print(f"  [Loss] Surprise loss weight: {args.surprise_loss_weight}")
+    if args.cross_attn_diversity_weight > 0:
+        print(f"  [Loss] Cross-attention diversity weight: {args.cross_attn_diversity_weight}")
+    if args.loop_improvement_weight > 0:
+        print(f"  [Loss] Loop improvement weight: {args.loop_improvement_weight}")
+    if args.disable_surprise:
+        print("  [Ablation] Surprise module DISABLED (prediction-only mode)")
+    if args.bypass_state_combiner:
+        print("  [Ablation] State combiner BYPASSED (raw features mode)")
     if args.gradient_checkpointing:
         print("  [Memory] Gradient checkpointing ENABLED")
     if args.backprop_steps > 0:
@@ -1082,8 +1195,8 @@ def main():
     print(f"\nStarting training for {config.max_steps} steps...")
     print(f"  Batch size: {config.batch_size}")
     print(f"  Loop steps: {config.num_loop_steps}")
-    print(f"  Pred neurons: {config.pred_d_neurons}, T={config.pred_T}")
-    print(f"  Surp neurons: {config.surp_d_neurons}, T={config.surp_T}")
+    print(f"  Pred: neurons={config.pred_d_neurons}, T={config.pred_T}, synapse={args.pred_synapse_hidden}, nlm={args.pred_nlm_hidden}")
+    print(f"  Surp: neurons={config.surp_d_neurons}, T={config.surp_T}, synapse={args.surp_synapse_hidden}, nlm={args.surp_nlm_hidden}")
     print(f"  Sync pairs: {config.sync_pairs}")
     if args.diagnostic_every > 0:
         print(f"  [Diagnostic] Report every {args.diagnostic_every} steps")
@@ -1297,6 +1410,14 @@ def main():
                     'nlm/surp_w2_norm': metrics.get('nlm_surp/w2_norm', 0),
                     'nlm/surp_w1_grad': metrics.get('nlm_surp/w1_grad_norm', 0),
                     'nlm/surp_w2_grad': metrics.get('nlm_surp/w2_grad_norm', 0),
+
+                    # === WORLD STATE (EMERGENT WORLD MODEL) ===
+                    # Persistent sync state that accumulates across all pages
+                    'world_state/norm': metrics.get('world_state/norm', 0),
+                    'world_state/mean': metrics.get('world_state/mean', 0),
+                    'world_state/std': metrics.get('world_state/std', 0),
+                    'world_state/update_count': metrics.get('world_state/update_count', 0),
+                    'world_state/update_gate': metrics.get('world_state/update_gate', 0.5),
                 }
                 wandb.log(log_dict, step=global_step)
 
@@ -1315,13 +1436,15 @@ def main():
                             "visualizations/nlm_neuron_lines": wandb.Image(fig_to_image(fig_lines))
                         }, step=global_step)
 
-                        # Create cross-module sync plot
+                        # Create cross-module sync plot (only if surprise is enabled)
                         fig_sync = create_cross_module_sync_plot(outputs_for_diag)
-                        wandb.log({
-                            "visualizations/cross_module_sync": wandb.Image(fig_to_image(fig_sync))
-                        }, step=global_step)
-
-                        print(f"  [Viz] Logged NLM heatmap, neuron lines, and cross-module sync plots")
+                        if fig_sync is not None:
+                            wandb.log({
+                                "visualizations/cross_module_sync": wandb.Image(fig_to_image(fig_sync))
+                            }, step=global_step)
+                            print(f"  [Viz] Logged NLM heatmap, neuron lines, and cross-module sync plots")
+                        else:
+                            print(f"  [Viz] Logged NLM heatmap and neuron lines (no cross-module sync in single-module mode)")
                     except Exception as e:
                         print(f"  [Viz] Warning: Failed to create visualization: {e}")
 

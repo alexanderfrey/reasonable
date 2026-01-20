@@ -66,6 +66,7 @@ from .prediction_ctm import PredictionCTM, PredictionCTMConfig, PredictionCTMOut
 from .surprise_ctm import SurpriseCTM, SurpriseCTMConfig, SurpriseCTMOutput
 from .global_sync import GlobalSyncModule, GlobalSyncConfig, GlobalSyncOutput
 from .prediction_module import PredictionTargets
+from .ctm_prediction_module import CTMLoss
 
 
 def compute_tick_certainties(
@@ -176,6 +177,7 @@ class PEMLoopGlobalOutput(NamedTuple):
     global_sync: GlobalSyncOutput          # Cross-module sync
     observation: torch.Tensor              # (B, S, D) attended observation
     attention_weights: torch.Tensor        # (B, H, S, S) attention pattern
+    world_state: Optional[torch.Tensor] = None  # (d_sync_state,) updated world state (for commit)
 
 
 class PEMLoopGlobalState(NamedTuple):
@@ -195,11 +197,19 @@ class PEMLoopGlobalConfig:
     pred_d_neurons: int = 256
     pred_T: int = 4
     pred_M: int = 8
+    pred_synapse_hidden: int = 1024   # Hidden dim in synapse U-NET (matches train_prediction.py)
+    pred_nlm_hidden: int = 64         # Hidden dim in per-neuron MLPs (matches train_prediction.py)
+    pred_d_sync_out: int = 256        # Sync pairs for output (matches train_prediction.py)
+    pred_d_sync_internal: int = 256   # Sync pairs for internal (matches train_prediction.py)
 
     # SurpriseCTM config
     surp_d_neurons: int = 128
     surp_T: int = 3
     surp_M: int = 4
+    surp_synapse_hidden: int = 512    # Hidden dim in synapse U-NET
+    surp_nlm_hidden: int = 32         # Hidden dim in per-neuron MLPs
+    surp_d_sync_out: int = 128        # Sync pairs for output
+    surp_d_sync_internal: int = 128   # Sync pairs for internal
 
     # GlobalSync config
     d_sync_space: int = 128
@@ -207,6 +217,10 @@ class PEMLoopGlobalConfig:
     sync_n_heads: int = 4
     sync_attention_temperature: float = 2.0  # Higher = softer cross-module attention
     sync_cross_residual_strength: float = 0.0  # Cross-module residual (0=off, 0.1-0.3=moderate)
+
+    # Persistent sync state (emergent world model)
+    use_persistent_state: bool = True  # Enable/disable persistent world state
+    d_sync_state: int = 256            # Dimension of persistent world state (S_world)
 
     # Prediction horizons
     immediate_horizon: int = 8
@@ -221,7 +235,8 @@ class PEMLoopGlobalConfig:
     observation_residual: float = 0.3  # Blend factor for observation update (0=replace, 1=keep)
 
     # Internal tick config (within CTM modules)
-    internal_obs_residual: float = 0.2  # Blend factor within CTM tick loop (prevents fixed-point)
+    # Lower values = more responsive ticks. 0.35 causes plateau, try 0.1-0.15
+    internal_obs_residual: float = 0.1  # Blend factor within CTM tick loop (prevents fixed-point)
 
     # Memory optimization
     gradient_checkpointing: bool = False  # Recompute activations in backward (saves VRAM)
@@ -229,8 +244,14 @@ class PEMLoopGlobalConfig:
 
     # Loss weights
     surprise_loss_weight: float = 0.1     # Weight for surprise calibration loss
+    cross_attn_diversity_weight: float = 0.0  # Penalize degenerate cross-module attention
+    loop_improvement_weight: float = 0.5  # Penalize loop steps that regress (step N worse than N-1)
 
     dropout: float = 0.0
+
+    # Debug/ablation flags
+    disable_surprise: bool = False        # Disable surprise module (prediction-only mode)
+    bypass_state_combiner: bool = False   # Skip state combiner, use raw features (for comparison with train_prediction.py)
 
 
 class SimpleAttention(nn.Module):
@@ -265,6 +286,16 @@ class SimpleAttention(nn.Module):
         self.q_proj = nn.Linear(d_model, d_model, bias=False)
         self.o_proj = nn.Linear(d_model, d_model, bias=False)
 
+        # Project surprise direction to query space
+        self.surprise_to_query = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, d_model),
+        )
+
+        # Learnable scale for surprise contribution (start small)
+        self.surprise_scale = nn.Parameter(torch.tensor(0.1))
+
         self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
 
         self._init_weights()
@@ -281,14 +312,18 @@ class SimpleAttention(nn.Module):
         sync: torch.Tensor,      # (B, S, sync_pairs) global sync state
         features: torch.Tensor,  # (B, S, d_model) features to attend to
         state: torch.Tensor,     # (B, S, d_model) current state
+        surprise_direction: Optional[torch.Tensor] = None,  # (B, S, d_model)
+        surprise_magnitude: Optional[torch.Tensor] = None,  # (B, S, 1)
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Attend to features based on global sync.
+        Attend to features based on global sync and surprise.
 
         Args:
             sync: Global sync state from GlobalSyncModule
             features: Features from backbone
             state: Current observation state
+            surprise_direction: Direction of surprise (normalize(actual - predicted))
+            surprise_magnitude: Magnitude of surprise (scalar per position)
 
         Returns:
             observation: (B, S, d_model) attended features
@@ -299,6 +334,14 @@ class SimpleAttention(nn.Module):
         # Build query from sync + state
         sync_query = self.sync_to_query(sync)  # (B, S, d_model)
         q = self.q_proj(sync_query + state)    # Combine sync and state
+
+        # Inject surprise into query: "attend to what surprised me"
+        if surprise_direction is not None:
+            surprise_query = self.surprise_to_query(surprise_direction)
+            if surprise_magnitude is not None:
+                # Scale by magnitude: bigger surprise → stronger steering
+                surprise_query = surprise_query * surprise_magnitude * self.surprise_scale
+            q = q + surprise_query
 
         # K, V from features
         k = self.k_proj(features)
@@ -344,18 +387,25 @@ class PEMLoopGlobal(nn.Module):
         super().__init__()
         self.config = config
 
-        # 1. PredictionCTM
+        # 1. PredictionCTM (with world state support for emergent world model)
         pred_config = PredictionCTMConfig(
             d_input=config.d_model,
             d_output=config.d_model,
             d_neurons=config.pred_d_neurons,
             T=config.pred_T,
             M=config.pred_M,
+            synapse_hidden=config.pred_synapse_hidden,
+            nlm_hidden=config.pred_nlm_hidden,
+            d_sync_out=config.pred_d_sync_out,
+            d_sync_internal=config.pred_d_sync_internal,
             immediate_horizon=config.immediate_horizon,
             shortterm_horizon=config.shortterm_horizon,
             longterm_horizon=config.longterm_horizon,
             dropout=config.dropout,
             internal_obs_residual=config.internal_obs_residual,
+            # World state config (for emergent world model)
+            d_world_state=config.d_sync_state,
+            use_world_state=config.use_persistent_state,
         )
         self.prediction = PredictionCTM(pred_config)
 
@@ -367,12 +417,16 @@ class PEMLoopGlobal(nn.Module):
             d_neurons=config.surp_d_neurons,
             T=config.surp_T,
             M=config.surp_M,
+            synapse_hidden=config.surp_synapse_hidden,
+            nlm_hidden=config.surp_nlm_hidden,
+            d_sync_out=config.surp_d_sync_out,
+            d_sync_internal=config.surp_d_sync_internal,
             dropout=config.dropout,
             internal_obs_residual=config.internal_obs_residual,
         )
         self.surprise = SurpriseCTM(surp_config)
 
-        # 3. GlobalSyncModule
+        # 3. GlobalSyncModule (with persistent sync state for emergent world model)
         sync_config = GlobalSyncConfig(
             d_sync_space=config.d_sync_space,
             sync_pairs=config.sync_pairs,
@@ -380,12 +434,15 @@ class PEMLoopGlobal(nn.Module):
             dropout=config.dropout,
             attention_temperature=config.sync_attention_temperature,
             cross_residual_strength=config.sync_cross_residual_strength,
+            use_persistent_state=config.use_persistent_state,
+            d_sync_state=config.d_sync_state,
         )
         self.global_sync = GlobalSyncModule(sync_config)
 
         # Register modules with GlobalSync
         self.global_sync.register_module('prediction', config.pred_d_neurons)
-        self.global_sync.register_module('surprise', config.surp_d_neurons)
+        if not config.disable_surprise:
+            self.global_sync.register_module('surprise', config.surp_d_neurons)
 
         # 4. Attention (sync -> attend to features)
         self.attention = SimpleAttention(
@@ -402,20 +459,62 @@ class PEMLoopGlobal(nn.Module):
             longterm_horizon=config.longterm_horizon,
         )
 
-        # 6. State combiner (for loop)
-        self.state_combiner = nn.Sequential(
+        # 6. CTM Loss (same as train_prediction.py)
+        self.ctm_loss = CTMLoss(
+            immediate_weight=1.0,
+            shortterm_weight=0.5,
+            longterm_weight=0.3,
+            use_cosine=True,
+            use_mse=True,
+            mse_weight=0.1,
+        )
+
+        # 7. Gated state combiner (for loop)
+        # Uses a learned gate to decide how much observation info to incorporate
+        # This prevents the loop from corrupting features - it can only ADD info
+        self.state_combiner_transform = nn.Sequential(
             nn.Linear(config.d_model * 2, config.d_model),
             nn.GELU(),
             nn.Linear(config.d_model, config.d_model),
         )
+        # Gate: sigmoid output determines how much transformed info to use vs raw features
+        self.state_combiner_gate = nn.Sequential(
+            nn.Linear(config.d_model * 2, config.d_model),
+            nn.Sigmoid(),
+        )
+        # Initialize gate to output ~0.1 initially (mostly use raw features)
+        with torch.no_grad():
+            self.state_combiner_gate[0].bias.data.fill_(-2.0)  # sigmoid(-2) ≈ 0.12
+
+        # 8. Initial observation transform (breaks symmetry in first loop step)
+        # Without this, first step sees state_combiner([features, features]) = no signal
+        self.observation_init = nn.Sequential(
+            nn.Linear(config.d_model, config.d_model),
+            nn.GELU(),
+            nn.Linear(config.d_model, config.d_model),
+        )
+        # Initialize with small weights to start close to features but not identical
+        with torch.no_grad():
+            # Make it approximately identity + small perturbation
+            self.observation_init[0].weight.data = torch.eye(config.d_model) * 0.9 + torch.randn(config.d_model, config.d_model) * 0.1
+            self.observation_init[2].weight.data = torch.eye(config.d_model) * 0.9 + torch.randn(config.d_model, config.d_model) * 0.1
 
     def init_state(self, features: torch.Tensor) -> PEMLoopGlobalState:
-        """Initialize loop state."""
+        """Initialize loop state.
+
+        IMPORTANT: observation is initialized as a TRANSFORMED version of features,
+        not the raw features themselves. This prevents the first loop step from
+        seeing state_combiner([features, features]) which provides no useful signal.
+        """
         B, S, D = features.shape
         device = features.device
 
+        # Transform features for initial observation to break symmetry
+        # Uses the observation_init projection to create a differentiated starting point
+        initial_obs = self.observation_init(features)
+
         return PEMLoopGlobalState(
-            observation=features,
+            observation=initial_obs,
             cumulative_sync=torch.zeros(B, S, self.config.sync_pairs, device=device),
         )
 
@@ -447,47 +546,76 @@ class PEMLoopGlobal(nn.Module):
         if targets is None:
             targets = self.target_computer.compute_targets_efficient(features)
 
-        # 1. Combine features with previous observation
-        combined = torch.cat([features, state.observation], dim=-1)
-        loop_features = self.state_combiner(combined)
+        # 1. Combine features with previous observation using gated skip connection
+        # Gate determines how much observation info to incorporate (vs using raw features)
+        # This prevents the loop from corrupting features - it can only ADD information
+        if self.config.bypass_state_combiner:
+            # Bypass: use raw features directly (equivalent to train_prediction.py)
+            loop_features = features
+        else:
+            combined = torch.cat([features, state.observation], dim=-1)
+            transformed = self.state_combiner_transform(combined)
+            gate = self.state_combiner_gate(combined)  # (B, S, d_model), values in [0, 1]
+            # Gated combination: features + gate * (transformed - features)
+            # When gate ≈ 0: output ≈ features (safe default)
+            # When gate ≈ 1: output ≈ transformed (full combination)
+            loop_features = features + gate * (transformed - features)
 
-        # 2. PredictionCTM: generate predictions
-        pred_output = self.prediction(loop_features)
+        # 2. Get current world state from GlobalSyncModule (emergent world model)
+        # This is the persistent sync state that accumulates across all forward passes
+        world_state = self.global_sync.get_world_state()
+
+        # 3. PredictionCTM: generate predictions (with world state influencing z_0)
+        pred_output = self.prediction(loop_features, world_state=world_state)
         predictions = pred_output.predictions
 
-        # 3. SurpriseCTM: compute surprise (using immediate scale)
-        surp_output = self.surprise(
-            predicted=predictions['immediate'],
-            actual=targets['immediate'],
-            valid_mask=targets.get('immediate_valid', None),
-        )
+        # 4. SurpriseCTM: compute surprise (using immediate scale)
+        if self.config.disable_surprise:
+            surp_output = None
+        else:
+            surp_output = self.surprise(
+                predicted=predictions['immediate'],
+                actual=targets['immediate'],
+                valid_mask=targets.get('immediate_valid', None),
+            )
 
-        # 4. GlobalSyncModule: cross-module synchronization
+        # 5. GlobalSyncModule: cross-module synchronization (computes updated world state)
         # Pass Z_history (all tick activations) for true sync computation (S = Z·Z^T)
-        global_sync_output = self.global_sync({
-            'prediction': pred_output.all_tick_activations,  # List[(B, S, pred_d_neurons)]
-            'surprise': surp_output.all_tick_activations,    # List[(B, S, surp_d_neurons)]
-        })
+        # Also computes updated world state via GRU-style gating
+        if self.config.disable_surprise:
+            # Prediction-only mode: no cross-module sync, just use prediction activations
+            global_sync_output = self.global_sync({
+                'prediction': pred_output.all_tick_activations,  # List[(B, S, pred_d_neurons)]
+            })
+        else:
+            global_sync_output = self.global_sync({
+                'prediction': pred_output.all_tick_activations,  # List[(B, S, pred_d_neurons)]
+                'surprise': surp_output.all_tick_activations,    # List[(B, S, surp_d_neurons)]
+            })
 
-        # 5. Update cumulative sync
+        # 6. Update cumulative sync
         cumulative_sync = (
             self.config.sync_decay * state.cumulative_sync +
             (1 - self.config.sync_decay) * global_sync_output.sync
         )
 
-        # 6. Attention: use global sync to attend to features
+        # 7. Attention: use global sync to attend to features
+        # Surprise steers attention: direction points to "what was unexpected"
         attended_obs, attn_weights = self.attention(
             sync=global_sync_output.sync,
             features=features,
             state=state.observation,
+            surprise_direction=surp_output.direction if surp_output is not None else None,
+            surprise_magnitude=surp_output.magnitude if surp_output is not None else None,
         )
 
-        # 7. Observation residual connection (prevents fixed points)
+        # 8. Observation residual connection (prevents fixed points)
         # Blend new attended observation with previous observation
         alpha = self.config.observation_residual
         observation = alpha * state.observation + (1 - alpha) * attended_obs
 
         # Build output and new state
+        # Include world_state for committing after backward pass
         output = PEMLoopGlobalOutput(
             predictions=predictions,
             prediction_output=pred_output,
@@ -495,6 +623,7 @@ class PEMLoopGlobal(nn.Module):
             global_sync=global_sync_output,
             observation=observation,
             attention_weights=attn_weights,
+            world_state=global_sync_output.world_state,  # Updated world state for commit
         )
 
         new_state = PEMLoopGlobalState(
@@ -503,6 +632,23 @@ class PEMLoopGlobal(nn.Module):
         )
 
         return output, new_state
+
+    def commit_world_state(self, world_state: torch.Tensor):
+        """
+        Commit the updated world state after backward pass.
+
+        Call this AFTER loss.backward() and optimizer.step() to update
+        the persistent world state with the computed update.
+
+        Args:
+            world_state: The world_state tensor from PEMLoopGlobalOutput.
+                        MUST be detached to avoid memory leaks.
+        """
+        self.global_sync.commit_world_state(world_state)
+
+    def get_world_state_stats(self) -> Dict[str, float]:
+        """Get statistics about the world state for logging."""
+        return self.global_sync.get_world_state_stats()
 
     def _step_for_checkpoint(
         self,
@@ -552,18 +698,33 @@ class PEMLoopGlobal(nn.Module):
         # Stack all-tick data for CTM loss
         # Prediction: all_tick_outputs (y_t) used directly for CTM loss
         pred_outputs_stacked = torch.stack(pred_out.all_tick_outputs, dim=0)
-        # Surprise: all_tick_magnitudes (cheap scalar per tick)
-        surp_mag_stacked = torch.stack(surp_out.all_tick_magnitudes, dim=0)
-        surp_outputs_stacked = torch.stack(surp_out.all_tick_outputs, dim=0)
+
+        # Surprise: handle disabled case with placeholder tensors
+        if surp_out is not None:
+            surp_mag_stacked = torch.stack(surp_out.all_tick_magnitudes, dim=0)
+            surp_outputs_stacked = torch.stack(surp_out.all_tick_outputs, dim=0)
+            surp_acts_stacked = torch.stack(surp_out.all_tick_activations, dim=0)
+            surp_magnitude = surp_out.magnitude
+            surp_raw = surp_out.raw
+            surp_certainty = surp_out.certainty
+        else:
+            # Placeholders for disabled surprise (single-element tensors)
+            device = features.device
+            surp_mag_stacked = torch.zeros(1, device=device)
+            surp_outputs_stacked = torch.zeros(1, device=device)
+            surp_acts_stacked = torch.zeros(1, device=device)
+            surp_magnitude = torch.zeros(1, device=device)
+            surp_raw = torch.zeros(1, device=device)
+            surp_certainty = torch.zeros(1, device=device)
 
         return (
             output.predictions['immediate'],
             output.predictions['shortterm'],
             output.predictions['longterm'],
             pred_out.certainty,
-            surp_out.magnitude,
-            surp_out.raw,
-            surp_out.certainty,
+            surp_magnitude,
+            surp_raw,
+            surp_certainty,
             output.global_sync.sync,
             output.global_sync.cross_module_sync,
             output.global_sync.module_contributions,
@@ -573,7 +734,7 @@ class PEMLoopGlobal(nn.Module):
             new_state.cumulative_sync,
             # Pass through activations for global sync reconstruction
             torch.stack(pred_out.all_tick_activations, dim=0),
-            torch.stack(surp_out.all_tick_activations, dim=0),
+            surp_acts_stacked,
             # CTM loss data
             pred_outputs_stacked,      # y_t at each tick (for prediction CTM loss)
             surp_mag_stacked,          # magnitude at each tick (for surprise CTM loss)
@@ -661,22 +822,25 @@ class PEMLoopGlobal(nn.Module):
                     all_tick_activations=[pred_acts_stacked[i] for i in range(pred_acts_stacked.shape[0])],
                 )
 
-                # Reconstruct surprise output
-                num_surp_ticks = surp_mag_stacked.shape[0]
-                all_tick_magnitudes = [surp_mag_stacked[t] for t in range(num_surp_ticks)]
-                surp_all_tick_outputs = [surp_outputs_stacked[t] for t in range(surp_outputs_stacked.shape[0])]
+                # Reconstruct surprise output (or None if disabled)
+                if self.config.disable_surprise:
+                    surp_output = None
+                else:
+                    num_surp_ticks = surp_mag_stacked.shape[0]
+                    all_tick_magnitudes = [surp_mag_stacked[t] for t in range(num_surp_ticks)]
+                    surp_all_tick_outputs = [surp_outputs_stacked[t] for t in range(surp_outputs_stacked.shape[0])]
 
-                surp_output = SurpriseCTMOutput(
-                    magnitude=surp_mag,
-                    direction=torch.zeros(1, device=surp_mag.device),  # Placeholder
-                    raw=surp_raw,
-                    post_activations=surp_acts_stacked[-1],
-                    sync_matrix=torch.zeros(1, device=surp_mag.device),
-                    certainty=surp_cert,
-                    all_tick_outputs=surp_all_tick_outputs,  # For certainty computation
-                    all_tick_activations=[surp_acts_stacked[i] for i in range(surp_acts_stacked.shape[0])],
-                    all_tick_magnitudes=all_tick_magnitudes,
-                )
+                    surp_output = SurpriseCTMOutput(
+                        magnitude=surp_mag,
+                        direction=torch.zeros(1, device=surp_mag.device),  # Placeholder
+                        raw=surp_raw,
+                        post_activations=surp_acts_stacked[-1],
+                        sync_matrix=torch.zeros(1, device=surp_mag.device),
+                        certainty=surp_cert,
+                        all_tick_outputs=surp_all_tick_outputs,  # For certainty computation
+                        all_tick_activations=[surp_acts_stacked[i] for i in range(surp_acts_stacked.shape[0])],
+                        all_tick_magnitudes=all_tick_magnitudes,
+                    )
 
                 # Reconstruct global sync output
                 global_sync_output = GlobalSyncOutput(
@@ -719,9 +883,10 @@ class PEMLoopGlobal(nn.Module):
             t2 = argmax(C)  - tick with maximum certainty
             L = (L_t1 + L_t2) / 2
 
-        For Prediction:
-            - Uses all_tick_outputs (y_t) directly - no readout heads per tick
-            - Compares y_t to immediate target (primary prediction task)
+        For Prediction (using CTMLoss - same as train_prediction.py):
+            - Applies readout heads at EACH tick (not just final)
+            - Computes weighted loss for all 3 horizons (immediate, shortterm, longterm)
+            - Uses cosine similarity + MSE components
 
         For Surprise:
             - Uses all_tick_magnitudes (cheap scalar output per tick)
@@ -729,6 +894,8 @@ class PEMLoopGlobal(nn.Module):
 
         Also includes:
         - Cross-module sync variance (encourages meaningful synchronization)
+        - Optional cross-attention diversity loss
+        - Optional loop improvement loss
         """
         device = outputs[0].predictions['immediate'].device
         total_loss = torch.tensor(0.0, device=device)
@@ -739,61 +906,65 @@ class PEMLoopGlobal(nn.Module):
             surp_output = output.surprise
 
             # ========== 1. PREDICTION CTM LOSS ==========
-            # Use y_t (all_tick_outputs) directly - no per-tick readouts needed
-            # Compare to immediate target (primary task)
+            # Use CTMLoss (same as train_prediction.py):
+            # - Applies readout heads at each tick
+            # - Computes loss for all 3 horizons (immediate, shortterm, longterm)
+            # - Uses cosine similarity + MSE
+            # - Finds t1=argmin(loss), t2=argmax(certainty), returns (L_t1 + L_t2) / 2
             all_tick_outputs = pred_output.all_tick_outputs
-            target = targets['immediate']
-            valid = targets.get('immediate_valid', None)
 
-            # Compute loss at each tick using raw y_t
-            all_tick_pred_losses = []
-            for y_t in all_tick_outputs:
-                if valid is not None and valid.any():
-                    cos_sim = F.cosine_similarity(y_t[valid], target[valid], dim=-1)
-                    tick_loss = (1 - cos_sim).mean()
-                else:
-                    tick_loss = torch.tensor(0.0, device=device)
-                all_tick_pred_losses.append(tick_loss)
-
-            # Compute certainties from output stability
-            all_tick_pred_certainties = compute_tick_certainties(all_tick_outputs)
-
-            # Apply CTM loss formula: L = (L_t1 + L_t2) / 2
-            if len(all_tick_pred_losses) > 0:
-                pred_ctm_loss, pred_t1, pred_t2 = compute_ctm_loss(
-                    all_tick_pred_losses,
-                    all_tick_pred_certainties,
+            if len(all_tick_outputs) > 0:
+                pred_ctm_loss, pred_loss_dict = self.ctm_loss(
+                    all_tick_outputs,
+                    targets,
+                    self.prediction.readout_immediate,
+                    self.prediction.readout_shortterm,
+                    self.prediction.readout_longterm,
                 )
+                # Extract tick selection info
+                pred_t1 = pred_loss_dict.get('t1', torch.tensor(0))
+                pred_t2 = pred_loss_dict.get('t2', torch.tensor(0))
+                if torch.is_tensor(pred_t1):
+                    pred_t1 = pred_t1.item()
+                if torch.is_tensor(pred_t2):
+                    pred_t2 = pred_t2.item()
+
                 loss_dict[f'step{step_idx}_pred_ctm_loss'] = pred_ctm_loss.detach()
                 loss_dict[f'step{step_idx}_pred_best_tick'] = float(pred_t1)
                 loss_dict[f'step{step_idx}_pred_certain_tick'] = float(pred_t2)
+                # Also log per-scale losses from final tick
+                loss_dict[f'step{step_idx}_immediate_loss'] = pred_loss_dict.get('immediate_loss', torch.tensor(0.0)).detach()
+                loss_dict[f'step{step_idx}_shortterm_loss'] = pred_loss_dict.get('shortterm_loss', torch.tensor(0.0)).detach()
+                loss_dict[f'step{step_idx}_longterm_loss'] = pred_loss_dict.get('longterm_loss', torch.tensor(0.0)).detach()
                 total_loss = total_loss + pred_ctm_loss
 
             # ========== 2. SURPRISE CTM LOSS ==========
-            # Use all_tick_magnitudes (cheap - just scalar per tick)
-            all_tick_surp_losses = []
-            for tick_mag in surp_output.all_tick_magnitudes:
-                # Surprise calibration: magnitude should track raw surprise
-                surp_cal_loss = F.mse_loss(tick_mag, surp_output.raw)
-                all_tick_surp_losses.append(surp_cal_loss)
+            # Skip if surprise is disabled
+            if surp_output is not None:
+                # Use all_tick_magnitudes (cheap - just scalar per tick)
+                all_tick_surp_losses = []
+                for tick_mag in surp_output.all_tick_magnitudes:
+                    # Surprise calibration: magnitude should track raw surprise
+                    surp_cal_loss = F.mse_loss(tick_mag, surp_output.raw)
+                    all_tick_surp_losses.append(surp_cal_loss)
 
-            # Compute certainties from surprise outputs
-            all_tick_surp_certainties = compute_tick_certainties(surp_output.all_tick_outputs)
+                # Compute certainties from surprise outputs
+                all_tick_surp_certainties = compute_tick_certainties(surp_output.all_tick_outputs)
 
-            # Apply CTM loss formula
-            if len(all_tick_surp_losses) > 0 and len(all_tick_surp_certainties) > 0:
-                surp_ctm_loss, surp_t1, surp_t2 = compute_ctm_loss(
-                    all_tick_surp_losses,
-                    all_tick_surp_certainties,
-                )
-                loss_dict[f'step{step_idx}_surp_ctm_loss'] = surp_ctm_loss.detach()
-                loss_dict[f'step{step_idx}_surp_best_tick'] = float(surp_t1)
-                loss_dict[f'step{step_idx}_surp_certain_tick'] = float(surp_t2)
-                total_loss = total_loss + self.config.surprise_loss_weight * surp_ctm_loss
-            else:
-                # Fallback
-                surp_cal_loss = F.mse_loss(surp_output.magnitude, surp_output.raw)
-                total_loss = total_loss + self.config.surprise_loss_weight * surp_cal_loss
+                # Apply CTM loss formula
+                if len(all_tick_surp_losses) > 0 and len(all_tick_surp_certainties) > 0:
+                    surp_ctm_loss, surp_t1, surp_t2 = compute_ctm_loss(
+                        all_tick_surp_losses,
+                        all_tick_surp_certainties,
+                    )
+                    loss_dict[f'step{step_idx}_surp_ctm_loss'] = surp_ctm_loss.detach()
+                    loss_dict[f'step{step_idx}_surp_best_tick'] = float(surp_t1)
+                    loss_dict[f'step{step_idx}_surp_certain_tick'] = float(surp_t2)
+                    total_loss = total_loss + self.config.surprise_loss_weight * surp_ctm_loss
+                else:
+                    # Fallback
+                    surp_cal_loss = F.mse_loss(surp_output.magnitude, surp_output.raw)
+                    total_loss = total_loss + self.config.surprise_loss_weight * surp_cal_loss
 
             # ========== 3. CROSS-MODULE SYNC VARIANCE ==========
             # Encourage meaningful cross-module synchronization
@@ -803,9 +974,63 @@ class PEMLoopGlobal(nn.Module):
             loss_dict[f'step{step_idx}_sync_var'] = sync_var.detach()
             total_loss = total_loss + sync_var_loss
 
+            # ========== 4. CROSS-ATTENTION DIVERSITY LOSS ==========
+            # Penalize degenerate attention (when modules only attend to themselves)
+            # cross_sync shape: (num_modules, num_modules, B, S)
+            # For 2 modules: [0,1] = P→S, [1,0] = S→P (off-diagonal)
+            if self.config.cross_attn_diversity_weight > 0 and cross_sync.shape[0] >= 2:
+                # Get off-diagonal attention (cross-module attention)
+                p_to_s = cross_sync[0, 1].mean()  # Prediction attending to Surprise
+                s_to_p = cross_sync[1, 0].mean()  # Surprise attending to Prediction
+
+                # We want both to be meaningful (not 0 or 1)
+                # Target: ~0.5 for balanced attention, penalize deviation toward 0 or 1
+                # Loss: -log(p) - log(1-p) is minimized at p=0.5 (cross-entropy style)
+                eps = 1e-6
+                diversity_loss = -(
+                    torch.log(p_to_s + eps) + torch.log(1 - p_to_s + eps) +
+                    torch.log(s_to_p + eps) + torch.log(1 - s_to_p + eps)
+                ) / 4  # Average over 4 terms
+
+                # Subtract baseline (value at p=0.5) so loss is 0 when balanced
+                baseline = -torch.log(torch.tensor(0.5 + eps)) * 2
+                diversity_loss = diversity_loss - baseline
+
+                loss_dict[f'step{step_idx}_cross_attn_diversity'] = diversity_loss.detach()
+                total_loss = total_loss + self.config.cross_attn_diversity_weight * diversity_loss
+
         # Average across loop steps
         num_steps = len(outputs)
         total_loss = total_loss / num_steps
+
+        # ========== 5. LOOP IMPROVEMENT LOSS ==========
+        # Penalize regression: if step N has worse loss than step N-1, add penalty
+        # This encourages the loop to make progress (or at least not regress)
+        if self.config.loop_improvement_weight > 0 and num_steps > 1:
+            # Compute prediction loss at each step
+            step_losses = []
+            for output in outputs:
+                pred = output.predictions['immediate']
+                target = targets['immediate']
+                valid = targets.get('immediate_valid', None)
+                if valid is not None and valid.any():
+                    cos_sim = F.cosine_similarity(pred[valid], target[valid], dim=-1)
+                    step_loss = (1 - cos_sim).mean()
+                else:
+                    step_loss = torch.tensor(0.0, device=device)
+                step_losses.append(step_loss)
+
+            # Sum of ReLU(loss[i+1] - loss[i]) - penalize only regression
+            improvement_loss = torch.tensor(0.0, device=device)
+            for i in range(len(step_losses) - 1):
+                regression = step_losses[i + 1] - step_losses[i]
+                improvement_loss = improvement_loss + F.relu(regression)
+
+            # Normalize by number of transitions
+            improvement_loss = improvement_loss / (num_steps - 1)
+            loss_dict['loop_improvement_loss'] = improvement_loss.detach()
+            total_loss = total_loss + self.config.loop_improvement_weight * improvement_loss
+
         loss_dict['loss'] = total_loss.detach()
 
         return total_loss, loss_dict

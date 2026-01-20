@@ -118,6 +118,24 @@ from .pem_loop import (
     create_pem_loop,
 )
 
+from .semantic_memory import (
+    SemanticMemoryConfig,
+    SemanticMemory,
+    MemoryIntegrator,
+    MemoryReadOutput,
+    create_semantic_memory,
+    create_memory_integrator,
+)
+
+from .memory_augmented_prediction import (
+    MemoryAugmentedPredictionConfig,
+    MemoryAugmentedPrediction,
+    MemoryAugmentedPredictionOutput,
+    SurpriseCompute,
+    SurpriseOutput,
+    create_memory_augmented_prediction,
+)
+
 __all__ = [
     # Feature extraction
     "FeatureExtractorConfig",
@@ -208,4 +226,18 @@ __all__ = [
     "PEMLoopOutput",
     "PEMLoopState",
     "create_pem_loop",
+    # Semantic Memory
+    "SemanticMemoryConfig",
+    "SemanticMemory",
+    "MemoryIntegrator",
+    "MemoryReadOutput",
+    "create_semantic_memory",
+    "create_memory_integrator",
+    # Memory-Augmented Prediction
+    "MemoryAugmentedPredictionConfig",
+    "MemoryAugmentedPrediction",
+    "MemoryAugmentedPredictionOutput",
+    "SurpriseCompute",
+    "SurpriseOutput",
+    "create_memory_augmented_prediction",
 ]
