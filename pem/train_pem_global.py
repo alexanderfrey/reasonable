@@ -16,15 +16,18 @@ Monitors:
 
 import argparse
 import math
+import os
+import random
 import time
 import io
 from dataclasses import dataclass
-from typing import Optional, Dict, List
+from pathlib import Path
+from typing import Optional, Dict, List, Iterator
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, IterableDataset
 import matplotlib
 matplotlib.use('Agg')  # Non-interactive backend
 import matplotlib.pyplot as plt
@@ -398,6 +401,7 @@ class TrainingConfig:
     max_steps: int = 10000
     warmup_steps: int = 100
     grad_clip: float = 1.0
+    num_epochs: int = 0  # If >0, train for this many epochs (overrides max_steps)
 
     # Loop
     num_loop_steps: int = 2
@@ -961,6 +965,20 @@ def train_step(
     # Add detailed world state metrics from monitor
     metrics.update(world_state_metrics)
 
+    # Compute state combiner gate metrics (critical for loop learning)
+    with torch.no_grad():
+        combined = torch.cat([features, final_state.observation], dim=-1)
+        gate_values = model.state_combiner_gate(combined)
+        metrics['gate/mean'] = gate_values.mean().item()
+        metrics['gate/std'] = gate_values.std().item()
+        metrics['gate/min'] = gate_values.min().item()
+        metrics['gate/max'] = gate_values.max().item()
+        # Also track how much loop_features differ from raw features
+        transformed = model.state_combiner_transform(combined)
+        loop_features = features + gate_values * (transformed - features)
+        loop_features_diff = (loop_features - features).abs().mean().item()
+        metrics['gate/loop_features_diff'] = loop_features_diff
+
     # Add oscillator metrics if available (from oscillatory world model)
     if final_output.global_sync.oscillator_metrics is not None:
         osc_metrics = final_output.global_sync.oscillator_metrics
@@ -1000,24 +1018,137 @@ def eval_step(
     return metrics
 
 
-def create_dataloader(config: TrainingConfig, split: str = 'train'):
-    """Create dataloader from HuggingFace dataset."""
-    from datasets import load_dataset
+def find_text_files(data_dir: str, num_files: int = 0, seed: int = 42) -> List[Path]:
+    """Find and optionally sample text files from directory."""
+    print(f"Scanning for text files in {data_dir}...")
 
-    # Load FineWeb-Edu sample
-    dataset = load_dataset(
-        "HuggingFaceFW/fineweb-edu",
-        "sample-10BT",
-        split="train",
-        streaming=True,
-    )
+    all_files = []
+    for root, _, files in os.walk(data_dir):
+        for f in files:
+            if f.endswith('.txt') and not f.startswith('._'):
+                all_files.append(Path(root) / f)
 
-    if split == 'val':
-        dataset = dataset.skip(10000).take(1000)
+    print(f"Found {len(all_files)} text files")
 
-    def collate_fn(batch):
-        texts = [item['text'][:config.max_length * 4] for item in batch]  # Rough char estimate
-        return texts
+    # Sample random subset if num_files > 0
+    if num_files > 0 and len(all_files) > num_files:
+        random.seed(seed)
+        sampled = random.sample(all_files, num_files)
+        print(f"Selected {len(sampled)} files for training")
+        return sampled
+
+    return all_files
+
+
+def load_and_clean_text(file_path: Path, min_length: int = 1000) -> Optional[str]:
+    """Load text file and perform basic cleaning."""
+    try:
+        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+            text = f.read()
+        text = text.strip()
+        if len(text) < min_length:
+            return None
+        return text
+    except Exception as e:
+        return None
+
+
+class LocalTextDataset(IterableDataset):
+    """Iterable dataset that streams text chunks from local text files."""
+
+    def __init__(
+        self,
+        file_paths: List[Path],
+        chunk_size: int = 2048,  # Characters per chunk
+        min_text_length: int = 1000,
+        shuffle: bool = True,
+    ):
+        self.file_paths = file_paths
+        self.chunk_size = chunk_size
+        self.min_text_length = min_text_length
+        self.shuffle = shuffle
+
+    def __iter__(self) -> Iterator[dict]:
+        """Yield text chunks from files."""
+        file_paths = self.file_paths.copy()
+
+        if self.shuffle:
+            random.shuffle(file_paths)
+
+        for file_path in file_paths:
+            text = load_and_clean_text(file_path, self.min_text_length)
+            if text is None:
+                continue
+
+            # Create overlapping chunks
+            stride = self.chunk_size // 2
+            for i in range(0, len(text) - self.chunk_size, stride):
+                chunk = text[i:i + self.chunk_size]
+                yield {'text': chunk}
+
+
+def create_dataloader(
+    config: TrainingConfig,
+    split: str = 'train',
+    dataset_type: str = 'fineweb',
+    data_dir: Optional[str] = None,
+    num_files: int = 0,
+):
+    """Create dataloader from HuggingFace dataset or local text files.
+
+    Args:
+        config: Training configuration
+        split: 'train' or 'val'
+        dataset_type: 'fineweb' for HuggingFace FineWeb-Edu, 'local' for local text files
+        data_dir: Directory containing text files (required if dataset_type='local')
+        num_files: Number of files to use (0 = all files)
+    """
+    if dataset_type == 'local':
+        if data_dir is None:
+            raise ValueError("data_dir required for local dataset")
+
+        file_paths = find_text_files(data_dir, num_files=num_files)
+        if not file_paths:
+            raise ValueError(f"No text files found in {data_dir}")
+
+        # Split for validation
+        if split == 'val':
+            random.seed(42)
+            random.shuffle(file_paths)
+            val_size = max(1, len(file_paths) // 20)  # 5% for validation
+            file_paths = file_paths[:val_size]
+        else:
+            random.seed(42)
+            random.shuffle(file_paths)
+            val_size = max(1, len(file_paths) // 20)
+            file_paths = file_paths[val_size:]
+
+        dataset = LocalTextDataset(
+            file_paths,
+            chunk_size=config.max_length * 4,  # Rough char estimate
+            shuffle=(split == 'train'),
+        )
+
+        def collate_fn(batch):
+            texts = [item['text'] for item in batch]
+            return texts
+
+    else:  # fineweb
+        from datasets import load_dataset
+
+        dataset = load_dataset(
+            "HuggingFaceFW/fineweb-edu",
+            "sample-10BT",
+            split="train",
+            streaming=True,
+        )
+
+        if split == 'val':
+            dataset = dataset.skip(10000).take(1000)
+
+        def collate_fn(batch):
+            texts = [item['text'][:config.max_length * 4] for item in batch]
+            return texts
 
     loader = DataLoader(
         dataset,
@@ -1064,13 +1195,17 @@ def main():
     parser.add_argument('--batch_size', type=int, default=4)
     parser.add_argument('--learning_rate', type=float, default=1e-4)
     parser.add_argument('--max_steps', type=int, default=10000)
+    parser.add_argument('--num_epochs', type=int, default=0,
+                        help='Train for this many epochs (0 = use max_steps instead)')
     parser.add_argument('--warmup_steps', type=int, default=100)
     parser.add_argument('--grad_clip', type=float, default=1.0)
     parser.add_argument('--num_loop_steps', type=int, default=2)
-    parser.add_argument('--observation_residual', type=float, default=0.3,
-                        help='Global loop observation blend factor (0=replace, 0.3=default, 1=keep)')
+    parser.add_argument('--observation_residual', type=float, default=0.2,
+                        help='Global loop observation blend factor (0=replace, 0.2=default, 1=keep)')
     parser.add_argument('--internal_obs_residual', type=float, default=0.2,
                         help='Internal tick observation blend factor (0=replace, 0.2=default, 1=keep)')
+    parser.add_argument('--state_combiner_gate_init', type=float, default=-0.85,
+                        help='State combiner gate init bias (sigmoid: -2→0.12, -0.85→0.30, 0→0.50)')
     parser.add_argument('--attention_temperature', type=float, default=2.0,
                         help='Cross-module attention temperature (higher=softer, default=2.0)')
     parser.add_argument('--cross_residual_strength', type=float, default=0.0,
@@ -1079,9 +1214,53 @@ def main():
                         help='Weight for surprise calibration loss (default=0.1, try 0.5-1.0 if surprise gradients vanish)')
     parser.add_argument('--cross_attn_diversity_weight', type=float, default=0.0,
                         help='Penalize degenerate cross-attention (0=off, 0.1-0.5=moderate, prevents attention collapse)')
-    parser.add_argument('--loop_improvement_weight', type=float, default=0.1,
-                        help='Penalize loop regression (0=off, 0.1=default, encourages later steps to improve or maintain)')
+    parser.add_argument('--loop_improvement_weight', type=float, default=0.5,
+                        help='Penalize loop regression (0=off, 0.5=default, encourages later steps to improve or maintain)')
     parser.add_argument('--max_length', type=int, default=512)
+
+    # Dataset args
+    parser.add_argument('--dataset', type=str, default='fineweb',
+                        choices=['fineweb', 'local'],
+                        help='Dataset to use: fineweb (HuggingFace) or local (text files)')
+    parser.add_argument('--data_dir', type=str, default=None,
+                        help='Directory containing text files (required if --dataset=local)')
+    parser.add_argument('--num_files', type=int, default=0,
+                        help='Number of text files to use (0=all files)')
+
+    # Oscillatory world model args
+    parser.add_argument('--num_oscillators', type=int, default=64,
+                        help='Number of oscillators in world model (memory slots)')
+    parser.add_argument('--min_period', type=int, default=8,
+                        help='Fastest oscillator period (phrase-level ~8 tokens)')
+    parser.add_argument('--max_period', type=int, default=4096,
+                        help='Slowest oscillator period (document-level ~4096 tokens)')
+    parser.add_argument('--d_world_output', type=int, default=256,
+                        help='Output dimension of world state')
+    parser.add_argument('--surprise_gate_bias', type=float, default=0.5,
+                        help='Base write strength for surprise gating (0.5 = moderate baseline)')
+    parser.add_argument('--surprise_gate_scale', type=float, default=1.0,
+                        help='How much surprise amplifies writing (higher = more surprise-sensitive)')
+    parser.add_argument('--disable_oscillatory_world', action='store_true',
+                        help='Disable oscillatory world model (for ablation)')
+    parser.add_argument('--auxiliary_prediction_weight', type=float, default=0.1,
+                        help='Weight for auxiliary prediction loss (trains oscillators to predict future)')
+    parser.add_argument('--auxiliary_prediction_horizon', type=int, default=8,
+                        help='How many steps ahead to predict for auxiliary loss')
+    parser.add_argument('--enable_auxiliary_prediction', action='store_true',
+                        help='Enable auxiliary prediction loss (disabled by default - ablation showed it hurts)')
+    parser.add_argument('--multi_tick_world_injection', action='store_true',
+                        help='Inject world state at each CTM tick (not just z_0)')
+    parser.add_argument('--surprise_signal_type', type=str, default='attention_entropy',
+                        choices=['ctm', 'prediction_error', 'attention_entropy'],
+                        help='Surprise signal type for oscillator memory gating (attention_entropy best per ablation)')
+
+    # Prediction horizon args
+    parser.add_argument('--immediate_horizon', type=int, default=8,
+                        help='Tokens ahead for immediate prediction (1=exact next token, 8=mean of next 8)')
+    parser.add_argument('--shortterm_horizon', type=int, default=64,
+                        help='Tokens ahead for shortterm prediction')
+    parser.add_argument('--longterm_horizon', type=int, default=256,
+                        help='Tokens ahead for longterm prediction')
 
     # Memory optimization args
     parser.add_argument('--gradient_checkpointing', action='store_true',
@@ -1119,6 +1298,7 @@ def main():
         batch_size=args.batch_size,
         learning_rate=args.learning_rate,
         max_steps=args.max_steps,
+        num_epochs=args.num_epochs,
         warmup_steps=args.warmup_steps,
         grad_clip=args.grad_clip,
         num_loop_steps=args.num_loop_steps,
@@ -1172,11 +1352,32 @@ def main():
         surp_nlm_hidden=args.surp_nlm_hidden,
         surp_d_sync_out=args.surp_d_sync_out,
         surp_d_sync_internal=args.surp_d_sync_internal,
+        # Oscillatory world model config
+        use_oscillatory_world=not args.disable_oscillatory_world,
+        num_oscillators=args.num_oscillators,
+        min_period=args.min_period,
+        max_period=args.max_period,
+        d_world_output=args.d_world_output,
+        surprise_gate_bias=args.surprise_gate_bias,
+        surprise_gate_scale=args.surprise_gate_scale,
+        # Auxiliary prediction (disabled by default per ablation results)
+        use_auxiliary_prediction=args.enable_auxiliary_prediction,
+        auxiliary_prediction_horizon=args.auxiliary_prediction_horizon,
+        auxiliary_prediction_weight=args.auxiliary_prediction_weight,
+        # Multi-tick world injection
+        multi_tick_world_injection=args.multi_tick_world_injection,
+        # Surprise signal type
+        surprise_signal_type=args.surprise_signal_type,
         # Other config
         sync_attention_temperature=args.attention_temperature,
         sync_cross_residual_strength=args.cross_residual_strength,
         observation_residual=args.observation_residual,
+        state_combiner_gate_init=args.state_combiner_gate_init,
         internal_obs_residual=args.internal_obs_residual,
+        # Prediction horizons
+        immediate_horizon=args.immediate_horizon,
+        shortterm_horizon=args.shortterm_horizon,
+        longterm_horizon=args.longterm_horizon,
         gradient_checkpointing=args.gradient_checkpointing,
         backprop_steps=args.backprop_steps,
         surprise_loss_weight=args.surprise_loss_weight,
@@ -1209,6 +1410,19 @@ def main():
         print("  [Memory] Gradient checkpointing ENABLED")
     if args.backprop_steps > 0:
         print(f"  [Memory] Truncated backprop: last {args.backprop_steps} steps")
+    if args.disable_oscillatory_world:
+        print("  [Ablation] Oscillatory world model DISABLED")
+    else:
+        print(f"  [Oscillator] n={args.num_oscillators} periods=[{args.min_period}, {args.max_period}] "
+              f"gate_bias={args.surprise_gate_bias} gate_scale={args.surprise_gate_scale}")
+        if args.enable_auxiliary_prediction:
+            print(f"  [AuxPred] ENABLED horizon={args.auxiliary_prediction_horizon} weight={args.auxiliary_prediction_weight}")
+        else:
+            print("  [AuxPred] Disabled (default - ablation showed it hurts performance)")
+        if args.multi_tick_world_injection:
+            print("  [World] Multi-tick injection ENABLED (world state at every CTM tick)")
+        if args.surprise_signal_type != 'ctm':
+            print(f"  [Surprise] Signal type: {args.surprise_signal_type}")
 
     # Create optimizer and scheduler
     optimizer = create_optimizer(model, config)
@@ -1220,12 +1434,26 @@ def main():
     print(f"  [Monitor] Oscillatory world model enabled (n_osc={pem_config.num_oscillators})")
 
     # Create dataloader
-    print("Creating dataloader...")
-    train_loader = create_dataloader(config, split='train')
+    print(f"Creating dataloader (dataset={args.dataset})...")
+    if args.dataset == 'local' and args.data_dir is None:
+        raise ValueError("--data_dir required when using --dataset=local")
+    train_loader = create_dataloader(
+        config,
+        split='train',
+        dataset_type=args.dataset,
+        data_dir=args.data_dir,
+        num_files=args.num_files,
+    )
     train_iter = iter(train_loader)
 
-    # Training loop
-    print(f"\nStarting training for {config.max_steps} steps...")
+    # Determine training mode
+    if config.num_epochs > 0:
+        training_mode = "epochs"
+        print(f"\nStarting training for {config.num_epochs} epochs...")
+    else:
+        training_mode = "steps"
+        print(f"\nStarting training for {config.max_steps} steps...")
+
     print(f"  Batch size: {config.batch_size}")
     print(f"  Loop steps: {config.num_loop_steps}")
     print(f"  Pred: neurons={config.pred_d_neurons}, T={config.pred_T}, synapse={args.pred_synapse_hidden}, nlm={args.pred_nlm_hidden}")
@@ -1238,6 +1466,9 @@ def main():
     global_step = 0
     running_loss = 0.0
     start_time = time.time()
+    current_epoch = 0
+    total_documents = 0
+    documents_in_epoch = 0
 
     # Track average best steps across training (overall and per-module)
     best_loss_step_sum = 0
@@ -1250,11 +1481,28 @@ def main():
     surp_best_cert_step_sum = 0
     num_logged = 0
 
-    while global_step < config.max_steps:
+    # Training loop condition
+    def should_continue_training():
+        if training_mode == "epochs":
+            return current_epoch < config.num_epochs
+        else:
+            return global_step < config.max_steps
+
+    while should_continue_training():
         # Get batch
         try:
             batch = next(train_iter)
         except StopIteration:
+            # Epoch complete
+            current_epoch += 1
+            documents_in_epoch = 0
+            print(f"\n{'='*60}")
+            print(f"EPOCH {current_epoch} COMPLETE (step {global_step}, {total_documents} docs)")
+            print(f"{'='*60}\n")
+
+            if training_mode == "epochs" and current_epoch >= config.num_epochs:
+                break
+
             train_iter = iter(train_loader)
             batch = next(train_iter)
 
@@ -1278,6 +1526,10 @@ def main():
         # Skip if too short
         if features.shape[1] < 32:
             continue
+
+        # Track documents
+        total_documents += len(batch)
+        documents_in_epoch += len(batch)
 
         # Training step (return outputs periodically for visualization and diagnostics)
         should_visualize = config.wandb_project and (global_step + 1) % (config.log_every * 10) == 0
@@ -1346,11 +1598,12 @@ def main():
             best_cert_val = metrics.get('best_certainty_value', 0)
             loss_impr = metrics.get('loss_improvement', 0)
 
-            print(f"Step {global_step:5d} | "
+            epoch_str = f"E{current_epoch}" if training_mode == "epochs" else ""
+            print(f"Step {global_step:5d} {epoch_str}| "
                   f"Loss: {avg_loss:.4f} (best: {best_loss_val:.3f} @step{best_loss_step}) | "
                   f"Cert: {best_cert_val:.2f} @step{best_cert_step} | "
                   f"ΔLoss: {loss_impr:+.3f} | "
-                  f"AvgBest: L{avg_best_loss_step:.1f} C{avg_best_cert_step:.1f} | "
+                  f"Docs: {total_documents} | "
                   f"{steps_per_sec:.2f} it/s")
 
             # Compact tick evolution monitoring (internal obs residual check)
@@ -1392,6 +1645,36 @@ def main():
                   f"active={osc_active_frac:.2f} mod(a/φ)={osc_amp_mod:.3f}/{osc_phase_mod:.3f} "
                   f"out={osc_out_norm:.2f} {osc_health_str}")
 
+            # Gate health monitoring (critical for loop learning)
+            gate_mean = metrics.get('gate/mean', 0)
+            gate_std = metrics.get('gate/std', 0)
+            gate_min = metrics.get('gate/min', 0)
+            gate_max = metrics.get('gate/max', 0)
+            loop_feat_diff = metrics.get('gate/loop_features_diff', 0)
+            gate_health_issues = []
+            if gate_mean < 0.15:
+                gate_health_issues.append("TOO_SMALL")
+            elif gate_mean > 0.85:
+                gate_health_issues.append("TOO_LARGE")
+            if loop_feat_diff < 0.01:
+                gate_health_issues.append("NO_INFLUENCE")
+            gate_health_str = " ".join(f"⚠{i}" for i in gate_health_issues) if gate_health_issues else "✓"
+            print(f"         Gate | mean={gate_mean:.3f} std={gate_std:.3f} "
+                  f"[{gate_min:.2f}-{gate_max:.2f}] loop_diff={loop_feat_diff:.4f} {gate_health_str}")
+
+            # Per-horizon loss breakdown (shows first vs last loop step)
+            # Lower = better. If world model helps, long should improve more than imm
+            imm_0 = metrics.get('loss/step0_immediate_loss', 0)
+            short_0 = metrics.get('loss/step0_shortterm_loss', 0)
+            long_0 = metrics.get('loss/step0_longterm_loss', 0)
+            # Try to get last step (step2 for 3-step loop)
+            last_step = config.num_loop_steps - 1
+            imm_last = metrics.get(f'loss/step{last_step}_immediate_loss', imm_0)
+            short_last = metrics.get(f'loss/step{last_step}_shortterm_loss', short_0)
+            long_last = metrics.get(f'loss/step{last_step}_longterm_loss', long_0)
+            # Show deltas (negative = improvement)
+            print(f"      Horizon | imm: {imm_0:.3f}→{imm_last:.3f} | short: {short_0:.3f}→{short_last:.3f} | long: {long_0:.3f}→{long_last:.3f}")
+
             # WandB logging (consolidated - only essential metrics)
             if config.wandb_project:
                 log_dict = {
@@ -1399,6 +1682,11 @@ def main():
                     'loss': avg_loss,
                     'learning_rate': scheduler.get_last_lr()[0],
                     'steps_per_sec': steps_per_sec,
+
+                    # Epoch/document tracking
+                    'epoch': current_epoch,
+                    'total_documents': total_documents,
+                    'documents_in_epoch': documents_in_epoch,
 
                     # === OVERALL BEST STEPS ===
                     'best/loss_value': metrics.get('best_loss_value', 0),
@@ -1496,6 +1784,17 @@ def main():
                     'oscillator/output_norm': metrics.get('oscillator/output_norm', 0),
                     'oscillator/output_mean': metrics.get('oscillator/output_mean', 0),
                     'oscillator/output_std': metrics.get('oscillator/output_std', 0),
+
+                    # Auxiliary prediction loss
+                    'loss/auxiliary_prediction': metrics.get('loss/auxiliary_prediction_loss', 0),
+
+                    # === STATE COMBINER GATE METRICS ===
+                    # Critical for loop learning - gate controls observation influence
+                    'gate/mean': metrics.get('gate/mean', 0),
+                    'gate/std': metrics.get('gate/std', 0),
+                    'gate/min': metrics.get('gate/min', 0),
+                    'gate/max': metrics.get('gate/max', 0),
+                    'gate/loop_features_diff': metrics.get('gate/loop_features_diff', 0),
                 }
                 wandb.log(log_dict, step=global_step)
 
@@ -1561,6 +1860,12 @@ def main():
     print("\n" + "="*60)
     print("TRAINING COMPLETE")
     print("="*60)
+    print(f"\nTraining Stats:")
+    print(f"  Total steps: {global_step}")
+    print(f"  Total epochs: {current_epoch}")
+    print(f"  Total documents: {total_documents}")
+    elapsed_total = time.time() - start_time
+    print(f"  Total time: {elapsed_total/60:.1f} minutes")
     if num_logged > 0:
         print(f"\nOverall (Global Loop):")
         print(f"  Average best loss step:      {best_loss_step_sum / num_logged:.2f}")

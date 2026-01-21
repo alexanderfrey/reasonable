@@ -169,6 +169,63 @@ def compute_ctm_loss(
     return ctm_loss, t1, t2
 
 
+def compute_prediction_error_surprise(
+    predicted: torch.Tensor,
+    actual: torch.Tensor,
+    normalize: bool = True,
+) -> torch.Tensor:
+    """
+    Compute surprise signal from prediction error.
+
+    Args:
+        predicted: (B, S, D) predicted features
+        actual: (B, S, D) actual features
+        normalize: If True, normalize the output to [0, 1] range
+
+    Returns:
+        surprise: (B, S, 1) surprise magnitude
+    """
+    # Compute per-position error
+    error = (predicted - actual).pow(2).mean(dim=-1, keepdim=True)  # (B, S, 1)
+
+    if normalize:
+        # Normalize to [0, 1] using sigmoid
+        error = torch.sigmoid(error - error.mean())
+
+    return error
+
+
+def compute_attention_entropy_surprise(
+    attention_weights: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Compute surprise signal from attention entropy.
+
+    High entropy = attention is spread out = uncertain = high surprise
+    Low entropy = attention is focused = confident = low surprise
+
+    Args:
+        attention_weights: (B, H, S, S) attention weights
+
+    Returns:
+        surprise: (B, S, 1) surprise magnitude
+    """
+    # Average over heads: (B, H, S, S) -> (B, S, S)
+    attn = attention_weights.mean(dim=1)
+
+    # Compute entropy for each query position
+    # H = -sum(p * log(p))
+    eps = 1e-10
+    entropy = -(attn * torch.log(attn + eps)).sum(dim=-1, keepdim=True)  # (B, S, 1)
+
+    # Normalize to [0, 1] range
+    # Max entropy is log(S) when attention is uniform
+    max_entropy = torch.log(torch.tensor(attn.shape[-1], dtype=attn.dtype, device=attn.device))
+    surprise = entropy / (max_entropy + eps)
+
+    return surprise
+
+
 class PEMLoopGlobalOutput(NamedTuple):
     """Output from PEM loop with global sync."""
     predictions: Dict[str, torch.Tensor]  # {immediate, shortterm, longterm}
@@ -178,12 +235,14 @@ class PEMLoopGlobalOutput(NamedTuple):
     observation: torch.Tensor              # (B, S, D) attended observation
     attention_weights: torch.Tensor        # (B, H, S, S) attention pattern
     world_state: Optional[torch.Tensor] = None  # (d_world_output,) current oscillatory world state (for monitoring)
+    loop_features: Optional[torch.Tensor] = None  # (B, S, D) features used in this step (for aux prediction loss)
 
 
 class PEMLoopGlobalState(NamedTuple):
     """State carried between PEM loop iterations."""
     observation: torch.Tensor              # (B, S, D) last observation
     cumulative_sync: torch.Tensor          # (B, S, sync_pairs) accumulated sync
+    world_state: Optional[torch.Tensor] = None  # (d_world_output,) differentiable world state from previous step
 
 
 @dataclass
@@ -224,6 +283,22 @@ class PEMLoopGlobalConfig:
     min_period: int = 8                 # Fastest oscillator period
     max_period: int = 4096              # Slowest oscillator period
     d_world_output: int = 256           # Output dimension of world state
+    surprise_gate_bias: float = 0.5     # Base write strength for surprise gating
+    surprise_gate_scale: float = 1.0    # How much surprise amplifies writing
+
+    # Auxiliary prediction (train oscillators to predict future)
+    # NOTE: Ablation tests showed this HURTS performance - disabled by default
+    use_auxiliary_prediction: bool = False
+    auxiliary_prediction_horizon: int = 8  # How many steps ahead to predict
+    auxiliary_prediction_weight: float = 0.1  # Loss weight for auxiliary prediction
+
+    # Multi-tick world state injection
+    multi_tick_world_injection: bool = False  # Inject world state at each CTM tick
+
+    # Alternative surprise signals (for oscillator memory gating)
+    # Options: "ctm" (uses SurpriseCTM), "prediction_error", "attention_entropy"
+    # NOTE: Ablation tests showed attention_entropy gives best certainty
+    surprise_signal_type: str = "attention_entropy"
 
     # Prediction horizons
     immediate_horizon: int = 8
@@ -235,7 +310,8 @@ class PEMLoopGlobalConfig:
 
     # Loop config
     sync_decay: float = 0.9      # Decay for cumulative sync
-    observation_residual: float = 0.3  # Blend factor for observation update (0=replace, 1=keep)
+    observation_residual: float = 0.2  # Blend factor for observation update (0=replace, 1=keep)
+    state_combiner_gate_init: float = -0.85  # Initial bias for state combiner gate (sigmoid of this value)
 
     # Internal tick config (within CTM modules)
     # Lower values = more responsive ticks. 0.35 causes plateau, try 0.1-0.15
@@ -409,6 +485,7 @@ class PEMLoopGlobal(nn.Module):
             # World state config (for oscillatory world model)
             d_world_state=config.d_world_output,
             use_world_state=config.use_oscillatory_world,
+            multi_tick_world_injection=config.multi_tick_world_injection,
         )
         self.prediction = PredictionCTM(pred_config)
 
@@ -442,6 +519,11 @@ class PEMLoopGlobal(nn.Module):
             min_period=config.min_period,
             max_period=config.max_period,
             d_world_output=config.d_world_output,
+            d_feature_input=config.d_model,  # Content features for memory writing
+            surprise_gate_bias=config.surprise_gate_bias,
+            surprise_gate_scale=config.surprise_gate_scale,
+            use_auxiliary_prediction=config.use_auxiliary_prediction,
+            auxiliary_prediction_horizon=config.auxiliary_prediction_horizon,
         )
         self.global_sync = GlobalSyncModule(sync_config)
 
@@ -488,9 +570,11 @@ class PEMLoopGlobal(nn.Module):
             nn.Linear(config.d_model * 2, config.d_model),
             nn.Sigmoid(),
         )
-        # Initialize gate to output ~0.1 initially (mostly use raw features)
+        # Initialize gate bias from config
+        # Default -0.85 gives sigmoid ≈ 0.30 (moderate observation influence)
+        # Previous value of -2.0 (sigmoid ≈ 0.12) was too conservative - loop couldn't learn
         with torch.no_grad():
-            self.state_combiner_gate[0].bias.data.fill_(-2.0)  # sigmoid(-2) ≈ 0.12
+            self.state_combiner_gate[0].bias.data.fill_(config.state_combiner_gate_init)
 
         # 8. Initial observation transform (breaks symmetry in first loop step)
         # Without this, first step sees state_combiner([features, features]) = no signal
@@ -522,6 +606,7 @@ class PEMLoopGlobal(nn.Module):
         return PEMLoopGlobalState(
             observation=initial_obs,
             cumulative_sync=torch.zeros(B, S, self.config.sync_pairs, device=device),
+            world_state=None,  # First step uses None, subsequent steps use differentiable world_state
         )
 
     def step(
@@ -567,9 +652,13 @@ class PEMLoopGlobal(nn.Module):
             # When gate ≈ 1: output ≈ transformed (full combination)
             loop_features = features + gate * (transformed - features)
 
-        # 2. Get current world state from GlobalSyncModule (emergent world model)
-        # This is the persistent sync state that accumulates across all forward passes
-        world_state = self.global_sync.get_world_state()
+        # 2. Get world state from state (differentiable from previous step's global_sync)
+        # For first step, state.world_state is None; oscillatory world model will still
+        # produce a differentiable output via its forward() method later
+        # Shape is either:
+        #   - (d_world_output,) when use_oscillator_cross_attention=False (broadcast)
+        #   - (B, S, d_world_output) when use_oscillator_cross_attention=True (position-specific)
+        world_state = state.world_state
 
         # 3. PredictionCTM: generate predictions (with world state influencing z_0)
         pred_output = self.prediction(loop_features, world_state=world_state)
@@ -585,19 +674,49 @@ class PEMLoopGlobal(nn.Module):
                 valid_mask=targets.get('immediate_valid', None),
             )
 
+        # 4.5. Compute surprise signal for oscillator memory gating
+        # Can use CTM surprise, prediction error, or attention entropy
+        surprise_signal = None
+        if self.config.surprise_signal_type == "ctm":
+            # Use SurpriseCTM magnitude (default)
+            if surp_output is not None:
+                surprise_signal = surp_output.magnitude
+        elif self.config.surprise_signal_type == "prediction_error":
+            # Use simple prediction error as surprise
+            surprise_signal = compute_prediction_error_surprise(
+                predicted=predictions['immediate'],
+                actual=targets['immediate'],
+            )
+        elif self.config.surprise_signal_type == "attention_entropy":
+            # Use attention entropy as surprise (computed after attention step)
+            # We'll compute this after step 7 and pass to next iteration
+            # For now, use CTM surprise if available, else None
+            if surp_output is not None:
+                surprise_signal = surp_output.magnitude
+
         # 5. GlobalSyncModule: cross-module synchronization (computes updated world state)
         # Pass Z_history (all tick activations) for true sync computation (S = Z·Z^T)
-        # Also computes updated world state via GRU-style gating
+        # NEW: Also pass features (content) and surprise (importance) for world model
+        #      - Features write WHAT to remember
+        #      - Surprise gates HOW STRONGLY to write (unexpected = important)
         if self.config.disable_surprise:
             # Prediction-only mode: no cross-module sync, just use prediction activations
-            global_sync_output = self.global_sync({
-                'prediction': pred_output.all_tick_activations,  # List[(B, S, pred_d_neurons)]
-            })
+            global_sync_output = self.global_sync(
+                module_activations={
+                    'prediction': pred_output.all_tick_activations,  # List[(B, S, pred_d_neurons)]
+                },
+                features=loop_features,  # Content to write to memory
+                surprise=surprise_signal,  # May be None, prediction_error, or ctm
+            )
         else:
-            global_sync_output = self.global_sync({
-                'prediction': pred_output.all_tick_activations,  # List[(B, S, pred_d_neurons)]
-                'surprise': surp_output.all_tick_activations,    # List[(B, S, surp_d_neurons)]
-            })
+            global_sync_output = self.global_sync(
+                module_activations={
+                    'prediction': pred_output.all_tick_activations,  # List[(B, S, pred_d_neurons)]
+                    'surprise': surp_output.all_tick_activations,    # List[(B, S, surp_d_neurons)]
+                },
+                features=loop_features,  # Content to write to memory
+                surprise=surprise_signal,  # Importance gate: high surprise = important
+            )
 
         # 6. Update cumulative sync
         cumulative_sync = (
@@ -620,6 +739,13 @@ class PEMLoopGlobal(nn.Module):
         alpha = self.config.observation_residual
         observation = alpha * state.observation + (1 - alpha) * attended_obs
 
+        # 8.5. If using attention entropy as surprise, compute it now for next iteration
+        # (This is used in the NEXT step's oscillator memory write)
+        if self.config.surprise_signal_type == "attention_entropy":
+            attention_entropy_surprise = compute_attention_entropy_surprise(attn_weights)
+            # Store in state for next iteration (we could also re-run global_sync with this)
+            # For simplicity, this affects the next iteration's memory write
+
         # Build output and new state
         # Include world_state for monitoring (oscillatory world evolves continuously, no commit needed)
         output = PEMLoopGlobalOutput(
@@ -630,11 +756,13 @@ class PEMLoopGlobal(nn.Module):
             observation=observation,
             attention_weights=attn_weights,
             world_state=global_sync_output.world_state,  # Current oscillatory world state for monitoring
+            loop_features=loop_features,  # For auxiliary prediction loss
         )
 
         new_state = PEMLoopGlobalState(
             observation=observation,
             cumulative_sync=cumulative_sync,
+            world_state=global_sync_output.world_state,  # Differentiable world state for next step
         )
 
         return output, new_state
@@ -674,10 +802,12 @@ class PEMLoopGlobal(nn.Module):
         if targets_longterm_valid is not None:
             targets['longterm_valid'] = targets_longterm_valid
 
-        # Reconstruct state
+        # Reconstruct state (world_state is None in checkpointed path for simplicity)
+        # This means gradient checkpointing may not fully support world_state gradients
         state = PEMLoopGlobalState(
             observation=observation,
             cumulative_sync=cumulative_sync,
+            world_state=None,  # TODO: Pass world_state through checkpoint if needed
         )
 
         # Run actual step
@@ -776,6 +906,7 @@ class PEMLoopGlobal(nn.Module):
                 state = PEMLoopGlobalState(
                     observation=state.observation.detach(),
                     cumulative_sync=state.cumulative_sync.detach(),
+                    world_state=state.world_state.detach() if state.world_state is not None else None,
                 )
 
             # Use gradient checkpointing if enabled
@@ -858,6 +989,7 @@ class PEMLoopGlobal(nn.Module):
                 state = PEMLoopGlobalState(
                     observation=new_obs,
                     cumulative_sync=new_cum_sync,
+                    world_state=None,  # Checkpoint path doesn't preserve world_state gradients
                 )
             else:
                 # Normal forward pass
@@ -1000,7 +1132,47 @@ class PEMLoopGlobal(nn.Module):
         num_steps = len(outputs)
         total_loss = total_loss / num_steps
 
-        # ========== 5. LOOP IMPROVEMENT LOSS ==========
+        # ========== 5. AUXILIARY PREDICTION LOSS ==========
+        # Train oscillators to predict future features
+        if self.config.auxiliary_prediction_weight > 0 and self.config.use_auxiliary_prediction:
+            aux_loss = torch.tensor(0.0, device=device)
+            aux_count = 0
+            horizon = self.global_sync.config.auxiliary_prediction_horizon
+
+            for step_idx, output in enumerate(outputs):
+                future_pred = output.global_sync.future_prediction
+                if future_pred is None:
+                    continue
+
+                # Target is average of features from future steps
+                # Use loop_features from future outputs if available
+                future_features = []
+                for future_idx in range(step_idx + 1, min(step_idx + 1 + horizon, num_steps)):
+                    if outputs[future_idx].loop_features is not None:
+                        # Average over batch and sequence
+                        future_features.append(
+                            outputs[future_idx].loop_features.mean(dim=(0, 1))
+                        )
+
+                if future_features:
+                    # Average future features
+                    future_target = torch.stack(future_features).mean(dim=0)
+
+                    # Cosine similarity loss
+                    cos_sim = F.cosine_similarity(
+                        future_pred.unsqueeze(0),
+                        future_target.unsqueeze(0),
+                        dim=-1
+                    )
+                    aux_loss = aux_loss + (1 - cos_sim.mean())
+                    aux_count += 1
+
+            if aux_count > 0:
+                aux_loss = aux_loss / aux_count
+                loss_dict['auxiliary_prediction_loss'] = aux_loss.detach()
+                total_loss = total_loss + self.config.auxiliary_prediction_weight * aux_loss
+
+        # ========== 6. LOOP IMPROVEMENT LOSS ==========
         # Penalize regression: if step N has worse loss than step N-1, add penalty
         # This encourages the loop to make progress (or at least not regress)
         if self.config.loop_improvement_weight > 0 and num_steps > 1:

@@ -61,6 +61,7 @@ from .oscillatory_world import (
     OscillatoryWorldState,
     OscillatoryWorldConfig,
     OscillatorMetrics,
+    OscillatorOutput,
     create_oscillatory_world,
 )
 
@@ -75,6 +76,8 @@ class GlobalSyncOutput(NamedTuple):
     oscillator_metrics: Optional[OscillatorMetrics] = None  # Detailed oscillator metrics
     oscillator_amplitudes: Optional[torch.Tensor] = None    # (num_oscillators,) current amplitudes
     oscillator_phases: Optional[torch.Tensor] = None        # (num_oscillators,) current phases
+    # Auxiliary prediction for future features
+    future_prediction: Optional[torch.Tensor] = None  # (d_feature_input,) predicted future features
 
 
 @dataclass
@@ -99,12 +102,32 @@ class GlobalSyncConfig:
     # Learnable module embeddings
     use_module_embeddings: bool = True
 
-    # Oscillatory world model (replaces GRU-based persistent state)
+    # Oscillatory world model (content-based memory with surprise gating)
     use_oscillatory_world: bool = True  # Enable/disable oscillatory world model
-    num_oscillators: int = 64           # Number of oscillators
+    num_oscillators: int = 64           # Number of oscillators (memory slots)
     min_period: int = 8                 # Fastest oscillator period
     max_period: int = 4096              # Slowest oscillator period
     d_world_output: int = 256           # Output dimension of world state
+    d_feature_input: int = 256          # Dimension of content features for writing
+    surprise_gate_bias: float = 0.5     # Base write strength for surprise gating
+    surprise_gate_scale: float = 1.0    # How much surprise amplifies writing
+
+    # Sync compression method (now used for QUERYING memory, not writing)
+    # "mean": Simple mean
+    # "attention": Learned attention-weighted pooling
+    # "last": Use last sequence position only (causal)
+    sync_compression: str = "attention"
+
+    # Oscillator cross-attention (positions attend to oscillator memory)
+    # When True, world_state output is (B, S, d_world_output) - position-specific
+    # When False, world_state output is (d_world_output,) - broadcast to all positions
+    use_oscillator_cross_attention: bool = True
+    osc_cross_attn_heads: int = 4
+
+    # Auxiliary prediction loss (train oscillators to predict future)
+    # When enabled, oscillator memory states are used to predict future features
+    use_auxiliary_prediction: bool = True
+    auxiliary_prediction_horizon: int = 8  # How many steps ahead to predict
 
 
 class RMSNorm(nn.Module):
@@ -471,18 +494,93 @@ class GlobalSyncModule(nn.Module):
         else:
             self.module_embeddings = None
 
-        # Oscillatory world model (replaces GRU-based persistent state)
+        # Oscillatory world model (content-based memory with surprise gating)
         if config.use_oscillatory_world:
             osc_config = OscillatoryWorldConfig(
                 num_oscillators=config.num_oscillators,
                 min_period=config.min_period,
                 max_period=config.max_period,
-                d_sync_input=config.sync_pairs,  # Input from compressed sync
+                d_feature_input=config.d_feature_input,  # Content features for writing
+                d_sync_input=config.sync_pairs,  # Legacy, kept for compatibility
                 d_output=config.d_world_output,
+                surprise_gate_bias=config.surprise_gate_bias,
+                surprise_gate_scale=config.surprise_gate_scale,
             )
             self.oscillatory_world = OscillatoryWorldState(osc_config)
+
+            # Feature compression for writing to memory
+            # Compress features (B, S, d_model) -> (d_feature_input,)
+            self.feature_compressor = nn.Sequential(
+                nn.Linear(config.d_feature_input, config.d_feature_input),
+                nn.GELU(),
+            )
+
+            # Sync to feature projection (fallback when features not provided)
+            # (sync_pairs,) -> (d_feature_input,)
+            self.sync_to_feature = nn.Linear(config.sync_pairs, config.d_feature_input)
+
+            # Attention network for sync compression (learns which positions matter)
+            if config.sync_compression == "attention":
+                self.sync_compression_attn = nn.Sequential(
+                    nn.Linear(config.sync_pairs, config.sync_pairs // 2),
+                    nn.GELU(),
+                    nn.Linear(config.sync_pairs // 2, 1),  # Score per position
+                )
+                # Initialize to produce near-uniform weights initially
+                with torch.no_grad():
+                    self.sync_compression_attn[-1].weight.mul_(0.1)
+                    self.sync_compression_attn[-1].bias.zero_()
+            else:
+                self.sync_compression_attn = None
+
+            # Cross-attention: positions attend to oscillator memory
+            # Query: sync (B, S, sync_pairs) -> each position queries based on its sync pattern
+            # Key/Value: oscillator states (num_oscillators,) -> memory bank
+            # Output: (B, S, d_world_output) -> position-specific world context
+            if config.use_oscillator_cross_attention:
+                self.osc_query_proj = nn.Linear(config.sync_pairs, config.d_world_output)
+                self.osc_key_proj = nn.Linear(config.num_oscillators, config.d_world_output)
+                self.osc_value_proj = nn.Linear(config.num_oscillators, config.d_world_output)
+                self.osc_cross_attn = nn.MultiheadAttention(
+                    embed_dim=config.d_world_output,
+                    num_heads=config.osc_cross_attn_heads,
+                    dropout=config.dropout,
+                    batch_first=True,
+                )
+                self.osc_output_norm = RMSNorm(config.d_world_output)
+            else:
+                self.osc_query_proj = None
+                self.osc_key_proj = None
+                self.osc_value_proj = None
+                self.osc_cross_attn = None
+                self.osc_output_norm = None
+
+            # Auxiliary prediction head (predict future features from memory)
+            if config.use_auxiliary_prediction:
+                # Predict future features from oscillator memory states
+                # Input: memory_states (num_oscillators,)
+                # Output: predicted future features (d_feature_input,)
+                self.future_predictor = nn.Sequential(
+                    nn.Linear(config.num_oscillators, config.d_feature_input),
+                    nn.GELU(),
+                    nn.Linear(config.d_feature_input, config.d_feature_input),
+                )
+                self.auxiliary_prediction_horizon = config.auxiliary_prediction_horizon
+            else:
+                self.future_predictor = None
+                self.auxiliary_prediction_horizon = 0
         else:
             self.oscillatory_world = None
+            self.feature_compressor = None
+            self.sync_to_feature = None
+            self.sync_compression_attn = None
+            self.osc_query_proj = None
+            self.osc_key_proj = None
+            self.osc_value_proj = None
+            self.osc_cross_attn = None
+            self.osc_output_norm = None
+            self.future_predictor = None
+            self.auxiliary_prediction_horizon = 0
 
     def register_module(self, name: str, d_neurons: int) -> None:
         """
@@ -541,13 +639,22 @@ class GlobalSyncModule(nn.Module):
     def forward(
         self,
         module_activations: Dict[str, List[torch.Tensor]],  # {name: List[(B, S, d_neurons)]}
+        features: Optional[torch.Tensor] = None,  # (B, S, d_feature_input) content for memory
+        surprise: Optional[torch.Tensor] = None,  # (B, S, 1) or scalar, importance gate
     ) -> GlobalSyncOutput:
         """
         Compute global sync from module post-activation histories.
 
+        New architecture: Content-based memory with surprise gating.
+        - Features (content) write to oscillator memory
+        - Surprise gates write strength (unexpected = important)
+        - Sync patterns query memory via cross-attention
+
         Args:
             module_activations: Dict mapping module name to Z_history
                                (list of post-activations at each tick)
+            features: Optional content features for writing to memory
+            surprise: Optional surprise magnitude for gating writes
 
         Returns:
             GlobalSyncOutput with sync state and cross-module analysis
@@ -589,23 +696,82 @@ class GlobalSyncModule(nn.Module):
         oscillator_metrics = None
         oscillator_amplitudes = None
         oscillator_phases = None
+        future_prediction = None
 
         if self.oscillatory_world is not None:
-            # Compress sync to single vector: mean over batch and sequence
-            # sync shape: (B, S, sync_pairs)
-            sync_compressed = sync.mean(dim=(0, 1))  # (sync_pairs,)
+            B, S, _ = sync.shape
 
-            # Oscillatory world model:
-            # 1. advance() - deterministic phase evolution
-            # 2. modulate() - learned modulation (THIS GETS GRADIENTS!)
-            # 3. read() - sample oscillator state
-            world_state = self.oscillatory_world(sync_compressed, dt=1.0)
+            # === WRITE PATH: Features + Surprise -> Oscillator Memory ===
+            if features is not None:
+                # Compress features to single vector for writing
+                # features: (B, S, d_feature_input) -> (d_feature_input,)
+                features_compressed = self.feature_compressor(features.mean(dim=(0, 1)))
+
+                # Compress surprise if provided
+                surprise_scalar = None
+                if surprise is not None:
+                    surprise_scalar = surprise.mean()  # Scalar importance
+
+                # Write to oscillator memory (content gated by surprise)
+                osc_output = self.oscillatory_world(
+                    features=features_compressed,
+                    surprise=surprise_scalar,
+                    dt=1.0
+                )
+            else:
+                # Fallback: use sync-based writing (legacy behavior)
+                if self.config.sync_compression == "attention" and self.sync_compression_attn is not None:
+                    attn_scores = self.sync_compression_attn(sync)
+                    attn_weights = F.softmax(attn_scores.view(-1), dim=0)
+                    attn_weights = attn_weights.view(B, S, 1)
+                    sync_compressed = (attn_weights * sync).sum(dim=(0, 1))
+                elif self.config.sync_compression == "last":
+                    sync_compressed = sync[:, -1, :].mean(dim=0)
+                else:
+                    sync_compressed = sync.mean(dim=(0, 1))
+
+                # Project sync to feature dimension (legacy fallback)
+                sync_as_features = self.sync_to_feature(sync_compressed)
+                osc_output = self.oscillatory_world(
+                    features=sync_as_features,
+                    surprise=None,
+                    dt=1.0
+                )
+
+            # osc_output.output: (d_world_output,) - projected output
+            # osc_output.memory_states: (num_oscillators,) - raw memory for cross-attention
+
+            # === READ PATH: Sync -> Query Memory -> Position-specific Context ===
+            if self.config.use_oscillator_cross_attention and self.osc_cross_attn is not None:
+                # Query: sync patterns determine what each position retrieves
+                # (B, S, sync_pairs) -> (B, S, d_world_output)
+                query = self.osc_query_proj(sync)
+
+                # Key/Value: oscillator memory states
+                # (num_oscillators,) -> (1, 1, d_world_output) -> (B, 1, d_world_output)
+                memory = osc_output.memory_states
+                key = self.osc_key_proj(memory).unsqueeze(0).unsqueeze(0).expand(B, -1, -1)
+                value = self.osc_value_proj(memory).unsqueeze(0).unsqueeze(0).expand(B, -1, -1)
+
+                # Cross-attention: each position queries what's relevant from memory
+                # Output: (B, S, d_world_output) - position-specific world context
+                attn_out, _ = self.osc_cross_attn(query, key, value)
+                world_state = self.osc_output_norm(attn_out + query)  # Residual + norm
+            else:
+                # No cross-attention: use projected output (broadcast to all positions)
+                world_state = osc_output.output
 
             # Get oscillator state for monitoring
             osc_state = self.oscillatory_world.get_oscillator_state()
             oscillator_amplitudes = osc_state['current_amplitudes']
             oscillator_phases = osc_state['phases']
             oscillator_metrics = self.oscillatory_world.get_metrics()
+
+            # Compute future prediction if enabled
+            future_prediction = None
+            if self.future_predictor is not None:
+                # Use memory states to predict future features
+                future_prediction = self.future_predictor(osc_output.memory_states)
 
         return GlobalSyncOutput(
             sync=sync,
@@ -615,6 +781,7 @@ class GlobalSyncModule(nn.Module):
             oscillator_metrics=oscillator_metrics,
             oscillator_amplitudes=oscillator_amplitudes,
             oscillator_phases=oscillator_phases,
+            future_prediction=future_prediction,
         )
 
     def get_world_state(self) -> Optional[torch.Tensor]:

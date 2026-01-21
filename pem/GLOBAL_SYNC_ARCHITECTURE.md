@@ -1,510 +1,455 @@
-# Global Sync Architecture
+# PEM Global Sync Architecture with Oscillatory World Model
 
-## Overview
+## Current Implementation (as of 2026-01-21)
 
-A new architectural twist where every module works internally with the CTM architecture
-(NLM -> Sync -> Synapse) and every module outputs its NLM post-activations into a global
-Sync module that produces a global synchronization status used to attend to new incoming features.
-
-## Core Idea
-
-Instead of having a single CTM for prediction with surprise modulating attention, we have
-**multiple specialized CTM-based modules** that each process information with their own
-internal dynamics. Their collective neural states feed into a **Global Sync Module** that
-determines what to attend to next.
-
-This aligns with **Global Workspace Theory (GWT)** - multiple specialized processors
-contributing to a unified conscious state.
-
-## Architecture Diagram
-
-```
-┌──────────────────────────────────────────────────────────────────────────────────┐
-│                                                                                  │
-│   Features ─────────────────────────────────────────────────────────────────┐    │
-│       │                                                                     │    │
-│       ▼                                                                     │    │
-│   ┌─────────────────────────────────────────────────────────────────────┐   │    │
-│   │                    CTM-Based Specialized Modules                    │   │    │
-│   │                                                                     │   │    │
-│   │  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐ │   │    │
-│   │  │ Prediction  │  │  Surprise   │  │   Valence   │  │  Curiosity  │ │   │    │
-│   │  │    CTM      │  │    CTM      │  │    CTM      │  │    CTM      │ │   │    │
-│   │  │             │  │             │  │             │  │             │ │   │    │
-│   │  │ NLM→Sync→   │  │ NLM→Sync→   │  │ NLM→Sync→   │  │ NLM→Sync→   │ │   │    │
-│   │  │ Synapse     │  │ Synapse     │  │ Synapse     │  │ Synapse     │ │   │    │
-│   │  │      │      │  │      │      │  │      │      │  │      │      │ │   │    │
-│   │  │      ▼      │  │      ▼      │  │      ▼      │  │      ▼      │ │   │    │
-│   │  │ predictions │  │  surprise   │  │   valence   │  │  curiosity  │ │   │    │
-│   │  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘ │   │    │
-│   │         │                │                │                │        │   │    │
-│   │         │    NLM Post-Activations (neural population states)        │   │    │
-│   │         ▼                ▼                ▼                ▼        │   │    │
-│   │  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐ │   │    │
-│   │  │ h_pred(t)   │  │ h_surp(t)   │  │ h_val(t)    │  │ h_cur(t)    │ │   │    │
-│   │  │ (B,S,D_n)   │  │ (B,S,D_n)   │  │ (B,S,D_n)   │  │ (B,S,D_n)   │ │   │    │
-│   │  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘ │   │    │
-│   │         │                │                │                │        │   │    │
-│   │  ┌─────────────┐  ┌─────────────┐                                   │   │    │
-│   │  │ Activation  │  │ Imagination │    (+ more modules...)            │   │    │
-│   │  │    CTM      │  │    CTM      │                                   │   │    │
-│   │  │      │      │  │      │      │                                   │   │    │
-│   │  │      ▼      │  │      ▼      │                                   │   │    │
-│   │  │  arousal    │  │  imagined   │                                   │   │    │
-│   │  └──────┬──────┘  └──────┬──────┘                                   │   │    │
-│   │         │                │                                          │   │    │
-│   │         ▼                ▼                                          │   │    │
-│   │  ┌─────────────┐  ┌─────────────┐                                   │   │    │
-│   │  │ h_act(t)    │  │ h_imag(t)   │                                   │   │    │
-│   │  └──────┬──────┘  └──────┬──────┘                                   │   │    │
-│   └─────────┼────────────────┼──────────────────────────────────────────┘   │    │
-│             │                │                                              │    │
-│             └───────┬────────┴────────┬─────────┬─────────┬────────────┘    │    │
-│                     │                 │         │         │                 │    │
-│                     ▼                 ▼         ▼         ▼                 │    │
-│   ┌─────────────────────────────────────────────────────────────────────┐   │    │
-│   │                         GLOBAL SYNC MODULE                          │   │    │
-│   │                                                                     │   │    │
-│   │    ┌────────────────────────────────────────────────────────────┐   │   │    │
-│   │    │  Concatenate all NLM post-activations:                     │   │   │    │
-│   │    │  H_global = [h_pred; h_surp; h_val; h_cur; h_act; h_imag]  │   │   │    │
-│   │    │            (B, S, D_n * num_modules)                       │   │   │    │
-│   │    └────────────────────────────────────────────────────────────┘   │   │    │
-│   │                              │                                      │   │    │
-│   │                              ▼                                      │   │    │
-│   │    ┌────────────────────────────────────────────────────────────┐   │   │    │
-│   │    │  Cross-Module Synchronization:                             │   │   │    │
-│   │    │  sync_matrix = H_global @ H_global.T                       │   │   │    │
-│   │    │                                                            │   │   │    │
-│   │    │  Which modules are "in sync"?                              │   │   │    │
-│   │    │  - Prediction aligned with Surprise? → expected error      │   │   │    │
-│   │    │  - Curiosity aligned with Valence? → motivated exploration │   │   │    │
-│   │    │  - Imagination aligned with Prediction? → grounded fantasy │   │   │    │
-│   │    └────────────────────────────────────────────────────────────┘   │   │    │
-│   │                              │                                      │   │    │
-│   │                              ▼                                      │   │    │
-│   │    ┌────────────────────────────────────────────────────────────┐   │   │    │
-│   │    │  Global Sync State:                                        │   │   │    │
-│   │    │  sync_global = f(sync_matrix, personality, memory)         │   │   │    │
-│   │    │              (B, S, sync_pairs)                            │   │   │    │
-│   │    └────────────────────────────────────────────────────────────┘   │   │    │
-│   │                              │                                      │   │    │
-│   └──────────────────────────────┼──────────────────────────────────────┘   │    │
-│                                  │                                          │    │
-│                                  ▼                                          │    │
-│   ┌─────────────────────────────────────────────────────────────────────┐   │    │
-│   │                      GLOBAL ATTENTION                               │   │    │
-│   │                                                                     │   │    │
-│   │    sync_global ──► OscillationQueryBuilder ──► query                │   │    │
-│   │                                                    │                │   │    │
-│   │                                                    ▼                │   │    │
-│   │    features (KV cache) ◄────────────── CrossAttention               │   │    │
-│   │                                                    │                │   │    │
-│   │                                                    ▼                │   │    │
-│   │                                              observation ───────────┼───┘    │
-│   │                                                                     │        │
-│   └─────────────────────────────────────────────────────────────────────┘        │
-│                                                                                  │
-└──────────────────────────────────────────────────────────────────────────────────┘
-```
-
-## Cross-Module Synchronization Matrix
-
-The global sync matrix captures **how different cognitive functions align**:
-
-```
-                 Pred   Surp   Val    Cur    Act    Imag
-            ┌──────────────────────────────────────────────┐
-Prediction  │  1.0    0.8    0.3    0.5    0.6    0.4     │  → "Am I predicting what surprises me?"
-Surprise    │  0.8    1.0    0.7    0.6    0.9    0.3     │  → "Is surprise emotional?"
-Valence     │  0.3    0.7    1.0    0.4    0.5    0.6     │  → "Is this good/bad aligned with imagination?"
-Curiosity   │  0.5    0.6    0.4    1.0    0.7    0.8     │  → "Am I curious about what I imagine?"
-Activation  │  0.6    0.9    0.5    0.7    1.0    0.5     │  → "Am I aroused by surprise?"
-Imagination │  0.4    0.3    0.6    0.8    0.5    1.0     │  → "Is imagination driven by curiosity?"
-            └──────────────────────────────────────────────┘
-```
-
-## What This Architecture Enables
-
-1. **Coherent attention**: Only attend when modules agree (high global sync)
-2. **Conflict detection**: Low sync between Valence and Curiosity → "I'm curious but scared"
-3. **Grounded imagination**: High Imagination-Prediction sync → realistic mental simulation
-4. **Emotional salience**: High Surprise-Valence sync → emotionally significant events
-5. **Motivated exploration**: High Curiosity-Activation sync → engaged exploration
-
-## CTM Module Base Interface
-
-Each CTM-based module exposes both its result AND its neural state:
-
-```python
-class CTMModuleOutput(NamedTuple):
-    """Output from any CTM-based module."""
-    result: torch.Tensor           # Module-specific output (predictions, surprise, etc.)
-    post_activations: torch.Tensor # (B, S, D_neurons) NLM state for global sync
-    local_sync: torch.Tensor       # (B, S, D_n, D_n) internal sync matrix
-    certainty: torch.Tensor        # (B, S) confidence in result
-
-
-class CTMModule(nn.Module):
-    """Base class for all CTM-based modules."""
-
-    def __init__(self, config: CTMModuleConfig):
-        super().__init__()
-        self.nlm = NeuralLogicModule(config)
-        self.sync = LocalSyncModule(config)
-        self.synapse = SynapseModule(config)
-        self.readout = nn.Linear(config.d_neurons, config.d_output)
-
-    def forward(self, x: torch.Tensor, ...) -> CTMModuleOutput:
-        h = self.nlm.init_state(x)
-        all_outputs = []
-
-        for tick in range(self.T):
-            h = self.nlm(h, x)              # NLM neurons process
-            local_sync = self.sync(h)        # Compute local sync
-            h = self.synapse(h, local_sync)  # Update via synapse
-            all_outputs.append(h)
-
-        # Select output using CTM's t1/t2 mechanism
-        result = self.readout(h)
-        certainty = self.compute_certainty(all_outputs)
-
-        return CTMModuleOutput(
-            result=result,
-            post_activations=h,      # For global sync
-            local_sync=local_sync,   # For analysis
-            certainty=certainty,
-        )
-```
-
-## Global Sync Module
-
-```python
-class GlobalSyncModule(nn.Module):
-    """
-    Combines post-activations from all CTM modules into global sync state.
-
-    This is the "global workspace" where all specialized processors meet.
-    """
-
-    def __init__(self, config: GlobalSyncConfig):
-        super().__init__()
-        self.num_modules = config.num_modules
-        self.d_neurons = config.d_neurons
-
-        # Project each module's activations to common space
-        self.module_projections = nn.ModuleList([
-            nn.Linear(config.d_neurons, config.d_sync_space)
-            for _ in range(config.num_modules)
-        ])
-
-        # Cross-module attention
-        self.cross_module_attn = nn.MultiheadAttention(
-            embed_dim=config.d_sync_space,
-            num_heads=config.n_heads,
-        )
-
-        # Sync integrator (includes personality, memory)
-        self.integrator = SyncIntegrator(config)
-
-    def forward(
-        self,
-        module_activations: List[torch.Tensor],  # [(B,S,D_n), ...] from each module
-        personality: torch.Tensor,
-        memory_state: torch.Tensor,
-    ) -> GlobalSyncOutput:
-        # 1. Project each module to common space
-        projected = [
-            proj(act) for proj, act in zip(self.module_projections, module_activations)
-        ]
-
-        # 2. Stack: (num_modules, B, S, D_sync)
-        stacked = torch.stack(projected, dim=0)
-
-        # 3. Cross-module sync matrix
-        # Which modules are aligned at each position?
-        sync_matrix = torch.einsum('mbsd,nbsd->mnsb', stacked, stacked)
-        sync_matrix = sync_matrix / math.sqrt(self.d_sync_space)
-
-        # 4. Cross-module attention (modules attend to each other)
-        # Reshape for attention: (B*S, num_modules, D_sync)
-        B, S, D = projected[0].shape
-        attn_input = stacked.permute(1, 2, 0, 3).reshape(B*S, self.num_modules, -1)
-
-        attended, attn_weights = self.cross_module_attn(
-            attn_input, attn_input, attn_input
-        )
-
-        # 5. Integrate with personality and memory
-        global_sync = self.integrator(
-            attended.reshape(B, S, -1),
-            personality,
-            memory_state,
-            sync_matrix,
-        )
-
-        return GlobalSyncOutput(
-            sync=global_sync,              # (B, S, sync_pairs)
-            cross_module_sync=sync_matrix, # (num_modules, num_modules, S, B)
-            attention_weights=attn_weights,
-        )
-```
-
-## Specialized CTM Modules
-
-### PredictionCTM
-- **Input**: Features from backbone
-- **Output**: Predictions at multiple temporal scales
-- **Post-activations**: "What I expect to see"
-
-### SurpriseCTM
-- **Input**: Predictions + actual features
-- **Output**: Surprise magnitude and direction
-- **Post-activations**: "What violated my expectations"
-
-### ValenceCTM
-- **Input**: Features + surprise
-- **Output**: Good/bad valence signal
-- **Post-activations**: "How I feel about this"
-
-### CuriosityCTM
-- **Input**: Features + uncertainty estimates
-- **Output**: Exploration bonus, information gain
-- **Post-activations**: "What I want to know more about"
-
-### ActivationCTM
-- **Input**: Features + surprise + valence
-- **Output**: Arousal level, attention temperature
-- **Post-activations**: "How engaged I am"
-
-### ImaginationCTM
-- **Input**: Features + curiosity + valence
-- **Output**: Imagined future states
-- **Post-activations**: "What I'm simulating"
-
-## Comparison: Current vs Proposed
-
-| Aspect | Current Architecture | Proposed Architecture |
-|--------|---------------------|----------------------|
-| Sync source | CTMPrediction only | All modules |
-| Module interaction | Sequential | Parallel + Global Sync |
-| Attention basis | Surprise only | Cross-module coherence |
-| "Consciousness" | Single stream | Global workspace |
-| Module architecture | Mixed (CTM + simple) | All CTM-based |
-| Interpretability | Limited | Rich (sync matrix) |
-
-## Implementation Plan
-
-1. **Phase 1: CTMModule Base Class**
-   - Extract common CTM logic into reusable base
-   - Define CTMModuleOutput interface
-   - Test with existing CTMPrediction
-
-2. **Phase 2: Convert Existing Modules**
-   - SurpriseModule → SurpriseCTM
-   - ValenceModule → ValenceCTM
-   - CuriosityModule → CuriosityCTM
-   - ActivationModule → ActivationCTM
-   - ImaginationModule → ImaginationCTM
-
-3. **Phase 3: Global Sync Module**
-   - Implement GlobalSyncModule
-   - Cross-module attention
-   - Integration with personality/memory
-
-4. **Phase 4: New PEM Loop**
-   - Wire all CTM modules in parallel
-   - Feed post-activations to GlobalSync
-   - Global attention from sync state
-
-5. **Phase 5: Training**
-   - Multi-task loss (each module + global coherence)
-   - Curriculum: start with fewer modules, add progressively
-
-## Emergent Self via Persistent Sync Patterns
-
-**Status: IMPLEMENTED** ✅
-
-### Vision
-
-Build toward an emergent "self" by making sync patterns **persistent** across time. The world model isn't a separate module - it **emerges from** accumulated synchronization patterns.
-
-Core principle: **Higher cognition emerges from sync, not alongside it.**
-
-### Key Design Decisions
-
-| Decision | Choice | Rationale |
-|----------|--------|-----------|
-| **Data format** | Continuous stream of pages | No batch complexity, natural reading flow |
-| **Reset policy** | Never reset | Accumulate general world knowledge across all books |
-| **Influence mechanism** | Initialize z_0 | World state biases what CTM attends to from the start |
-
-### Architecture
-
-```
-         Continuous Stream: Book1_p1, Book1_p2, ..., Book2_p1, Book2_p2, ...
-                                          │
-                                          ▼
-┌─────────────────────────────────────────────────────────────┐
-│              PERSISTENT SYNC STATE (S_world)                │
-│                                                             │
-│   Shape: (d_sync_state,) - single vector, never reset       │
-│                                                             │
-│   • Lives across ALL forward passes                         │
-│   • Updated incrementally via GRU-style gated mechanism     │
-│   • IS the world model (emergent, not engineered)          │
-│   • Accumulates knowledge across entire library             │
-└─────────────────────────────────────────────────────────────┘
-                              │
-                              │ S_world → z_0 (initial post-activations)
-                              │
-           ┌──────────────────┼──────────────────┐
-           ▼                  ▼                  ▼
-     ┌──────────┐       ┌──────────┐       ┌──────────┐
-     │  Page 1  │       │  Page 2  │       │  Page N  │
-     │          │       │          │       │          │
-     │ z_0=f(Sw)│       │ z_0=f(Sw)│       │ z_0=f(Sw)│
-     │ ↓        │       │ ↓        │       │ ↓        │
-     │ CTM ticks│       │ CTM ticks│       │ CTM ticks│
-     │ ↓        │       │ ↓        │       │ ↓        │
-     │ S_new_1  │       │ S_new_2  │       │ S_new_N  │
-     └────┬─────┘       └────┬─────┘       └────┬─────┘
-          │                  │                  │
-          └─────► update ◄───┴─────► update ◄───┘
-                    │                   │
-                    ▼                   ▼
-              S_world_1 ──────► S_world_2 ──────► ...
-```
-
-### Implementation Components
-
-#### 1. PersistentSyncState (`global_sync.py`)
-```python
-class PersistentSyncState(nn.Module):
-    """Maintains sync state across time - the emergent world model."""
-
-    def __init__(self, d_sync: int = 256):
-        self.register_buffer('S_world', torch.zeros(d_sync))
-        self.register_buffer('update_count', torch.tensor(0))
-
-    def get_state(self) -> torch.Tensor:
-        return self.S_world
-
-    @torch.no_grad()
-    def update(self, S_new: torch.Tensor):
-        self.S_world.copy_(S_new)
-        self.update_count.add_(1)
-```
-
-#### 2. SyncUpdateGate (`global_sync.py`)
-GRU-style gating for selective incorporation of new sync patterns:
-```python
-class SyncUpdateGate(nn.Module):
-    """Decides how much to incorporate new sync vs keep old."""
-
-    def forward(self, S_world, S_new) -> torch.Tensor:
-        # GRU mechanics: reset gate, update gate, candidate
-        r = sigmoid(self.reset_gate([S_world, S_new]))
-        z = sigmoid(self.update_gate([S_world, S_new]))  # ~0.12 initially
-        candidate = tanh(self.candidate([r * S_world, S_new]))
-        return (1 - z) * S_world + z * candidate
-```
-
-#### 3. World State → z_0 Projection (`ctm_base.py`)
-```python
-# In CTMCore.__init__
-self.world_to_z0 = nn.Sequential(
-    nn.Linear(d_world_state, d_neurons),
-    nn.Tanh(),  # Same range as post-activations
-)
-
-# In CTMCore.forward
-if world_state is not None:
-    z_world = self.world_to_z0(world_state)
-    z_t = z_t + z_world.unsqueeze(0).unsqueeze(0)  # Bias initial state
-```
-
-#### 4. Training Loop Integration (`train_pem_global.py`)
-```python
-for page in continuous_stream:
-    # Forward pass - world state influences z_0
-    output, state = model(page)
-
-    # Backward pass
-    loss.backward()
-    optimizer.step()
-
-    # Commit updated world state AFTER backward (detached)
-    model.commit_world_state(output.world_state.detach())
-```
-
-### Configuration
-
-```python
-# GlobalSyncConfig
-use_persistent_state: bool = True   # Enable/disable
-d_sync_state: int = 256             # World state dimension
-
-# CTMBaseConfig
-use_world_state: bool = True        # Enable world state initialization
-d_world_state: int = 256            # Must match d_sync_state
-```
-
-### Metrics & Logging
-
-| Metric | What It Shows |
-|--------|---------------|
-| `world_state/norm` | How much knowledge accumulates |
-| `world_state/update_gate` | How much new info incorporated (0=ignore, 1=replace) |
-| `world_state/update_count` | Number of pages processed |
-| `world_state/mean`, `world_state/std` | Distribution statistics |
-
-### What Emerges
-
-| Level | What It Is | How It Emerges |
-|-------|------------|----------------|
-| **World Model** | S_world captures narrative understanding | Accumulated sync patterns |
-| **Continuity** | Same "reader" across pages | Persistent state carries forward |
-| **Attention Bias** | Focus on what matters | S_world shapes CTM initial state |
-| **Future: Self-Model** | Patterns about own processing | Sync patterns that predict other sync patterns |
-| **Future: Metacognition** | Awareness of own states | Surprise about S_world predictions |
-
-### Files Modified
-
-| File | Changes |
-|------|---------|
-| `pem/global_sync.py` | `PersistentSyncState`, `SyncUpdateGate`, integrated with `GlobalSyncModule` |
-| `pem/ctm_base.py` | `world_to_z0` projection, `world_state` param in `CTMCore.forward()` |
-| `pem/prediction_ctm.py` | Pass `world_state` through to core |
-| `pem/pem_loop_global.py` | Wire world state: read before CTM, update after, new methods |
-| `pem/train_pem_global.py` | `commit_world_state()` after backward, wandb logging |
-| `pem/data/continuous_loader.py` | New continuous streaming data loaders |
-
-### Future Directions
-
-Once persistent sync is working, natural next steps:
-
-1. **Self-prediction**: Predict what S_world will become → metacognition
-2. **Variable thinking**: S_world influences T (how long to think)
-3. **Memory integration**: S_world helps decide what to remember
-4. **Multiple timescales**: Fast S_world (current page) + slow S_world (lifetime)
+This document provides a complete architectural overview of the PEM system with the oscillatory world model.
 
 ---
 
-## Open Questions
+## High-Level Architecture
 
-1. **Should modules run in parallel or sequence?**
-   - Parallel: faster, but no inter-module dependencies within tick
-   - Sequential: slower, but surprise can inform valence within same tick
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────┐
+│                              PEM LOOP (Iterative Processing)                            │
+│                                                                                         │
+│   Input: Token Embeddings (B, S, d_model)                                               │
+│                    │                                                                    │
+│                    ▼                                                                    │
+│   ┌────────────────────────────────────────────────────────────────────────────────┐   │
+│   │                        ITERATION i (i = 1..num_iterations)                      │   │
+│   │                                                                                 │   │
+│   │   State: observation, cumulative_sync, world_state                              │   │
+│   │                    │                                                            │   │
+│   │   ┌────────────────┼────────────────┐                                           │   │
+│   │   │                │                │                                           │   │
+│   │   ▼                ▼                ▼                                           │   │
+│   │ ┌─────────┐  ┌─────────────┐  ┌─────────────┐                                   │   │
+│   │ │Prediction│  │  Surprise   │  │   Memory    │                                   │   │
+│   │ │   CTM   │  │    CTM      │  │    CTM      │                                   │   │
+│   │ └────┬────┘  └──────┬──────┘  └──────┬──────┘                                   │   │
+│   │      │              │                │                                          │   │
+│   │      │   Post-Activations (Z_history for each module)                           │   │
+│   │      │              │                │                                          │   │
+│   │      └──────────────┼────────────────┘                                          │   │
+│   │                     ▼                                                           │   │
+│   │   ┌─────────────────────────────────────────────────────────────────────────┐   │   │
+│   │   │                      GLOBAL SYNC MODULE                                 │   │   │
+│   │   │                                                                         │   │   │
+│   │   │   ┌─────────────────────────────────────────────────────────────────┐   │   │   │
+│   │   │   │  1. Sync Computation: S = Z · Z^T (per module)                  │   │   │   │
+│   │   │   │     - Captures neural synchronization patterns                  │   │   │   │
+│   │   │   │     - Subsamples to sync_pairs dimensions                       │   │   │   │
+│   │   │   └─────────────────────────────────────────────────────────────────┘   │   │   │
+│   │   │                              │                                          │   │   │
+│   │   │                              ▼                                          │   │   │
+│   │   │   ┌─────────────────────────────────────────────────────────────────┐   │   │   │
+│   │   │   │  2. Cross-Module Attention                                      │   │   │   │
+│   │   │   │     - Which modules have similar sync dynamics?                 │   │   │   │
+│   │   │   │     - Produces attended_syncs per module                        │   │   │   │
+│   │   │   └─────────────────────────────────────────────────────────────────┘   │   │   │
+│   │   │                              │                                          │   │   │
+│   │   │                              ▼                                          │   │   │
+│   │   │   ┌─────────────────────────────────────────────────────────────────┐   │   │   │
+│   │   │   │  3. Sync Integration                                            │   │   │   │
+│   │   │   │     - Combines module syncs into global sync (B, S, sync_pairs) │   │   │   │
+│   │   │   └─────────────────────────────────────────────────────────────────┘   │   │   │
+│   │   │                              │                                          │   │   │
+│   │   │         ┌────────────────────┴────────────────────┐                     │   │   │
+│   │   │         │                                         │                     │   │   │
+│   │   │         ▼                                         ▼                     │   │   │
+│   │   │   ┌───────────┐                       ┌───────────────────────────┐     │   │   │
+│   │   │   │   Sync    │                       │  OSCILLATORY WORLD MODEL  │     │   │   │
+│   │   │   │  Output   │                       │  (Content-based Memory)   │     │   │   │
+│   │   │   └───────────┘                       │                           │     │   │   │
+│   │   │                                       │  See detailed diagram     │     │   │   │
+│   │   │                                       │  below                    │     │   │   │
+│   │   │                                       └─────────────┬─────────────┘     │   │   │
+│   │   │                                                     │                   │   │   │
+│   │   │                                                     ▼                   │   │   │
+│   │   │                                       ┌───────────────────────────┐     │   │   │
+│   │   │                                       │  World State (B, S, d)    │     │   │   │
+│   │   │                                       │  Position-specific ctx    │     │   │   │
+│   │   │                                       └───────────────────────────┘     │   │   │
+│   │   └─────────────────────────────────────────────────────────────────────────┘   │   │
+│   │                     │                                   │                       │   │
+│   │                     ▼                                   │                       │   │
+│   │   ┌─────────────────────────────────────────────────────┼───────────────────┐   │   │
+│   │   │              PERCEPTION ATTENTION                   │                   │   │   │
+│   │   │   sync → Query → Attend to Features → observation   │                   │   │   │
+│   │   └─────────────────────────────────────────────────────┼───────────────────┘   │   │
+│   │                     │                                   │                       │   │
+│   │                     ▼                                   │                       │   │
+│   │              New observation ◄──────────────────────────┘                       │   │
+│   │                     │         (world_state biases CTM z_0)                      │   │
+│   │                     │                                                           │   │
+│   └─────────────────────┼───────────────────────────────────────────────────────────┘   │
+│                         │                                                               │
+│                         ▼                                                               │
+│                   Next iteration                                                        │
+│                                                                                         │
+└─────────────────────────────────────────────────────────────────────────────────────────┘
+```
 
-2. **How many ticks per module?**
-   - Same T for all? Or different T based on complexity?
-   - Prediction may need more ticks than Valence
+---
 
-3. **Should global sync run every tick or only at end?**
-   - Every tick: richer dynamics, more compute
-   - End only: simpler, faster
+## Oscillatory World Model - Detailed Data Flow
 
-4. **How to handle module-specific inputs?**
-   - Some modules need outputs from others (Surprise needs Predictions)
-   - Stagger computation? Or use previous tick's outputs?
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────┐
+│                        OSCILLATORY WORLD MODEL (Content-based Memory)                   │
+│                                                                                         │
+│  KEY INSIGHT: Store WHAT happened (content), gated by WHAT mattered (surprise),         │
+│               retrieved by WHAT's relevant now (sync)                                   │
+│                                                                                         │
+│  ═══════════════════════════════════════════════════════════════════════════════════   │
+│                                                                                         │
+│                              ┌─────────────────────┐                                    │
+│                              │      INPUTS         │                                    │
+│                              └──────────┬──────────┘                                    │
+│                                         │                                               │
+│           ┌─────────────────────────────┼─────────────────────────────┐                 │
+│           │                             │                             │                 │
+│           ▼                             ▼                             ▼                 │
+│   ┌───────────────┐            ┌───────────────┐            ┌───────────────┐          │
+│   │   Features    │            │    Surprise   │            │     Sync      │          │
+│   │ (B,S,d_model) │            │  (B,S,1) mag  │            │(B,S,sync_pairs)│          │
+│   │   Content to  │            │  Importance   │            │  Query for    │          │
+│   │   remember    │            │  gate         │            │  retrieval    │          │
+│   └───────┬───────┘            └───────┬───────┘            └───────┬───────┘          │
+│           │                             │                             │                 │
+│           ▼                             │                             │                 │
+│   ┌───────────────┐                     │                             │                 │
+│   │    Mean +     │                     │                             │                 │
+│   │  Compress     │                     │                             │                 │
+│   │ (d_feature)   │                     │                             │                 │
+│   └───────┬───────┘                     │                             │                 │
+│           │                             │                             │                 │
+│  ═════════╪═════════════════════════════╪═════════════════════════════╪═════════════   │
+│           │        WRITE PATH           │                             │                 │
+│           │                             │                             │                 │
+│           ▼                             ▼                             │                 │
+│   ┌───────────────────────────────────────────────────────┐           │                 │
+│   │              AMPLITUDE MODULATION                     │           │                 │
+│   │                                                       │           │                 │
+│   │   features ──► amp_modulator ──► amp_mod (N_osc,)     │           │                 │
+│   │                    │                                  │           │                 │
+│   │   surprise ──► sigmoid(bias + scale*surp) ──► gate    │           │                 │
+│   │                    │                                  │           │                 │
+│   │              gated_amp_mod = amp_mod * gate           │           │                 │
+│   │                    │                                  │           │                 │
+│   │   base_amplitudes * (1 + gated_amp_mod * max_mod)     │           │                 │
+│   │                    │                                  │           │                 │
+│   │                    ▼                                  │           │                 │
+│   │            modulated_amplitudes (N_osc,)              │           │                 │
+│   └───────────────────────┬───────────────────────────────┘           │                 │
+│                           │                                           │                 │
+│                           ▼                                           │                 │
+│   ┌───────────────────────────────────────────────────────┐           │                 │
+│   │              PHASE MODULATION                         │           │                 │
+│   │                                                       │           │                 │
+│   │   features ──► phase_modulator ──► phase_shift        │           │                 │
+│   │                                                       │           │                 │
+│   │   effective_phase = phases + freq_contrib + shift     │           │                 │
+│   │                     ▲                                 │           │                 │
+│   │                     │                                 │           │                 │
+│   │   phases (buffer) ──┘  (detached, carries state)      │           │                 │
+│   └───────────────────────┬───────────────────────────────┘           │                 │
+│                           │                                           │                 │
+│                           ▼                                           │                 │
+│   ┌───────────────────────────────────────────────────────┐           │                 │
+│   │              OSCILLATOR OUTPUT                        │           │                 │
+│   │                                                       │           │                 │
+│   │   memory_states = modulated_amps * sin(eff_phases)    │           │                 │
+│   │                           │                           │           │                 │
+│   │                           │ (num_oscillators,)        │           │                 │
+│   │                           │                           │           │                 │
+│   │                           ▼                           │           │                 │
+│   │                 ┌─────────────────┐                   │           │                 │
+│   │                 │  Memory Bank    │                   │           │                 │
+│   │                 │  64 oscillators │                   │           │                 │
+│   │                 │  periods: 8-4096│                   │           │                 │
+│   │                 └────────┬────────┘                   │           │                 │
+│   └──────────────────────────┼────────────────────────────┘           │                 │
+│                              │                                        │                 │
+│  ════════════════════════════╪════════════════════════════════════════╪═════════════   │
+│                              │        READ PATH                       │                 │
+│                              │                                        │                 │
+│                              ▼                                        ▼                 │
+│   ┌─────────────────────────────────────────────────────────────────────────────────┐  │
+│   │                        CROSS-ATTENTION READOUT                                  │  │
+│   │                                                                                 │  │
+│   │   Sync (B,S,sync_pairs) ──► osc_query_proj ──► Query (B,S,d_world)              │  │
+│   │                                                      │                          │  │
+│   │   Memory (num_osc,) ──► osc_key_proj ──► Key (B,1,d_world)                      │  │
+│   │                     └──► osc_value_proj ─► Value (B,1,d_world)                  │  │
+│   │                                                      │                          │  │
+│   │                              ┌───────────────────────┘                          │  │
+│   │                              ▼                                                  │  │
+│   │                     MultiheadAttention                                          │  │
+│   │                              │                                                  │  │
+│   │                              ▼                                                  │  │
+│   │                  attn_out (B,S,d_world)                                         │  │
+│   │                              │                                                  │  │
+│   │                              ▼                                                  │  │
+│   │              world_state = RMSNorm(attn_out + Query)                            │  │
+│   │                              │                                                  │  │
+│   │                              │  (B, S, d_world_output)                          │  │
+│   │                              │  Position-specific context!                      │  │
+│   │                              │                                                  │  │
+│   └──────────────────────────────┼──────────────────────────────────────────────────┘  │
+│                                  │                                                     │
+└──────────────────────────────────┼─────────────────────────────────────────────────────┘
+                                   │
+                                   ▼
+                    ┌───────────────────────────┐
+                    │    OUTPUT: world_state    │
+                    │    (B, S, d_world_output) │
+                    │                           │
+                    │    Each position has its  │
+                    │    own retrieved context  │
+                    │    from oscillator memory │
+                    └───────────────────────────┘
+```
+
+---
+
+## CTM Integration - How World State Affects Processing
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────┐
+│                          CTM CORE (Prediction, Surprise, Memory)                        │
+│                                                                                         │
+│   Inputs:                                                                               │
+│     - observation: (B, S, d_neurons)                                                    │
+│     - world_state: (B, S, d_world) position-specific  OR  (d_world,) broadcast          │
+│                                                                                         │
+│   ┌─────────────────────────────────────────────────────────────────────────────────┐   │
+│   │                         NLM INITIALIZATION (t=0)                                │   │
+│   │                                                                                 │   │
+│   │   x_embed ──► x_to_z0 ──► z_0 (B, S, d_neurons)                                 │   │
+│   │                              │                                                  │   │
+│   │   world_state ──► world_to_z0 ──► z_world                                       │   │
+│   │                                      │                                          │   │
+│   │                                      │  if world_state.dim() == 1:              │   │
+│   │                                      │      broadcast to (B, S, d_neurons)      │   │
+│   │                                      │  else:                                   │   │
+│   │                                      │      project (B, S, d_world) → (B,S,d_n) │   │
+│   │                                      │                                          │   │
+│   │                              z_t = z_0 + z_world  ◄────────────────────────────┘   │
+│   │                                      │                                          │   │
+│   │                                      │  World context biases initial state!     │   │
+│   │                                      │                                          │   │
+│   └──────────────────────────────────────┼──────────────────────────────────────────┘   │
+│                                          │                                              │
+│                                          ▼                                              │
+│   ┌─────────────────────────────────────────────────────────────────────────────────┐   │
+│   │                         NLM DYNAMICS (t=1..T)                                   │   │
+│   │                                                                                 │   │
+│   │   for t in range(T_ticks):                                                      │   │
+│   │       z_t = NLM.forward(z_t)                                                    │   │
+│   │       y_t = z_to_y(z_t)                                                         │   │
+│   │       all_tick_activations.append(z_t)                                          │   │
+│   │       all_tick_outputs.append(y_t)                                              │   │
+│   │                                                                                 │   │
+│   │   # Final tick output is the prediction                                         │   │
+│   │   predictions = y_T                                                             │   │
+│   │                                                                                 │   │
+│   └─────────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                         │
+└─────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Gradient Flow
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────┐
+│                              GRADIENT FLOW DIAGRAM                                      │
+│                                                                                         │
+│   Loss (prediction error)                                                               │
+│         │                                                                               │
+│         ▼                                                                               │
+│   CTM outputs ◄─── z_to_y                                                               │
+│         │                                                                               │
+│         ▼                                                                               │
+│   z_t (NLM dynamics) ◄─── NLM.forward()                                                 │
+│         │                                                                               │
+│         ▼                                                                               │
+│   z_0 = z_init + z_world                                                                │
+│         │              │                                                                │
+│         │              ▼                                                                │
+│         │      world_to_z0 ◄─── LEARNABLE                                               │
+│         │              │                                                                │
+│         │              ▼                                                                │
+│         │      world_state (from cross-attention)                                       │
+│         │              │                                                                │
+│         │              ▼                                                                │
+│         │      osc_cross_attn, osc_query_proj, etc. ◄─── LEARNABLE                      │
+│         │              │                                                                │
+│         │              ▼                                                                │
+│         │      memory_states = amps * sin(phases)                                       │
+│         │              │                                                                │
+│         │              ▼                                                                │
+│         │      modulated_amps ◄─── base_amplitudes ◄─── LEARNABLE                       │
+│         │              │                                                                │
+│         │              ▼                                                                │
+│         │      amp_modulator, phase_modulator ◄─── LEARNABLE                            │
+│         │              │                                                                │
+│         │              ▼                                                                │
+│         │      feature_compressor ◄─── LEARNABLE                                        │
+│         │              │                                                                │
+│         ▼              ▼                                                                │
+│   x_to_z0 ◄─── LEARNABLE                                                                │
+│                                                                                         │
+│   NOTE: phases buffer is DETACHED - carries state but doesn't need gradients            │
+│         frequencies get gradients through effective_phase computation                   │
+│                                                                                         │
+└─────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Tensor Shapes Summary
+
+| Tensor | Shape | Description |
+|--------|-------|-------------|
+| `features` | `(B, S, d_model)` | Token embeddings, content for memory |
+| `surprise` | `(B, S, 1)` | Surprise magnitude, gates memory writes |
+| `sync` | `(B, S, sync_pairs)` | Global sync state, queries memory |
+| `features_compressed` | `(d_feature_input,)` | Compressed features for writing |
+| `surprise_scalar` | `scalar` | Compressed surprise for gating |
+| `memory_states` | `(num_oscillators,)` | Oscillator outputs (64 values) |
+| `world_state` | `(B, S, d_world_output)` | Position-specific retrieved context |
+| `z_t` | `(B, S, d_neurons)` | NLM post-activations |
+| `all_tick_activations` | `List[(B, S, d_neurons)]` | History for sync computation |
+
+---
+
+## Key Design Decisions
+
+### 1. Content-based Memory (vs Sync-based)
+- **Original**: Sync patterns → Oscillators → World state
+- **Problem**: Sync captures HOW neurons fire together, not WHAT content
+- **Fix**: Features (content) → Oscillators, Sync → Query readout
+
+### 2. Surprise Gating
+- High surprise = unexpected = important to remember
+- `write_gate = sigmoid(bias + surprise * scale)`
+- Prevents writing mundane content, prioritizes novelty
+- **Best signal**: `attention_entropy` (per ablation tests)
+
+### 3. Position-Specific Readout (vs Broadcast)
+- **Original**: Single world_state vector broadcast to all positions
+- **Problem**: No position-specific context
+- **Fix**: Cross-attention where each position queries memory with its sync
+
+### 4. Oscillator Timescale Hierarchy
+```
+Oscillator 0:  period=8     → phrase-level memory (~8 tokens)
+Oscillator 31: period=512   → paragraph-level memory
+Oscillator 63: period=4096  → document-level memory (~4096 tokens)
+```
+
+---
+
+## File Locations
+
+| Component | File | Key Functions |
+|-----------|------|---------------|
+| PEM Loop | `pem/pem_loop_global.py` | `PEMLoopGlobal.forward()` |
+| Global Sync | `pem/global_sync.py` | `GlobalSyncModule.forward()` |
+| Oscillatory World | `pem/oscillatory_world.py` | `OscillatoryWorldState.forward()` |
+| CTM Core | `pem/ctm_base.py` | `CTMCore.forward()` |
+| Prediction CTM | `pem/prediction_ctm.py` | `PredictionCTM.forward()` |
+| Surprise CTM | `pem/surprise_ctm.py` | `SurpriseCTM.forward()` |
+| Training | `pem/train_pem_global.py` | Training loop |
+| Ablation Tests | `pem/run_ablation_tests.py` | Ablation experiments |
+
+---
+
+## Ablation Test Results (2026-01-21)
+
+### Results Table (sorted by loss, best to worst)
+
+| Configuration | Loss | Certainty | Loop Improvement | World State Benefit |
+|--------------|------|-----------|------------------|---------------------|
+| **no_aux_pred** | **0.0271** | 0.540 | **+0.0443** | +10.1% |
+| no_world_model | 0.0292 | 0.590 | +0.0165 | +0.0% |
+| **surprise_attn_entropy** | 0.0560 | **0.714** | +0.0182 | +64.6% |
+| surprise_pred_error | 0.0625 | 0.664 | +0.0171 | +86.0% |
+| multi_tick_injection | 0.0790 | 0.174 | +0.0046 | +28.3% |
+| baseline | 0.0805 | 0.624 | +0.0164 | +80.3% |
+| combined_best | 0.1102 | 0.020 | +0.0070 | +47.6% |
+| aux_pred_high_weight | 0.1711 | 0.553 | +0.0221 | +86.2% |
+
+### Key Findings
+
+1. **Auxiliary Prediction Loss - HURTS Performance**
+   - Disabling it achieved lowest loss (0.0271) - nearly 3x better than baseline
+   - **Recommendation: Keep disabled (default)**
+
+2. **Surprise Signal Types**
+   - `attention_entropy`: Best certainty (0.714), good loss
+   - `prediction_error`: Good balance
+   - **Recommendation: Use `attention_entropy` (now default)**
+
+3. **Multi-tick World Injection - Not Beneficial**
+   - Very low certainty (0.174) vs baseline (0.624)
+   - **Recommendation: Keep disabled (default)**
+
+4. **Combined Features - Worst Overall**
+   - Combining all features resulted in worst performance
+   - **Recommendation: Don't stack features**
+
+### Optimal Configuration
+
+```bash
+python -m pem.train_pem_global \
+    --dataset local \
+    --data_dir /path/to/texts \
+    --surprise_signal_type attention_entropy  # Default
+    # auxiliary prediction disabled by default
+    # multi-tick injection disabled by default
+```
+
+---
+
+## Configuration Options
+
+### Oscillatory World Model
+```python
+num_oscillators: int = 64           # Number of oscillators (memory slots)
+min_period: int = 8                 # Fastest oscillator (phrase-level)
+max_period: int = 4096              # Slowest oscillator (document-level)
+d_world_output: int = 256           # Output dimension of world state
+surprise_gate_bias: float = 0.5     # Base write strength
+surprise_gate_scale: float = 1.0    # Surprise sensitivity
+```
+
+### Surprise Signal
+```python
+surprise_signal_type: str = "attention_entropy"  # Best per ablation
+# Options: "ctm", "prediction_error", "attention_entropy"
+```
+
+### Auxiliary Prediction (disabled by default)
+```python
+use_auxiliary_prediction: bool = False  # Hurts performance per ablation
+auxiliary_prediction_horizon: int = 8
+auxiliary_prediction_weight: float = 0.1
+```
+
+### Multi-tick World Injection (disabled by default)
+```python
+multi_tick_world_injection: bool = False  # Low certainty per ablation
+```
+
+---
+
+## Future Directions
+
+1. **Hyperparameter tuning** - Optimize oscillator count and frequency range
+2. **Longer training** - More epochs/documents for better convergence
+3. **Alternative architectures** - Different readout mechanisms
+4. **Multi-document learning** - Cross-document knowledge transfer

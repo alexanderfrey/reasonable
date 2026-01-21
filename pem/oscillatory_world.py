@@ -38,6 +38,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+class OscillatorOutput(NamedTuple):
+    """Output from oscillatory world state forward pass."""
+    output: torch.Tensor           # (d_output,) projected world state
+    memory_states: torch.Tensor    # (num_oscillators,) raw oscillator values for cross-attention
+
+
 class OscillatorMetrics(NamedTuple):
     """Metrics from oscillatory world state for monitoring."""
     # Phase statistics
@@ -66,16 +72,23 @@ class OscillatorMetrics(NamedTuple):
 
 @dataclass
 class OscillatoryWorldConfig:
-    """Configuration for OscillatoryWorldState."""
+    """Configuration for OscillatoryWorldState.
+
+    New architecture: Content-based memory with surprise gating.
+    - Features (content) write to memory via amplitude modulation
+    - Surprise gates write strength (unexpected = important to remember)
+    - Sync queries memory via cross-attention (handled in GlobalSyncModule)
+    """
 
     # Oscillator parameters
-    num_oscillators: int = 64  # Number of oscillators
+    num_oscillators: int = 64  # Number of oscillators (memory slots)
     min_period: int = 8        # Fastest oscillator period (steps)
     max_period: int = 4096     # Slowest oscillator period (steps)
 
-    # Input/output dimensions
-    d_sync_input: int = 256    # Dimension of sync input for modulation
-    d_output: int = 256        # Output dimension
+    # Input dimensions
+    d_feature_input: int = 256  # Dimension of content features for writing
+    d_sync_input: int = 256     # Dimension of sync input (legacy, for compatibility)
+    d_output: int = 256         # Output dimension
 
     # Modulation network hidden dim
     modulation_hidden_mult: int = 2  # Hidden = num_oscillators * mult
@@ -83,6 +96,10 @@ class OscillatoryWorldConfig:
     # Constraints
     max_amp_modulation: float = 1.0   # Maximum amplitude modulation (Tanh output)
     max_phase_shift: float = 0.5      # Maximum phase shift per step (fraction of pi)
+
+    # Surprise gating
+    surprise_gate_bias: float = 0.5   # Base write strength (0.5 = moderate baseline)
+    surprise_gate_scale: float = 1.0  # How much surprise amplifies writing
 
     # Initialization
     init_amplitude_scale: float = 1.0  # Initial amplitude scale
@@ -141,24 +158,32 @@ class OscillatoryWorldState(nn.Module):
             torch.ones(N) * config.init_amplitude_scale
         )
 
-        # Amplitude modulation network
-        # Input: sync signal -> Output: amplitude scaling per oscillator
+        # === CONTENT WRITE PATH ===
+        # Amplitude modulation network: FEATURES -> what to store in each oscillator
+        # Input: content features -> Output: amplitude scaling per oscillator
         hidden_dim = N * config.modulation_hidden_mult
         self.amp_modulator = nn.Sequential(
-            nn.Linear(config.d_sync_input, hidden_dim),
+            nn.Linear(config.d_feature_input, hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, N),
             nn.Tanh(),  # Bound to [-1, 1] for stable modulation
         )
 
-        # Phase modulation network
-        # Input: sync signal -> Output: phase shift per oscillator
+        # Phase modulation network: FEATURES -> timing/phase encoding
+        # Input: content features -> Output: phase shift per oscillator
         self.phase_modulator = nn.Sequential(
-            nn.Linear(config.d_sync_input, hidden_dim),
+            nn.Linear(config.d_feature_input, hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, N),
             nn.Tanh(),  # Bound phase shifts
         )
+
+        # === SURPRISE GATING ===
+        # Surprise determines HOW STRONGLY to write (importance gate)
+        # Higher surprise = more important to remember
+        # surprise_gate = sigmoid(surprise_gate_bias + surprise * surprise_gate_scale)
+        self.surprise_gate_bias = config.surprise_gate_bias
+        self.surprise_gate_scale = config.surprise_gate_scale
 
         # Output projection: oscillator state -> d_output
         self.output_proj = nn.Linear(N, config.d_output)
@@ -209,41 +234,76 @@ class OscillatoryWorldState(nn.Module):
         if self.output_proj.bias is not None:
             nn.init.zeros_(self.output_proj.bias)
 
-    def forward(self, sync_input: torch.Tensor, dt: float = 1.0) -> torch.Tensor:
+    def forward(
+        self,
+        features: torch.Tensor,
+        surprise: Optional[torch.Tensor] = None,
+        dt: float = 1.0,
+    ) -> OscillatorOutput:
         """
-        Full forward pass: compute oscillator output with gradients flowing through
-        frequencies, base_amplitudes, and modulation networks.
+        Content-based memory write with surprise gating.
+
+        New architecture:
+        - Features (content) determine WHAT to store in each oscillator
+        - Surprise determines HOW STRONGLY to write (importance gate)
+        - Output provides memory states for cross-attention querying
 
         The key insight is that we keep self.phases as a DETACHED buffer (persistent
-        state), but compute DIFFERENTIABLE contributions on top of it. This allows
-        gradients to flow without in-place modification issues across PEM loop steps.
+        state), but compute DIFFERENTIABLE contributions on top of it.
 
         Gradient paths:
         - frequencies → freq_contribution → effective_phase → output
         - base_amplitudes → modulated_amps → output
-        - amp_modulator → amp_mod → modulated_amps → output
-        - phase_modulator → phase_shift → effective_phase → output
+        - features → amp_modulator → amp_mod → modulated_amps → output
+        - features → phase_modulator → phase_shift → effective_phase → output
+        - surprise → write_gate → modulated_amps → output
 
         Args:
-            sync_input: (d_sync_input,) compressed sync signal
+            features: (d_feature_input,) compressed content features
+            surprise: Optional scalar or (1,) surprise magnitude for gating
             dt: Time step for phase advance
 
         Returns:
-            (d_output,) world state vector
+            OscillatorOutput with projected output and raw memory states
         """
+        # === SURPRISE GATING ===
+        # Higher surprise = more important to remember = stronger write
+        if surprise is not None:
+            # Ensure surprise is a scalar
+            if surprise.numel() > 1:
+                surprise = surprise.mean()
+            # Compute write gate: sigmoid(bias + surprise * scale)
+            write_gate = torch.sigmoid(
+                self.surprise_gate_bias + surprise * self.surprise_gate_scale
+            )
+        else:
+            # Default: moderate write strength
+            write_gate = torch.tensor(
+                self.surprise_gate_bias,
+                device=features.device,
+                dtype=features.dtype
+            ).sigmoid()
+
         # === DIFFERENTIABLE COMPUTATIONS ===
 
         # Frequency contribution to phase (DIFFERENTIABLE w.r.t. frequencies)
         freq_contribution = 2 * math.pi * self.frequencies * dt
 
-        # Amplitude modulation (DIFFERENTIABLE w.r.t. amp_modulator and base_amplitudes)
-        amp_mod = self.amp_modulator(sync_input)  # (N,), in [-1, 1]
-        modulated_amps = self.base_amplitudes * (1 + amp_mod * self.config.max_amp_modulation)
+        # Amplitude modulation from FEATURES (DIFFERENTIABLE)
+        # Features determine WHAT content to store in each oscillator
+        amp_mod = self.amp_modulator(features)  # (N,), in [-1, 1]
+
+        # Apply surprise gate: scale the amplitude modulation by importance
+        # When surprise is high, we write more strongly
+        gated_amp_mod = amp_mod * write_gate
+
+        modulated_amps = self.base_amplitudes * (1 + gated_amp_mod * self.config.max_amp_modulation)
         modulated_amps = modulated_amps.clamp(min=0.0)
 
-        # Phase modulation (DIFFERENTIABLE w.r.t. phase_modulator)
-        phase_mod = self.phase_modulator(sync_input)  # (N,), in [-1, 1]
-        phase_shift = phase_mod * self.config.max_phase_shift * math.pi
+        # Phase modulation from FEATURES (DIFFERENTIABLE)
+        # Features also influence timing/phase encoding
+        phase_mod = self.phase_modulator(features)  # (N,), in [-1, 1]
+        phase_shift = phase_mod * self.config.max_phase_shift * math.pi * write_gate
 
         # === EFFECTIVE PHASE COMPUTATION ===
         # base_phase: detached accumulated phase from buffer (no gradients)
@@ -265,14 +325,16 @@ class OscillatoryWorldState(nn.Module):
             self._update_count.add_(1)
 
         # === COMPUTE OUTPUT ===
-        # osc_values: differentiable w.r.t. modulated_amps (-> base_amplitudes, amp_modulator)
-        #             and effective_phase (-> frequencies, phase_modulator)
-        osc_values = modulated_amps * torch.sin(effective_phase)
+        # osc_values: differentiable w.r.t. modulated_amps and effective_phase
+        # These are the raw oscillator states that serve as MEMORY
+        osc_values = modulated_amps * torch.sin(effective_phase)  # (num_oscillators,)
 
-        # Project to output dimension
+        # Project to output dimension (for legacy compatibility)
         output = self.output_proj(osc_values)  # (d_output,)
 
-        return output
+        # Return both projected output and raw oscillator values
+        # Raw values are used as memory keys/values for cross-attention
+        return OscillatorOutput(output=output, memory_states=osc_values)
 
     # Legacy methods for compatibility - now just call forward()
     def advance(self, dt: float = 1.0):

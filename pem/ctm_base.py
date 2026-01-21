@@ -103,6 +103,7 @@ class CTMBaseConfig:
     # When world_state is provided, z_0 is initialized from it instead of zeros
     d_world_state: int = 256     # Dimension of world state (must match GlobalSyncConfig.d_sync_state)
     use_world_state: bool = True # Enable world state initialization
+    multi_tick_world_injection: bool = False  # Inject world state at each tick (not just z_0)
 
 
 class RMSNorm(nn.Module):
@@ -482,8 +483,21 @@ class CTMCore(nn.Module):
                 nn.Linear(config.d_world_state, config.d_neurons),
                 nn.Tanh(),  # Same range as post-activations
             )
+            # Multi-tick injection: separate projection for each tick
+            # Uses smaller gain to avoid overwhelming the NLM dynamics
+            if config.multi_tick_world_injection:
+                self.world_to_tick = nn.Sequential(
+                    nn.Linear(config.d_world_state, config.d_neurons),
+                    nn.Tanh(),
+                )
+                # Initialize with smaller weights for subtle influence
+                with torch.no_grad():
+                    self.world_to_tick[0].weight.mul_(0.1)
+            else:
+                self.world_to_tick = None
         else:
             self.world_to_z0 = None
+            self.world_to_tick = None
 
         self.norm_out = RMSNorm(config.d_output)
 
@@ -566,11 +580,19 @@ class CTMCore(nn.Module):
         # Add world state bias to z_0 if provided (emergent world model influence)
         # This is the key mechanism: accumulated sync patterns bias initial attention
         if world_state is not None and self.world_to_z0 is not None:
-            # world_state: (d_world_state,) -> (d_neurons,)
-            z_world = self.world_to_z0(world_state)  # (d_neurons,)
-            z_world_for_monitoring = z_world.clone()
-            # Broadcast to all batch items and sequence positions
-            z_t = z_t + z_world.unsqueeze(0).unsqueeze(0)  # (B, S, d_neurons)
+            # Handle both shapes:
+            # - (d_world_state,): broadcast mode (old behavior)
+            # - (B, S, d_world_state): position-specific mode (with cross-attention)
+            if world_state.dim() == 1:
+                # Broadcast mode: (d_world_state,) -> (d_neurons,) -> (B, S, d_neurons)
+                z_world = self.world_to_z0(world_state)  # (d_neurons,)
+                z_world_for_monitoring = z_world.clone()
+                z_t = z_t + z_world.unsqueeze(0).unsqueeze(0)  # (B, S, d_neurons)
+            else:
+                # Position-specific mode: (B, S, d_world_state) -> (B, S, d_neurons)
+                z_world = self.world_to_z0(world_state)  # (B, S, d_neurons)
+                z_world_for_monitoring = z_world.mean(dim=(0, 1)).clone()  # For monitoring
+                z_t = z_t + z_world  # (B, S, d_neurons) - each position gets its own bias
 
         # Initialize observation (attended features) for first tick
         # Before sync is available, use projected input features
@@ -609,6 +631,18 @@ class CTMCore(nn.Module):
 
             # 3. NLM: process history -> post-activations
             z_t_new = self.nlm(A_history)
+
+            # 3.5. Multi-tick world state injection (optional)
+            # Inject world context at each tick for continuous influence
+            if world_state is not None and self.world_to_tick is not None:
+                if world_state.dim() == 1:
+                    # Broadcast mode
+                    tick_world = self.world_to_tick(world_state)
+                    z_t_new = z_t_new + tick_world.unsqueeze(0).unsqueeze(0)
+                else:
+                    # Position-specific mode
+                    tick_world = self.world_to_tick(world_state)
+                    z_t_new = z_t_new + tick_world
 
             # 4. Update post-activation history
             Z_history.append(z_t_new)
