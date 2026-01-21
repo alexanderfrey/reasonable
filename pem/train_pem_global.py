@@ -961,9 +961,14 @@ def train_step(
     # Add detailed world state metrics from monitor
     metrics.update(world_state_metrics)
 
-    # Add update gate value if available (how much new info is incorporated)
-    if final_output.global_sync.update_gate_value is not None:
-        metrics['world_state/update_gate'] = final_output.global_sync.update_gate_value.item()
+    # Add oscillator metrics if available (from oscillatory world model)
+    if final_output.global_sync.oscillator_metrics is not None:
+        osc_metrics = final_output.global_sync.oscillator_metrics
+        # OscillatorMetrics is a NamedTuple, convert to dict
+        osc_dict = osc_metrics._asdict() if hasattr(osc_metrics, '_asdict') else osc_metrics
+        for key, value in osc_dict.items():
+            if isinstance(value, (int, float)):
+                metrics[f'world_state/osc_{key}'] = value
 
     if return_outputs:
         return metrics, outputs, targets

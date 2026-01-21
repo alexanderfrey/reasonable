@@ -209,108 +209,20 @@ class OscillatoryWorldState(nn.Module):
         if self.output_proj.bias is not None:
             nn.init.zeros_(self.output_proj.bias)
 
-    def advance(self, dt: float = 1.0):
-        """
-        Advance oscillator phases by one time step.
-
-        This is deterministic - phases evolve based on learned frequencies.
-        Called once per forward pass (page/batch).
-
-        Args:
-            dt: Time step size (default 1.0)
-        """
-        # Phase advance: φ += 2π * f * dt
-        # Use detach to ensure no gradients flow through phase accumulation
-        # (we want gradients through frequency, not through accumulated phase)
-        phase_delta = 2 * math.pi * self.frequencies.detach() * dt
-        self.phases = (self.phases + phase_delta) % (2 * math.pi)
-        self._update_count = self._update_count + 1
-
-    def modulate(self, sync_input: torch.Tensor):
-        """
-        Apply learned modulation based on sync input.
-
-        THIS IS WHERE GRADIENTS FLOW! The modulation networks learn
-        how to adjust oscillator amplitudes and phases based on input.
-
-        Args:
-            sync_input: (d_sync_input,) compressed sync signal
-        """
-        # Amplitude modulation: scale base amplitudes
-        amp_mod = self.amp_modulator(sync_input)  # (N,), in [-1, 1]
-        self._last_amp_mod = amp_mod.detach()
-
-        # Modulated amplitude = base * (1 + amp_mod)
-        # With Tanh output, this gives range [0, 2] * base
-        # Using clamp to ensure non-negative
-        modulated_amps = self.base_amplitudes * (1 + amp_mod * self.config.max_amp_modulation)
-        modulated_amps = modulated_amps.clamp(min=0.0)
-
-        # Phase modulation: shift phases
-        phase_mod = self.phase_modulator(sync_input)  # (N,), in [-1, 1]
-        self._last_phase_mod = phase_mod.detach()
-
-        # Scale phase shift to max_phase_shift * π
-        # This is kept differentiable for use in read()
-        phase_shift = phase_mod * self.config.max_phase_shift * math.pi
-
-        # Update stored phases (non-differentiable - we don't backprop through history)
-        with torch.no_grad():
-            self.phases = (self.phases + phase_shift.detach()) % (2 * math.pi)
-            self.current_amplitudes = modulated_amps.detach()
-
-        # Store the modulated values for use in read()
-        # These maintain the gradient graph for backprop through modulation networks
-        self._modulated_amps_for_read = modulated_amps
-        self._phase_shift_for_read = phase_shift  # Keep phase shift differentiable
-
-    def read(self) -> torch.Tensor:
-        """
-        Read current oscillator state as output vector.
-
-        The oscillator output is computed as: A * sin(φ_base + φ_shift)
-        where A (amplitude) and φ_shift (phase modulation) are differentiable.
-
-        Returns:
-            (d_output,) world state vector
-        """
-        # Get amplitudes (differentiable if just modulated)
-        if hasattr(self, '_modulated_amps_for_read'):
-            amps = self._modulated_amps_for_read
-        else:
-            amps = self.current_amplitudes
-
-        # Get phase shift (differentiable if just modulated)
-        if hasattr(self, '_phase_shift_for_read'):
-            # Compute output with differentiable phase shift:
-            # sin(base_phase + phase_shift)
-            # Note: base_phase is already updated by advance(), so we need to
-            # subtract the detached shift to get the "pre-modulated" phase,
-            # then add the differentiable shift
-            # Simpler: just use sin(phase_buffer - detached_shift + diff_shift)
-            # = sin(phase_buffer + (diff_shift - detached_shift))
-            # = sin(phase_buffer) when diff_shift == detached_shift (same computation)
-            # But for gradients, we use: sin(phase_buffer - 0 + phase_shift)
-            # Actually, since phase_buffer already includes the shift, we compute:
-            # output = A * sin(φ)  where we want ∂output/∂phase_shift
-            # Using the trick: sin(a + b) = sin(a)cos(b) + cos(a)sin(b)
-            # If b is small (phase_shift is bounded), we can approximate
-            # For exact gradients: compute sin(base + shift) where base is detached
-            base_phase = self.phases - self._phase_shift_for_read.detach()
-            effective_phase = base_phase + self._phase_shift_for_read  # Differentiable!
-            osc_values = amps * torch.sin(effective_phase)
-        else:
-            # Fallback: no differentiable phase shift
-            osc_values = amps * torch.sin(self.phases)
-
-        # Project to output dimension
-        output = self.output_proj(osc_values)  # (d_output,)
-
-        return output
-
     def forward(self, sync_input: torch.Tensor, dt: float = 1.0) -> torch.Tensor:
         """
-        Full forward pass: advance, modulate, read.
+        Full forward pass: compute oscillator output with gradients flowing through
+        frequencies, base_amplitudes, and modulation networks.
+
+        The key insight is that we keep self.phases as a DETACHED buffer (persistent
+        state), but compute DIFFERENTIABLE contributions on top of it. This allows
+        gradients to flow without in-place modification issues across PEM loop steps.
+
+        Gradient paths:
+        - frequencies → freq_contribution → effective_phase → output
+        - base_amplitudes → modulated_amps → output
+        - amp_modulator → amp_mod → modulated_amps → output
+        - phase_modulator → phase_shift → effective_phase → output
 
         Args:
             sync_input: (d_sync_input,) compressed sync signal
@@ -319,9 +231,63 @@ class OscillatoryWorldState(nn.Module):
         Returns:
             (d_output,) world state vector
         """
-        self.advance(dt)
-        self.modulate(sync_input)
-        return self.read()
+        # === DIFFERENTIABLE COMPUTATIONS ===
+
+        # Frequency contribution to phase (DIFFERENTIABLE w.r.t. frequencies)
+        freq_contribution = 2 * math.pi * self.frequencies * dt
+
+        # Amplitude modulation (DIFFERENTIABLE w.r.t. amp_modulator and base_amplitudes)
+        amp_mod = self.amp_modulator(sync_input)  # (N,), in [-1, 1]
+        modulated_amps = self.base_amplitudes * (1 + amp_mod * self.config.max_amp_modulation)
+        modulated_amps = modulated_amps.clamp(min=0.0)
+
+        # Phase modulation (DIFFERENTIABLE w.r.t. phase_modulator)
+        phase_mod = self.phase_modulator(sync_input)  # (N,), in [-1, 1]
+        phase_shift = phase_mod * self.config.max_phase_shift * math.pi
+
+        # === EFFECTIVE PHASE COMPUTATION ===
+        # base_phase: detached accumulated phase from buffer (no gradients)
+        # freq_contribution: differentiable (gradients to frequencies)
+        # phase_shift: differentiable (gradients to phase_modulator)
+        effective_phase = self.phases.detach() + freq_contribution + phase_shift
+
+        # === UPDATE BUFFER FOR NEXT CALL (detached) ===
+        with torch.no_grad():
+            # Store modulation values for monitoring
+            self._last_amp_mod.copy_(amp_mod.detach())
+            self._last_phase_mod.copy_(phase_mod.detach())
+            self.current_amplitudes.copy_(modulated_amps.detach())
+
+            # Update phase buffer: accumulated_phase + freq + phase_shift
+            # This is the state that will be used in the NEXT forward call
+            new_phases = (self.phases + freq_contribution.detach() + phase_shift.detach()) % (2 * math.pi)
+            self.phases.copy_(new_phases)
+            self._update_count.add_(1)
+
+        # === COMPUTE OUTPUT ===
+        # osc_values: differentiable w.r.t. modulated_amps (-> base_amplitudes, amp_modulator)
+        #             and effective_phase (-> frequencies, phase_modulator)
+        osc_values = modulated_amps * torch.sin(effective_phase)
+
+        # Project to output dimension
+        output = self.output_proj(osc_values)  # (d_output,)
+
+        return output
+
+    # Legacy methods for compatibility - now just call forward()
+    def advance(self, dt: float = 1.0):
+        """Legacy method - phase advance is now integrated into forward()."""
+        pass  # No-op, advance happens in forward()
+
+    def modulate(self, sync_input: torch.Tensor):
+        """Legacy method - modulation is now integrated into forward()."""
+        pass  # No-op, modulation happens in forward()
+
+    def read(self) -> torch.Tensor:
+        """Legacy method - reading is now integrated into forward()."""
+        # Return current state projection (no differentiable modulation)
+        osc_values = self.current_amplitudes * torch.sin(self.phases)
+        return self.output_proj(osc_values)
 
     def reset_phases(self, random: bool = True):
         """
@@ -337,6 +303,15 @@ class OscillatoryWorldState(nn.Module):
                 self.phases.zero_()
             self.current_amplitudes.copy_(self.base_amplitudes)
             self._update_count.zero_()
+
+    def detach_state(self):
+        """
+        Detach persistent state from computation graph.
+
+        With the new forward() implementation, the buffer is always kept detached,
+        so this method is now a no-op. Kept for API compatibility.
+        """
+        pass  # Buffer is always detached in new implementation
 
     def get_oscillator_state(self) -> Dict[str, torch.Tensor]:
         """Get current oscillator state for monitoring."""

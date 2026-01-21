@@ -32,7 +32,14 @@ def test_ctm_base():
 
     # Test forward
     x = torch.randn(2, 16, 512)  # (B, S, d_input)
-    post_act, sync_matrix, output, all_outputs, all_activations = core(x)
+    result = core(x)
+
+    # CTMCore now returns CTMCoreOutput NamedTuple
+    post_act = result.post_activations
+    sync_matrix = result.sync_matrix
+    output = result.output
+    all_outputs = result.all_outputs
+    all_activations = result.all_activations
 
     print(f"Input: {x.shape}")
     print(f"Post-activations: {post_act.shape}")
