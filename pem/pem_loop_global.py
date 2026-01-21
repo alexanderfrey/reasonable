@@ -283,6 +283,7 @@ class PEMLoopGlobalConfig:
     min_period: int = 8                 # Fastest oscillator period
     max_period: int = 4096              # Slowest oscillator period
     d_world_output: int = 256           # Output dimension of world state
+    d_osc_embed: int = 64               # Per-oscillator embedding dim for cross-attention
     surprise_gate_bias: float = 0.5     # Base write strength for surprise gating
     surprise_gate_scale: float = 1.0    # How much surprise amplifies writing
 
@@ -519,6 +520,7 @@ class PEMLoopGlobal(nn.Module):
             min_period=config.min_period,
             max_period=config.max_period,
             d_world_output=config.d_world_output,
+            d_osc_embed=config.d_osc_embed,  # Per-oscillator embedding for cross-attention
             d_feature_input=config.d_model,  # Content features for memory writing
             surprise_gate_bias=config.surprise_gate_bias,
             surprise_gate_scale=config.surprise_gate_scale,

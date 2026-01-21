@@ -96,18 +96,21 @@
 │   │   │   │                 └──────────┬──────────┘                             │     │  │
 │   │   │   └────────────────────────────┼───────────────────────────────────────┘     │  │
 │   │   │                                │                                             │  │
-│   │   │   READ PATH (sync-queried):    │                                             │  │
+│   │   │   READ PATH (sync-queried, attends over 64 oscillators):                    │  │
 │   │   │   ┌────────────────────────────┼───────────────────────────────────────┐     │  │
 │   │   │   │                            ▼                                       │     │  │
-│   │   │   │  global_sync ──► Query projection ──► Q (B,S,d_world)              │     │  │
-│   │   │   │  memory_states ──► Key projection ──► K (1,64,d_world)             │     │  │
-│   │   │   │               └──► Value projection ─► V (1,64,d_world)            │     │  │
+│   │   │   │  global_sync ──► Query projection ──► Q (B, S, d_world)            │     │  │
 │   │   │   │                                                                    │     │  │
-│   │   │   │              MultiheadAttention(Q, K, V)                           │     │  │
+│   │   │   │  osc_embeddings (64, d_embed) * (1 + memory_states)                │     │  │
+│   │   │   │       │                                                            │     │  │
+│   │   │   │       ├──► Key projection ──► K (B, 64, d_world)                   │     │  │
+│   │   │   │       └──► Value projection ─► V (B, 64, d_world)                  │     │  │
+│   │   │   │                                                                    │     │  │
+│   │   │   │  MultiheadAttention(Q, K, V) - selects among 64 oscillators!       │     │  │
 │   │   │   │                          │                                         │     │  │
 │   │   │   │                          ▼                                         │     │  │
 │   │   │   │              world_state (B, S, d_world)                           │     │  │
-│   │   │   │              (position-specific context!)                          │     │  │
+│   │   │   │              (position-specific weighted combination)              │     │  │
 │   │   │   └────────────────────────────┬───────────────────────────────────────┘     │  │
 │   │   │                                │                                             │  │
 │   │   └────────────────────────────────┼─────────────────────────────────────────────┘  │
@@ -246,6 +249,9 @@
 │     - amp_modulator: MLP (256 → 128 → 64) content → amplitude       │
 │     - phase_modulator: MLP (256 → 128 → 64) content → phase         │
 │     - output_proj: Linear (64 → 256)                                │
+│     - osc_embeddings: (64, 64) per-oscillator learned embeddings    │
+│     - osc_key_proj: Linear (64 → 256) per-oscillator key            │
+│     - osc_value_proj: Linear (64 → 256) per-oscillator value        │
 │                                                                     │
 │   RUNTIME BUFFERS (persistent state):                               │
 │     - phases: (64,) current phase of each oscillator                │

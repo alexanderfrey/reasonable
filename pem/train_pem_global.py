@@ -1236,6 +1236,8 @@ def main():
                         help='Slowest oscillator period (document-level ~4096 tokens)')
     parser.add_argument('--d_world_output', type=int, default=256,
                         help='Output dimension of world state')
+    parser.add_argument('--d_osc_embed', type=int, default=64,
+                        help='Per-oscillator embedding dimension for cross-attention')
     parser.add_argument('--surprise_gate_bias', type=float, default=0.5,
                         help='Base write strength for surprise gating (0.5 = moderate baseline)')
     parser.add_argument('--surprise_gate_scale', type=float, default=1.0,
@@ -1358,6 +1360,7 @@ def main():
         min_period=args.min_period,
         max_period=args.max_period,
         d_world_output=args.d_world_output,
+        d_osc_embed=args.d_osc_embed,
         surprise_gate_bias=args.surprise_gate_bias,
         surprise_gate_scale=args.surprise_gate_scale,
         # Auxiliary prediction (disabled by default per ablation results)

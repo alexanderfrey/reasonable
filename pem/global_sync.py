@@ -123,6 +123,7 @@ class GlobalSyncConfig:
     # When False, world_state output is (d_world_output,) - broadcast to all positions
     use_oscillator_cross_attention: bool = True
     osc_cross_attn_heads: int = 4
+    d_osc_embed: int = 64  # Per-oscillator embedding dimension for cross-attention
 
     # Auxiliary prediction loss (train oscillators to predict future)
     # When enabled, oscillator memory states are used to predict future features
@@ -535,12 +536,23 @@ class GlobalSyncModule(nn.Module):
 
             # Cross-attention: positions attend to oscillator memory
             # Query: sync (B, S, sync_pairs) -> each position queries based on its sync pattern
-            # Key/Value: oscillator states (num_oscillators,) -> memory bank
+            # Key/Value: 64 oscillators, each as a separate key-value pair
             # Output: (B, S, d_world_output) -> position-specific world context
             if config.use_oscillator_cross_attention:
+                # Learnable embedding per oscillator (like positional embeddings)
+                # Each oscillator gets a learned representation that encodes its "role"
+                self.osc_embeddings = nn.Parameter(
+                    torch.randn(config.num_oscillators, config.d_osc_embed) * 0.02
+                )
+
+                # Query projection: sync -> d_world_output
                 self.osc_query_proj = nn.Linear(config.sync_pairs, config.d_world_output)
-                self.osc_key_proj = nn.Linear(config.num_oscillators, config.d_world_output)
-                self.osc_value_proj = nn.Linear(config.num_oscillators, config.d_world_output)
+
+                # Key/Value projections: per-oscillator embedding -> d_world_output
+                # Input: (num_oscillators, d_osc_embed), Output: (num_oscillators, d_world_output)
+                self.osc_key_proj = nn.Linear(config.d_osc_embed, config.d_world_output)
+                self.osc_value_proj = nn.Linear(config.d_osc_embed, config.d_world_output)
+
                 self.osc_cross_attn = nn.MultiheadAttention(
                     embed_dim=config.d_world_output,
                     num_heads=config.osc_cross_attn_heads,
@@ -549,6 +561,7 @@ class GlobalSyncModule(nn.Module):
                 )
                 self.osc_output_norm = RMSNorm(config.d_world_output)
             else:
+                self.osc_embeddings = None
                 self.osc_query_proj = None
                 self.osc_key_proj = None
                 self.osc_value_proj = None
@@ -747,14 +760,28 @@ class GlobalSyncModule(nn.Module):
                 # (B, S, sync_pairs) -> (B, S, d_world_output)
                 query = self.osc_query_proj(sync)
 
-                # Key/Value: oscillator memory states
-                # (num_oscillators,) -> (1, 1, d_world_output) -> (B, 1, d_world_output)
-                memory = osc_output.memory_states
-                key = self.osc_key_proj(memory).unsqueeze(0).unsqueeze(0).expand(B, -1, -1)
-                value = self.osc_value_proj(memory).unsqueeze(0).unsqueeze(0).expand(B, -1, -1)
+                # Key/Value: each oscillator is a separate key-value pair
+                # memory_states: (num_oscillators,) - scalar state per oscillator
+                # osc_embeddings: (num_oscillators, d_osc_embed) - learned embedding per oscillator
+                memory = osc_output.memory_states  # (num_oscillators,)
 
-                # Cross-attention: each position queries what's relevant from memory
-                # Output: (B, S, d_world_output) - position-specific world context
+                # Modulate embeddings by oscillator state: embedding * (1 + state)
+                # This allows the memory content to influence what's retrieved
+                # state > 0: amplify embedding, state < 0: flip sign, state = 0: suppress
+                modulated_embeddings = self.osc_embeddings * (1.0 + memory.unsqueeze(-1))
+                # modulated_embeddings: (num_oscillators, d_osc_embed)
+
+                # Project to key/value: (num_oscillators, d_osc_embed) -> (num_oscillators, d_world_output)
+                key = self.osc_key_proj(modulated_embeddings)    # (num_osc, d_world)
+                value = self.osc_value_proj(modulated_embeddings)  # (num_osc, d_world)
+
+                # Expand for batch: (num_osc, d_world) -> (B, num_osc, d_world)
+                key = key.unsqueeze(0).expand(B, -1, -1)
+                value = value.unsqueeze(0).expand(B, -1, -1)
+
+                # Cross-attention: each position queries the 64 oscillators
+                # Query: (B, S, d_world), Key: (B, 64, d_world), Value: (B, 64, d_world)
+                # Output: (B, S, d_world) - position-specific weighted combination of oscillators
                 attn_out, _ = self.osc_cross_attn(query, key, value)
                 world_state = self.osc_output_norm(attn_out + query)  # Residual + norm
             else:
