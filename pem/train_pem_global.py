@@ -472,6 +472,19 @@ def compute_detailed_metrics(
     """
     metrics = {}
 
+    def safe_corr(a: torch.Tensor, b: torch.Tensor) -> float:
+        a = a.float().reshape(-1)
+        b = b.float().reshape(-1)
+        if a.numel() == 0 or b.numel() == 0:
+            return 0.0
+        a = a - a.mean()
+        b = b - b.mean()
+        denom = a.std(unbiased=False) * b.std(unbiased=False) + 1e-8
+        denom_val = denom.item()
+        if denom_val == 0:
+            return 0.0
+        return (a * b).mean().item() / denom_val
+
     # Track per-step metrics for finding best step (LOOP level)
     step_losses = []           # Overall prediction loss
     step_certainties = []      # Combined certainty
@@ -487,6 +500,7 @@ def compute_detailed_metrics(
     pred_certain_ticks = []    # Which internal tick was most certain
     surp_best_ticks = []       # Which internal tick was best for surprise
     surp_certain_ticks = []    # Which internal tick was most certain
+    pred_tick_spreads = []     # Std of tick losses (diversity)
 
     for step_idx, output in enumerate(outputs):
         step_loss = 0.0
@@ -543,6 +557,8 @@ def compute_detailed_metrics(
                 tick_losses.append(tick_loss)
 
             pred_best_ticks.append(int(np.argmin(tick_losses)))
+            if tick_losses:
+                pred_tick_spreads.append(float(np.std(tick_losses)))
 
             # Compute certainties from output stability
             if len(pred_out.all_tick_outputs) > 1:
@@ -602,12 +618,22 @@ def compute_detailed_metrics(
         # Average which internal ticks are being selected
         if pred_best_ticks:
             metrics['ctm_pred_avg_best_tick'] = float(np.mean(pred_best_ticks))
+            metrics['ctm/pred_t1_mean'] = float(np.mean(pred_best_ticks))
         if pred_certain_ticks:
             metrics['ctm_pred_avg_certain_tick'] = float(np.mean(pred_certain_ticks))
+            metrics['ctm/pred_t2_mean'] = float(np.mean(pred_certain_ticks))
         if surp_best_ticks:
             metrics['ctm_surp_avg_best_tick'] = float(np.mean(surp_best_ticks))
         if surp_certain_ticks:
             metrics['ctm_surp_avg_certain_tick'] = float(np.mean(surp_certain_ticks))
+        if pred_best_ticks and pred_certain_ticks:
+            pair_count = min(len(pred_best_ticks), len(pred_certain_ticks))
+            agreement = sum(
+                1 for i in range(pair_count) if pred_best_ticks[i] == pred_certain_ticks[i]
+            ) / max(pair_count, 1)
+            metrics['ctm/t1_t2_agreement'] = float(agreement)
+        if pred_tick_spreads:
+            metrics['ctm/tick_loss_spread'] = float(np.mean(pred_tick_spreads))
 
         # Final step metrics (for monitoring convergence)
         metrics['final_step_loss'] = step_losses[-1]
@@ -625,10 +651,33 @@ def compute_detailed_metrics(
             metrics['cross_sync_pred_surp'] = 0.0
             metrics['cross_sync_surp_pred'] = 0.0
 
+        # Loop loss trajectory
+        metrics['loop/loss_step0'] = step_losses[0] if len(step_losses) > 0 else 0.0
+        metrics['loop/loss_step1'] = step_losses[1] if len(step_losses) > 1 else 0.0
+        metrics['loop/loss_stepN'] = step_losses[-1] if len(step_losses) > 0 else 0.0
+        if len(step_losses) > 1:
+            monotonic = sum(
+                1 for i in range(1, len(step_losses)) if step_losses[i] <= step_losses[i - 1]
+            ) / (len(step_losses) - 1)
+            metrics['loop/monotonic_improve'] = float(monotonic)
+
+        # Oscillator attention entropy evolution across loop steps
+        e0 = outputs[0].global_sync.osc_attn_entropy if outputs[0].global_sync is not None else None
+        eN = outputs[-1].global_sync.osc_attn_entropy if outputs[-1].global_sync is not None else None
+        if e0 is not None and eN is not None:
+            metrics['osc_xattn/entropy_step0'] = float(e0)
+            metrics['osc_xattn/entropy_stepN'] = float(eN)
+            metrics['osc_xattn/entropy_delta'] = float(eN - e0)
+
     # Improvement across steps (did iterating help?)
     if len(outputs) > 1:
         metrics['loss_improvement'] = step_losses[0] - step_losses[-1]  # Positive = improved
         metrics['certainty_improvement'] = step_certainties[-1] - step_certainties[0]  # Positive = improved
+        obs_0 = outputs[0].observation
+        obs_1 = outputs[1].observation
+        obs_n = outputs[-1].observation
+        metrics['loop/obs_delta_01'] = (obs_1 - obs_0).norm().item() / (obs_0.numel() ** 0.5)
+        metrics['loop/obs_delta_total'] = (obs_n - obs_0).norm().item() / (obs_0.numel() ** 0.5)
 
     # ===== TICK EVOLUTION METRICS (for internal obs residual monitoring) =====
     # Compute how much activations change across internal ticks
@@ -660,6 +709,21 @@ def compute_detailed_metrics(
             metrics['tick_surp_late_delta'] = sum(surp_deltas[-2:]) if len(surp_deltas) >= 2 else surp_deltas[-1]
             metrics['tick_surp_first_delta'] = surp_deltas[0] if surp_deltas else 0
             metrics['tick_surp_plateau'] = 1.0 if (surp_deltas and surp_deltas[-1] < surp_deltas[0] * 0.1) else 0.0
+
+        # Surprise-prediction coupling (final step)
+        if surp_out is not None:
+            pred = final_out.predictions['immediate']
+            target = targets['immediate']
+            valid = targets.get('immediate_valid', None)
+            pred_err = 1 - F.cosine_similarity(pred, target, dim=-1)  # (B, S)
+            surp_mag = surp_out.magnitude.squeeze(-1)
+            surp_raw = surp_out.raw.squeeze(-1)
+            if valid is not None and valid.any():
+                pred_err = pred_err[valid]
+                surp_mag = surp_mag[valid]
+                surp_raw = surp_raw[valid]
+            metrics['surprise/pred_error_corr'] = safe_corr(pred_err, surp_mag)
+            metrics['surprise/raw_vs_calibrated'] = safe_corr(surp_raw, surp_mag)
 
     return metrics
 
@@ -872,6 +936,69 @@ def compute_nlm_metrics(model: PEMLoopGlobal) -> Dict[str, float]:
     if hasattr(surp_synapse, 'out') and surp_synapse.out.weight.grad is not None:
         metrics['synapse_surp/out_grad_norm'] = surp_synapse.out.weight.grad.norm().item()
 
+    # Oscillator cross-attention gradients (critical for oscillator selection learning)
+    global_sync = model.global_sync
+    if hasattr(global_sync, 'osc_embeddings') and global_sync.osc_embeddings is not None:
+        metrics['osc_xattn/embed_norm'] = global_sync.osc_embeddings.norm().item()
+        if global_sync.osc_embeddings.grad is not None:
+            metrics['osc_xattn/embed_grad'] = global_sync.osc_embeddings.grad.norm().item()
+        else:
+            metrics['osc_xattn/embed_grad'] = 0.0
+
+    if hasattr(global_sync, 'osc_query_proj') and global_sync.osc_query_proj is not None:
+        metrics['osc_xattn/query_norm'] = global_sync.osc_query_proj.weight.norm().item()
+        if global_sync.osc_query_proj.weight.grad is not None:
+            metrics['osc_xattn/query_grad'] = global_sync.osc_query_proj.weight.grad.norm().item()
+        else:
+            metrics['osc_xattn/query_grad'] = 0.0
+
+    if hasattr(global_sync, 'osc_key_proj') and global_sync.osc_key_proj is not None:
+        metrics['osc_xattn/key_norm'] = global_sync.osc_key_proj.weight.norm().item()
+        if global_sync.osc_key_proj.weight.grad is not None:
+            metrics['osc_xattn/key_grad'] = global_sync.osc_key_proj.weight.grad.norm().item()
+        else:
+            metrics['osc_xattn/key_grad'] = 0.0
+
+    if hasattr(global_sync, 'osc_value_proj') and global_sync.osc_value_proj is not None:
+        metrics['osc_xattn/value_norm'] = global_sync.osc_value_proj.weight.norm().item()
+        if global_sync.osc_value_proj.weight.grad is not None:
+            metrics['osc_xattn/value_grad'] = global_sync.osc_value_proj.weight.grad.norm().item()
+        else:
+            metrics['osc_xattn/value_grad'] = 0.0
+
+    # Gate gradient monitoring
+    gate_params = list(model.state_combiner_gate.parameters())
+    gate_grad_sq = 0.0
+    for p in gate_params:
+        if p.grad is not None:
+            gate_grad_sq += p.grad.norm().item() ** 2
+    metrics['gate/grad_norm'] = math.sqrt(gate_grad_sq) if gate_grad_sq > 0 else 0.0
+
+    # Relative update monitoring (are queries doing all the learning?)
+    query_grad = metrics.get('osc_xattn/query_grad', 0.0)
+    key_grad = metrics.get('osc_xattn/key_grad', 0.0)
+    value_grad = metrics.get('osc_xattn/value_grad', 0.0)
+    query_norm = metrics.get('osc_xattn/query_norm', 0.0)
+    key_norm = metrics.get('osc_xattn/key_norm', 0.0)
+    value_norm = metrics.get('osc_xattn/value_norm', 0.0)
+    eps = 1e-12
+    if query_norm > 0:
+        metrics['osc_xattn/query_rel_update'] = query_grad / (query_norm + eps)
+    else:
+        metrics['osc_xattn/query_rel_update'] = 0.0
+    if key_norm > 0:
+        metrics['osc_xattn/key_rel_update'] = key_grad / (key_norm + eps)
+    else:
+        metrics['osc_xattn/key_rel_update'] = 0.0
+    if value_norm > 0:
+        metrics['osc_xattn/value_rel_update'] = value_grad / (value_norm + eps)
+    else:
+        metrics['osc_xattn/value_rel_update'] = 0.0
+    metrics['osc_xattn/qk_grad_ratio'] = query_grad / (key_grad + eps)
+    metrics['osc_xattn/qk_rel_update_ratio'] = (
+        metrics['osc_xattn/query_rel_update'] / (metrics['osc_xattn/key_rel_update'] + eps)
+    )
+
     return metrics
 
 
@@ -933,6 +1060,9 @@ def train_step(
             'oscillator/output_mean': osc_metrics.output_mean,
             'oscillator/output_std': osc_metrics.output_std,
         }
+        # Add cross-attention entropy (measures diversity of oscillator selection)
+        if final_output.global_sync.osc_attn_entropy is not None:
+            world_state_metrics['oscillator/attn_entropy'] = final_output.global_sync.osc_attn_entropy
 
     # NOTE: Oscillatory world model evolves continuously during forward pass
     # No commit_world_state() needed - oscillators advance and modulate automatically
@@ -973,11 +1103,22 @@ def train_step(
         metrics['gate/std'] = gate_values.std().item()
         metrics['gate/min'] = gate_values.min().item()
         metrics['gate/max'] = gate_values.max().item()
+        metrics['gate/position_variance'] = gate_values.var(dim=1, unbiased=False).mean().item()
         # Also track how much loop_features differ from raw features
         transformed = model.state_combiner_transform(combined)
         loop_features = features + gate_values * (transformed - features)
         loop_features_diff = (loop_features - features).abs().mean().item()
         metrics['gate/loop_features_diff'] = loop_features_diff
+        if outputs:
+            combined_0 = torch.cat([features, outputs[0].observation], dim=-1)
+            gate_0 = model.state_combiner_gate(combined_0)
+            combined_n = torch.cat([features, outputs[-1].observation], dim=-1)
+            gate_n = model.state_combiner_gate(combined_n)
+            gate_0_mean = gate_0.mean().item()
+            gate_n_mean = gate_n.mean().item()
+            metrics['gate/mean_step0'] = gate_0_mean
+            metrics['gate/mean_stepN'] = gate_n_mean
+            metrics['gate/step0_vs_stepN'] = gate_n_mean - gate_0_mean
 
     # Add oscillator metrics if available (from oscillatory world model)
     if final_output.global_sync.oscillator_metrics is not None:
@@ -1483,6 +1624,9 @@ def main():
     surp_best_loss_step_sum = 0
     surp_best_cert_step_sum = 0
     num_logged = 0
+    qk_rel_ratio_warn_threshold = 1e3
+    qk_rel_ratio_warn_min_logs = 3
+    qk_rel_ratio_warn_streak = 0
 
     # Training loop condition
     def should_continue_training():
@@ -1600,10 +1744,22 @@ def main():
             best_loss_val = metrics.get('best_loss_value', 0)
             best_cert_val = metrics.get('best_certainty_value', 0)
             loss_impr = metrics.get('loss_improvement', 0)
+            qk_rel_ratio = metrics.get('osc_xattn/qk_rel_update_ratio', 0)
+            has_xattn = (
+                metrics.get('osc_xattn/query_norm', 0) > 0 and
+                metrics.get('osc_xattn/key_norm', 0) > 0
+            )
+            if has_xattn:
+                if qk_rel_ratio > qk_rel_ratio_warn_threshold:
+                    qk_rel_ratio_warn_streak += 1
+                else:
+                    qk_rel_ratio_warn_streak = 0
+            else:
+                qk_rel_ratio_warn_streak = 0
 
             epoch_str = f"E{current_epoch}" if training_mode == "epochs" else ""
             print(f"Step {global_step:5d} {epoch_str}| "
-                  f"Loss: {avg_loss:.4f} (best: {best_loss_val:.3f} @step{best_loss_step}) | "
+                  f"Loss: {avg_loss:.4f} (loop-best: {best_loss_val:.3f} @step{best_loss_step}) | "
                   f"Cert: {best_cert_val:.2f} @step{best_cert_step} | "
                   f"ΔLoss: {loss_impr:+.3f} | "
                   f"Docs: {total_documents} | "
@@ -1632,6 +1788,7 @@ def main():
             # Oscillator health monitoring
             osc_amp_mean = metrics.get('oscillator/amplitude_mean', 0)
             osc_phase_entropy = metrics.get('oscillator/phase_entropy', 0)
+            osc_attn_entropy = metrics.get('oscillator/attn_entropy', 0)
             osc_active_frac = metrics.get('oscillator/active_frac', 0)
             osc_amp_mod = metrics.get('oscillator/amp_mod_mean', 0)
             osc_phase_mod = metrics.get('oscillator/phase_mod_mean', 0)
@@ -1643,10 +1800,47 @@ def main():
                 osc_health_issues.append("NO_MODULATION")
             if osc_out_norm > 100:
                 osc_health_issues.append("EXPLODING")
+            # Low attention entropy means always selecting same oscillators
+            if osc_attn_entropy > 0 and osc_attn_entropy < 1.0:
+                osc_health_issues.append("LOW_ATTN_DIV")
             osc_health_str = " ".join(f"⚠{i}" for i in osc_health_issues) if osc_health_issues else "✓"
-            print(f"   Oscillator | amp={osc_amp_mean:.3f} φH={osc_phase_entropy:.2f} "
+            print(f"   Oscillator | amp={osc_amp_mean:.3f} φH={osc_phase_entropy:.2f} aH={osc_attn_entropy:.2f} "
                   f"active={osc_active_frac:.2f} mod(a/φ)={osc_amp_mod:.3f}/{osc_phase_mod:.3f} "
                   f"out={osc_out_norm:.2f} {osc_health_str}")
+
+            # Oscillator cross-attention gradient monitoring
+            osc_embed_grad = metrics.get('osc_xattn/embed_grad', 0)
+            osc_query_grad = metrics.get('osc_xattn/query_grad', 0)
+            osc_key_grad = metrics.get('osc_xattn/key_grad', 0)
+            osc_value_grad = metrics.get('osc_xattn/value_grad', 0)
+            osc_qk_ratio = metrics.get('osc_xattn/qk_grad_ratio', 0)
+            osc_query_rel = metrics.get('osc_xattn/query_rel_update', 0)
+            osc_key_rel = metrics.get('osc_xattn/key_rel_update', 0)
+            osc_attn_ratio = metrics.get('osc_xattn/attn_query_ratio', 0)
+            xattn_grad_issues = []
+            if osc_embed_grad == 0:
+                xattn_grad_issues.append("EMBED_NOGRAD")
+            elif osc_embed_grad < 1e-6:
+                xattn_grad_issues.append("EMBED_VANISH")
+            if osc_query_grad == 0:
+                xattn_grad_issues.append("QUERY_NOGRAD")
+            elif osc_query_grad < 1e-6:
+                xattn_grad_issues.append("QUERY_VANISH")
+            if osc_key_grad == 0:
+                xattn_grad_issues.append("KEY_NOGRAD")
+            elif osc_key_grad < 1e-6:
+                xattn_grad_issues.append("KEY_VANISH")
+            if osc_value_grad == 0:
+                xattn_grad_issues.append("VALUE_NOGRAD")
+            elif osc_value_grad < 1e-6:
+                xattn_grad_issues.append("VALUE_VANISH")
+            if qk_rel_ratio_warn_streak >= qk_rel_ratio_warn_min_logs:
+                xattn_grad_issues.append(f"QUERY_DOMINANTx{qk_rel_ratio_warn_streak}")
+            xattn_status = " ".join(f"⚠{i}" for i in xattn_grad_issues) if xattn_grad_issues else "✓"
+            print(f"    Osc XAttn | ∇embed={osc_embed_grad:.2e} ∇query={osc_query_grad:.2e} "
+                  f"∇key={osc_key_grad:.2e} ∇value={osc_value_grad:.2e} "
+                  f"q/k={osc_qk_ratio:.1e} relΔq={osc_query_rel:.1e} relΔk={osc_key_rel:.1e} "
+                  f"a/q={osc_attn_ratio:.1e} {xattn_status}")
 
             # Gate health monitoring (critical for loop learning)
             gate_mean = metrics.get('gate/mean', 0)
@@ -1737,6 +1931,10 @@ def main():
                     'ctm_ticks/pred_certain': metrics.get('ctm_pred_avg_certain_tick', 0),
                     'ctm_ticks/surp_best': metrics.get('ctm_surp_avg_best_tick', 0),
                     'ctm_ticks/surp_certain': metrics.get('ctm_surp_avg_certain_tick', 0),
+                    'ctm/pred_t1_mean': metrics.get('ctm/pred_t1_mean', 0),
+                    'ctm/pred_t2_mean': metrics.get('ctm/pred_t2_mean', 0),
+                    'ctm/t1_t2_agreement': metrics.get('ctm/t1_t2_agreement', 0),
+                    'ctm/tick_loss_spread': metrics.get('ctm/tick_loss_spread', 0),
                     'sync/surp_to_pred': metrics.get('cross_sync_surp_pred', 0.5),
 
                     # === TICK EVOLUTION (internal obs residual monitoring) ===
@@ -1746,6 +1944,13 @@ def main():
                     'tick_evolution/surp_total_delta': metrics.get('tick_surp_total_delta', 0),
                     'tick_evolution/surp_late_delta': metrics.get('tick_surp_late_delta', 0),
                     'tick_evolution/surp_plateau': metrics.get('tick_surp_plateau', 0),
+                    # === LOOP REFINEMENT ===
+                    'loop/loss_step0': metrics.get('loop/loss_step0', 0),
+                    'loop/loss_step1': metrics.get('loop/loss_step1', 0),
+                    'loop/loss_stepN': metrics.get('loop/loss_stepN', 0),
+                    'loop/monotonic_improve': metrics.get('loop/monotonic_improve', 0),
+                    'loop/obs_delta_01': metrics.get('loop/obs_delta_01', 0),
+                    'loop/obs_delta_total': metrics.get('loop/obs_delta_total', 0),
 
                     # === NLM GRADIENT/WEIGHT MONITORING ===
                     'nlm/pred_w1_norm': metrics.get('nlm_pred/w1_norm', 0),
@@ -1788,6 +1993,38 @@ def main():
                     'oscillator/output_mean': metrics.get('oscillator/output_mean', 0),
                     'oscillator/output_std': metrics.get('oscillator/output_std', 0),
 
+                    # Frequency band utilization
+                    'osc/slow_amp_mean': metrics.get('osc/slow_amp_mean', 0),
+                    'osc/mid_amp_mean': metrics.get('osc/mid_amp_mean', 0),
+                    'osc/fast_amp_mean': metrics.get('osc/fast_amp_mean', 0),
+                    'osc/freq_band_ratio': metrics.get('osc/freq_band_ratio', 0),
+
+                    # Cross-attention entropy (measures oscillator selection diversity)
+                    'oscillator/attn_entropy': metrics.get('oscillator/attn_entropy', 0),
+                    'osc_xattn/entropy_step0': metrics.get('osc_xattn/entropy_step0', 0),
+                    'osc_xattn/entropy_stepN': metrics.get('osc_xattn/entropy_stepN', 0),
+                    'osc_xattn/entropy_delta': metrics.get('osc_xattn/entropy_delta', 0),
+
+                    # Cross-attention gradients (critical for oscillator selection learning)
+                    'osc_xattn/embed_grad': metrics.get('osc_xattn/embed_grad', 0),
+                    'osc_xattn/query_grad': metrics.get('osc_xattn/query_grad', 0),
+                    'osc_xattn/key_grad': metrics.get('osc_xattn/key_grad', 0),
+                    'osc_xattn/value_grad': metrics.get('osc_xattn/value_grad', 0),
+                    'osc_xattn/embed_norm': metrics.get('osc_xattn/embed_norm', 0),
+                    'osc_xattn/query_norm': metrics.get('osc_xattn/query_norm', 0),
+                    'osc_xattn/key_norm': metrics.get('osc_xattn/key_norm', 0),
+                    'osc_xattn/value_norm': metrics.get('osc_xattn/value_norm', 0),
+                    'osc_xattn/query_rel_update': metrics.get('osc_xattn/query_rel_update', 0),
+                    'osc_xattn/key_rel_update': metrics.get('osc_xattn/key_rel_update', 0),
+                    'osc_xattn/value_rel_update': metrics.get('osc_xattn/value_rel_update', 0),
+                    'osc_xattn/qk_grad_ratio': metrics.get('osc_xattn/qk_grad_ratio', 0),
+                    'osc_xattn/qk_rel_update_ratio': metrics.get('osc_xattn/qk_rel_update_ratio', 0),
+                    'osc_xattn/attn_out_norm': metrics.get('osc_xattn/attn_out_norm', 0),
+                    'osc_xattn/query_act_norm': metrics.get('osc_xattn/query_act_norm', 0),
+                    'osc_xattn/attn_query_ratio': metrics.get('osc_xattn/attn_query_ratio', 0),
+                    'osc_xattn/top1_osc_weight': metrics.get('osc_xattn/top1_osc_weight', 0),
+                    'osc_xattn/key_query_cosine': metrics.get('osc_xattn/key_query_cosine', 0),
+
                     # Auxiliary prediction loss
                     'loss/auxiliary_prediction': metrics.get('loss/auxiliary_prediction_loss', 0),
 
@@ -1798,6 +2035,22 @@ def main():
                     'gate/min': metrics.get('gate/min', 0),
                     'gate/max': metrics.get('gate/max', 0),
                     'gate/loop_features_diff': metrics.get('gate/loop_features_diff', 0),
+                    'gate/grad_norm': metrics.get('gate/grad_norm', 0),
+                    'gate/position_variance': metrics.get('gate/position_variance', 0),
+                    'gate/mean_step0': metrics.get('gate/mean_step0', 0),
+                    'gate/mean_stepN': metrics.get('gate/mean_stepN', 0),
+                    'gate/step0_vs_stepN': metrics.get('gate/step0_vs_stepN', 0),
+
+                    # === FEATURE WRITE ATTENTION ===
+                    'feature_write/pos_attn_entropy': metrics.get('feature_write/pos_attn_entropy', 0),
+                    'feature_write/top1_weight': metrics.get('feature_write/top1_weight', 0),
+                    'feature_write/top5_weight': metrics.get('feature_write/top5_weight', 0),
+                    'feature_write/surprise_correlation': metrics.get('feature_write/surprise_correlation', 0),
+
+                    # === SURPRISE COUPLING ===
+                    'surprise/pred_error_corr': metrics.get('surprise/pred_error_corr', 0),
+                    'surprise/raw_vs_calibrated': metrics.get('surprise/raw_vs_calibrated', 0),
+                    'surprise/write_gate_mean': metrics.get('surprise/write_gate_mean', 0),
                 }
                 wandb.log(log_dict, step=global_step)
 

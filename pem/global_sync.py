@@ -587,6 +587,13 @@ class GlobalSyncModule(nn.Module):
             self._last_osc_attn_out_norm = None
             self._last_osc_query_act_norm = None
             self._last_osc_attn_query_ratio = None
+            self._last_osc_attn_top1 = None
+            self._last_osc_key_query_cosine = None
+            self._last_feature_write_attn_entropy = None
+            self._last_feature_write_top1 = None
+            self._last_feature_write_top5 = None
+            self._last_feature_write_surprise_corr = None
+            self._last_write_gate = None
 
             # Auxiliary prediction head (predict future features from memory)
             if config.use_auxiliary_prediction:
@@ -618,6 +625,13 @@ class GlobalSyncModule(nn.Module):
             self._last_osc_attn_out_norm = None
             self._last_osc_query_act_norm = None
             self._last_osc_attn_query_ratio = None
+            self._last_osc_attn_top1 = None
+            self._last_osc_key_query_cosine = None
+            self._last_feature_write_attn_entropy = None
+            self._last_feature_write_top1 = None
+            self._last_feature_write_top5 = None
+            self._last_feature_write_surprise_corr = None
+            self._last_write_gate = None
 
     def register_module(self, name: str, d_neurons: int) -> None:
         """
@@ -781,15 +795,43 @@ class GlobalSyncModule(nn.Module):
 
             # === WRITE PATH: Features + Surprise -> Oscillator Memory ===
             if features is not None:
-                # Compress features to single vector for writing
+                # Compress features to single vector for writing using attention pooling
                 # features: (B, S, d_feature_input) -> (d_feature_input,)
                 if self.feature_write_attn is not None:
                     attn_scores = self.feature_write_attn(features).squeeze(-1)  # (B, S)
-                    attn_weights = F.softmax(attn_scores, dim=-1).unsqueeze(-1)  # (B, S, 1)
-                    pooled = (attn_weights * features).sum(dim=1)  # (B, d_feature_input)
+                    attn_weights = F.softmax(attn_scores, dim=-1)  # (B, S)
+                    # Feature write attention diagnostics
+                    with torch.no_grad():
+                        eps = 1e-10
+                        attn_entropy = -(attn_weights * torch.log(attn_weights + eps)).sum(dim=-1)
+                        self._last_feature_write_attn_entropy = attn_entropy.mean().item()
+                        self._last_feature_write_top1 = attn_weights.max(dim=-1).values.mean().item()
+                        topk = min(5, attn_weights.shape[-1])
+                        self._last_feature_write_top5 = attn_weights.topk(topk, dim=-1).values.sum(dim=-1).mean().item()
+                        if surprise is not None:
+                            surp = surprise
+                            if surp.dim() == 3:
+                                surp = surp.squeeze(-1)
+                            if surp.shape == attn_weights.shape:
+                                a = attn_weights.reshape(-1).float()
+                                b = surp.reshape(-1).float()
+                                a = a - a.mean()
+                                b = b - b.mean()
+                                denom = a.std(unbiased=False) * b.std(unbiased=False) + 1e-8
+                                self._last_feature_write_surprise_corr = ((a * b).mean() / denom).item()
+                            else:
+                                self._last_feature_write_surprise_corr = None
+                        else:
+                            self._last_feature_write_surprise_corr = None
+                    attn_weights_exp = attn_weights.unsqueeze(-1)  # (B, S, 1)
+                    pooled = (attn_weights_exp * features).sum(dim=1)  # (B, d_feature_input)
                     features_compressed = self.feature_compressor(pooled.mean(dim=0))
                 else:
                     features_compressed = self.feature_compressor(features.mean(dim=(0, 1)))
+                    self._last_feature_write_attn_entropy = None
+                    self._last_feature_write_top1 = None
+                    self._last_feature_write_top5 = None
+                    self._last_feature_write_surprise_corr = None
 
                 # Compress surprise if provided
                 surprise_scalar = None
@@ -797,12 +839,25 @@ class GlobalSyncModule(nn.Module):
                     if self.feature_write_attn is not None:
                         if surprise.dim() == 2:
                             surprise = surprise.unsqueeze(-1)
-                        surprise_pooled = (attn_weights * surprise).sum(dim=1)  # (B, 1)
+                        surprise_pooled = (attn_weights_exp * surprise).sum(dim=1)  # (B, 1)
                         surprise_scalar = surprise_pooled.mean(dim=0)  # (1,)
                     else:
                         surprise_scalar = surprise.mean()  # Scalar importance
 
                 # Write to oscillator memory (content gated by surprise)
+                if surprise_scalar is not None:
+                    self._last_write_gate = torch.sigmoid(
+                        self.oscillatory_world.surprise_gate_bias + surprise_scalar * self.oscillatory_world.surprise_gate_scale
+                    ).item()
+                else:
+                    self._last_write_gate = torch.sigmoid(
+                        torch.tensor(
+                            self.oscillatory_world.surprise_gate_bias,
+                            device=features_compressed.device,
+                            dtype=features_compressed.dtype,
+                        )
+                    ).item()
+
                 osc_output = self.oscillatory_world(
                     features=features_compressed,
                     surprise=surprise_scalar,
@@ -810,6 +865,10 @@ class GlobalSyncModule(nn.Module):
                 )
             else:
                 # Fallback: use sync-based writing (legacy behavior)
+                self._last_feature_write_attn_entropy = None
+                self._last_feature_write_top1 = None
+                self._last_feature_write_top5 = None
+                self._last_feature_write_surprise_corr = None
                 if self.config.sync_compression == "attention" and self.sync_compression_attn is not None:
                     attn_scores = self.sync_compression_attn(sync)
                     attn_weights = F.softmax(attn_scores.view(-1), dim=0)
@@ -822,6 +881,13 @@ class GlobalSyncModule(nn.Module):
 
                 # Project sync to feature dimension (legacy fallback)
                 sync_as_features = self.sync_to_feature(sync_compressed)
+                self._last_write_gate = torch.sigmoid(
+                    torch.tensor(
+                        self.oscillatory_world.surprise_gate_bias,
+                        device=sync_as_features.device,
+                        dtype=sync_as_features.dtype,
+                    )
+                ).item()
                 osc_output = self.oscillatory_world(
                     features=sync_as_features,
                     surprise=None,
@@ -867,6 +933,12 @@ class GlobalSyncModule(nn.Module):
                 self._last_osc_attn_query_ratio = (
                     self._last_osc_attn_out_norm / (self._last_osc_query_act_norm + 1e-8)
                 )
+                self._last_osc_attn_top1 = attn_weights.max(dim=-1).values.mean().item()
+                with torch.no_grad():
+                    q_norm = F.normalize(query, dim=-1)
+                    k_norm = F.normalize(key, dim=-1)
+                    qk_cos = torch.einsum('bsd,bnd->bsn', q_norm, k_norm).mean()
+                    self._last_osc_key_query_cosine = qk_cos.item()
 
                 # Compute attention entropy: measures how distributed attention is
                 # High entropy = using many oscillators (good), low = always same ones (bad)
@@ -885,6 +957,8 @@ class GlobalSyncModule(nn.Module):
                 self._last_osc_attn_out_norm = None
                 self._last_osc_query_act_norm = None
                 self._last_osc_attn_query_ratio = None
+                self._last_osc_attn_top1 = None
+                self._last_osc_key_query_cosine = None
 
             # Get oscillator state for monitoring
             osc_state = self.oscillatory_world.get_oscillator_state()
@@ -952,6 +1026,40 @@ class GlobalSyncModule(nn.Module):
             'oscillator/amp_mod_mean': metrics.amp_mod_mean,
             'oscillator/phase_mod_mean': metrics.phase_mod_mean,
         }
+        # Oscillator frequency band utilization (based on learned frequencies)
+        freqs = osc_state['frequencies']
+        amps = osc_state['current_amplitudes'].abs()
+        if freqs.numel() >= 4:
+            sorted_idx = torch.argsort(freqs)
+            amps_sorted = amps[sorted_idx]
+            n = amps_sorted.numel()
+            n_band = n // 4
+            n_slow = n_band
+            n_fast = n_band
+            n_mid = n - n_slow - n_fast
+            slow_mean = amps_sorted[:n_slow].mean()
+            mid_mean = amps_sorted[n_slow:n_slow + n_mid].mean() if n_mid > 0 else amps_sorted[:n_slow].mean()
+            fast_mean = amps_sorted[-n_fast:].mean() if n_fast > 0 else amps_sorted[-n_slow:].mean()
+            stats.update({
+                'osc/slow_amp_mean': slow_mean.item(),
+                'osc/mid_amp_mean': mid_mean.item(),
+                'osc/fast_amp_mean': fast_mean.item(),
+                'osc/freq_band_ratio': (slow_mean / (fast_mean + 1e-8)).item(),
+            })
+        if self._last_feature_write_attn_entropy is not None:
+            stats.update({
+                'feature_write/pos_attn_entropy': self._last_feature_write_attn_entropy,
+                'feature_write/top1_weight': self._last_feature_write_top1,
+                'feature_write/top5_weight': self._last_feature_write_top5,
+                'feature_write/surprise_correlation': self._last_feature_write_surprise_corr
+                if self._last_feature_write_surprise_corr is not None else 0.0,
+            })
+        if self._last_write_gate is not None:
+            stats['surprise/write_gate_mean'] = self._last_write_gate
+        if self._last_osc_attn_top1 is not None:
+            stats['osc_xattn/top1_osc_weight'] = self._last_osc_attn_top1
+        if self._last_osc_key_query_cosine is not None:
+            stats['osc_xattn/key_query_cosine'] = self._last_osc_key_query_cosine
         if self._last_osc_attn_out_norm is not None:
             stats.update({
                 'osc_xattn/attn_out_norm': self._last_osc_attn_out_norm,
