@@ -2124,6 +2124,21 @@ def main():
                     f"uniqueness={wt_uniqueness:.3f} similarity={wt_similarity:.3f}"
                 )
 
+            # Self-state INPUT diagnostics (why is diversity low?)
+            ss_in_sync = world_stats.get('ss_input/sync_norm')
+            ss_in_pred = world_stats.get('ss_input/pred_norm')
+            ss_in_surp = world_stats.get('ss_input/surprise')
+            ss_in_conf = world_stats.get('ss_input/confidence')
+            ss_in_change = world_stats.get('ss_input/step_change')
+            ss_out_change = world_stats.get('self_state/step_change')
+            if ss_in_sync is not None:
+                # Compare input change vs output change to see if compressor is collapsing
+                ratio = ss_out_change / (ss_in_change + 1e-8) if ss_in_change else 0
+                print(
+                    f"    SS Inputs | sync={ss_in_sync:.2f} pred={ss_in_pred:.2f} "
+                    f"surp={ss_in_surp:.3f} conf={ss_in_conf:.3f} | Δin={ss_in_change:.3f} Δout={ss_out_change:.3f} ratio={ratio:.2f}"
+                )
+
             # WandB logging (consolidated - only essential metrics)
             if config.wandb_project:
                 log_dict = {

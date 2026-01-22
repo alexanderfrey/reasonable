@@ -610,6 +610,14 @@ class GlobalSyncModule(nn.Module):
             self._last_self_state_step_change = None
             self._last_self_state_stored_coverage = None
             self._prev_self_state_for_change = None  # For tracking step-to-step change
+            # Self-state INPUT diagnostics (what goes into the compressor)
+            self._last_ss_input_sync_norm = None
+            self._last_ss_input_pred_norm = None
+            self._last_ss_input_surprise = None
+            self._last_ss_input_confidence = None
+            self._last_ss_input_total_norm = None
+            self._prev_ss_input_for_change = None
+            self._last_ss_input_step_change = None
             self._last_feature_write_attn_entropy = None
             self._last_feature_write_top1 = None
             self._last_feature_write_top5 = None
@@ -679,6 +687,14 @@ class GlobalSyncModule(nn.Module):
             self._last_self_state_step_change = None
             self._last_self_state_stored_coverage = None
             self._prev_self_state_for_change = None
+            # Self-state INPUT diagnostics
+            self._last_ss_input_sync_norm = None
+            self._last_ss_input_pred_norm = None
+            self._last_ss_input_surprise = None
+            self._last_ss_input_confidence = None
+            self._last_ss_input_total_norm = None
+            self._prev_ss_input_for_change = None
+            self._last_ss_input_step_change = None
             self._last_feature_write_attn_entropy = None
             self._last_feature_write_top1 = None
             self._last_feature_write_top5 = None
@@ -914,6 +930,24 @@ class GlobalSyncModule(nn.Module):
 
                 # Track self-state metrics
                 with torch.no_grad():
+                    # === INPUT DIAGNOSTICS ===
+                    # Track what goes INTO the compressor
+                    self._last_ss_input_sync_norm = sync_summary_proj.norm().item()
+                    self._last_ss_input_pred_norm = pred_summary_proj.norm().item()
+                    self._last_ss_input_surprise = surprise_scalar.item()
+                    self._last_ss_input_confidence = confidence_scalar.item()
+                    self._last_ss_input_total_norm = self_state_input.norm().item()
+
+                    # Track input step-to-step change
+                    if self._prev_ss_input_for_change is not None:
+                        self._last_ss_input_step_change = (
+                            self_state_input - self._prev_ss_input_for_change
+                        ).norm().item()
+                    else:
+                        self._last_ss_input_step_change = 0.0
+                    self._prev_ss_input_for_change = self_state_input.detach().clone()
+
+                    # === OUTPUT DIAGNOSTICS ===
                     # Compressor output variation (is it producing varied self-states?)
                     self._last_self_state_compressor_std = self_state.std().item()
 
@@ -1356,6 +1390,18 @@ class GlobalSyncModule(nn.Module):
                 'self_state/compressor_std': self._last_self_state_compressor_std,
                 # Dynamics: is self-state changing between steps?
                 'self_state/step_change': self._last_self_state_step_change,
+            })
+
+        # === SELF-STATE INPUT DIAGNOSTICS ===
+        # Track what goes INTO the compressor to diagnose low diversity
+        if self._last_ss_input_sync_norm is not None:
+            stats.update({
+                'ss_input/sync_norm': self._last_ss_input_sync_norm,
+                'ss_input/pred_norm': self._last_ss_input_pred_norm,
+                'ss_input/surprise': self._last_ss_input_surprise,
+                'ss_input/confidence': self._last_ss_input_confidence,
+                'ss_input/total_norm': self._last_ss_input_total_norm,
+                'ss_input/step_change': self._last_ss_input_step_change,
             })
 
         return stats
