@@ -525,8 +525,11 @@ class GlobalSyncModule(nn.Module):
                 nn.GELU(),
                 nn.Linear(hidden_dim, 1),
             )
+            # Initialize with larger scale (0.5) to break symmetry and allow
+            # attention to differentiate positions. Small scale (0.1) leads to
+            # near-uniform attention over 512 positions with weak learning signal.
             with torch.no_grad():
-                self.feature_write_attn[-1].weight.mul_(0.1)
+                self.feature_write_attn[-1].weight.mul_(0.5)
                 self.feature_write_attn[-1].bias.zero_()
 
             # Sync to feature projection (fallback when features not provided)
