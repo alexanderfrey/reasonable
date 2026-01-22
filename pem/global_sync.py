@@ -78,6 +78,9 @@ class GlobalSyncOutput(NamedTuple):
     oscillator_phases: Optional[torch.Tensor] = None        # (num_oscillators,) current phases
     # Auxiliary prediction for future features
     future_prediction: Optional[torch.Tensor] = None  # (d_feature_input,) predicted future features
+    # Oscillator cross-attention entropy (measures selection diversity)
+    # High entropy = using many oscillators, low = always same ones
+    osc_attn_entropy: Optional[float] = None
 
 
 @dataclass
@@ -515,6 +518,16 @@ class GlobalSyncModule(nn.Module):
                 nn.Linear(config.d_feature_input, config.d_feature_input),
                 nn.GELU(),
             )
+            # Learned attention pooling over sequence positions for memory write
+            hidden_dim = max(1, config.d_feature_input // 2)
+            self.feature_write_attn = nn.Sequential(
+                nn.Linear(config.d_feature_input, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, 1),
+            )
+            with torch.no_grad():
+                self.feature_write_attn[-1].weight.mul_(0.1)
+                self.feature_write_attn[-1].bias.zero_()
 
             # Sync to feature projection (fallback when features not provided)
             # (sync_pairs,) -> (d_feature_input,)
@@ -539,10 +552,17 @@ class GlobalSyncModule(nn.Module):
             # Key/Value: 64 oscillators, each as a separate key-value pair
             # Output: (B, S, d_world_output) -> position-specific world context
             if config.use_oscillator_cross_attention:
+                if config.d_world_output % config.osc_cross_attn_heads != 0:
+                    raise ValueError(
+                        "d_world_output must be divisible by osc_cross_attn_heads "
+                        f"(got {config.d_world_output} and {config.osc_cross_attn_heads})"
+                    )
                 # Learnable embedding per oscillator (like positional embeddings)
                 # Each oscillator gets a learned representation that encodes its "role"
+                # Use larger scale (0.5) to ensure oscillators are distinguishable after K/V projection
+                # Small scale (0.02) leads to near-uniform attention and vanishing key gradients
                 self.osc_embeddings = nn.Parameter(
-                    torch.randn(config.num_oscillators, config.d_osc_embed) * 0.02
+                    torch.randn(config.num_oscillators, config.d_osc_embed) * 0.5
                 )
 
                 # Query projection: sync -> d_world_output
@@ -553,12 +573,9 @@ class GlobalSyncModule(nn.Module):
                 self.osc_key_proj = nn.Linear(config.d_osc_embed, config.d_world_output)
                 self.osc_value_proj = nn.Linear(config.d_osc_embed, config.d_world_output)
 
-                self.osc_cross_attn = nn.MultiheadAttention(
-                    embed_dim=config.d_world_output,
-                    num_heads=config.osc_cross_attn_heads,
-                    dropout=config.dropout,
-                    batch_first=True,
-                )
+                # Use scaled dot-product attention directly over pre-projected Q/K/V
+                # to avoid redundant key/value projections inside MultiheadAttention.
+                self.osc_cross_attn = None
                 self.osc_output_norm = RMSNorm(config.d_world_output)
             else:
                 self.osc_embeddings = None
@@ -567,6 +584,9 @@ class GlobalSyncModule(nn.Module):
                 self.osc_value_proj = None
                 self.osc_cross_attn = None
                 self.osc_output_norm = None
+            self._last_osc_attn_out_norm = None
+            self._last_osc_query_act_norm = None
+            self._last_osc_attn_query_ratio = None
 
             # Auxiliary prediction head (predict future features from memory)
             if config.use_auxiliary_prediction:
@@ -585,6 +605,7 @@ class GlobalSyncModule(nn.Module):
         else:
             self.oscillatory_world = None
             self.feature_compressor = None
+            self.feature_write_attn = None
             self.sync_to_feature = None
             self.sync_compression_attn = None
             self.osc_query_proj = None
@@ -594,6 +615,9 @@ class GlobalSyncModule(nn.Module):
             self.osc_output_norm = None
             self.future_predictor = None
             self.auxiliary_prediction_horizon = 0
+            self._last_osc_attn_out_norm = None
+            self._last_osc_query_act_norm = None
+            self._last_osc_attn_query_ratio = None
 
     def register_module(self, name: str, d_neurons: int) -> None:
         """
@@ -626,6 +650,47 @@ class GlobalSyncModule(nn.Module):
 
         # Recreate cross-module attention with updated num_modules
         self._create_attention_layers()
+
+    def _osc_cross_attention(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Scaled dot-product cross-attention with explicit Q/K/V projections.
+
+        Args:
+            query: (B, S, d_world)
+            key: (B, N, d_world)
+            value: (B, N, d_world)
+        Returns:
+            attn_out: (B, S, d_world)
+            attn_weights: (B, S, N) averaged over heads (for entropy metrics)
+        """
+        B, S, d_world = query.shape
+        n_osc = key.shape[1]
+        n_heads = self.config.osc_cross_attn_heads
+        head_dim = d_world // n_heads
+
+        # (B, S, d_world) -> (B, H, S, head_dim)
+        q = query.view(B, S, n_heads, head_dim).transpose(1, 2)
+        k = key.view(B, n_osc, n_heads, head_dim).transpose(1, 2)
+        v = value.view(B, n_osc, n_heads, head_dim).transpose(1, 2)
+
+        scale = head_dim ** -0.5
+        attn_logits = torch.matmul(q, k.transpose(-2, -1)) * scale
+        attn_weights = torch.softmax(attn_logits, dim=-1)
+
+        if self.config.dropout > 0 and self.training:
+            attn_weights = F.dropout(attn_weights, p=self.config.dropout)
+
+        attn_out = torch.matmul(attn_weights, v)
+        attn_out = attn_out.transpose(1, 2).contiguous().view(B, S, d_world)
+
+        # Average over heads for entropy monitoring
+        attn_weights_avg = attn_weights.mean(dim=1)
+        return attn_out, attn_weights_avg
 
     def _create_attention_layers(self):
         """Create/recreate attention layers based on registered modules."""
@@ -718,12 +783,24 @@ class GlobalSyncModule(nn.Module):
             if features is not None:
                 # Compress features to single vector for writing
                 # features: (B, S, d_feature_input) -> (d_feature_input,)
-                features_compressed = self.feature_compressor(features.mean(dim=(0, 1)))
+                if self.feature_write_attn is not None:
+                    attn_scores = self.feature_write_attn(features).squeeze(-1)  # (B, S)
+                    attn_weights = F.softmax(attn_scores, dim=-1).unsqueeze(-1)  # (B, S, 1)
+                    pooled = (attn_weights * features).sum(dim=1)  # (B, d_feature_input)
+                    features_compressed = self.feature_compressor(pooled.mean(dim=0))
+                else:
+                    features_compressed = self.feature_compressor(features.mean(dim=(0, 1)))
 
                 # Compress surprise if provided
                 surprise_scalar = None
                 if surprise is not None:
-                    surprise_scalar = surprise.mean()  # Scalar importance
+                    if self.feature_write_attn is not None:
+                        if surprise.dim() == 2:
+                            surprise = surprise.unsqueeze(-1)
+                        surprise_pooled = (attn_weights * surprise).sum(dim=1)  # (B, 1)
+                        surprise_scalar = surprise_pooled.mean(dim=0)  # (1,)
+                    else:
+                        surprise_scalar = surprise.mean()  # Scalar importance
 
                 # Write to oscillator memory (content gated by surprise)
                 osc_output = self.oscillatory_world(
@@ -755,7 +832,7 @@ class GlobalSyncModule(nn.Module):
             # osc_output.memory_states: (num_oscillators,) - raw memory for cross-attention
 
             # === READ PATH: Sync -> Query Memory -> Position-specific Context ===
-            if self.config.use_oscillator_cross_attention and self.osc_cross_attn is not None:
+            if self.config.use_oscillator_cross_attention:
                 # Query: sync patterns determine what each position retrieves
                 # (B, S, sync_pairs) -> (B, S, d_world_output)
                 query = self.osc_query_proj(sync)
@@ -782,11 +859,32 @@ class GlobalSyncModule(nn.Module):
                 # Cross-attention: each position queries the 64 oscillators
                 # Query: (B, S, d_world), Key: (B, 64, d_world), Value: (B, 64, d_world)
                 # Output: (B, S, d_world) - position-specific weighted combination of oscillators
-                attn_out, _ = self.osc_cross_attn(query, key, value)
+                attn_out, attn_weights = self._osc_cross_attention(query, key, value)
+                # attn_weights: (B, S, 64) - attention over 64 oscillators per position
                 world_state = self.osc_output_norm(attn_out + query)  # Residual + norm
+                self._last_osc_attn_out_norm = attn_out.norm(dim=-1).mean().item()
+                self._last_osc_query_act_norm = query.norm(dim=-1).mean().item()
+                self._last_osc_attn_query_ratio = (
+                    self._last_osc_attn_out_norm / (self._last_osc_query_act_norm + 1e-8)
+                )
+
+                # Compute attention entropy: measures how distributed attention is
+                # High entropy = using many oscillators (good), low = always same ones (bad)
+                # Entropy = -sum(p * log(p)), max entropy = log(64) ≈ 4.16 for uniform
+                with torch.no_grad():
+                    # Average attention weights across batch and positions
+                    avg_attn = attn_weights.mean(dim=(0, 1))  # (64,)
+                    # Add small epsilon to avoid log(0)
+                    avg_attn = avg_attn + 1e-10
+                    avg_attn = avg_attn / avg_attn.sum()  # Renormalize
+                    osc_attn_entropy = -(avg_attn * torch.log(avg_attn)).sum().item()
             else:
                 # No cross-attention: use projected output (broadcast to all positions)
                 world_state = osc_output.output
+                osc_attn_entropy = None
+                self._last_osc_attn_out_norm = None
+                self._last_osc_query_act_norm = None
+                self._last_osc_attn_query_ratio = None
 
             # Get oscillator state for monitoring
             osc_state = self.oscillatory_world.get_oscillator_state()
@@ -809,6 +907,7 @@ class GlobalSyncModule(nn.Module):
             oscillator_amplitudes=oscillator_amplitudes,
             oscillator_phases=oscillator_phases,
             future_prediction=future_prediction,
+            osc_attn_entropy=osc_attn_entropy,
         )
 
     def get_world_state(self) -> Optional[torch.Tensor]:
@@ -835,7 +934,7 @@ class GlobalSyncModule(nn.Module):
         metrics = self.oscillatory_world.get_metrics()
         osc_state = self.oscillatory_world.get_oscillator_state()
 
-        return {
+        stats = {
             # Basic output stats
             'world_state/norm': metrics.output_norm,
             'world_state/mean': metrics.output_mean,
@@ -853,6 +952,13 @@ class GlobalSyncModule(nn.Module):
             'oscillator/amp_mod_mean': metrics.amp_mod_mean,
             'oscillator/phase_mod_mean': metrics.phase_mod_mean,
         }
+        if self._last_osc_attn_out_norm is not None:
+            stats.update({
+                'osc_xattn/attn_out_norm': self._last_osc_attn_out_norm,
+                'osc_xattn/query_act_norm': self._last_osc_query_act_norm,
+                'osc_xattn/attn_query_ratio': self._last_osc_attn_query_ratio,
+            })
+        return stats
 
     def reset_oscillator_phases(self, random: bool = True):
         """
