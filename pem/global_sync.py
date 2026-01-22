@@ -1219,6 +1219,16 @@ class GlobalSyncModule(nn.Module):
             })
 
         # === TEMPORAL METRICS (phase-tagged writes) ===
+        # Oscillator bank sizes
+        n_osc = self.config.num_oscillators
+        n_self = self.oscillatory_world.config.num_self_oscillators
+        n_world = n_osc - n_self
+        stats.update({
+            'oscillator/num_world': n_world,
+            'oscillator/num_self': n_self,
+            'oscillator/num_total': n_osc,
+        })
+
         phase_diff_stats = self.oscillatory_world.get_phase_diff_features()
         stats.update({
             'temporal/phase_dist_mean': phase_diff_stats['phase_dist_mean'].item(),
