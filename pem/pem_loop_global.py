@@ -322,6 +322,7 @@ class PEMLoopGlobalConfig:
     # Memory optimization
     gradient_checkpointing: bool = False  # Recompute activations in backward (saves VRAM)
     backprop_steps: int = -1              # Only backprop through last N steps (-1 = all)
+    osc_state_updates_in_checkpoint: bool = True  # Update oscillatory state during checkpointed forward
 
     # Loss weights
     surprise_loss_weight: float = 0.1     # Weight for surprise calibration loss
@@ -914,6 +915,11 @@ class PEMLoopGlobal(nn.Module):
 
             # Use gradient checkpointing if enabled
             if self.config.gradient_checkpointing and self.training and step >= first_grad_step:
+                # Control oscillatory state updates during checkpointed forward
+                if self.global_sync.oscillatory_world is not None:
+                    self.global_sync.oscillatory_world.set_state_updates_enabled(
+                        self.config.osc_state_updates_in_checkpoint
+                    )
                 # Flatten inputs for checkpoint (needs all tensor args)
                 ckpt_result = checkpoint(
                     self._step_for_checkpoint,
@@ -928,6 +934,8 @@ class PEMLoopGlobal(nn.Module):
                     state.cumulative_sync,
                     use_reentrant=False,
                 )
+                if self.global_sync.oscillatory_world is not None:
+                    self.global_sync.oscillatory_world.set_state_updates_enabled(True)
 
                 # Reconstruct output from checkpoint result
                 (pred_imm, pred_short, pred_long, pred_cert, surp_mag, surp_raw, surp_cert,
@@ -996,6 +1004,8 @@ class PEMLoopGlobal(nn.Module):
                 )
             else:
                 # Normal forward pass
+                if self.global_sync.oscillatory_world is not None:
+                    self.global_sync.oscillatory_world.set_state_updates_enabled(True)
                 output, state = self.step(features, targets, state)
 
             outputs.append(output)

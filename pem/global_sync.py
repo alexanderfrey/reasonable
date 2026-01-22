@@ -1042,6 +1042,17 @@ class GlobalSyncModule(nn.Module):
                     write_self_states = osc_output.write_self_states  # (num_osc, d_self_state)
                     self_state_contribution = self.self_state_to_value(write_self_states)  # (num_osc, d_world)
 
+                    # Weight self-state contribution by recency/strength of writes
+                    write_strengths = getattr(osc_output, "write_strengths", None)
+                    if write_strengths is not None:
+                        # Normalize to [0, 1] to avoid scale blow-up
+                        max_strength = write_strengths.max()
+                        if max_strength > 0:
+                            strength_weights = write_strengths / (max_strength + 1e-8)
+                        else:
+                            strength_weights = write_strengths
+                        self_state_contribution = self_state_contribution * strength_weights.unsqueeze(-1)
+
                     # Track self-state contribution metrics
                     with torch.no_grad():
                         base_value_norm = value.norm().item()
