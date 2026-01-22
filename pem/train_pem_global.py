@@ -728,6 +728,65 @@ def compute_detailed_metrics(
     return metrics
 
 
+@torch.no_grad()
+def compute_oscillator_ablation(
+    model: PEMLoopGlobal,
+    output,  # PEMLoopGlobalOutput from final step
+    targets: Dict[str, torch.Tensor],
+) -> Dict[str, float]:
+    """
+    Compute prediction degradation when oscillator contribution is disabled.
+
+    This measures how much the oscillators actually help predictions by
+    comparing loss with vs without world_state.
+
+    Returns:
+        Dict with:
+            - osc_ablation/loss_with: Loss with oscillators (normal)
+            - osc_ablation/loss_without: Loss without oscillators
+            - osc_ablation/degradation: How much worse without oscillators (positive = oscillators help)
+            - osc_ablation/relative_help: Relative improvement from oscillators
+    """
+    metrics = {}
+
+    # Get the loop features from the output (this is what prediction module uses)
+    loop_features = output.loop_features
+    if loop_features is None:
+        return metrics
+
+    # Compute loss with normal predictions (oscillators enabled)
+    pred_with = output.predictions['immediate']
+    target = targets['immediate']
+    valid = targets.get('immediate_valid', None)
+
+    if valid is not None and valid.any():
+        cos_sim_with = F.cosine_similarity(pred_with[valid], target[valid], dim=-1).mean()
+        loss_with = (1 - cos_sim_with).item()
+    else:
+        loss_with = 0.0
+
+    # Run prediction WITHOUT world_state (oscillators disabled)
+    pred_output_without = model.prediction(loop_features, world_state=None)
+    pred_without = pred_output_without.predictions['immediate']
+
+    if valid is not None and valid.any():
+        cos_sim_without = F.cosine_similarity(pred_without[valid], target[valid], dim=-1).mean()
+        loss_without = (1 - cos_sim_without).item()
+    else:
+        loss_without = 0.0
+
+    # Compute degradation metrics
+    degradation = loss_without - loss_with  # Positive = oscillators help
+    relative_help = degradation / (loss_without + 1e-8)  # Fraction of loss explained by oscillators
+
+    metrics['osc_ablation/loss_with'] = loss_with
+    metrics['osc_ablation/loss_without'] = loss_without
+    metrics['osc_ablation/degradation'] = degradation
+    metrics['osc_ablation/relative_help'] = relative_help
+
+    return metrics
+
+
 def print_diagnostic_report(
     outputs: List,
     targets: Dict[str, torch.Tensor],
@@ -894,9 +953,16 @@ def print_diagnostic_report(
         fw_top1 = world_stats.get('feature_write/top1_weight', None)
         fw_top5 = world_stats.get('feature_write/top5_weight', None)
         fw_surp_corr = world_stats.get('feature_write/surprise_correlation', None)
+        fw_surp_abs_corr = world_stats.get('feature_write/surprise_abs_correlation', None)
+        surp_mean = world_stats.get('surprise/mean', None)
+        surp_std = world_stats.get('surprise/std', None)
+        surp_pos = world_stats.get('surprise/pos_frac', None)
         if fw_entropy is not None:
             surp_str = f" surp_corr={fw_surp_corr:.2f}" if fw_surp_corr is not None else ""
-            print(f"[FeatWrite] entropy={fw_entropy:.2f} top1={fw_top1:.3f} top5={fw_top5:.3f}{surp_str}")
+            abs_str = f" abs_corr={fw_surp_abs_corr:.2f}" if fw_surp_abs_corr is not None else ""
+            print(f"[FeatWrite] entropy={fw_entropy:.2f} top1={fw_top1:.3f} top5={fw_top5:.3f}{surp_str}{abs_str}")
+        if surp_mean is not None:
+            print(f"[Surprise] mean={surp_mean:.3f} std={surp_std:.3f} pos={surp_pos:.2f}")
 
         # Write gate
         write_gate = world_stats.get('surprise/write_gate_mean', None)
@@ -942,6 +1008,17 @@ def print_diagnostic_report(
         surp_raw_cal = metrics.get('surprise/raw_vs_calibrated', None)
         if surp_pred_corr is not None:
             print(f"[Surprise] pred_err_corr={surp_pred_corr:.3f} raw_cal_corr={surp_raw_cal:.3f}")
+
+        # Oscillator ablation (most important - does the oscillator actually help?)
+        osc_abl_loss_with = metrics.get('osc_ablation/loss_with', None)
+        osc_abl_loss_without = metrics.get('osc_ablation/loss_without', None)
+        osc_abl_deg = metrics.get('osc_ablation/degradation', None)
+        osc_abl_rel = metrics.get('osc_ablation/relative_help', None)
+        if osc_abl_deg is not None:
+            status = "✓ OSCILLATORS HELPING" if osc_abl_deg > 0.001 else (
+                "≈ NEUTRAL" if abs(osc_abl_deg) < 0.001 else "✗ OSCILLATORS HURTING")
+            print(f"\n[OscAblation] loss_with={osc_abl_loss_with:.4f} loss_without={osc_abl_loss_without:.4f}")
+            print(f"              degradation={osc_abl_deg:+.4f} relative_help={osc_abl_rel:.1%} {status}")
 
     # ===== SUMMARY =====
     issues = []
@@ -1766,6 +1843,9 @@ def main():
 
         # Print diagnostic report if requested
         if should_diagnose and outputs_for_diag is not None:
+            # Compute oscillator ablation metric
+            osc_ablation_metrics = compute_oscillator_ablation(model, outputs_for_diag[-1], targets_for_diag)
+            metrics.update(osc_ablation_metrics)
             print_diagnostic_report(outputs_for_diag, targets_for_diag, global_step + 1, model=model, metrics=metrics)
 
         scheduler.step()
@@ -1955,9 +2035,16 @@ def main():
             fw_top1 = world_stats.get('feature_write/top1_weight')
             fw_top5 = world_stats.get('feature_write/top5_weight')
             fw_surp_corr = world_stats.get('feature_write/surprise_correlation')
+            fw_surp_abs_corr = world_stats.get('feature_write/surprise_abs_correlation')
+            surp_mean = world_stats.get('surprise/mean')
+            surp_std = world_stats.get('surprise/std')
+            surp_pos = world_stats.get('surprise/pos_frac')
             if fw_entropy is not None:
-                surp_str = f" surp_corr={fw_surp_corr:.2f}" if fw_surp_corr else ""
-                print(f"   Feat Write | entropy={fw_entropy:.2f} top1={fw_top1:.3f} top5={fw_top5:.3f}{surp_str}")
+                surp_str = f" surp_corr={fw_surp_corr:.2f}" if fw_surp_corr is not None else ""
+                abs_str = f" abs_corr={fw_surp_abs_corr:.2f}" if fw_surp_abs_corr is not None else ""
+                print(f"   Feat Write | entropy={fw_entropy:.2f} top1={fw_top1:.3f} top5={fw_top5:.3f}{surp_str}{abs_str}")
+            if surp_mean is not None:
+                print(f"     Surprise | mean={surp_mean:.3f} std={surp_std:.3f} pos={surp_pos:.2f}")
 
             # Loop trajectory
             l0 = metrics.get('loop/loss_step0')
@@ -1975,6 +2062,13 @@ def main():
             spread = metrics.get('ctm/tick_loss_spread')
             if t1 is not None:
                 print(f"          CTM | t1={t1:.1f} t2={t2:.1f} agree={agree:.0%} spread={spread:.4f}")
+
+            # Oscillator ablation (only on diagnostic steps)
+            osc_abl_deg = metrics.get('osc_ablation/degradation')
+            osc_abl_rel = metrics.get('osc_ablation/relative_help')
+            if osc_abl_deg is not None:
+                abl_status = "✓ HELPING" if osc_abl_deg > 0.001 else ("≈ NEUTRAL" if abs(osc_abl_deg) < 0.001 else "✗ HURTING")
+                print(f"  Osc Ablation | degradation={osc_abl_deg:+.4f} relative_help={osc_abl_rel:.1%} {abl_status}")
 
             # WandB logging (consolidated - only essential metrics)
             if config.wandb_project:
@@ -2150,11 +2244,15 @@ def main():
                     'feature_write/top1_weight': metrics.get('feature_write/top1_weight', 0),
                     'feature_write/top5_weight': metrics.get('feature_write/top5_weight', 0),
                     'feature_write/surprise_correlation': metrics.get('feature_write/surprise_correlation', 0),
+                    'feature_write/surprise_abs_correlation': metrics.get('feature_write/surprise_abs_correlation', 0),
 
                     # === SURPRISE COUPLING ===
                     'surprise/pred_error_corr': metrics.get('surprise/pred_error_corr', 0),
                     'surprise/raw_vs_calibrated': metrics.get('surprise/raw_vs_calibrated', 0),
                     'surprise/write_gate_mean': metrics.get('surprise/write_gate_mean', 0),
+                    'surprise/mean': metrics.get('surprise/mean', 0),
+                    'surprise/std': metrics.get('surprise/std', 0),
+                    'surprise/pos_frac': metrics.get('surprise/pos_frac', 0),
                 }
                 wandb.log(log_dict, step=global_step)
 

@@ -596,6 +596,10 @@ class GlobalSyncModule(nn.Module):
             self._last_feature_write_top1 = None
             self._last_feature_write_top5 = None
             self._last_feature_write_surprise_corr = None
+            self._last_feature_write_surprise_abs_corr = None
+            self._last_surprise_mean = None
+            self._last_surprise_std = None
+            self._last_surprise_pos_frac = None
             self._last_write_gate = None
 
             # Auxiliary prediction head (predict future features from memory)
@@ -634,6 +638,10 @@ class GlobalSyncModule(nn.Module):
             self._last_feature_write_top1 = None
             self._last_feature_write_top5 = None
             self._last_feature_write_surprise_corr = None
+            self._last_feature_write_surprise_abs_corr = None
+            self._last_surprise_mean = None
+            self._last_surprise_std = None
+            self._last_surprise_pos_frac = None
             self._last_write_gate = None
 
     def register_module(self, name: str, d_neurons: int) -> None:
@@ -792,6 +800,7 @@ class GlobalSyncModule(nn.Module):
         oscillator_amplitudes = None
         oscillator_phases = None
         future_prediction = None
+        osc_attn_entropy = None
 
         if self.oscillatory_world is not None:
             B, S, _ = sync.shape
@@ -817,17 +826,31 @@ class GlobalSyncModule(nn.Module):
                             surp = surprise
                             if surp.dim() == 3:
                                 surp = surp.squeeze(-1)
+                            self._last_surprise_mean = surp.mean().item()
+                            self._last_surprise_std = surp.std(unbiased=False).item()
+                            self._last_surprise_pos_frac = (surp > 0).float().mean().item()
                             if surp.shape == attn_weights.shape:
                                 a = attn_weights.reshape(-1).float()
                                 b = surp.reshape(-1).float()
-                                a = a - a.mean()
-                                b = b - b.mean()
-                                denom = a.std(unbiased=False) * b.std(unbiased=False) + 1e-8
-                                self._last_feature_write_surprise_corr = ((a * b).mean() / denom).item()
+                                a_centered = a - a.mean()
+                                b_centered = b - b.mean()
+                                denom = a_centered.std(unbiased=False) * b_centered.std(unbiased=False) + 1e-8
+                                self._last_feature_write_surprise_corr = ((a_centered * b_centered).mean() / denom).item()
+                                b_abs = b.abs()
+                                b_abs_centered = b_abs - b_abs.mean()
+                                denom_abs = a_centered.std(unbiased=False) * b_abs_centered.std(unbiased=False) + 1e-8
+                                self._last_feature_write_surprise_abs_corr = (
+                                    (a_centered * b_abs_centered).mean() / denom_abs
+                                ).item()
                             else:
                                 self._last_feature_write_surprise_corr = None
+                                self._last_feature_write_surprise_abs_corr = None
                         else:
                             self._last_feature_write_surprise_corr = None
+                            self._last_feature_write_surprise_abs_corr = None
+                            self._last_surprise_mean = None
+                            self._last_surprise_std = None
+                            self._last_surprise_pos_frac = None
                     attn_weights_exp = attn_weights.unsqueeze(-1)  # (B, S, 1)
                     pooled = (attn_weights_exp * features).sum(dim=1)  # (B, d_feature_input)
                     features_compressed = self.feature_compressor(pooled.mean(dim=0))
@@ -837,6 +860,18 @@ class GlobalSyncModule(nn.Module):
                     self._last_feature_write_top1 = None
                     self._last_feature_write_top5 = None
                     self._last_feature_write_surprise_corr = None
+                    self._last_feature_write_surprise_abs_corr = None
+                    if surprise is not None:
+                        surp = surprise
+                        if surp.dim() == 3:
+                            surp = surp.squeeze(-1)
+                        self._last_surprise_mean = surp.mean().item()
+                        self._last_surprise_std = surp.std(unbiased=False).item()
+                        self._last_surprise_pos_frac = (surp > 0).float().mean().item()
+                    else:
+                        self._last_surprise_mean = None
+                        self._last_surprise_std = None
+                        self._last_surprise_pos_frac = None
 
                 # Compress surprise if provided
                 surprise_scalar = None
@@ -1058,6 +1093,14 @@ class GlobalSyncModule(nn.Module):
                 'feature_write/top5_weight': self._last_feature_write_top5,
                 'feature_write/surprise_correlation': self._last_feature_write_surprise_corr
                 if self._last_feature_write_surprise_corr is not None else 0.0,
+                'feature_write/surprise_abs_correlation': self._last_feature_write_surprise_abs_corr
+                if self._last_feature_write_surprise_abs_corr is not None else 0.0,
+            })
+        if self._last_surprise_mean is not None:
+            stats.update({
+                'surprise/mean': self._last_surprise_mean,
+                'surprise/std': self._last_surprise_std,
+                'surprise/pos_frac': self._last_surprise_pos_frac,
             })
         if self._last_write_gate is not None:
             stats['surprise/write_gate_mean'] = self._last_write_gate
