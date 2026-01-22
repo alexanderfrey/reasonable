@@ -1748,6 +1748,14 @@ def main():
     print(f"  Pred: neurons={config.pred_d_neurons}, T={config.pred_T}, synapse={args.pred_synapse_hidden}, nlm={args.pred_nlm_hidden}")
     print(f"  Surp: neurons={config.surp_d_neurons}, T={config.surp_T}, synapse={args.surp_synapse_hidden}, nlm={args.surp_nlm_hidden}")
     print(f"  Sync pairs: {config.sync_pairs}")
+
+    # Log oscillator architecture (world vs self split)
+    n_osc = model.global_sync.config.num_oscillators
+    n_self = model.global_sync.oscillatory_world.config.num_self_oscillators
+    n_world = n_osc - n_self
+    d_self_state = model.global_sync.oscillatory_world.config.d_self_state
+    print(f"  Oscillators: {n_world} world + {n_self} self = {n_osc} total (d_self_state={d_self_state})")
+
     if args.diagnostic_every > 0:
         print(f"  [Diagnostic] Report every {args.diagnostic_every} steps")
     print()
@@ -2078,12 +2086,8 @@ def main():
             world_write_frac = world_stats.get('temporal/world_write_fraction')
             self_write_frac = world_stats.get('temporal/self_write_fraction')
             if phase_dist is not None:
-                # Get oscillator bank sizes
-                n_osc = model.global_sync.config.num_oscillators
-                n_self = model.global_sync.oscillatory_world.config.num_self_oscillators
-                n_world = n_osc - n_self
                 print(f"     Temporal | phase_dist={phase_dist:.2f} write_frac={write_frac:.2f} self_div={self_state_div:.3f}")
-                print(f"   Self-World | align={self_world_align:.3f} world={world_write_frac:.0%}of{n_world} self={self_write_frac:.0%}of{n_self}")
+                print(f"   Self-World | align={self_world_align:.3f} w_write={world_write_frac:.0%} s_write={self_write_frac:.0%}")
 
             # Self-state mechanism metrics (autobiographical memory health)
             ss_contrib = world_stats.get('self_state/contribution_norm')
