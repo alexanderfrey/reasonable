@@ -665,7 +665,7 @@ class OscillatoryWorldState(nn.Module):
                 old_self_norm = self.write_self_states[~recent_mask].norm(dim=-1).mean() if (~recent_mask).any() else recent_self_norm
                 stats['self_state_recency_ratio'] = recent_self_norm / (old_self_norm + 1e-8)
             else:
-            stats['self_state_recency_ratio'] = torch.tensor(1.0, device=self.phases.device)
+                stats['self_state_recency_ratio'] = torch.tensor(1.0, device=self.phases.device)
 
             # Self-state gating diagnostics
             stats['self_state_change'] = self._last_self_state_change.detach()
