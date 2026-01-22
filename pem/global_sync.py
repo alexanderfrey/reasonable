@@ -603,6 +603,13 @@ class GlobalSyncModule(nn.Module):
             self._last_osc_attn_query_ratio = None
             self._last_osc_attn_top1 = None
             self._last_osc_key_query_cosine = None
+            # Self-state tracking metrics
+            self._last_self_state_contribution_norm = None
+            self._last_self_state_value_ratio = None
+            self._last_self_state_compressor_std = None
+            self._last_self_state_step_change = None
+            self._last_self_state_stored_coverage = None
+            self._prev_self_state_for_change = None  # For tracking step-to-step change
             self._last_feature_write_attn_entropy = None
             self._last_feature_write_top1 = None
             self._last_feature_write_top5 = None
@@ -661,6 +668,13 @@ class GlobalSyncModule(nn.Module):
             self._last_osc_attn_query_ratio = None
             self._last_osc_attn_top1 = None
             self._last_osc_key_query_cosine = None
+            # Self-state tracking metrics
+            self._last_self_state_contribution_norm = None
+            self._last_self_state_value_ratio = None
+            self._last_self_state_compressor_std = None
+            self._last_self_state_step_change = None
+            self._last_self_state_stored_coverage = None
+            self._prev_self_state_for_change = None
             self._last_feature_write_attn_entropy = None
             self._last_feature_write_top1 = None
             self._last_feature_write_top5 = None
@@ -845,9 +859,26 @@ class GlobalSyncModule(nn.Module):
                 else:
                     pred_summary = sync_summary[:self.config.d_feature_input]  # Truncate if needed
                 self_state = self.self_state_compressor(pred_summary)  # (d_self_state,)
+
+                # Track self-state metrics
+                with torch.no_grad():
+                    # Compressor output variation (is it producing varied self-states?)
+                    self._last_self_state_compressor_std = self_state.std().item()
+
+                    # Step-to-step change (is self-state changing between steps?)
+                    if self._prev_self_state_for_change is not None:
+                        self._last_self_state_step_change = (
+                            self_state - self._prev_self_state_for_change
+                        ).norm().item()
+                    else:
+                        self._last_self_state_step_change = 0.0
+                    self._prev_self_state_for_change = self_state.detach().clone()
+
                 self._last_self_state = self_state.detach()
             else:
                 self_state = None
+                self._last_self_state_compressor_std = None
+                self._last_self_state_step_change = None
 
             # === WRITE PATH: Features + Surprise -> Oscillator Memory ===
             if features is not None:
@@ -1010,7 +1041,25 @@ class GlobalSyncModule(nn.Module):
                 if self.self_state_to_value is not None:
                     write_self_states = osc_output.write_self_states  # (num_osc, d_self_state)
                     self_state_contribution = self.self_state_to_value(write_self_states)  # (num_osc, d_world)
+
+                    # Track self-state contribution metrics
+                    with torch.no_grad():
+                        base_value_norm = value.norm().item()
+                        contrib_norm = self_state_contribution.norm().item()
+                        self._last_self_state_contribution_norm = contrib_norm
+                        self._last_self_state_value_ratio = contrib_norm / (base_value_norm + 1e-8)
+
+                        # Coverage: fraction of oscillators with non-zero stored self-state
+                        osc_self_state_norms = write_self_states.norm(dim=-1)  # (num_osc,)
+                        self._last_self_state_stored_coverage = (
+                            osc_self_state_norms > 1e-6
+                        ).float().mean().item()
+
                     value = value + self_state_contribution  # Enrich value with autobiographical context
+                else:
+                    self._last_self_state_contribution_norm = 0.0
+                    self._last_self_state_value_ratio = 0.0
+                    self._last_self_state_stored_coverage = 0.0
 
                 # Expand for batch: (num_osc, d_world) -> (B, num_osc, d_world)
                 key = key.unsqueeze(0).expand(B, -1, -1)
@@ -1198,6 +1247,24 @@ class GlobalSyncModule(nn.Module):
             'temporal/self_coherence': coherence_stats['self_coherence'].item(),
             'temporal/write_timing_coherence': coherence_stats['write_timing_coherence'].item(),
         })
+
+        # === SELF-STATE MECHANISM METRICS ===
+        # These track whether the autobiographical memory is working correctly
+        if self._last_self_state_contribution_norm is not None:
+            stats.update({
+                # Contribution: is self-state affecting predictions?
+                'self_state/contribution_norm': self._last_self_state_contribution_norm,
+                'self_state/value_ratio': self._last_self_state_value_ratio,
+                # Coverage: are oscillators storing self-states?
+                'self_state/stored_coverage': self._last_self_state_stored_coverage,
+            })
+        if self._last_self_state_compressor_std is not None:
+            stats.update({
+                # Compressor: is it producing varied outputs?
+                'self_state/compressor_std': self._last_self_state_compressor_std,
+                # Dynamics: is self-state changing between steps?
+                'self_state/step_change': self._last_self_state_step_change,
+            })
 
         return stats
 

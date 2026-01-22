@@ -2081,6 +2081,15 @@ def main():
                 print(f"     Temporal | phase_dist={phase_dist:.2f} write_frac={write_frac:.2f} self_div={self_state_div:.3f}")
                 print(f"   Self-World | align={self_world_align:.3f} w_write={world_write_frac:.2f} s_write={self_write_frac:.2f}")
 
+            # Self-state mechanism metrics (autobiographical memory health)
+            ss_contrib = world_stats.get('self_state/contribution_norm')
+            ss_ratio = world_stats.get('self_state/value_ratio')
+            ss_coverage = world_stats.get('self_state/stored_coverage')
+            ss_comp_std = world_stats.get('self_state/compressor_std')
+            ss_step_change = world_stats.get('self_state/step_change')
+            if ss_contrib is not None:
+                print(f"   Self-State | contrib={ss_contrib:.3f} ratio={ss_ratio:.3f} coverage={ss_coverage:.2f} comp_std={ss_comp_std:.3f} Δstep={ss_step_change:.3f}")
+
             # WandB logging (consolidated - only essential metrics)
             if config.wandb_project:
                 log_dict = {
@@ -2289,6 +2298,13 @@ def main():
                     'temporal/world_coherence': metrics.get('temporal/world_coherence', 0),
                     'temporal/self_coherence': metrics.get('temporal/self_coherence', 0),
                     'temporal/write_timing_coherence': metrics.get('temporal/write_timing_coherence', 0),
+
+                    # === SELF-STATE MECHANISM (autobiographical memory health) ===
+                    'self_state/contribution_norm': metrics.get('self_state/contribution_norm', 0),
+                    'self_state/value_ratio': metrics.get('self_state/value_ratio', 0),
+                    'self_state/stored_coverage': metrics.get('self_state/stored_coverage', 0),
+                    'self_state/compressor_std': metrics.get('self_state/compressor_std', 0),
+                    'self_state/step_change': metrics.get('self_state/step_change', 0),
                 }
                 wandb.log(log_dict, step=global_step)
 
