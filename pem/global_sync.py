@@ -133,6 +133,10 @@ class GlobalSyncConfig:
     use_auxiliary_prediction: bool = True
     auxiliary_prediction_horizon: int = 8  # How many steps ahead to predict
 
+    # Self-state tracking (autobiographical memory)
+    # Self-state captures: prediction summary, surprise level, confidence
+    d_self_state: int = 64  # Dimension of self-state vector
+
 
 class RMSNorm(nn.Module):
     """Root Mean Square Layer Normalization."""
@@ -509,6 +513,7 @@ class GlobalSyncModule(nn.Module):
                 d_output=config.d_world_output,
                 surprise_gate_bias=config.surprise_gate_bias,
                 surprise_gate_scale=config.surprise_gate_scale,
+                d_self_state=config.d_self_state,  # Self-state dimension
             )
             self.oscillatory_world = OscillatoryWorldState(osc_config)
 
@@ -616,6 +621,19 @@ class GlobalSyncModule(nn.Module):
             else:
                 self.future_predictor = None
                 self.auxiliary_prediction_horizon = 0
+
+            # Self-state compressor: prediction activations → compact self-state
+            # Captures "what am I predicting" and "how confident am I"
+            # Input: d_world_output (from prediction summary)
+            # Output: d_self_state (compact cognitive state)
+            self.self_state_compressor = nn.Sequential(
+                nn.Linear(config.d_world_output, 128),
+                nn.GELU(),
+                nn.Linear(128, config.d_self_state),
+            )
+            # Buffer to store last prediction output for self-state computation
+            self.register_buffer('_last_prediction_output', None)
+            self._last_self_state = None  # Computed self-state (not a buffer, computed each forward)
         else:
             self.oscillatory_world = None
             self.feature_compressor = None
@@ -629,6 +647,8 @@ class GlobalSyncModule(nn.Module):
             self.osc_output_norm = None
             self.future_predictor = None
             self.auxiliary_prediction_horizon = 0
+            self.self_state_compressor = None
+            self._last_self_state = None
             self._last_osc_attn_out_norm = None
             self._last_osc_query_act_norm = None
             self._last_osc_attn_query_ratio = None
@@ -805,6 +825,23 @@ class GlobalSyncModule(nn.Module):
         if self.oscillatory_world is not None:
             B, S, _ = sync.shape
 
+            # === SELF-STATE COMPUTATION ===
+            # Compute self-state from previous world state (captures cognitive context)
+            # This creates autobiographical memory: "what I was experiencing when I learned this"
+            if self.self_state_compressor is not None:
+                # Use sync as proxy for prediction state (summarizes current processing)
+                # Alternative: could use features if they represent predictions
+                sync_summary = sync.mean(dim=(0, 1))  # (sync_pairs,) -> compress across batch/seq
+                # Project to world output dimension first (sync_pairs -> d_world_output)
+                if hasattr(self, 'sync_to_feature') and self.sync_to_feature is not None:
+                    pred_summary = self.sync_to_feature(sync_summary)  # (d_world_output,)
+                else:
+                    pred_summary = sync_summary[:self.config.d_world_output]  # Truncate if needed
+                self_state = self.self_state_compressor(pred_summary)  # (d_self_state,)
+                self._last_self_state = self_state
+            else:
+                self_state = None
+
             # === WRITE PATH: Features + Surprise -> Oscillator Memory ===
             if features is not None:
                 # Compress features to single vector for writing using attention pooling
@@ -901,6 +938,7 @@ class GlobalSyncModule(nn.Module):
                 osc_output = self.oscillatory_world(
                     features=features_compressed,
                     surprise=surprise_scalar,
+                    self_state=self_state,
                     dt=1.0
                 )
             else:
@@ -931,6 +969,7 @@ class GlobalSyncModule(nn.Module):
                 osc_output = self.oscillatory_world(
                     features=sync_as_features,
                     surprise=None,
+                    self_state=self_state,
                     dt=1.0
                 )
 
@@ -1114,6 +1153,37 @@ class GlobalSyncModule(nn.Module):
                 'osc_xattn/query_act_norm': self._last_osc_query_act_norm,
                 'osc_xattn/attn_query_ratio': self._last_osc_attn_query_ratio,
             })
+
+        # === TEMPORAL METRICS (phase-tagged writes) ===
+        phase_diff_stats = self.oscillatory_world.get_phase_diff_features()
+        stats.update({
+            'temporal/phase_dist_mean': phase_diff_stats['phase_dist_mean'].item(),
+            'temporal/phase_dist_std': phase_diff_stats['phase_dist_std'].item(),
+            'temporal/estimated_age_mean': phase_diff_stats['estimated_age_mean'].item(),
+            'temporal/estimated_age_std': phase_diff_stats['estimated_age_std'].item(),
+            'temporal/write_fraction': phase_diff_stats['write_fraction'].item(),
+            'temporal/write_strength_mean': phase_diff_stats['write_strength_mean'].item(),
+            # World vs self oscillator breakdowns
+            'temporal/world_phase_dist_mean': phase_diff_stats['world_phase_dist_mean'].item(),
+            'temporal/world_estimated_age_mean': phase_diff_stats['world_estimated_age_mean'].item(),
+            'temporal/world_write_fraction': phase_diff_stats['world_write_fraction'].item(),
+            'temporal/self_phase_dist_mean': phase_diff_stats['self_phase_dist_mean'].item(),
+            'temporal/self_estimated_age_mean': phase_diff_stats['self_estimated_age_mean'].item(),
+            'temporal/self_write_fraction': phase_diff_stats['self_write_fraction'].item(),
+            # Self-state diversity metrics
+            'temporal/self_state_diversity': phase_diff_stats['self_state_diversity'].item(),
+            'temporal/self_state_recency_ratio': phase_diff_stats['self_state_recency_ratio'].item(),
+        })
+
+        # === SELF-WORLD COHERENCE METRICS ===
+        coherence_stats = self.oscillatory_world.compute_self_world_coherence()
+        stats.update({
+            'temporal/self_world_alignment': coherence_stats['self_world_alignment'].item(),
+            'temporal/world_coherence': coherence_stats['world_coherence'].item(),
+            'temporal/self_coherence': coherence_stats['self_coherence'].item(),
+            'temporal/write_timing_coherence': coherence_stats['write_timing_coherence'].item(),
+        })
+
         return stats
 
     def reset_oscillator_phases(self, random: bool = True):

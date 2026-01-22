@@ -42,6 +42,10 @@ class OscillatorOutput(NamedTuple):
     """Output from oscillatory world state forward pass."""
     output: torch.Tensor           # (d_output,) projected world state
     memory_states: torch.Tensor    # (num_oscillators,) raw oscillator values for cross-attention
+    phase_dist: torch.Tensor       # (num_oscillators,) smooth phase distance [0, 2] - how far from write phase
+    estimated_age: torch.Tensor    # (num_oscillators,) estimated age in steps (within period)
+    write_strengths: torch.Tensor  # (num_oscillators,) current write intensity
+    write_self_states: torch.Tensor  # (num_oscillators, d_self_state) self-state at write time
 
 
 class OscillatorMetrics(NamedTuple):
@@ -78,6 +82,11 @@ class OscillatoryWorldConfig:
     - Features (content) write to memory via amplitude modulation
     - Surprise gates write strength (unexpected = important to remember)
     - Sync queries memory via cross-attention (handled in GlobalSyncModule)
+
+    Extended with self-state tracking for autobiographical memory:
+    - World oscillators (0 to N-num_self) store environment content
+    - Self oscillators (N-num_self to N) store cognitive/prediction state
+    - Write_self_states buffer stores self-state at write time for each oscillator
     """
 
     # Oscillator parameters
@@ -103,6 +112,15 @@ class OscillatoryWorldConfig:
 
     # Initialization
     init_amplitude_scale: float = 1.0  # Initial amplitude scale
+
+    # Phase-tagged writes (temporal awareness)
+    phase_write_threshold: float = 0.1   # Min |amp_mod| to count as significant write
+    write_strength_decay: float = 0.99   # Decay factor for old write strengths
+
+    # Self-state tracking (autobiographical memory)
+    num_self_oscillators: int = 16       # Oscillators dedicated to self-state (indices N-16 to N)
+    d_self_state: int = 64               # Dimension of self-state input
+    self_write_threshold: float = 0.1    # Min self-state change to trigger write
 
 
 class OscillatoryWorldState(nn.Module):
@@ -204,6 +222,40 @@ class OscillatoryWorldState(nn.Module):
         # Update counter
         self.register_buffer('_update_count', torch.tensor(0, dtype=torch.long))
 
+        # === PHASE-TAGGED WRITES (temporal awareness) ===
+        # Track when each oscillator was written to (phase at write time)
+        self.register_buffer('write_phases', torch.zeros(N))
+        # Track write intensity for each oscillator (decays over time)
+        self.register_buffer('write_strengths', torch.zeros(N))
+        # Guard against double-update during checkpointing
+        self.register_buffer('_last_update_count', torch.tensor(-1, dtype=torch.long))
+
+        # === SELF-STATE AT WRITE TIME (autobiographical memory) ===
+        # Store compressed self-state when each oscillator was written
+        # This creates memory of "what I was experiencing when I learned this"
+        self.register_buffer('write_self_states', torch.zeros(N, config.d_self_state))
+        # Track last self-state for detecting cognitive shifts
+        self.register_buffer('_last_self_state', torch.zeros(config.d_self_state))
+
+        # === SELF-STATE MODULATION NETWORKS ===
+        # For self oscillators (indices N - num_self_oscillators : N)
+        # Input: self-state vector (prediction summary + surprise + confidence)
+        # Output: amplitude modulation for self oscillators
+        N_self = config.num_self_oscillators
+        self.self_amp_modulator = nn.Sequential(
+            nn.Linear(config.d_self_state, N_self * 2),
+            nn.GELU(),
+            nn.Linear(N_self * 2, N_self),
+            nn.Tanh(),
+        )
+
+        self.self_phase_modulator = nn.Sequential(
+            nn.Linear(config.d_self_state, N_self * 2),
+            nn.GELU(),
+            nn.Linear(N_self * 2, N_self),
+            nn.Tanh(),
+        )
+
         self._init_weights()
 
     def _init_weights(self):
@@ -229,6 +281,26 @@ class OscillatoryWorldState(nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
+        # Self-state amplitude modulator: small init for gradual self-state learning
+        for i, m in enumerate(self.self_amp_modulator.modules()):
+            if isinstance(m, nn.Linear):
+                if i == len(list(self.self_amp_modulator.modules())) - 2:
+                    nn.init.xavier_uniform_(m.weight, gain=0.1)
+                else:
+                    nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+        # Self-state phase modulator: small init
+        for i, m in enumerate(self.self_phase_modulator.modules()):
+            if isinstance(m, nn.Linear):
+                if i == len(list(self.self_phase_modulator.modules())) - 2:
+                    nn.init.xavier_uniform_(m.weight, gain=0.1)
+                else:
+                    nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
         # Output projection
         nn.init.xavier_uniform_(self.output_proj.weight)
         if self.output_proj.bias is not None:
@@ -238,103 +310,179 @@ class OscillatoryWorldState(nn.Module):
         self,
         features: torch.Tensor,
         surprise: Optional[torch.Tensor] = None,
+        self_state: Optional[torch.Tensor] = None,
         dt: float = 1.0,
     ) -> OscillatorOutput:
         """
-        Content-based memory write with surprise gating.
+        Content-based memory write with surprise gating and self-state tracking.
 
-        New architecture:
-        - Features (content) determine WHAT to store in each oscillator
-        - Surprise determines HOW STRONGLY to write (importance gate)
-        - Output provides memory states for cross-attention querying
-
-        The key insight is that we keep self.phases as a DETACHED buffer (persistent
-        state), but compute DIFFERENTIABLE contributions on top of it.
+        Extended architecture with world + self oscillators:
+        - World oscillators (0 to N_world): store environment content, gated by surprise
+        - Self oscillators (N_world to N): store cognitive state, gated by self-state change
+        - write_self_states: store self-state at write time for autobiographical memory
 
         Gradient paths:
         - frequencies → freq_contribution → effective_phase → output
         - base_amplitudes → modulated_amps → output
-        - features → amp_modulator → amp_mod → modulated_amps → output
-        - features → phase_modulator → phase_shift → effective_phase → output
-        - surprise → write_gate → modulated_amps → output
+        - features → amp_modulator → amp_mod_world → modulated_amps → output
+        - features → phase_modulator → phase_shift_world → effective_phase → output
+        - surprise → write_gate_world → modulated_amps → output
+        - self_state → self_amp_modulator → amp_mod_self → modulated_amps → output
+        - self_state → self_phase_modulator → phase_shift_self → effective_phase → output
 
         Args:
             features: (d_feature_input,) compressed content features
             surprise: Optional scalar or (1,) surprise magnitude for gating
+            self_state: Optional (d_self_state,) cognitive state for self oscillators
             dt: Time step for phase advance
 
         Returns:
-            OscillatorOutput with projected output and raw memory states
+            OscillatorOutput with projected output, memory states, and temporal metadata
         """
-        # === SURPRISE GATING ===
+        N = self.config.num_oscillators
+        N_self = self.config.num_self_oscillators
+        N_world = N - N_self
+
+        # === CHECKPOINTING GUARD ===
+        # Prevent double-update during gradient checkpointing
+        current_count = self._update_count.item()
+        if current_count == self._last_update_count.item():
+            # Already updated in this step - skip buffer updates
+            skip_buffer_update = True
+        else:
+            skip_buffer_update = False
+
+        # === WORLD OSCILLATOR GATING (indices 0:N_world) ===
         # Higher surprise = more important to remember = stronger write
         if surprise is not None:
-            # Ensure surprise is a scalar
             if surprise.numel() > 1:
                 surprise = surprise.mean()
-            # Compute write gate: sigmoid(bias + surprise * scale)
-            write_gate = torch.sigmoid(
+            write_gate_world = torch.sigmoid(
                 self.surprise_gate_bias + surprise * self.surprise_gate_scale
             )
         else:
-            # Default: moderate write strength
-            write_gate = torch.tensor(
+            write_gate_world = torch.tensor(
                 self.surprise_gate_bias,
                 device=features.device,
                 dtype=features.dtype
             ).sigmoid()
+
+        # === SELF OSCILLATOR GATING (indices N_world:N) ===
+        # Gate by self-state change magnitude (cognitive shift = worth remembering)
+        if self_state is not None:
+            self_state_change = (self_state - self._last_self_state).norm()
+            write_gate_self = torch.sigmoid(
+                self_state_change - self.config.self_write_threshold
+            )
+        else:
+            write_gate_self = torch.tensor(0.0, device=features.device, dtype=features.dtype)
 
         # === DIFFERENTIABLE COMPUTATIONS ===
 
         # Frequency contribution to phase (DIFFERENTIABLE w.r.t. frequencies)
         freq_contribution = 2 * math.pi * self.frequencies * dt
 
-        # Amplitude modulation from FEATURES (DIFFERENTIABLE)
-        # Features determine WHAT content to store in each oscillator
-        amp_mod = self.amp_modulator(features)  # (N,), in [-1, 1]
+        # === WORLD OSCILLATOR MODULATION (from features) ===
+        amp_mod_world_full = self.amp_modulator(features)  # (N,), in [-1, 1]
+        amp_mod_world = amp_mod_world_full[:N_world]
+        phase_mod_world_full = self.phase_modulator(features)  # (N,), in [-1, 1]
+        phase_mod_world = phase_mod_world_full[:N_world]
 
-        # Apply surprise gate: scale the amplitude modulation by importance
-        # When surprise is high, we write more strongly
-        gated_amp_mod = amp_mod * write_gate
+        gated_amp_mod_world = amp_mod_world * write_gate_world
+
+        # === SELF OSCILLATOR MODULATION (from self_state) ===
+        if self_state is not None:
+            amp_mod_self = self.self_amp_modulator(self_state)  # (N_self,), in [-1, 1]
+            phase_mod_self = self.self_phase_modulator(self_state)  # (N_self,), in [-1, 1]
+            gated_amp_mod_self = amp_mod_self * write_gate_self
+        else:
+            gated_amp_mod_self = torch.zeros(N_self, device=features.device, dtype=features.dtype)
+            phase_mod_self = torch.zeros(N_self, device=features.device, dtype=features.dtype)
+
+        # === COMBINE WORLD + SELF ===
+        gated_amp_mod = torch.cat([gated_amp_mod_world, gated_amp_mod_self])
+        phase_mod = torch.cat([phase_mod_world, phase_mod_self])
+
+        # Compute combined write gate for phase shift scaling
+        write_gate_combined = torch.cat([
+            write_gate_world.expand(N_world),
+            write_gate_self.expand(N_self)
+        ])
 
         modulated_amps = self.base_amplitudes * (1 + gated_amp_mod * self.config.max_amp_modulation)
         modulated_amps = modulated_amps.clamp(min=0.0)
 
-        # Phase modulation from FEATURES (DIFFERENTIABLE)
-        # Features also influence timing/phase encoding
-        phase_mod = self.phase_modulator(features)  # (N,), in [-1, 1]
-        phase_shift = phase_mod * self.config.max_phase_shift * math.pi * write_gate
+        phase_shift = phase_mod * self.config.max_phase_shift * math.pi * write_gate_combined
 
         # === EFFECTIVE PHASE COMPUTATION ===
-        # base_phase: detached accumulated phase from buffer (no gradients)
-        # freq_contribution: differentiable (gradients to frequencies)
-        # phase_shift: differentiable (gradients to phase_modulator)
         effective_phase = self.phases.detach() + freq_contribution + phase_shift
 
-        # === UPDATE BUFFER FOR NEXT CALL (detached) ===
-        with torch.no_grad():
-            # Store modulation values for monitoring
-            self._last_amp_mod.copy_(amp_mod.detach())
-            self._last_phase_mod.copy_(phase_mod.detach())
-            self.current_amplitudes.copy_(modulated_amps.detach())
+        # === COMPUTE PHASE DISTANCE AND ESTIMATED AGE ===
+        # Smooth phase distance: 1 - cos(Δphase) gives [0, 2] range
+        # 0 = just written (same phase), 2 = half period ago (opposite phase)
+        phase_diff = effective_phase - self.write_phases
+        phase_dist = 1 - torch.cos(phase_diff)  # (N,), in [0, 2]
 
-            # Update phase buffer: accumulated_phase + freq + phase_shift
-            # This is the state that will be used in the NEXT forward call
-            new_phases = (self.phases + freq_contribution.detach() + phase_shift.detach()) % (2 * math.pi)
-            self.phases.copy_(new_phases)
-            self._update_count.add_(1)
+        # Estimated age in steps (within one period)
+        # age = phase_diff / (2π * frequency)
+        estimated_age = phase_diff.abs() / (2 * math.pi * self.frequencies + 1e-8)
+
+        # === UPDATE BUFFERS FOR NEXT CALL (detached) ===
+        if not skip_buffer_update:
+            with torch.no_grad():
+                # Store modulation values for monitoring
+                self._last_amp_mod.copy_(gated_amp_mod.detach())
+                self._last_phase_mod.copy_(phase_mod.detach())
+                self.current_amplitudes.copy_(modulated_amps.detach())
+
+                # Update phase buffer
+                new_phases = (self.phases + freq_contribution.detach() + phase_shift.detach()) % (2 * math.pi)
+                self.phases.copy_(new_phases)
+
+                # === PHASE-TAGGED WRITES ===
+                # Decay old write strengths
+                self.write_strengths.mul_(self.config.write_strength_decay)
+
+                # Update write_phases and write_strengths for oscillators that were written to
+                write_mask = (gated_amp_mod.abs() > self.config.phase_write_threshold)
+                write_intensity = gated_amp_mod.abs().detach()
+
+                # Only update write_phases for oscillators with significant writes
+                self.write_phases = torch.where(
+                    write_mask,
+                    new_phases,
+                    self.write_phases
+                )
+                self.write_strengths = torch.where(
+                    write_mask,
+                    write_intensity,
+                    self.write_strengths
+                )
+
+                # === AUTOBIOGRAPHICAL MEMORY ===
+                # Store current self_state for oscillators that were written to
+                if self_state is not None:
+                    for i in range(N):
+                        if write_mask[i]:
+                            self.write_self_states[i] = self_state.detach()
+                    # Update last self-state for next comparison
+                    self._last_self_state.copy_(self_state.detach())
+
+                self._update_count.add_(1)
+                self._last_update_count.copy_(self._update_count)
 
         # === COMPUTE OUTPUT ===
-        # osc_values: differentiable w.r.t. modulated_amps and effective_phase
-        # These are the raw oscillator states that serve as MEMORY
-        osc_values = modulated_amps * torch.sin(effective_phase)  # (num_oscillators,)
-
-        # Project to output dimension (for legacy compatibility)
+        osc_values = modulated_amps * torch.sin(effective_phase)  # (N,)
         output = self.output_proj(osc_values)  # (d_output,)
 
-        # Return both projected output and raw oscillator values
-        # Raw values are used as memory keys/values for cross-attention
-        return OscillatorOutput(output=output, memory_states=osc_values)
+        return OscillatorOutput(
+            output=output,
+            memory_states=osc_values,
+            phase_dist=phase_dist,
+            estimated_age=estimated_age,
+            write_strengths=self.write_strengths.clone(),
+            write_self_states=self.write_self_states.clone(),
+        )
 
     # Legacy methods for compatibility - now just call forward()
     def advance(self, dt: float = 1.0):
@@ -353,7 +501,7 @@ class OscillatoryWorldState(nn.Module):
 
     def reset_phases(self, random: bool = True):
         """
-        Reset oscillator phases.
+        Reset oscillator phases and all temporal tracking buffers.
 
         Args:
             random: If True, randomize phases. If False, set to zero.
@@ -365,6 +513,13 @@ class OscillatoryWorldState(nn.Module):
                 self.phases.zero_()
             self.current_amplitudes.copy_(self.base_amplitudes)
             self._update_count.zero_()
+            # Reset phase-tagged write buffers
+            self.write_phases.zero_()
+            self.write_strengths.zero_()
+            self._last_update_count.fill_(-1)
+            # Reset self-state tracking
+            self.write_self_states.zero_()
+            self._last_self_state.zero_()
 
     def detach_state(self):
         """
@@ -444,6 +599,121 @@ class OscillatoryWorldState(nn.Module):
                 output_mean=output_mean,
                 output_std=output_std,
             )
+
+    def get_phase_diff_features(self) -> Dict[str, torch.Tensor]:
+        """
+        Get phase-difference based features for temporal awareness.
+
+        Returns statistics about memory freshness and self-state diversity.
+        These can be logged and used to understand temporal dynamics.
+
+        Returns:
+            Dict with temporal and self-state metrics.
+        """
+        with torch.no_grad():
+            N = self.config.num_oscillators
+            N_self = self.config.num_self_oscillators
+            N_world = N - N_self
+
+            # Compute current phase distance from write phases
+            phase_diff = self.phases - self.write_phases
+            phase_dist = 1 - torch.cos(phase_diff)  # [0, 2]
+
+            # Estimated age in steps
+            estimated_age = phase_diff.abs() / (2 * math.pi * self.frequencies + 1e-8)
+
+            stats = {}
+
+            # Overall stats
+            stats['phase_dist_mean'] = phase_dist.mean()
+            stats['phase_dist_std'] = phase_dist.std()
+            stats['estimated_age_mean'] = estimated_age.mean()
+            stats['estimated_age_std'] = estimated_age.std()
+
+            # Write activity
+            stats['write_fraction'] = (self.write_strengths > self.config.phase_write_threshold).float().mean()
+            stats['write_strength_mean'] = self.write_strengths.mean()
+
+            # World oscillator stats (indices 0:N_world)
+            stats['world_phase_dist_mean'] = phase_dist[:N_world].mean()
+            stats['world_estimated_age_mean'] = estimated_age[:N_world].mean()
+            stats['world_write_fraction'] = (
+                self.write_strengths[:N_world] > self.config.phase_write_threshold
+            ).float().mean()
+
+            # Self oscillator stats (indices N_world:N)
+            stats['self_phase_dist_mean'] = phase_dist[N_world:].mean()
+            stats['self_estimated_age_mean'] = estimated_age[N_world:].mean()
+            stats['self_write_fraction'] = (
+                self.write_strengths[N_world:] > self.config.phase_write_threshold
+            ).float().mean()
+
+            # Self-state diversity: are we storing varied cognitive states?
+            # Higher variance = more diverse self-states stored
+            self_state_var = self.write_self_states.var(dim=0).mean()
+            stats['self_state_diversity'] = self_state_var
+
+            # Self-state recency correlation with write_strengths
+            # Measures if recent writes have stronger stored self-states
+            recent_mask = phase_dist < 0.5  # Recently written
+            if recent_mask.any():
+                recent_self_norm = self.write_self_states[recent_mask].norm(dim=-1).mean()
+                old_self_norm = self.write_self_states[~recent_mask].norm(dim=-1).mean() if (~recent_mask).any() else recent_self_norm
+                stats['self_state_recency_ratio'] = recent_self_norm / (old_self_norm + 1e-8)
+            else:
+                stats['self_state_recency_ratio'] = torch.tensor(1.0, device=self.phases.device)
+
+            return stats
+
+    def compute_self_world_coherence(self) -> Dict[str, torch.Tensor]:
+        """
+        Measure alignment between self and world oscillators.
+
+        High coherence: self and world written together (integrated experience)
+        Low coherence: self and world out of sync (dissociated processing)
+
+        This measures whether cognitive self-state and world content are
+        being processed in a coordinated way.
+
+        Returns:
+            Dict with coherence metrics.
+        """
+        with torch.no_grad():
+            N = self.config.num_oscillators
+            N_self = self.config.num_self_oscillators
+            N_world = N - N_self
+
+            world_phases = self.phases[:N_world]
+            self_phases = self.phases[N_world:]
+
+            # Mean phase vectors (Kuramoto order parameter style)
+            world_cos = torch.cos(world_phases).mean()
+            world_sin = torch.sin(world_phases).mean()
+            self_cos = torch.cos(self_phases).mean()
+            self_sin = torch.sin(self_phases).mean()
+
+            # World coherence: how synchronized are world oscillators with each other?
+            world_coherence = torch.sqrt(world_cos**2 + world_sin**2)
+
+            # Self coherence: how synchronized are self oscillators with each other?
+            self_coherence = torch.sqrt(self_cos**2 + self_sin**2)
+
+            # Self-world alignment: cos(world_mean_phase - self_mean_phase)
+            # High = self and world in phase, low = out of phase
+            self_world_alignment = world_cos * self_cos + world_sin * self_sin
+
+            # Write timing coherence: are self and world being written at similar times?
+            world_write_active = (self.write_strengths[:N_world] > self.config.phase_write_threshold).float()
+            self_write_active = (self.write_strengths[N_world:] > self.config.phase_write_threshold).float()
+            # Measure overlap in write activity
+            write_timing_coherence = (world_write_active.mean() * self_write_active.mean()).sqrt()
+
+            return {
+                'self_world_alignment': self_world_alignment,
+                'world_coherence': world_coherence,
+                'self_coherence': self_coherence,
+                'write_timing_coherence': write_timing_coherence,
+            }
 
 
 def create_oscillatory_world(

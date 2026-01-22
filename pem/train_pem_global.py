@@ -2070,6 +2070,17 @@ def main():
                 abl_status = "✓ HELPING" if osc_abl_deg > 0.001 else ("≈ NEUTRAL" if abs(osc_abl_deg) < 0.001 else "✗ HURTING")
                 print(f"  Osc Ablation | degradation={osc_abl_deg:+.4f} relative_help={osc_abl_rel:.1%} {abl_status}")
 
+            # Temporal awareness metrics (phase-tagged writes, self-state)
+            phase_dist = world_stats.get('temporal/phase_dist_mean')
+            write_frac = world_stats.get('temporal/write_fraction')
+            self_state_div = world_stats.get('temporal/self_state_diversity')
+            self_world_align = world_stats.get('temporal/self_world_alignment')
+            world_write_frac = world_stats.get('temporal/world_write_fraction')
+            self_write_frac = world_stats.get('temporal/self_write_fraction')
+            if phase_dist is not None:
+                print(f"     Temporal | phase_dist={phase_dist:.2f} write_frac={write_frac:.2f} self_div={self_state_div:.3f}")
+                print(f"   Self-World | align={self_world_align:.3f} w_write={world_write_frac:.2f} s_write={self_write_frac:.2f}")
+
             # WandB logging (consolidated - only essential metrics)
             if config.wandb_project:
                 log_dict = {
@@ -2253,6 +2264,31 @@ def main():
                     'surprise/mean': metrics.get('surprise/mean', 0),
                     'surprise/std': metrics.get('surprise/std', 0),
                     'surprise/pos_frac': metrics.get('surprise/pos_frac', 0),
+
+                    # === TEMPORAL AWARENESS (phase-tagged writes) ===
+                    'temporal/phase_dist_mean': metrics.get('temporal/phase_dist_mean', 0),
+                    'temporal/phase_dist_std': metrics.get('temporal/phase_dist_std', 0),
+                    'temporal/estimated_age_mean': metrics.get('temporal/estimated_age_mean', 0),
+                    'temporal/estimated_age_std': metrics.get('temporal/estimated_age_std', 0),
+                    'temporal/write_fraction': metrics.get('temporal/write_fraction', 0),
+                    'temporal/write_strength_mean': metrics.get('temporal/write_strength_mean', 0),
+                    # World vs self oscillator breakdowns
+                    'temporal/world_phase_dist_mean': metrics.get('temporal/world_phase_dist_mean', 0),
+                    'temporal/world_estimated_age_mean': metrics.get('temporal/world_estimated_age_mean', 0),
+                    'temporal/world_write_fraction': metrics.get('temporal/world_write_fraction', 0),
+                    'temporal/self_phase_dist_mean': metrics.get('temporal/self_phase_dist_mean', 0),
+                    'temporal/self_estimated_age_mean': metrics.get('temporal/self_estimated_age_mean', 0),
+                    'temporal/self_write_fraction': metrics.get('temporal/self_write_fraction', 0),
+
+                    # === SELF-STATE TRACKING (autobiographical memory) ===
+                    'temporal/self_state_diversity': metrics.get('temporal/self_state_diversity', 0),
+                    'temporal/self_state_recency_ratio': metrics.get('temporal/self_state_recency_ratio', 0),
+
+                    # === SELF-WORLD COHERENCE ===
+                    'temporal/self_world_alignment': metrics.get('temporal/self_world_alignment', 0),
+                    'temporal/world_coherence': metrics.get('temporal/world_coherence', 0),
+                    'temporal/self_coherence': metrics.get('temporal/self_coherence', 0),
+                    'temporal/write_timing_coherence': metrics.get('temporal/write_timing_coherence', 0),
                 }
                 wandb.log(log_dict, step=global_step)
 
