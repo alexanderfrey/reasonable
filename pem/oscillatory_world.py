@@ -218,6 +218,8 @@ class OscillatoryWorldState(nn.Module):
         # Track last modulation values for monitoring
         self.register_buffer('_last_amp_mod', torch.zeros(N))
         self.register_buffer('_last_phase_mod', torch.zeros(N))
+        self.register_buffer('_last_self_state_change', torch.tensor(0.0))
+        self.register_buffer('_last_write_gate_self', torch.tensor(0.0))
 
         # Update counter
         self.register_buffer('_update_count', torch.tensor(0, dtype=torch.long))
@@ -370,8 +372,12 @@ class OscillatoryWorldState(nn.Module):
             write_gate_self = torch.sigmoid(
                 self_state_change - self.config.self_write_threshold
             )
+            self._last_self_state_change.copy_(self_state_change.detach())
+            self._last_write_gate_self.copy_(write_gate_self.detach())
         else:
             write_gate_self = torch.tensor(0.0, device=features.device, dtype=features.dtype)
+            self._last_self_state_change.zero_()
+            self._last_write_gate_self.zero_()
 
         # === DIFFERENTIABLE COMPUTATIONS ===
 
@@ -659,7 +665,11 @@ class OscillatoryWorldState(nn.Module):
                 old_self_norm = self.write_self_states[~recent_mask].norm(dim=-1).mean() if (~recent_mask).any() else recent_self_norm
                 stats['self_state_recency_ratio'] = recent_self_norm / (old_self_norm + 1e-8)
             else:
-                stats['self_state_recency_ratio'] = torch.tensor(1.0, device=self.phases.device)
+            stats['self_state_recency_ratio'] = torch.tensor(1.0, device=self.phases.device)
+
+            # Self-state gating diagnostics
+            stats['self_state_change'] = self._last_self_state_change.detach()
+            stats['self_write_gate'] = self._last_write_gate_self.detach()
 
             return stats
 

@@ -2095,8 +2095,13 @@ def main():
             ss_coverage = world_stats.get('self_state/stored_coverage')
             ss_comp_std = world_stats.get('self_state/compressor_std')
             ss_step_change = world_stats.get('self_state/step_change')
+            ss_write_gate = world_stats.get('self_state/write_gate')
             if ss_contrib is not None:
-                print(f"   Self-State | contrib={ss_contrib:.3f} ratio={ss_ratio:.3f} coverage={ss_coverage:.2f} comp_std={ss_comp_std:.3f} Δstep={ss_step_change:.3f}")
+                gate_str = f" gate={ss_write_gate:.3f}" if ss_write_gate is not None else ""
+                print(
+                    f"   Self-State | contrib={ss_contrib:.3f} ratio={ss_ratio:.3f} "
+                    f"coverage={ss_coverage:.2f} comp_std={ss_comp_std:.3f} Δstep={ss_step_change:.3f}{gate_str}"
+                )
 
             # WandB logging (consolidated - only essential metrics)
             if config.wandb_project:
@@ -2313,6 +2318,8 @@ def main():
                     'self_state/stored_coverage': metrics.get('self_state/stored_coverage', 0),
                     'self_state/compressor_std': metrics.get('self_state/compressor_std', 0),
                     'self_state/step_change': metrics.get('self_state/step_change', 0),
+                    'self_state/write_gate': metrics.get('self_state/write_gate', 0),
+                    'self_state/change': metrics.get('self_state/change', 0),
                 }
                 wandb.log(log_dict, step=global_step)
 

@@ -711,6 +711,7 @@ class PEMLoopGlobal(nn.Module):
                 },
                 features=loop_features,  # Content to write to memory
                 surprise=surprise_signal,  # May be None, prediction_error, or ctm
+                prediction_certainty=pred_output.certainty,
             )
         else:
             global_sync_output = self.global_sync(
@@ -720,6 +721,7 @@ class PEMLoopGlobal(nn.Module):
                 },
                 features=loop_features,  # Content to write to memory
                 surprise=surprise_signal,  # Importance gate: high surprise = important
+                prediction_certainty=pred_output.certainty,
             )
 
         # 6. Update cumulative sync

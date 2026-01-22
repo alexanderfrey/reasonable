@@ -635,12 +635,20 @@ class GlobalSyncModule(nn.Module):
                 self.future_predictor = None
                 self.auxiliary_prediction_horizon = 0
 
-            # Self-state compressor: prediction activations → compact self-state
-            # Captures "what am I predicting" and "how confident am I"
-            # Input: d_feature_input (from prediction summary)
+            # Prediction summary projection: post-activations -> d_feature_input
+            # Lazy to adapt to pred_d_neurons without plumbing config through
+            self.pred_summary_proj = nn.Sequential(
+                nn.LazyLinear(config.d_feature_input),
+                nn.GELU(),
+                nn.Linear(config.d_feature_input, config.d_feature_input),
+            )
+
+            # Self-state compressor: prediction + surprise + confidence + sync summary
+            # Input: [sync_summary, pred_summary, surprise_scalar, confidence] -> d_self_state
             # Output: d_self_state (compact cognitive state)
+            self_state_in_dim = (2 * config.d_feature_input) + 2
             self.self_state_compressor = nn.Sequential(
-                nn.Linear(config.d_feature_input, 128),
+                nn.Linear(self_state_in_dim, 128),
                 nn.GELU(),
                 nn.Linear(128, config.d_self_state),
             )
@@ -661,6 +669,7 @@ class GlobalSyncModule(nn.Module):
             self.osc_output_norm = None
             self.future_predictor = None
             self.auxiliary_prediction_horizon = 0
+            self.pred_summary_proj = None
             self.self_state_compressor = None
             self._last_self_state = None
             self._last_osc_attn_out_norm = None
@@ -785,6 +794,7 @@ class GlobalSyncModule(nn.Module):
         module_activations: Dict[str, List[torch.Tensor]],  # {name: List[(B, S, d_neurons)]}
         features: Optional[torch.Tensor] = None,  # (B, S, d_feature_input) content for memory
         surprise: Optional[torch.Tensor] = None,  # (B, S, 1) or scalar, importance gate
+        prediction_certainty: Optional[torch.Tensor] = None,  # (B, S, 1) or scalar
     ) -> GlobalSyncOutput:
         """
         Compute global sync from module post-activation histories.
@@ -847,18 +857,42 @@ class GlobalSyncModule(nn.Module):
             B, S, _ = sync.shape
 
             # === SELF-STATE COMPUTATION ===
-            # Compute self-state from previous world state (captures cognitive context)
+            # Compute self-state from prediction + surprise + confidence + sync summary
             # This creates autobiographical memory: "what I was experiencing when I learned this"
             if self.self_state_compressor is not None:
-                # Use sync as proxy for prediction state (summarizes current processing)
-                # Alternative: could use features if they represent predictions
                 sync_summary = sync.mean(dim=(0, 1))  # (sync_pairs,) -> compress across batch/seq
-                # Project to feature dimension first (sync_pairs -> d_feature_input)
+                # Project sync summary to feature dimension (sync_pairs -> d_feature_input)
                 if hasattr(self, 'sync_to_feature') and self.sync_to_feature is not None:
-                    pred_summary = self.sync_to_feature(sync_summary)  # (d_feature_input,)
+                    sync_summary_proj = self.sync_to_feature(sync_summary)  # (d_feature_input,)
                 else:
-                    pred_summary = sync_summary[:self.config.d_feature_input]  # Truncate if needed
-                self_state = self.self_state_compressor(pred_summary)  # (d_self_state,)
+                    sync_summary_proj = sync_summary[:self.config.d_feature_input]  # Truncate if needed
+
+                # Prediction summary from prediction activations (last tick)
+                pred_summary_proj = torch.zeros_like(sync_summary_proj)
+                if 'prediction' in module_activations and len(module_activations['prediction']) > 0:
+                    pred_last = module_activations['prediction'][-1]  # (B, S, d_pred)
+                    pred_summary_raw = pred_last.mean(dim=(0, 1))  # (d_pred,)
+                    pred_summary_proj = self.pred_summary_proj(pred_summary_raw)  # (d_feature_input,)
+
+                # Surprise scalar
+                if surprise is not None:
+                    surprise_scalar = surprise.mean()
+                else:
+                    surprise_scalar = torch.tensor(0.0, device=sync.device, dtype=sync.dtype)
+
+                # Prediction confidence scalar
+                if prediction_certainty is not None:
+                    confidence_scalar = prediction_certainty.mean()
+                else:
+                    confidence_scalar = torch.tensor(0.0, device=sync.device, dtype=sync.dtype)
+
+                self_state_input = torch.cat([
+                    sync_summary_proj,
+                    pred_summary_proj,
+                    surprise_scalar.reshape(1),
+                    confidence_scalar.reshape(1),
+                ], dim=0)
+                self_state = self.self_state_compressor(self_state_input)  # (d_self_state,)
 
                 # Track self-state metrics
                 with torch.no_grad():
@@ -1259,6 +1293,10 @@ class GlobalSyncModule(nn.Module):
             'temporal/self_state_diversity': phase_diff_stats['self_state_diversity'].item(),
             'temporal/self_state_recency_ratio': phase_diff_stats['self_state_recency_ratio'].item(),
         })
+        if 'self_state_change' in phase_diff_stats:
+            stats['self_state/change'] = phase_diff_stats['self_state_change'].item()
+        if 'self_write_gate' in phase_diff_stats:
+            stats['self_state/write_gate'] = phase_diff_stats['self_write_gate'].item()
 
         # === SELF-WORLD COHERENCE METRICS ===
         coherence_stats = self.oscillatory_world.compute_self_world_coherence()
