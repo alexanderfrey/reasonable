@@ -581,6 +581,11 @@ class GlobalSyncModule(nn.Module):
                 self.osc_key_proj = nn.Linear(config.d_osc_embed, config.d_world_output)
                 self.osc_value_proj = nn.Linear(config.d_osc_embed, config.d_world_output)
 
+                # Self-state to value projection: enrich retrieved values with autobiographical context
+                # Input: write_self_states (num_oscillators, d_self_state)
+                # Output: (num_oscillators, d_world_output) added to value
+                self.self_state_to_value = nn.Linear(config.d_self_state, config.d_world_output)
+
                 # Use scaled dot-product attention directly over pre-projected Q/K/V
                 # to avoid redundant key/value projections inside MultiheadAttention.
                 self.osc_cross_attn = None
@@ -590,6 +595,7 @@ class GlobalSyncModule(nn.Module):
                 self.osc_query_proj = None
                 self.osc_key_proj = None
                 self.osc_value_proj = None
+                self.self_state_to_value = None
                 self.osc_cross_attn = None
                 self.osc_output_norm = None
             self._last_osc_attn_out_norm = None
@@ -624,10 +630,10 @@ class GlobalSyncModule(nn.Module):
 
             # Self-state compressor: prediction activations → compact self-state
             # Captures "what am I predicting" and "how confident am I"
-            # Input: d_world_output (from prediction summary)
+            # Input: d_feature_input (from prediction summary)
             # Output: d_self_state (compact cognitive state)
             self.self_state_compressor = nn.Sequential(
-                nn.Linear(config.d_world_output, 128),
+                nn.Linear(config.d_feature_input, 128),
                 nn.GELU(),
                 nn.Linear(128, config.d_self_state),
             )
@@ -643,6 +649,7 @@ class GlobalSyncModule(nn.Module):
             self.osc_query_proj = None
             self.osc_key_proj = None
             self.osc_value_proj = None
+            self.self_state_to_value = None
             self.osc_cross_attn = None
             self.osc_output_norm = None
             self.future_predictor = None
@@ -832,13 +839,13 @@ class GlobalSyncModule(nn.Module):
                 # Use sync as proxy for prediction state (summarizes current processing)
                 # Alternative: could use features if they represent predictions
                 sync_summary = sync.mean(dim=(0, 1))  # (sync_pairs,) -> compress across batch/seq
-                # Project to world output dimension first (sync_pairs -> d_world_output)
+                # Project to feature dimension first (sync_pairs -> d_feature_input)
                 if hasattr(self, 'sync_to_feature') and self.sync_to_feature is not None:
-                    pred_summary = self.sync_to_feature(sync_summary)  # (d_world_output,)
+                    pred_summary = self.sync_to_feature(sync_summary)  # (d_feature_input,)
                 else:
-                    pred_summary = sync_summary[:self.config.d_world_output]  # Truncate if needed
+                    pred_summary = sync_summary[:self.config.d_feature_input]  # Truncate if needed
                 self_state = self.self_state_compressor(pred_summary)  # (d_self_state,)
-                self._last_self_state = self_state
+                self._last_self_state = self_state.detach()
             else:
                 self_state = None
 
@@ -996,6 +1003,14 @@ class GlobalSyncModule(nn.Module):
                 # Project to key/value: (num_oscillators, d_osc_embed) -> (num_oscillators, d_world_output)
                 key = self.osc_key_proj(modulated_embeddings)    # (num_osc, d_world)
                 value = self.osc_value_proj(modulated_embeddings)  # (num_osc, d_world)
+
+                # === AUTOBIOGRAPHICAL MEMORY: Enrich values with self-state at write time ===
+                # write_self_states: (num_osc, d_self_state) - cognitive context when each oscillator was written
+                # This adds "what I was experiencing when I learned this" to retrieved values
+                if self.self_state_to_value is not None:
+                    write_self_states = osc_output.write_self_states  # (num_osc, d_self_state)
+                    self_state_contribution = self.self_state_to_value(write_self_states)  # (num_osc, d_world)
+                    value = value + self_state_contribution  # Enrich value with autobiographical context
 
                 # Expand for batch: (num_osc, d_world) -> (B, num_osc, d_world)
                 key = key.unsqueeze(0).expand(B, -1, -1)

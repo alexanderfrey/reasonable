@@ -227,8 +227,9 @@ class OscillatoryWorldState(nn.Module):
         self.register_buffer('write_phases', torch.zeros(N))
         # Track write intensity for each oscillator (decays over time)
         self.register_buffer('write_strengths', torch.zeros(N))
-        # Guard against double-update during checkpointing
-        self.register_buffer('_last_update_count', torch.tensor(-1, dtype=torch.long))
+        # Controls whether persistent buffers are updated on forward()
+        # (Allows callers to explicitly disable updates if needed)
+        self._state_updates_enabled = True
 
         # === SELF-STATE AT WRITE TIME (autobiographical memory) ===
         # Store compressed self-state when each oscillator was written
@@ -343,14 +344,9 @@ class OscillatoryWorldState(nn.Module):
         N_self = self.config.num_self_oscillators
         N_world = N - N_self
 
-        # === CHECKPOINTING GUARD ===
-        # Prevent double-update during gradient checkpointing
-        current_count = self._update_count.item()
-        if current_count == self._last_update_count.item():
-            # Already updated in this step - skip buffer updates
-            skip_buffer_update = True
-        else:
-            skip_buffer_update = False
+        # === STATE UPDATE CONTROL ===
+        # Caller can disable updates to avoid double-advance during checkpointing.
+        skip_buffer_update = not self._state_updates_enabled
 
         # === WORLD OSCILLATOR GATING (indices 0:N_world) ===
         # Higher surprise = more important to remember = stronger write
@@ -469,7 +465,6 @@ class OscillatoryWorldState(nn.Module):
                     self._last_self_state.copy_(self_state.detach())
 
                 self._update_count.add_(1)
-                self._last_update_count.copy_(self._update_count)
 
         # === COMPUTE OUTPUT ===
         osc_values = modulated_amps * torch.sin(effective_phase)  # (N,)
@@ -516,10 +511,13 @@ class OscillatoryWorldState(nn.Module):
             # Reset phase-tagged write buffers
             self.write_phases.zero_()
             self.write_strengths.zero_()
-            self._last_update_count.fill_(-1)
             # Reset self-state tracking
             self.write_self_states.zero_()
             self._last_self_state.zero_()
+
+    def set_state_updates_enabled(self, enabled: bool) -> None:
+        """Enable/disable persistent buffer updates during forward()."""
+        self._state_updates_enabled = bool(enabled)
 
     def detach_state(self):
         """
