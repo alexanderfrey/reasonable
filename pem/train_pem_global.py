@@ -2103,7 +2103,7 @@ def main():
                 gate_str = f" gate={ss_write_gate:.3f}" if ss_write_gate is not None else ""
                 amp_str = ""
                 if ss_gated_amp_mean is not None and ss_gated_amp_max is not None and ss_gated_amp_over is not None:
-                    phase_write_threshold = model.global_sync.oscillatory_world.config.phase_write_threshold
+                    phase_write_threshold = model.global_sync.oscillatory_world.config.phase_write_threshold_self
                     amp_str = (
                         f" amp_mean={ss_gated_amp_mean:.3e} amp_max={ss_gated_amp_max:.3e} "
                         f"over={ss_gated_amp_over:.1%} thr={phase_write_threshold:.2f}"
@@ -2111,6 +2111,17 @@ def main():
                 print(
                     f"   Self-State | contrib={ss_contrib:.3f} ratio={ss_ratio:.3f} "
                     f"coverage={ss_coverage:.2f} comp_std={ss_comp_std:.3f} Δstep={ss_step_change:.3f}{gate_str}{amp_str}"
+                )
+
+            # Write time spread metrics (is autobiographical memory accumulating?)
+            wt_spread = world_stats.get('temporal/write_phase_spread')
+            wt_age_range = world_stats.get('temporal/estimated_age_range')
+            wt_uniqueness = world_stats.get('temporal/self_state_uniqueness')
+            wt_similarity = world_stats.get('temporal/self_state_avg_similarity')
+            if wt_spread is not None:
+                print(
+                    f"  Write Spread | phase_std={wt_spread:.3f} age_range={wt_age_range:.1f} "
+                    f"uniqueness={wt_uniqueness:.3f} similarity={wt_similarity:.3f}"
                 )
 
             # WandB logging (consolidated - only essential metrics)
@@ -2315,6 +2326,16 @@ def main():
                     # === SELF-STATE TRACKING (autobiographical memory) ===
                     'temporal/self_state_diversity': metrics.get('temporal/self_state_diversity', 0),
                     'temporal/self_state_recency_ratio': metrics.get('temporal/self_state_recency_ratio', 0),
+
+                    # === WRITE TIME SPREAD (memory accumulation) ===
+                    'temporal/write_phase_spread': metrics.get('temporal/write_phase_spread', 0),
+                    'temporal/write_phase_spread_world': metrics.get('temporal/write_phase_spread_world', 0),
+                    'temporal/write_phase_spread_self': metrics.get('temporal/write_phase_spread_self', 0),
+                    'temporal/estimated_age_range': metrics.get('temporal/estimated_age_range', 0),
+                    'temporal/estimated_age_range_world': metrics.get('temporal/estimated_age_range_world', 0),
+                    'temporal/estimated_age_range_self': metrics.get('temporal/estimated_age_range_self', 0),
+                    'temporal/self_state_uniqueness': metrics.get('temporal/self_state_uniqueness', 0),
+                    'temporal/self_state_avg_similarity': metrics.get('temporal/self_state_avg_similarity', 0),
 
                     # === SELF-WORLD COHERENCE ===
                     'temporal/self_world_alignment': metrics.get('temporal/self_world_alignment', 0),

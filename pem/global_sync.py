@@ -1310,6 +1310,15 @@ class GlobalSyncModule(nn.Module):
             # Self-state diversity metrics
             'temporal/self_state_diversity': phase_diff_stats['self_state_diversity'].item(),
             'temporal/self_state_recency_ratio': phase_diff_stats['self_state_recency_ratio'].item(),
+            # Write time spread metrics
+            'temporal/write_phase_spread': phase_diff_stats['write_phase_spread'].item(),
+            'temporal/write_phase_spread_world': phase_diff_stats['write_phase_spread_world'].item(),
+            'temporal/write_phase_spread_self': phase_diff_stats['write_phase_spread_self'].item(),
+            'temporal/estimated_age_range': phase_diff_stats['estimated_age_range'].item(),
+            'temporal/estimated_age_range_world': phase_diff_stats['estimated_age_range_world'].item(),
+            'temporal/estimated_age_range_self': phase_diff_stats['estimated_age_range_self'].item(),
+            'temporal/self_state_uniqueness': phase_diff_stats['self_state_uniqueness'].item(),
+            'temporal/self_state_avg_similarity': phase_diff_stats['self_state_avg_similarity'].item(),
         })
         if 'self_state_change' in phase_diff_stats:
             stats['self_state/change'] = phase_diff_stats['self_state_change'].item()

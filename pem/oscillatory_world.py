@@ -114,7 +114,8 @@ class OscillatoryWorldConfig:
     init_amplitude_scale: float = 1.0  # Initial amplitude scale
 
     # Phase-tagged writes (temporal awareness)
-    phase_write_threshold: float = 0.1   # Min |amp_mod| to count as significant write
+    phase_write_threshold: float = 0.1   # Min |amp_mod| to count as significant write (world)
+    phase_write_threshold_self: float = 0.01  # Min |amp_mod| for self oscillators (can be lower)
     write_strength_decay: float = 0.99   # Decay factor for old write strengths
 
     # Self-state tracking (autobiographical memory)
@@ -403,8 +404,9 @@ class OscillatoryWorldState(nn.Module):
             self_gated_abs = gated_amp_mod_self.abs()
             self._last_self_gated_amp_mean.copy_(self_gated_abs.mean().detach())
             self._last_self_gated_amp_max.copy_(self_gated_abs.max().detach())
+            self_threshold = self.config.phase_write_threshold_self
             self._last_self_gated_amp_over_threshold.copy_(
-                (self_gated_abs > self.config.phase_write_threshold).float().mean().detach()
+                (self_gated_abs > self_threshold).float().mean().detach()
             )
         else:
             gated_amp_mod_self = torch.zeros(N_self, device=features.device, dtype=features.dtype)
@@ -458,7 +460,11 @@ class OscillatoryWorldState(nn.Module):
                 self.write_strengths.mul_(self.config.write_strength_decay)
 
                 # Update write_phases and write_strengths for oscillators that were written to
-                write_mask = (gated_amp_mod.abs() > self.config.phase_write_threshold)
+                world_threshold = self.config.phase_write_threshold
+                self_threshold = self.config.phase_write_threshold_self
+                write_mask_world = (gated_amp_mod_world.abs() > world_threshold)
+                write_mask_self = (gated_amp_mod_self.abs() > self_threshold)
+                write_mask = torch.cat([write_mask_world, write_mask_self])
                 write_intensity = gated_amp_mod.abs().detach()
 
                 # Only update write_phases for oscillators with significant writes
@@ -646,28 +652,59 @@ class OscillatoryWorldState(nn.Module):
             stats['estimated_age_mean'] = estimated_age.mean()
             stats['estimated_age_std'] = estimated_age.std()
 
-            # Write activity
-            stats['write_fraction'] = (self.write_strengths > self.config.phase_write_threshold).float().mean()
+            # Write activity (use separate thresholds for world/self)
+            world_threshold = self.config.phase_write_threshold
+            self_threshold = self.config.phase_write_threshold_self
+            world_active = (self.write_strengths[:N_world] > world_threshold)
+            self_active = (self.write_strengths[N_world:] > self_threshold)
+            stats['write_fraction'] = torch.cat([world_active, self_active]).float().mean()
             stats['write_strength_mean'] = self.write_strengths.mean()
 
             # World oscillator stats (indices 0:N_world)
             stats['world_phase_dist_mean'] = phase_dist[:N_world].mean()
             stats['world_estimated_age_mean'] = estimated_age[:N_world].mean()
-            stats['world_write_fraction'] = (
-                self.write_strengths[:N_world] > self.config.phase_write_threshold
-            ).float().mean()
+            stats['world_write_fraction'] = world_active.float().mean()
 
             # Self oscillator stats (indices N_world:N)
             stats['self_phase_dist_mean'] = phase_dist[N_world:].mean()
             stats['self_estimated_age_mean'] = estimated_age[N_world:].mean()
-            stats['self_write_fraction'] = (
-                self.write_strengths[N_world:] > self.config.phase_write_threshold
-            ).float().mean()
+            stats['self_write_fraction'] = self_active.float().mean()
 
             # Self-state diversity: are we storing varied cognitive states?
             # Higher variance = more diverse self-states stored
             self_state_var = self.write_self_states.var(dim=0).mean()
             stats['self_state_diversity'] = self_state_var
+
+            # === WRITE TIME SPREAD ===
+            # Measures if oscillators are being written at different times
+            # High spread = temporal diversity, Low spread = all written together
+
+            # Write phase spread (std of write_phases)
+            # If all oscillators written at same time, spread ≈ 0
+            stats['write_phase_spread'] = self.write_phases.std()
+            stats['write_phase_spread_world'] = self.write_phases[:N_world].std()
+            stats['write_phase_spread_self'] = self.write_phases[N_world:].std()
+
+            # Age range: max - min estimated age
+            # Large range = some old memories, some new
+            age_range = estimated_age.max() - estimated_age.min()
+            stats['estimated_age_range'] = age_range
+            stats['estimated_age_range_world'] = estimated_age[:N_world].max() - estimated_age[:N_world].min()
+            stats['estimated_age_range_self'] = estimated_age[N_world:].max() - estimated_age[N_world:].min()
+
+            # Age quartiles: what fraction of oscillators are "old" vs "new"?
+            median_age = estimated_age.median()
+            stats['age_below_median_frac'] = (estimated_age < median_age).float().mean()
+
+            # Self-state uniqueness: pairwise cosine similarity
+            # Low similarity = diverse stored states, High = all similar
+            wss_norm = self.write_self_states / (self.write_self_states.norm(dim=1, keepdim=True) + 1e-8)
+            pairwise_cos = torch.mm(wss_norm, wss_norm.t())  # (N, N)
+            # Exclude diagonal (self-similarity = 1)
+            mask = ~torch.eye(N, dtype=torch.bool, device=pairwise_cos.device)
+            avg_pairwise_cos = pairwise_cos[mask].mean()
+            stats['self_state_avg_similarity'] = avg_pairwise_cos
+            stats['self_state_uniqueness'] = 1 - avg_pairwise_cos  # Higher = more unique
 
             # Self-state recency correlation with write_strengths
             # Measures if recent writes have stronger stored self-states
@@ -726,8 +763,10 @@ class OscillatoryWorldState(nn.Module):
             self_world_alignment = world_cos * self_cos + world_sin * self_sin
 
             # Write timing coherence: are self and world being written at similar times?
-            world_write_active = (self.write_strengths[:N_world] > self.config.phase_write_threshold).float()
-            self_write_active = (self.write_strengths[N_world:] > self.config.phase_write_threshold).float()
+            world_threshold = self.config.phase_write_threshold
+            self_threshold = self.config.phase_write_threshold_self
+            world_write_active = (self.write_strengths[:N_world] > world_threshold).float()
+            self_write_active = (self.write_strengths[N_world:] > self_threshold).float()
             # Measure overlap in write activity
             write_timing_coherence = (world_write_active.mean() * self_write_active.mean()).sqrt()
 
