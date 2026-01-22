@@ -732,6 +732,8 @@ def print_diagnostic_report(
     outputs: List,
     targets: Dict[str, torch.Tensor],
     step: int,
+    model: Optional[nn.Module] = None,
+    metrics: Optional[Dict[str, float]] = None,
 ):
     """
     Print compact diagnostic report to terminal.
@@ -874,6 +876,72 @@ def print_diagnostic_report(
         obs_cos = F.cosine_similarity(obs_0.reshape(1, -1), obs_f.reshape(1, -1)).item()
         conv_status = "⚠fixed-point" if obs_cos > 0.9999 else "✓"
         print(f"\n[Obs] Δ(0→{num_steps-1}): {obs_delta:.4f} | cos: {obs_cos:.6f} {conv_status}")
+
+    # ===== 7. NEW METRICS (from model and metrics dict) =====
+    if model is not None and hasattr(model, 'global_sync'):
+        world_stats = model.global_sync.get_world_state_stats()
+
+        # Oscillator frequency bands
+        slow_amp = world_stats.get('osc/slow_amp_mean', None)
+        mid_amp = world_stats.get('osc/mid_amp_mean', None)
+        fast_amp = world_stats.get('osc/fast_amp_mean', None)
+        freq_ratio = world_stats.get('osc/freq_band_ratio', None)
+        if slow_amp is not None:
+            print(f"\n[OscBands] slow={slow_amp:.3f} mid={mid_amp:.3f} fast={fast_amp:.3f} ratio={freq_ratio:.2f}")
+
+        # Feature write attention
+        fw_entropy = world_stats.get('feature_write/pos_attn_entropy', None)
+        fw_top1 = world_stats.get('feature_write/top1_weight', None)
+        fw_top5 = world_stats.get('feature_write/top5_weight', None)
+        fw_surp_corr = world_stats.get('feature_write/surprise_correlation', None)
+        if fw_entropy is not None:
+            surp_str = f" surp_corr={fw_surp_corr:.2f}" if fw_surp_corr is not None else ""
+            print(f"[FeatWrite] entropy={fw_entropy:.2f} top1={fw_top1:.3f} top5={fw_top5:.3f}{surp_str}")
+
+        # Write gate
+        write_gate = world_stats.get('surprise/write_gate_mean', None)
+        if write_gate is not None:
+            print(f"[WriteGate] mean={write_gate:.3f}")
+
+        # Oscillator cross-attention extra metrics
+        osc_top1 = world_stats.get('osc_xattn/top1_osc_weight', None)
+        osc_kq_cos = world_stats.get('osc_xattn/key_query_cosine', None)
+        if osc_top1 is not None:
+            print(f"[OscXAttn] top1={osc_top1:.3f} kq_cos={osc_kq_cos:.3f}")
+
+    if metrics is not None:
+        # Loop trajectory
+        l0 = metrics.get('loop/loss_step0', None)
+        l1 = metrics.get('loop/loss_step1', None)
+        ln = metrics.get('loop/loss_stepN', None)
+        mono = metrics.get('loop/monotonic_improve', None)
+        obs_d01 = metrics.get('loop/obs_delta_01', None)
+        obs_dtot = metrics.get('loop/obs_delta_total', None)
+        if l0 is not None:
+            mono_str = f" mono={mono:.2f}" if mono is not None else ""
+            obs_str = f" obs_Δ01={obs_d01:.3f} tot={obs_dtot:.3f}" if obs_d01 is not None else ""
+            print(f"\n[LoopTraj] L0={l0:.3f} L1={l1:.3f} LN={ln:.3f}{mono_str}{obs_str}")
+
+        # CTM tick selection
+        t1 = metrics.get('ctm/pred_t1_mean', None)
+        t2 = metrics.get('ctm/pred_t2_mean', None)
+        agree = metrics.get('ctm/t1_t2_agreement', None)
+        spread = metrics.get('ctm/tick_loss_spread', None)
+        if t1 is not None:
+            print(f"[CTM] t1={t1:.1f} t2={t2:.1f} agree={agree:.2f} spread={spread:.4f}")
+
+        # Oscillator attention entropy evolution
+        e0 = metrics.get('osc_xattn/entropy_step0', None)
+        en = metrics.get('osc_xattn/entropy_stepN', None)
+        ed = metrics.get('osc_xattn/entropy_delta', None)
+        if e0 is not None:
+            print(f"[OscEntropy] step0={e0:.2f} stepN={en:.2f} Δ={ed:+.3f}")
+
+        # Surprise-prediction correlation
+        surp_pred_corr = metrics.get('surprise/pred_error_corr', None)
+        surp_raw_cal = metrics.get('surprise/raw_vs_calibrated', None)
+        if surp_pred_corr is not None:
+            print(f"[Surprise] pred_err_corr={surp_pred_corr:.3f} raw_cal_corr={surp_raw_cal:.3f}")
 
     # ===== SUMMARY =====
     issues = []
@@ -1698,7 +1766,7 @@ def main():
 
         # Print diagnostic report if requested
         if should_diagnose and outputs_for_diag is not None:
-            print_diagnostic_report(outputs_for_diag, targets_for_diag, global_step + 1)
+            print_diagnostic_report(outputs_for_diag, targets_for_diag, global_step + 1, model=model, metrics=metrics)
 
         scheduler.step()
 
