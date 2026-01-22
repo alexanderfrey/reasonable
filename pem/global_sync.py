@@ -802,7 +802,9 @@ class GlobalSyncModule(nn.Module):
                 # features: (B, S, d_feature_input) -> (d_feature_input,)
                 if self.feature_write_attn is not None:
                     attn_scores = self.feature_write_attn(features).squeeze(-1)  # (B, S)
-                    attn_weights = F.softmax(attn_scores, dim=-1)  # (B, S)
+                    # Use low temperature (0.1) to sharpen attention over 512 positions
+                    # Without this, softmax spreads mass uniformly even with score variance
+                    attn_weights = F.softmax(attn_scores / 0.1, dim=-1)  # (B, S)
                     # Feature write attention diagnostics
                     with torch.no_grad():
                         eps = 1e-10
