@@ -372,20 +372,22 @@ class PredictionTargets:
 
     Used during training to create the ground truth that predictions
     should match.
+
+    Targets are single tokens at specific offsets (not averaged windows).
+    This preserves full variance at all horizons.
     """
 
     def __init__(
         self,
-        immediate_horizon: int = 8,
-        shortterm_horizon: int = 64,
-        longterm_horizon: Optional[int] = 256,
+        immediate_horizon: int = 1,
+        shortterm_horizon: int = 32,
+        longterm_horizon: Optional[int] = None,
     ):
         """
         Args:
-            immediate_horizon: Number of tokens ahead for immediate target (~2-3 words)
-            shortterm_horizon: Number of tokens ahead for short-term target (~1-2 sentences)
-            longterm_horizon: Number of tokens ahead for long-term target (~paragraphs)
-                              None = rest of sequence
+            immediate_horizon: Exact token offset for immediate target (default: 1 = next token)
+            shortterm_horizon: Exact token offset for short-term target (default: 32)
+            longterm_horizon: Exact token offset for long-term target (default: None = end of sequence)
         """
         self.immediate_horizon = immediate_horizon
         self.shortterm_horizon = shortterm_horizon
@@ -397,12 +399,14 @@ class PredictionTargets:
         padding_mask: Optional[torch.Tensor] = None,  # (B, S) True for valid positions
     ) -> Dict[str, torch.Tensor]:
         """
-        Compute multi-scale prediction targets.
+        Compute multi-scale prediction targets using endpoint prediction.
 
         For position t, compute:
-            - immediate: mean(features[t+1:t+1+immediate_horizon]) ~2-3 words
-            - shortterm: mean(features[t+1:t+1+shortterm_horizon]) ~1-2 sentences
-            - longterm:  mean(features[t+1:t+1+longterm_horizon]) or rest of seq
+            - immediate: features[t + immediate_horizon] (e.g., next token)
+            - shortterm: features[t + shortterm_horizon] (e.g., 32 tokens ahead)
+            - longterm:  features[t + longterm_horizon] (e.g., 128 tokens ahead)
+
+        Each target is a single token, preserving full variance at all horizons.
 
         Args:
             features: Actual features from feature extractor
@@ -414,7 +418,6 @@ class PredictionTargets:
         """
         B, S, D = features.shape
         device = features.device
-        dtype = features.dtype
 
         # Initialize targets
         immediate_targets = torch.zeros_like(features)
@@ -433,29 +436,32 @@ class PredictionTargets:
             seq_lengths = torch.full((B,), S, device=device)
 
         for b in range(B):
-            seq_len = seq_lengths[b].item()
+            seq_len = int(seq_lengths[b].item())
 
-            for t in range(int(seq_len) - 1):  # Can't predict from last position
-                # Immediate: mean of next `immediate_horizon` tokens (~2-3 words)
-                end_imm = min(t + 1 + self.immediate_horizon, int(seq_len))
-                if end_imm > t + 1:
-                    immediate_targets[b, t] = features[b, t+1:end_imm].mean(dim=0)
-                    immediate_valid[b, t] = True
+            # Immediate: single token at t + immediate_horizon
+            valid_end = seq_len - self.immediate_horizon
+            if valid_end > 0:
+                immediate_targets[b, :valid_end] = features[b, self.immediate_horizon:seq_len]
+                immediate_valid[b, :valid_end] = True
+                if padding_mask is not None:
+                    immediate_valid[b, :valid_end] &= padding_mask[b, :valid_end]
 
-                # Short-term: mean of next `shortterm_horizon` tokens (~1-2 sentences)
-                end_short = min(t + 1 + self.shortterm_horizon, int(seq_len))
-                if end_short > t + 1:
-                    shortterm_targets[b, t] = features[b, t+1:end_short].mean(dim=0)
-                    shortterm_valid[b, t] = True
+            # Shortterm: single token at t + shortterm_horizon
+            valid_end = seq_len - self.shortterm_horizon
+            if valid_end > 0:
+                shortterm_targets[b, :valid_end] = features[b, self.shortterm_horizon:seq_len]
+                shortterm_valid[b, :valid_end] = True
+                if padding_mask is not None:
+                    shortterm_valid[b, :valid_end] &= padding_mask[b, :valid_end]
 
-                # Long-term: mean of next `longterm_horizon` tokens (or rest of seq if None)
-                if self.longterm_horizon is None:
-                    end_long = int(seq_len)
-                else:
-                    end_long = min(t + 1 + self.longterm_horizon, int(seq_len))
-                if end_long > t + 1:
-                    longterm_targets[b, t] = features[b, t+1:end_long].mean(dim=0)
-                    longterm_valid[b, t] = True
+            # Longterm: single token at t + longterm_horizon (or last token if None)
+            longterm_horizon = self.longterm_horizon if self.longterm_horizon is not None else (seq_len - 1)
+            valid_end = seq_len - longterm_horizon
+            if valid_end > 0:
+                longterm_targets[b, :valid_end] = features[b, longterm_horizon:seq_len]
+                longterm_valid[b, :valid_end] = True
+                if padding_mask is not None:
+                    longterm_valid[b, :valid_end] &= padding_mask[b, :valid_end]
 
         return {
             'immediate': immediate_targets,
@@ -472,99 +478,46 @@ class PredictionTargets:
         padding_mask: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """
-        Vectorized target computation (faster for training).
+        Vectorized endpoint target computation (faster for training).
 
-        Uses cumsum tricks to avoid explicit loops.
+        For position t, targets are single tokens at exact offsets:
+            - immediate: features[t + immediate_horizon]
+            - shortterm: features[t + shortterm_horizon]
+            - longterm:  features[t + longterm_horizon]
         """
         B, S, D = features.shape
         device = features.device
 
         if padding_mask is not None:
             padding_mask = padding_mask.to(device=device).bool()
-            mask_f = padding_mask.to(features.dtype)
-            masked_features = features * mask_f.unsqueeze(-1)
 
-            # Use cumulative sums for efficient mean computation
-            # cumsum[i] = sum of features[0:i+1] (masked)
-            cumsum = torch.cumsum(masked_features, dim=1)  # (B, S, D)
-            counts = torch.cumsum(mask_f, dim=1)  # (B, S)
-            counts_padded = F.pad(counts, (1, 0))  # (B, S+1)
-        else:
-            # Use cumulative sums for efficient mean computation
-            # cumsum[i] = sum of features[0:i+1]
-            cumsum = torch.cumsum(features, dim=1)  # (B, S, D)
-            counts_padded = None
+        # Helper to compute endpoint targets for a given horizon
+        def endpoint_targets(horizon: int) -> Tuple[torch.Tensor, torch.Tensor]:
+            targets = torch.zeros_like(features)
+            valid = torch.zeros(B, S, dtype=torch.bool, device=device)
 
-        # Prepend zeros for easier indexing
-        cumsum_padded = F.pad(cumsum, (0, 0, 1, 0))  # (B, S+1, D)
+            if horizon < S:
+                # targets[:, t] = features[:, t + horizon] for valid t
+                valid_positions = S - horizon
+                targets[:, :valid_positions] = features[:, horizon:]
+                valid[:, :valid_positions] = True
 
-        # Immediate targets: mean of next `immediate_horizon` tokens (~2-3 words)
-        immediate_targets = torch.zeros_like(features)
-        immediate_valid = torch.zeros(B, S, dtype=torch.bool, device=device)
+                if padding_mask is not None:
+                    # Source position must be valid AND target position must be valid
+                    target_valid = padding_mask[:, horizon:]  # (B, S-horizon)
+                    source_valid = padding_mask[:, :valid_positions]  # (B, S-horizon)
+                    combined_valid = target_valid & source_valid
+                    valid[:, :valid_positions] = combined_valid
+                    # Zero out invalid targets
+                    targets[:, :valid_positions] = targets[:, :valid_positions] * combined_valid.unsqueeze(-1)
 
-        for t in range(S - 1):
-            end_idx = min(t + 1 + self.immediate_horizon, S)
-            if padding_mask is None:
-                count = end_idx - (t + 1)
-                if count > 0:
-                    immediate_targets[:, t] = (cumsum_padded[:, end_idx] - cumsum_padded[:, t + 1]) / count
-                    immediate_valid[:, t] = True
-            else:
-                window_counts = counts_padded[:, end_idx] - counts_padded[:, t + 1]
-                denom = window_counts.clamp_min(1).unsqueeze(-1)
-                window_sum = cumsum_padded[:, end_idx] - cumsum_padded[:, t + 1]
-                mean = window_sum / denom
-                valid = (window_counts > 0) & padding_mask[:, t]
-                immediate_targets[:, t] = mean * valid.unsqueeze(-1)
-                immediate_valid[:, t] = valid
+            return targets, valid
 
-        # Short-term targets: mean of next `shortterm_horizon` tokens (~1-2 sentences)
-        shortterm_targets = torch.zeros_like(features)
-        shortterm_valid = torch.zeros(B, S, dtype=torch.bool, device=device)
-
-        for t in range(S - 1):
-            end_idx = min(t + 1 + self.shortterm_horizon, S)
-            if padding_mask is None:
-                count = end_idx - (t + 1)
-                if count > 0:
-                    # mean = (cumsum[end_idx-1] - cumsum[t]) / count
-                    shortterm_targets[:, t] = (cumsum_padded[:, end_idx] - cumsum_padded[:, t + 1]) / count
-                    shortterm_valid[:, t] = True
-            else:
-                window_counts = counts_padded[:, end_idx] - counts_padded[:, t + 1]
-                denom = window_counts.clamp_min(1).unsqueeze(-1)
-                window_sum = cumsum_padded[:, end_idx] - cumsum_padded[:, t + 1]
-                mean = window_sum / denom
-                valid = (window_counts > 0) & padding_mask[:, t]
-                shortterm_targets[:, t] = mean * valid.unsqueeze(-1)
-                shortterm_valid[:, t] = valid
-
-        # Long-term targets: mean of features[t+1:t+1+longterm_horizon] or rest of seq
-        longterm_targets = torch.zeros_like(features)
-        longterm_valid = torch.zeros(B, S, dtype=torch.bool, device=device)
-
-        for t in range(S - 1):
-            if self.longterm_horizon is None:
-                # Rest of sequence
-                end_idx = S
-            else:
-                # Fixed horizon
-                end_idx = min(t + 1 + self.longterm_horizon, S)
-
-            if padding_mask is None:
-                count = end_idx - (t + 1)
-                if count > 0:
-                    # mean = (cumsum[end_idx] - cumsum[t+1]) / count
-                    longterm_targets[:, t] = (cumsum_padded[:, end_idx] - cumsum_padded[:, t + 1]) / count
-                    longterm_valid[:, t] = True
-            else:
-                window_counts = counts_padded[:, end_idx] - counts_padded[:, t + 1]
-                denom = window_counts.clamp_min(1).unsqueeze(-1)
-                window_sum = cumsum_padded[:, end_idx] - cumsum_padded[:, t + 1]
-                mean = window_sum / denom
-                valid = (window_counts > 0) & padding_mask[:, t]
-                longterm_targets[:, t] = mean * valid.unsqueeze(-1)
-                longterm_valid[:, t] = valid
+        immediate_targets, immediate_valid = endpoint_targets(self.immediate_horizon)
+        shortterm_targets, shortterm_valid = endpoint_targets(self.shortterm_horizon)
+        # Handle None longterm_horizon: predict the last token (S-1) for all positions
+        longterm_horizon = self.longterm_horizon if self.longterm_horizon is not None else (S - 1)
+        longterm_targets, longterm_valid = endpoint_targets(longterm_horizon)
 
         # Apply padding mask if provided
         if padding_mask is not None:

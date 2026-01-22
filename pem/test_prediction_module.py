@@ -111,8 +111,10 @@ def test_prediction_targets():
     logger.info("TEST: Prediction targets computation")
     logger.info("=" * 60)
 
-    # Test with all horizons explicit
-    # immediate=2, shortterm=4, longterm=None (rest of sequence)
+    # Test with all horizons explicit using ENDPOINT prediction (not averaging)
+    # immediate=2: predict features[t+2]
+    # shortterm=4: predict features[t+4]
+    # longterm=None: predict last token (features[S-1])
     target_computer = PredictionTargets(
         immediate_horizon=2,
         shortterm_horizon=4,
@@ -132,54 +134,69 @@ def test_prediction_targets():
 
     logger.info(f"Target keys: {list(targets.keys())}")
 
-    # Verify immediate targets (mean of next 2 tokens)
-    # immediate[3] = mean(features[4:6]) = mean([4,5]) = 4.5
+    # Verify immediate targets (endpoint at t+2)
+    # immediate[3] = features[3+2] = features[5] = 5.0
     immediate_at_3 = targets['immediate'][0, 3, 0].item()
-    expected_immediate_3 = (4 + 5) / 2  # 4.5
+    expected_immediate_3 = 5.0  # features[5]
     logger.info(f"  Position 3 immediate (horizon=2): {immediate_at_3:.2f} (expected: {expected_immediate_3})")
 
-    # Verify shortterm targets (mean of next 4 tokens)
-    # shortterm[3] = mean(features[4:8]) = mean([4,5,6,7]) = 5.5
+    # Verify shortterm targets (endpoint at t+4)
+    # shortterm[3] = features[3+4] = features[7] = 7.0
     shortterm_at_3 = targets['shortterm'][0, 3, 0].item()
-    expected_shortterm_3 = (4 + 5 + 6 + 7) / 4  # 5.5
+    expected_shortterm_3 = 7.0  # features[7]
     logger.info(f"  Position 3 shortterm (horizon=4): {shortterm_at_3:.2f} (expected: {expected_shortterm_3})")
 
-    # Verify longterm targets (mean of all remaining when longterm_horizon=None)
-    # longterm[3] = mean(features[4:10]) = mean([4,5,6,7,8,9]) = 6.5
-    longterm_at_3 = targets['longterm'][0, 3, 0].item()
-    expected_longterm_3 = (4 + 5 + 6 + 7 + 8 + 9) / 6  # 6.5
-    logger.info(f"  Position 3 longterm (horizon=None): {longterm_at_3:.2f} (expected: {expected_longterm_3})")
+    # Verify longterm targets (endpoint at last token when longterm_horizon=None)
+    # longterm[0] = features[S-1] = features[9] = 9.0 (only position 0 is valid)
+    longterm_at_0 = targets['longterm'][0, 0, 0].item()
+    expected_longterm_0 = 9.0  # features[9]
+    logger.info(f"  Position 0 longterm (horizon=None → last token): {longterm_at_0:.2f} (expected: {expected_longterm_0})")
 
     assert abs(immediate_at_3 - expected_immediate_3) < 0.01
     assert abs(shortterm_at_3 - expected_shortterm_3) < 0.01
-    assert abs(longterm_at_3 - expected_longterm_3) < 0.01
+    assert abs(longterm_at_0 - expected_longterm_0) < 0.01
 
     # Test with fixed longterm_horizon=4
     logger.info("\nTesting with fixed longterm_horizon=4:")
     target_computer_fixed = PredictionTargets(immediate_horizon=2, shortterm_horizon=4, longterm_horizon=4)
     targets_fixed = target_computer_fixed.compute_targets_efficient(features)
 
-    # longterm[3] with horizon=4 = mean(features[4:8]) = mean([4,5,6,7]) = 5.5
+    # longterm[3] with horizon=4 = features[3+4] = features[7] = 7.0
     longterm_fixed_at_3 = targets_fixed['longterm'][0, 3, 0].item()
-    expected_longterm_fixed_3 = (4 + 5 + 6 + 7) / 4  # 5.5
+    expected_longterm_fixed_3 = 7.0  # features[7]
     logger.info(f"  Position 3 longterm (horizon=4): {longterm_fixed_at_3:.2f} (expected: {expected_longterm_fixed_3})")
     assert abs(longterm_fixed_at_3 - expected_longterm_fixed_3) < 0.01
 
-    # Test default horizons (immediate=8)
-    logger.info("\nTesting default horizons (immediate=8):")
-    target_computer_default = PredictionTargets()  # immediate=8, shortterm=64, longterm=2048
-    targets_default = target_computer_default.compute_targets_efficient(features)
-    # immediate[3] with horizon=8 = mean(features[4:10]) = mean([4,5,6,7,8,9]) = 6.5 (capped at S=10)
-    immediate_default_at_3 = targets_default['immediate'][0, 3, 0].item()
-    expected_immediate_default_3 = (4 + 5 + 6 + 7 + 8 + 9) / 6  # 6.5
-    logger.info(f"  Position 3 immediate (horizon=8, capped): {immediate_default_at_3:.2f} (expected: {expected_immediate_default_3})")
-    assert abs(immediate_default_at_3 - expected_immediate_default_3) < 0.01
+    # Test default horizons with larger sequence (immediate=1, shortterm=32, longterm=None)
+    logger.info("\nTesting default horizons (immediate=1, shortterm=32, longterm=None):")
+    B_large, S_large, D_large = 2, 200, 8
+    features_large = torch.arange(S_large).float().unsqueeze(0).unsqueeze(-1).expand(B_large, S_large, D_large)
+    target_computer_default = PredictionTargets()  # immediate=1, shortterm=32, longterm=None
+    targets_default = target_computer_default.compute_targets_efficient(features_large)
+    # immediate[50] = features[51] = 51.0
+    immediate_default_at_50 = targets_default['immediate'][0, 50, 0].item()
+    expected_immediate_default_50 = 51.0
+    logger.info(f"  Position 50 immediate (horizon=1): {immediate_default_at_50:.2f} (expected: {expected_immediate_default_50})")
+    # shortterm[50] = features[82] = 82.0
+    shortterm_default_at_50 = targets_default['shortterm'][0, 50, 0].item()
+    expected_shortterm_default_50 = 82.0
+    logger.info(f"  Position 50 shortterm (horizon=32): {shortterm_default_at_50:.2f} (expected: {expected_shortterm_default_50})")
+    # longterm with None = end of sequence (S-1=199), so longterm[0] = features[199] = 199.0
+    longterm_default_at_0 = targets_default['longterm'][0, 0, 0].item()
+    expected_longterm_default_0 = 199.0
+    logger.info(f"  Position 0 longterm (horizon=None → end): {longterm_default_at_0:.2f} (expected: {expected_longterm_default_0})")
+    assert abs(immediate_default_at_50 - expected_immediate_default_50) < 0.01
+    assert abs(shortterm_default_at_50 - expected_shortterm_default_50) < 0.01
+    assert abs(longterm_default_at_0 - expected_longterm_default_0) < 0.01
 
-    # Check validity masks
-    logger.info(f"\nValidity masks:")
-    logger.info(f"  Immediate valid positions: {targets['immediate_valid'].sum(dim=1).tolist()}")
-    logger.info(f"  Shortterm valid positions: {targets['shortterm_valid'].sum(dim=1).tolist()}")
-    logger.info(f"  Longterm valid positions: {targets['longterm_valid'].sum(dim=1).tolist()}")
+    # Check validity masks (for S=10 with horizons 2, 4, 9)
+    # immediate (horizon=2): valid for t+2 < S, so t < 8, meaning 8 positions
+    # shortterm (horizon=4): valid for t+4 < S, so t < 6, meaning 6 positions
+    # longterm (horizon=9 when None): valid for t+9 < S, so t < 1, meaning 1 position
+    logger.info(f"\nValidity masks (S=10):")
+    logger.info(f"  Immediate valid positions (horizon=2): {targets['immediate_valid'].sum(dim=1).tolist()} (expected: [8, 8])")
+    logger.info(f"  Shortterm valid positions (horizon=4): {targets['shortterm_valid'].sum(dim=1).tolist()} (expected: [6, 6])")
+    logger.info(f"  Longterm valid positions (horizon=9): {targets['longterm_valid'].sum(dim=1).tolist()} (expected: [1, 1])")
 
     logger.info("Prediction targets test PASSED ✓")
     return True

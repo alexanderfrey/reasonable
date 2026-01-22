@@ -301,10 +301,11 @@ class PEMLoopGlobalConfig:
     # NOTE: Ablation tests showed attention_entropy gives best certainty
     surprise_signal_type: str = "attention_entropy"
 
-    # Prediction horizons
-    immediate_horizon: int = 8
-    shortterm_horizon: int = 64
-    longterm_horizon: int = 256
+    # Prediction horizons (exact token offsets, not window sizes)
+    # Each target is a single token at t + horizon, preserving full variance
+    immediate_horizon: int = 1    # next token
+    shortterm_horizon: int = 32   # ~1 sentence ahead
+    longterm_horizon: Optional[int] = None  # end of sequence
 
     # Attention config
     attention_n_heads: int = 8
