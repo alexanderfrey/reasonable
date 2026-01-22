@@ -2096,11 +2096,21 @@ def main():
             ss_comp_std = world_stats.get('self_state/compressor_std')
             ss_step_change = world_stats.get('self_state/step_change')
             ss_write_gate = world_stats.get('self_state/write_gate')
+            ss_gated_amp_mean = world_stats.get('self_state/gated_amp_mean')
+            ss_gated_amp_max = world_stats.get('self_state/gated_amp_max')
+            ss_gated_amp_over = world_stats.get('self_state/gated_amp_over_threshold')
             if ss_contrib is not None:
                 gate_str = f" gate={ss_write_gate:.3f}" if ss_write_gate is not None else ""
+                amp_str = ""
+                if ss_gated_amp_mean is not None and ss_gated_amp_max is not None and ss_gated_amp_over is not None:
+                    phase_write_threshold = model.global_sync.oscillatory_world.config.phase_write_threshold
+                    amp_str = (
+                        f" amp_mean={ss_gated_amp_mean:.3e} amp_max={ss_gated_amp_max:.3e} "
+                        f"over={ss_gated_amp_over:.1%} thr={phase_write_threshold:.2f}"
+                    )
                 print(
                     f"   Self-State | contrib={ss_contrib:.3f} ratio={ss_ratio:.3f} "
-                    f"coverage={ss_coverage:.2f} comp_std={ss_comp_std:.3f} Δstep={ss_step_change:.3f}{gate_str}"
+                    f"coverage={ss_coverage:.2f} comp_std={ss_comp_std:.3f} Δstep={ss_step_change:.3f}{gate_str}{amp_str}"
                 )
 
             # WandB logging (consolidated - only essential metrics)
@@ -2319,6 +2329,9 @@ def main():
                     'self_state/compressor_std': metrics.get('self_state/compressor_std', 0),
                     'self_state/step_change': metrics.get('self_state/step_change', 0),
                     'self_state/write_gate': metrics.get('self_state/write_gate', 0),
+                    'self_state/gated_amp_mean': metrics.get('self_state/gated_amp_mean', 0),
+                    'self_state/gated_amp_max': metrics.get('self_state/gated_amp_max', 0),
+                    'self_state/gated_amp_over_threshold': metrics.get('self_state/gated_amp_over_threshold', 0),
                     'self_state/change': metrics.get('self_state/change', 0),
                 }
                 wandb.log(log_dict, step=global_step)

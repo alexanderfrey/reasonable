@@ -635,13 +635,8 @@ class GlobalSyncModule(nn.Module):
                 self.future_predictor = None
                 self.auxiliary_prediction_horizon = 0
 
-            # Prediction summary projection: post-activations -> d_feature_input
-            # Lazy to adapt to pred_d_neurons without plumbing config through
-            self.pred_summary_proj = nn.Sequential(
-                nn.LazyLinear(config.d_feature_input),
-                nn.GELU(),
-                nn.Linear(config.d_feature_input, config.d_feature_input),
-            )
+            # Prediction summary projection: initialized when prediction module is registered
+            self.pred_summary_proj = None
 
             # Self-state compressor: prediction + surprise + confidence + sync summary
             # Input: [sync_summary, pred_summary, surprise_scalar, confidence] -> d_self_state
@@ -708,6 +703,25 @@ class GlobalSyncModule(nn.Module):
             dropout=self.config.dropout,
         )
         self.module_names.append(name)
+
+        # Initialize prediction summary projector when prediction module is registered
+        if name == 'prediction':
+            if self.pred_summary_proj is None:
+                self.pred_summary_proj = nn.Sequential(
+                    nn.Linear(d_neurons, self.config.d_feature_input),
+                    nn.GELU(),
+                    nn.Linear(self.config.d_feature_input, self.config.d_feature_input),
+                )
+            else:
+                # Guard against mismatched dimensions if re-registered
+                first_linear = next(
+                    (m for m in self.pred_summary_proj.modules() if isinstance(m, nn.Linear)),
+                    None
+                )
+                if first_linear is not None and first_linear.in_features != d_neurons:
+                    raise ValueError(
+                        f"Prediction module d_neurons mismatch: existing={first_linear.in_features}, new={d_neurons}"
+                    )
 
         if self.module_embeddings is not None:
             # Use larger scale (0.5 instead of 0.02) for meaningful differentiation
@@ -869,7 +883,11 @@ class GlobalSyncModule(nn.Module):
 
                 # Prediction summary from prediction activations (last tick)
                 pred_summary_proj = torch.zeros_like(sync_summary_proj)
-                if 'prediction' in module_activations and len(module_activations['prediction']) > 0:
+                if (
+                    self.pred_summary_proj is not None
+                    and 'prediction' in module_activations
+                    and len(module_activations['prediction']) > 0
+                ):
                     pred_last = module_activations['prediction'][-1]  # (B, S, d_pred)
                     pred_summary_raw = pred_last.mean(dim=(0, 1))  # (d_pred,)
                     pred_summary_proj = self.pred_summary_proj(pred_summary_raw)  # (d_feature_input,)
@@ -1297,6 +1315,12 @@ class GlobalSyncModule(nn.Module):
             stats['self_state/change'] = phase_diff_stats['self_state_change'].item()
         if 'self_write_gate' in phase_diff_stats:
             stats['self_state/write_gate'] = phase_diff_stats['self_write_gate'].item()
+        if 'self_gated_amp_mean' in phase_diff_stats:
+            stats['self_state/gated_amp_mean'] = phase_diff_stats['self_gated_amp_mean'].item()
+        if 'self_gated_amp_max' in phase_diff_stats:
+            stats['self_state/gated_amp_max'] = phase_diff_stats['self_gated_amp_max'].item()
+        if 'self_gated_amp_over_threshold' in phase_diff_stats:
+            stats['self_state/gated_amp_over_threshold'] = phase_diff_stats['self_gated_amp_over_threshold'].item()
 
         # === SELF-WORLD COHERENCE METRICS ===
         coherence_stats = self.oscillatory_world.compute_self_world_coherence()

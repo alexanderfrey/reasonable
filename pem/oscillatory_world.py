@@ -220,6 +220,9 @@ class OscillatoryWorldState(nn.Module):
         self.register_buffer('_last_phase_mod', torch.zeros(N))
         self.register_buffer('_last_self_state_change', torch.tensor(0.0))
         self.register_buffer('_last_write_gate_self', torch.tensor(0.0))
+        self.register_buffer('_last_self_gated_amp_mean', torch.tensor(0.0))
+        self.register_buffer('_last_self_gated_amp_max', torch.tensor(0.0))
+        self.register_buffer('_last_self_gated_amp_over_threshold', torch.tensor(0.0))
 
         # Update counter
         self.register_buffer('_update_count', torch.tensor(0, dtype=torch.long))
@@ -397,9 +400,18 @@ class OscillatoryWorldState(nn.Module):
             amp_mod_self = self.self_amp_modulator(self_state)  # (N_self,), in [-1, 1]
             phase_mod_self = self.self_phase_modulator(self_state)  # (N_self,), in [-1, 1]
             gated_amp_mod_self = amp_mod_self * write_gate_self
+            self_gated_abs = gated_amp_mod_self.abs()
+            self._last_self_gated_amp_mean.copy_(self_gated_abs.mean().detach())
+            self._last_self_gated_amp_max.copy_(self_gated_abs.max().detach())
+            self._last_self_gated_amp_over_threshold.copy_(
+                (self_gated_abs > self.config.phase_write_threshold).float().mean().detach()
+            )
         else:
             gated_amp_mod_self = torch.zeros(N_self, device=features.device, dtype=features.dtype)
             phase_mod_self = torch.zeros(N_self, device=features.device, dtype=features.dtype)
+            self._last_self_gated_amp_mean.zero_()
+            self._last_self_gated_amp_max.zero_()
+            self._last_self_gated_amp_over_threshold.zero_()
 
         # === COMBINE WORLD + SELF ===
         gated_amp_mod = torch.cat([gated_amp_mod_world, gated_amp_mod_self])
@@ -670,6 +682,9 @@ class OscillatoryWorldState(nn.Module):
             # Self-state gating diagnostics
             stats['self_state_change'] = self._last_self_state_change.detach()
             stats['self_write_gate'] = self._last_write_gate_self.detach()
+            stats['self_gated_amp_mean'] = self._last_self_gated_amp_mean.detach()
+            stats['self_gated_amp_max'] = self._last_self_gated_amp_max.detach()
+            stats['self_gated_amp_over_threshold'] = self._last_self_gated_amp_over_threshold.detach()
 
             return stats
 
