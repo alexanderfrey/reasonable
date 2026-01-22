@@ -1940,6 +1940,42 @@ def main():
             # Show deltas (negative = improvement)
             print(f"      Horizon | imm: {imm_0:.3f}→{imm_last:.3f} | short: {short_0:.3f}→{short_last:.3f} | long: {long_0:.3f}→{long_last:.3f}")
 
+            # === NEW METRICS ===
+            # Oscillator frequency bands
+            world_stats = model.global_sync.get_world_state_stats()
+            slow_amp = world_stats.get('osc/slow_amp_mean')
+            mid_amp = world_stats.get('osc/mid_amp_mean')
+            fast_amp = world_stats.get('osc/fast_amp_mean')
+            freq_ratio = world_stats.get('osc/freq_band_ratio')
+            if slow_amp is not None:
+                print(f"    Osc Bands | slow={slow_amp:.3f} mid={mid_amp:.3f} fast={fast_amp:.3f} ratio={freq_ratio:.2f}")
+
+            # Feature write attention
+            fw_entropy = world_stats.get('feature_write/pos_attn_entropy')
+            fw_top1 = world_stats.get('feature_write/top1_weight')
+            fw_top5 = world_stats.get('feature_write/top5_weight')
+            fw_surp_corr = world_stats.get('feature_write/surprise_correlation')
+            if fw_entropy is not None:
+                surp_str = f" surp_corr={fw_surp_corr:.2f}" if fw_surp_corr else ""
+                print(f"   Feat Write | entropy={fw_entropy:.2f} top1={fw_top1:.3f} top5={fw_top5:.3f}{surp_str}")
+
+            # Loop trajectory
+            l0 = metrics.get('loop/loss_step0')
+            l1 = metrics.get('loop/loss_step1')
+            ln = metrics.get('loop/loss_stepN')
+            mono = metrics.get('loop/monotonic_improve')
+            if l0 is not None:
+                mono_str = f" mono={mono:.0%}" if mono is not None else ""
+                print(f"    Loop Traj | L0={l0:.3f}→L1={l1:.3f}→LN={ln:.3f}{mono_str}")
+
+            # CTM tick selection
+            t1 = metrics.get('ctm/pred_t1_mean')
+            t2 = metrics.get('ctm/pred_t2_mean')
+            agree = metrics.get('ctm/t1_t2_agreement')
+            spread = metrics.get('ctm/tick_loss_spread')
+            if t1 is not None:
+                print(f"          CTM | t1={t1:.1f} t2={t2:.1f} agree={agree:.0%} spread={spread:.4f}")
+
             # WandB logging (consolidated - only essential metrics)
             if config.wandb_project:
                 log_dict = {
