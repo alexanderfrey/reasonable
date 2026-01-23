@@ -115,7 +115,7 @@ class OscillatoryWorldConfig:
 
     # Phase-tagged writes (temporal awareness)
     phase_write_threshold: float = 0.1   # Min |amp_mod| to count as significant write (world)
-    phase_write_threshold_self: float = 0.01  # Min |amp_mod| for self oscillators (can be lower)
+    phase_write_threshold_self: float = 0.05  # Min |amp_mod| for self oscillators (raised for selectivity)
     write_strength_decay: float = 0.99   # Decay factor for old write strengths
 
     # Self-state tracking (autobiographical memory)
@@ -244,6 +244,8 @@ class OscillatoryWorldState(nn.Module):
         self.register_buffer('write_self_states', torch.zeros(N, config.d_self_state))
         # Track last self-state for detecting cognitive shifts
         self.register_buffer('_last_self_state', torch.zeros(config.d_self_state))
+        # Keep current (non-detached) self-state for diversity loss
+        self._last_self_state_for_loss = None
 
         # === SELF-STATE MODULATION NETWORKS ===
         # For self oscillators (indices N - num_self_oscillators : N)
@@ -263,11 +265,6 @@ class OscillatoryWorldState(nn.Module):
             nn.Linear(N_self * 2, N_self),
             nn.Tanh(),
         )
-
-        # Learnable gain for self modulation (controls amplitude scale)
-        # Initialized < 1 to start with smaller self-oscillator writes
-        # Model can learn to increase if needed
-        self.self_mod_gain = nn.Parameter(torch.tensor(0.1))
 
         self._init_weights()
 
@@ -381,6 +378,8 @@ class OscillatoryWorldState(nn.Module):
         # === SELF OSCILLATOR GATING (indices N_world:N) ===
         # Gate by relative self-state change (scale-invariant cognitive shift)
         if self_state is not None:
+            # Store current self-state for diversity loss (keep gradients)
+            self._last_self_state_for_loss = self_state
             self_state_change = (self_state - self._last_self_state).norm()
             self_state_norm = self_state.norm()
             relative_change = self_state_change / (self_state_norm + 1e-8)
@@ -393,6 +392,7 @@ class OscillatoryWorldState(nn.Module):
             write_gate_self = torch.tensor(0.0, device=features.device, dtype=features.dtype)
             self._last_self_state_change.zero_()
             self._last_write_gate_self.zero_()
+            self._last_self_state_for_loss = None
 
         # === DIFFERENTIABLE COMPUTATIONS ===
 
@@ -409,11 +409,9 @@ class OscillatoryWorldState(nn.Module):
 
         # === SELF OSCILLATOR MODULATION (from self_state) ===
         if self_state is not None:
-            amp_mod_self_raw = self.self_amp_modulator(self_state)  # (N_self,), in [-1, 1]
-            phase_mod_self_raw = self.self_phase_modulator(self_state)  # (N_self,), in [-1, 1]
-            # Apply learnable gain to control self modulation scale
-            amp_mod_self = amp_mod_self_raw * self.self_mod_gain
-            phase_mod_self = phase_mod_self_raw * self.self_mod_gain
+            amp_mod_self = self.self_amp_modulator(self_state)  # (N_self,), in [-1, 1]
+            phase_mod_self = self.self_phase_modulator(self_state)  # (N_self,), in [-1, 1]
+            # Note: magnitude control now handled by self_state_residual_gain in global_sync.py
             gated_amp_mod_self = amp_mod_self * write_gate_self
             self_gated_abs = gated_amp_mod_self.abs()
             self._last_self_gated_amp_mean.copy_(self_gated_abs.mean().detach())
@@ -812,6 +810,40 @@ class OscillatoryWorldState(nn.Module):
                 'write_timing_coherence': write_timing_coherence,
                 'write_phase_alignment': write_phase_alignment,
             }
+
+    def compute_self_state_diversity_loss(self) -> torch.Tensor:
+        """
+        Compute a loss that encourages diversity in stored self-states.
+
+        High similarity between self-states means the autobiographical memory
+        isn't capturing varied cognitive states. This loss penalizes that.
+
+        Returns:
+            Scalar loss tensor (higher when self-states are too similar).
+        """
+        current = self._last_self_state_for_loss
+        if current is None:
+            return torch.tensor(0.0, device=self.write_self_states.device)
+
+        # Use only valid (non-zero) stored self-states to avoid rewarding "no writes"
+        wss = self.write_self_states  # (N, d_self_state)
+        valid_mask = wss.norm(dim=1) > 1e-6
+        stored = wss[valid_mask]
+        if stored.shape[0] == 0:
+            return torch.tensor(0.0, device=wss.device)
+
+        # Normalize for cosine similarity
+        stored_norm = stored / (stored.norm(dim=1, keepdim=True) + 1e-8)
+        current_norm = current / (current.norm() + 1e-8)
+
+        # Similarity of current state vs stored memories (gradient flows through current)
+        sims = torch.matmul(stored_norm, current_norm)
+
+        # Penalize only positive similarities (negatively correlated is fine)
+        diversity_loss = sims.clamp(min=0).mean()
+        # Clear reference to avoid retaining graph between steps
+        self._last_self_state_for_loss = None
+        return diversity_loss
 
 
 def create_oscillatory_world(
