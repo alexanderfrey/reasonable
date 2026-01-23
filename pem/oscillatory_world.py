@@ -121,7 +121,7 @@ class OscillatoryWorldConfig:
     # Self-state tracking (autobiographical memory)
     num_self_oscillators: int = 16       # Oscillators dedicated to self-state (indices N-16 to N)
     d_self_state: int = 64               # Dimension of self-state input
-    self_write_threshold: float = 0.1    # Min self-state change to trigger write
+    self_write_threshold: float = 0.1    # Min relative self-state change to trigger write (scale-invariant)
 
 
 class OscillatoryWorldState(nn.Module):
@@ -370,13 +370,15 @@ class OscillatoryWorldState(nn.Module):
             ).sigmoid()
 
         # === SELF OSCILLATOR GATING (indices N_world:N) ===
-        # Gate by self-state change magnitude (cognitive shift = worth remembering)
+        # Gate by relative self-state change (scale-invariant cognitive shift)
         if self_state is not None:
             self_state_change = (self_state - self._last_self_state).norm()
+            self_state_norm = self_state.norm()
+            relative_change = self_state_change / (self_state_norm + 1e-8)
             write_gate_self = torch.sigmoid(
-                self_state_change - self.config.self_write_threshold
+                relative_change - self.config.self_write_threshold
             )
-            self._last_self_state_change.copy_(self_state_change.detach())
+            self._last_self_state_change.copy_(relative_change.detach())
             self._last_write_gate_self.copy_(write_gate_self.detach())
         else:
             write_gate_self = torch.tensor(0.0, device=features.device, dtype=features.dtype)
