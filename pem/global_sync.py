@@ -962,23 +962,26 @@ class GlobalSyncModule(nn.Module):
                     confidence_scalar = torch.tensor(0.0, device=sync.device, dtype=sync.dtype)
 
                 # === NORMALIZATION ===
-                # Apply LayerNorm to 256-dim vectors to balance magnitudes
-                # Before: sync ~6.91, pred ~1.56 -> sync dominates
-                # After: both normalized to similar scale
-                sync_summary_norm = self.sync_summary_norm(sync_summary_proj_raw)
-                pred_summary_norm = self.pred_summary_norm(pred_summary_proj_raw)
+                # Apply LayerNorm then unit-normalize to balance component magnitudes.
+                # LayerNorm alone produces norms ~√d, so 256-dim vectors dominate 32-dim embeddings.
+                # Unit normalization ensures each component contributes equally regardless of dimension.
+                sync_ln = self.sync_summary_norm(sync_summary_proj_raw)
+                pred_ln = self.pred_summary_norm(pred_summary_proj_raw)
+                sync_summary_norm = F.normalize(sync_ln, dim=0)  # Unit norm
+                pred_summary_norm = F.normalize(pred_ln, dim=0)  # Unit norm
 
-                # Embed scalars to higher dimension for comparable representation
-                # Before: scalars ~0.02-0.43 had negligible influence
-                # After: embedded to d_scalar_embed dims with GELU activation
-                surprise_embed = self.surprise_embed(surprise_scalar.reshape(1))  # (d_scalar_embed,)
-                confidence_embed = self.confidence_embed(confidence_scalar.reshape(1))  # (d_scalar_embed,)
+                # Embed scalars to higher dimension, then unit-normalize
+                # This gives surprise/confidence equal influence as sync/pred
+                surprise_raw = self.surprise_embed(surprise_scalar.reshape(1))  # (d_scalar_embed,)
+                confidence_raw = self.confidence_embed(confidence_scalar.reshape(1))  # (d_scalar_embed,)
+                surprise_embed = F.normalize(surprise_raw, dim=0)  # Unit norm
+                confidence_embed = F.normalize(confidence_raw, dim=0)  # Unit norm
 
                 self_state_input = torch.cat([
-                    sync_summary_norm,    # (d_feature_input,) - normalized
-                    pred_summary_norm,    # (d_feature_input,) - normalized
-                    surprise_embed,       # (d_scalar_embed,) - embedded
-                    confidence_embed,     # (d_scalar_embed,) - embedded
+                    sync_summary_norm,    # (d_feature_input,) - unit norm
+                    pred_summary_norm,    # (d_feature_input,) - unit norm
+                    surprise_embed,       # (d_scalar_embed,) - unit norm
+                    confidence_embed,     # (d_scalar_embed,) - unit norm
                 ], dim=0)
                 self_state = self.self_state_compressor(self_state_input)  # (d_self_state,)
 
