@@ -2150,6 +2150,15 @@ def main():
                         f"Δin={ss_in_change:.2f} Δout={ss_out_change:.2f} ratio={ratio:.2f}"
                     )
 
+            # Show learnable scales (if they exist)
+            if hasattr(model.global_sync, 'sync_scale') and model.global_sync.sync_scale is not None:
+                print(
+                    f"    SS Scales | sync={model.global_sync.sync_scale.item():.1f} "
+                    f"pred={model.global_sync.pred_scale.item():.1f} "
+                    f"surp={model.global_sync.surprise_scale.item():.1f} "
+                    f"conf={model.global_sync.confidence_scale.item():.1f}"
+                )
+
             # WandB logging (consolidated - only essential metrics)
             if config.wandb_project:
                 log_dict = {
