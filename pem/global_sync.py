@@ -679,6 +679,15 @@ class GlobalSyncModule(nn.Module):
                 nn.GELU(),
             )
 
+            # Per-block learnable scales (applied after unit-norm normalization)
+            # Initialized to sqrt(d_feature_input) to restore reasonable magnitude while keeping balance
+            # Each block can learn its own amplitude importance
+            init_scale = float(config.d_feature_input ** 0.5)  # sqrt(256) = 16
+            self.sync_scale = nn.Parameter(torch.tensor(init_scale))
+            self.pred_scale = nn.Parameter(torch.tensor(init_scale))
+            self.surprise_scale = nn.Parameter(torch.tensor(init_scale))
+            self.confidence_scale = nn.Parameter(torch.tensor(init_scale))
+
             # Updated input dim: 2 * d_feature_input (normalized) + 2 * d_scalar_embed (embedded)
             self_state_in_dim = (2 * config.d_feature_input) + (2 * config.d_scalar_embed)
             self.self_state_compressor = nn.Sequential(
@@ -710,6 +719,11 @@ class GlobalSyncModule(nn.Module):
             self.pred_summary_norm = None
             self.surprise_embed = None
             self.confidence_embed = None
+            # Per-block learnable scales (None when oscillatory world disabled)
+            self.sync_scale = None
+            self.pred_scale = None
+            self.surprise_scale = None
+            self.confidence_scale = None
             self._last_self_state = None
             self._last_osc_attn_out_norm = None
             self._last_osc_query_act_norm = None
@@ -965,23 +979,24 @@ class GlobalSyncModule(nn.Module):
                 # Apply LayerNorm then unit-normalize to balance component magnitudes.
                 # LayerNorm alone produces norms ~√d, so 256-dim vectors dominate 32-dim embeddings.
                 # Unit normalization ensures each component contributes equally regardless of dimension.
+                # Then apply learnable per-block scales to restore magnitude and allow learned importance.
                 sync_ln = self.sync_summary_norm(sync_summary_proj_raw)
                 pred_ln = self.pred_summary_norm(pred_summary_proj_raw)
-                sync_summary_norm = F.normalize(sync_ln, dim=0)  # Unit norm
-                pred_summary_norm = F.normalize(pred_ln, dim=0)  # Unit norm
+                sync_summary_norm = F.normalize(sync_ln, dim=0) * self.sync_scale
+                pred_summary_norm = F.normalize(pred_ln, dim=0) * self.pred_scale
 
-                # Embed scalars to higher dimension, then unit-normalize
+                # Embed scalars to higher dimension, then unit-normalize and scale
                 # This gives surprise/confidence equal influence as sync/pred
                 surprise_raw = self.surprise_embed(surprise_scalar.reshape(1))  # (d_scalar_embed,)
                 confidence_raw = self.confidence_embed(confidence_scalar.reshape(1))  # (d_scalar_embed,)
-                surprise_embed = F.normalize(surprise_raw, dim=0)  # Unit norm
-                confidence_embed = F.normalize(confidence_raw, dim=0)  # Unit norm
+                surprise_embed = F.normalize(surprise_raw, dim=0) * self.surprise_scale
+                confidence_embed = F.normalize(confidence_raw, dim=0) * self.confidence_scale
 
                 self_state_input = torch.cat([
-                    sync_summary_norm,    # (d_feature_input,) - unit norm
-                    pred_summary_norm,    # (d_feature_input,) - unit norm
-                    surprise_embed,       # (d_scalar_embed,) - unit norm
-                    confidence_embed,     # (d_scalar_embed,) - unit norm
+                    sync_summary_norm,    # (d_feature_input,) - unit norm * scale
+                    pred_summary_norm,    # (d_feature_input,) - unit norm * scale
+                    surprise_embed,       # (d_scalar_embed,) - unit norm * scale
+                    confidence_embed,     # (d_scalar_embed,) - unit norm * scale
                 ], dim=0)
                 self_state = self.self_state_compressor(self_state_input)  # (d_self_state,)
 
