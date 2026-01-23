@@ -948,6 +948,13 @@ def print_diagnostic_report(
     # ===== 7. NEW METRICS (from model and metrics dict) =====
     if model is not None and hasattr(model, 'global_sync'):
         world_stats = model.global_sync.get_world_state_stats()
+        gs = model.global_sync
+
+        # Check if phase-based self-sync is enabled
+        has_phase_sync = hasattr(gs, 'phase_self_sync_computer') and gs.phase_self_sync_computer is not None
+        has_autobio = hasattr(gs, 'autobio_retriever') and gs.autobio_retriever is not None
+        if not has_phase_sync and not has_autobio:
+            print(f"[EmergingSelf] DISABLED (phase_sync={has_phase_sync}, autobio={has_autobio})")
 
         # Oscillator frequency bands
         slow_amp = world_stats.get('osc/slow_amp_mean', None)
@@ -988,20 +995,19 @@ def print_diagnostic_report(
         R_self = world_stats.get('phase_self_sync/R_self', None)
         R_write = world_stats.get('phase_self_sync/R_write', None)
         write_frac = world_stats.get('phase_self_sync/write_fraction', None)
+        phase_sync_std = world_stats.get('phase_self_sync/phase_sync_std', None)
         autobio_entropy = world_stats.get('autobio/attn_entropy', None)
         autobio_norm = world_stats.get('autobio/context_norm', None)
         autobio_top1 = world_stats.get('autobio/attn_top1', None)
+        autobio_active = world_stats.get('autobio/attn_active_count', None)
         coherence_gate = world_stats.get('autobio/coherence_gate', None)
         if R_self is not None:
             write_spread = 1 - R_write if R_write is not None else 0
-            write_str = f" spread={write_spread:.2f}" if R_write is not None else ""
-            frac_str = f" wfrac={write_frac:.2f}" if write_frac is not None else ""
-            print(f"[PhaseSelfSync] R_self={R_self:.3f}{write_str}{frac_str}")
+            std_str = f" sync_std={phase_sync_std:.2f}" if phase_sync_std is not None else ""
+            print(f"[PhaseSelfSync] R_self={R_self:.3f} spread={write_spread:.2f} wfrac={write_frac:.2f}{std_str}")
         if autobio_entropy is not None:
-            norm_str = f" ctx_norm={autobio_norm:.3f}" if autobio_norm is not None else ""
-            top1_str = f" top1={autobio_top1:.2f}" if autobio_top1 is not None else ""
-            gate_str = f" gate={coherence_gate:.2f}" if coherence_gate is not None else ""
-            print(f"[Autobio] entropy={autobio_entropy:.2f}{top1_str}{norm_str}{gate_str}")
+            active_str = f" active={int(autobio_active)}" if autobio_active is not None else ""
+            print(f"[Autobio] entropy={autobio_entropy:.2f} top1={autobio_top1:.2f} gate={coherence_gate:.2f} ctx={autobio_norm:.2f}{active_str}")
 
         # Self-state transformer attention (which components are being used)
         pool_autobio = world_stats.get('ss_attn/pool_autobio', None)
@@ -1010,8 +1016,12 @@ def print_diagnostic_report(
         pool_surp = world_stats.get('ss_attn/pool_surprise', None)
         pool_conf = world_stats.get('ss_attn/pool_confidence', None)
         if pool_sync is not None:
-            autobio_str = f" autobio={pool_autobio:.2f}" if pool_autobio is not None else ""
-            print(f"[SS Attn] sync={pool_sync:.2f} pred={pool_pred:.2f} surp={pool_surp:.2f} conf={pool_conf:.2f}{autobio_str}")
+            if pool_autobio is not None:
+                # 5-token mode with autobio
+                print(f"    SS Attn | sync={pool_sync:.2f} pred={pool_pred:.2f} surp={pool_surp:.2f} conf={pool_conf:.2f} autobio={pool_autobio:.2f}")
+            else:
+                # 4-token mode (autobio disabled)
+                print(f"    SS Attn | pool: sync={pool_sync:.2f} pred={pool_pred:.2f} surp={pool_surp:.2f} conf={pool_conf:.2f}")
 
     if metrics is not None:
         # Loop trajectory
