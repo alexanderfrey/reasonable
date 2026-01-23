@@ -136,6 +136,7 @@ class GlobalSyncConfig:
     # Self-state tracking (autobiographical memory)
     # Self-state captures: prediction summary, surprise level, confidence
     d_self_state: int = 64  # Dimension of self-state vector
+    d_self_state_hidden: int = 256  # Hidden dimension in self-state compressor (wider = less compression)
     d_scalar_embed: int = 32  # Embedding dimension for surprise/confidence scalars
 
 
@@ -689,11 +690,12 @@ class GlobalSyncModule(nn.Module):
             self.confidence_scale = nn.Parameter(torch.tensor(init_scale))
 
             # Updated input dim: 2 * d_feature_input (normalized) + 2 * d_scalar_embed (embedded)
+            # Compressor: 576 → hidden → 64 (wider hidden = less variation loss)
             self_state_in_dim = (2 * config.d_feature_input) + (2 * config.d_scalar_embed)
             self.self_state_compressor = nn.Sequential(
-                nn.Linear(self_state_in_dim, 128),
+                nn.Linear(self_state_in_dim, config.d_self_state_hidden),
                 nn.GELU(),
-                nn.Linear(128, config.d_self_state),
+                nn.Linear(config.d_self_state_hidden, config.d_self_state),
             )
             # Buffer to store last prediction output for self-state computation
             self.register_buffer('_last_prediction_output', None)
