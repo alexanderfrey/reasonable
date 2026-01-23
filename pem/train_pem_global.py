@@ -2228,8 +2228,9 @@ def main():
                 if probe_results:
                     surp_r2 = probe_results.get('surprise_r2', 0)
                     conf_r2 = probe_results.get('confidence_r2', 0)
+                    conf_deep_r2 = probe_results.get('confidence_deep_r2', 0)
                     write_r2 = probe_results.get('write_r2', 0)
-                    print(f"   SS Probes | surprise_R2={surp_r2:.3f} confidence_R2={conf_r2:.3f} write_R2={write_r2:.3f}")
+                    print(f"   SS Probes | surp={surp_r2:.2f} conf={conf_r2:.2f} conf_deep={conf_deep_r2:.2f} write={write_r2:.2f}")
 
             # Self-state transformer attention weights
             if hasattr(model.global_sync, 'self_state_transformer') and model.global_sync.self_state_transformer is not None:

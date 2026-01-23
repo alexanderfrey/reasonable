@@ -227,8 +227,10 @@ class SelfStateProbe(nn.Module):
     """
     Probing classifier to test what can be decoded from self-state.
 
-    Small MLP that predicts a target variable from self-state.
-    If the probe achieves high accuracy, that information is encoded in self-state.
+    Supports different architectures:
+    - linear: Single linear layer (tests if information is linearly separable)
+    - shallow: One hidden layer (tests simple nonlinear encoding)
+    - deep: Two hidden layers (tests complex nonlinear encoding)
     """
 
     def __init__(
@@ -237,18 +239,33 @@ class SelfStateProbe(nn.Module):
         target_type: str = "regression",  # "regression" or "classification"
         n_classes: int = 1,  # For classification
         hidden_dim: int = 32,
+        architecture: str = "shallow",  # "linear", "shallow", or "deep"
     ):
         super().__init__()
         self.target_type = target_type
         self.n_classes = n_classes
+        self.architecture = architecture
 
         out_dim = n_classes if target_type == "classification" else 1
 
-        self.probe = nn.Sequential(
-            nn.Linear(d_self_state, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, out_dim),
-        )
+        if architecture == "linear":
+            self.probe = nn.Linear(d_self_state, out_dim)
+        elif architecture == "shallow":
+            self.probe = nn.Sequential(
+                nn.Linear(d_self_state, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, out_dim),
+            )
+        elif architecture == "deep":
+            self.probe = nn.Sequential(
+                nn.Linear(d_self_state, hidden_dim * 2),
+                nn.ReLU(),
+                nn.Linear(hidden_dim * 2, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, out_dim),
+            )
+        else:
+            raise ValueError(f"Unknown architecture: {architecture}")
 
     def forward(self, self_state: torch.Tensor) -> torch.Tensor:
         return self.probe(self_state)
@@ -298,12 +315,14 @@ class ProbeTrainer:
         name: str,
         target_type: str = "regression",
         n_classes: int = 1,
+        architecture: str = "shallow",
     ):
         """Add a new probe for a specific target."""
         probe = SelfStateProbe(
             d_self_state=self.d_self_state,
             target_type=target_type,
             n_classes=n_classes,
+            architecture=architecture,
         )
         self.probes[name] = probe
         self.optimizers[name] = torch.optim.Adam(probe.parameters(), lr=1e-3)
@@ -333,10 +352,11 @@ class ProbeTrainer:
 
         losses = {}
 
-        # Define targets for each probe
+        # Define targets for each probe (handle _deep suffix variants)
         targets = {
             'surprise': surprise,
             'confidence': confidence,
+            'confidence_deep': confidence,  # Same target, different architecture
             'write': did_write,
         }
 
@@ -370,6 +390,7 @@ class ProbeTrainer:
         targets = {
             'surprise': data['surprise'],
             'confidence': data['confidence'],
+            'confidence_deep': data['confidence'],  # Same target, different architecture
             'write': data['did_write'],
         }
 
@@ -426,8 +447,12 @@ class SelfStateAnalyzer:
         self.probe_trainer = None
         if enable_probes:
             self.probe_trainer = ProbeTrainer(d_self_state)
-            self.probe_trainer.add_probe('surprise', target_type='regression')
-            self.probe_trainer.add_probe('confidence', target_type='regression')
+            # Linear probes (test if info is linearly separable)
+            self.probe_trainer.add_probe('surprise', target_type='regression', architecture='linear')
+            self.probe_trainer.add_probe('confidence', target_type='regression', architecture='linear')
+            self.probe_trainer.add_probe('write', target_type='regression', architecture='linear')
+            # Deep MLP probes (test if info is nonlinearly encoded)
+            self.probe_trainer.add_probe('confidence_deep', target_type='regression', architecture='deep')
             self.probe_trainer.add_probe('write', target_type='regression')
 
     def record(
