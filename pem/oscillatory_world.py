@@ -369,6 +369,8 @@ class OscillatoryWorldState(nn.Module):
                 device=features.device,
                 dtype=features.dtype
             ).sigmoid()
+        # Ensure scalar for diagnostics and gating
+        write_gate_world = write_gate_world.mean()  # Always reduce to scalar (handles any shape)
         self._last_write_gate_world.copy_(write_gate_world.detach())
 
         # === SELF OSCILLATOR GATING (indices N_world:N) ===
