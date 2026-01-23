@@ -2129,15 +2129,26 @@ def main():
             ss_in_pred = world_stats.get('ss_input/pred_norm')
             ss_in_surp = world_stats.get('ss_input/surprise')
             ss_in_conf = world_stats.get('ss_input/confidence')
+            ss_normed_sync = world_stats.get('ss_normed/sync_norm')
+            ss_normed_pred = world_stats.get('ss_normed/pred_norm')
+            ss_normed_surp = world_stats.get('ss_normed/surprise_norm')
+            ss_normed_conf = world_stats.get('ss_normed/confidence_norm')
             ss_in_change = world_stats.get('ss_input/step_change')
             ss_out_change = world_stats.get('self_state/step_change')
             if ss_in_sync is not None:
                 # Compare input change vs output change to see if compressor is collapsing
                 ratio = ss_out_change / (ss_in_change + 1e-8) if ss_in_change else 0
+                # Show raw vs normalized to verify normalization is working
                 print(
-                    f"    SS Inputs | sync={ss_in_sync:.2f} pred={ss_in_pred:.2f} "
-                    f"surp={ss_in_surp:.3f} conf={ss_in_conf:.3f} | Δin={ss_in_change:.3f} Δout={ss_out_change:.3f} ratio={ratio:.2f}"
+                    f"    SS Raw    | sync={ss_in_sync:.2f} pred={ss_in_pred:.2f} "
+                    f"surp={ss_in_surp:.2f} conf={ss_in_conf:.2f}"
                 )
+                if ss_normed_sync is not None:
+                    print(
+                        f"    SS Normed | sync={ss_normed_sync:.2f} pred={ss_normed_pred:.2f} "
+                        f"surp={ss_normed_surp:.2f} conf={ss_normed_conf:.2f} | "
+                        f"Δin={ss_in_change:.2f} Δout={ss_out_change:.2f} ratio={ratio:.2f}"
+                    )
 
             # WandB logging (consolidated - only essential metrics)
             if config.wandb_project:

@@ -136,6 +136,7 @@ class GlobalSyncConfig:
     # Self-state tracking (autobiographical memory)
     # Self-state captures: prediction summary, surprise level, confidence
     d_self_state: int = 64  # Dimension of self-state vector
+    d_scalar_embed: int = 32  # Embedding dimension for surprise/confidence scalars
 
 
 class RMSNorm(nn.Module):
@@ -611,10 +612,16 @@ class GlobalSyncModule(nn.Module):
             self._last_self_state_stored_coverage = None
             self._prev_self_state_for_change = None  # For tracking step-to-step change
             # Self-state INPUT diagnostics (what goes into the compressor)
+            # Raw values (before normalization)
             self._last_ss_input_sync_norm = None
             self._last_ss_input_pred_norm = None
             self._last_ss_input_surprise = None
             self._last_ss_input_confidence = None
+            # Normalized values (after LayerNorm/embedding)
+            self._last_ss_normed_sync_norm = None
+            self._last_ss_normed_pred_norm = None
+            self._last_ss_normed_surprise_norm = None
+            self._last_ss_normed_confidence_norm = None
             self._last_ss_input_total_norm = None
             self._prev_ss_input_for_change = None
             self._last_ss_input_step_change = None
@@ -647,9 +654,33 @@ class GlobalSyncModule(nn.Module):
             self.pred_summary_proj = None
 
             # Self-state compressor: prediction + surprise + confidence + sync summary
-            # Input: [sync_summary, pred_summary, surprise_scalar, confidence] -> d_self_state
+            # Input: [sync_summary, pred_summary, surprise_embed, confidence_embed] -> d_self_state
             # Output: d_self_state (compact cognitive state)
-            self_state_in_dim = (2 * config.d_feature_input) + 2
+            #
+            # Normalization strategy to address input magnitude imbalance:
+            # - sync_summary_proj norm ~6.91, pred_summary_proj norm ~1.56
+            # - surprise/confidence scalars ~0.02-0.43
+            # Without normalization, sync dominates and compressor collapses variation.
+            #
+            # Solution:
+            # 1. LayerNorm on 256-dim vectors (sync, pred) -> unit scale
+            # 2. Embed scalars (1 -> d_scalar_embed) so they have comparable capacity
+            self.sync_summary_norm = nn.LayerNorm(config.d_feature_input)
+            self.pred_summary_norm = nn.LayerNorm(config.d_feature_input)
+
+            # Scalar embeddings: project 1-dim to d_scalar_embed for comparable representation
+            # This gives surprise/confidence more capacity to influence self-state
+            self.surprise_embed = nn.Sequential(
+                nn.Linear(1, config.d_scalar_embed),
+                nn.GELU(),
+            )
+            self.confidence_embed = nn.Sequential(
+                nn.Linear(1, config.d_scalar_embed),
+                nn.GELU(),
+            )
+
+            # Updated input dim: 2 * d_feature_input (normalized) + 2 * d_scalar_embed (embedded)
+            self_state_in_dim = (2 * config.d_feature_input) + (2 * config.d_scalar_embed)
             self.self_state_compressor = nn.Sequential(
                 nn.Linear(self_state_in_dim, 128),
                 nn.GELU(),
@@ -674,6 +705,11 @@ class GlobalSyncModule(nn.Module):
             self.auxiliary_prediction_horizon = 0
             self.pred_summary_proj = None
             self.self_state_compressor = None
+            # Normalization layers (None when oscillatory world disabled)
+            self.sync_summary_norm = None
+            self.pred_summary_norm = None
+            self.surprise_embed = None
+            self.confidence_embed = None
             self._last_self_state = None
             self._last_osc_attn_out_norm = None
             self._last_osc_query_act_norm = None
@@ -687,11 +723,16 @@ class GlobalSyncModule(nn.Module):
             self._last_self_state_step_change = None
             self._last_self_state_stored_coverage = None
             self._prev_self_state_for_change = None
-            # Self-state INPUT diagnostics
+            # Self-state INPUT diagnostics (raw values)
             self._last_ss_input_sync_norm = None
             self._last_ss_input_pred_norm = None
             self._last_ss_input_surprise = None
             self._last_ss_input_confidence = None
+            # Self-state INPUT diagnostics (normalized/embedded values)
+            self._last_ss_normed_sync_norm = None
+            self._last_ss_normed_pred_norm = None
+            self._last_ss_normed_surprise_norm = None
+            self._last_ss_normed_confidence_norm = None
             self._last_ss_input_total_norm = None
             self._prev_ss_input_for_change = None
             self._last_ss_input_step_change = None
@@ -893,12 +934,12 @@ class GlobalSyncModule(nn.Module):
                 sync_summary = sync.mean(dim=(0, 1))  # (sync_pairs,) -> compress across batch/seq
                 # Project sync summary to feature dimension (sync_pairs -> d_feature_input)
                 if hasattr(self, 'sync_to_feature') and self.sync_to_feature is not None:
-                    sync_summary_proj = self.sync_to_feature(sync_summary)  # (d_feature_input,)
+                    sync_summary_proj_raw = self.sync_to_feature(sync_summary)  # (d_feature_input,)
                 else:
-                    sync_summary_proj = sync_summary[:self.config.d_feature_input]  # Truncate if needed
+                    sync_summary_proj_raw = sync_summary[:self.config.d_feature_input]  # Truncate if needed
 
                 # Prediction summary from prediction activations (last tick)
-                pred_summary_proj = torch.zeros_like(sync_summary_proj)
+                pred_summary_proj_raw = torch.zeros_like(sync_summary_proj_raw)
                 if (
                     self.pred_summary_proj is not None
                     and 'prediction' in module_activations
@@ -906,7 +947,7 @@ class GlobalSyncModule(nn.Module):
                 ):
                     pred_last = module_activations['prediction'][-1]  # (B, S, d_pred)
                     pred_summary_raw = pred_last.mean(dim=(0, 1))  # (d_pred,)
-                    pred_summary_proj = self.pred_summary_proj(pred_summary_raw)  # (d_feature_input,)
+                    pred_summary_proj_raw = self.pred_summary_proj(pred_summary_raw)  # (d_feature_input,)
 
                 # Surprise scalar
                 if surprise is not None:
@@ -920,22 +961,41 @@ class GlobalSyncModule(nn.Module):
                 else:
                     confidence_scalar = torch.tensor(0.0, device=sync.device, dtype=sync.dtype)
 
+                # === NORMALIZATION ===
+                # Apply LayerNorm to 256-dim vectors to balance magnitudes
+                # Before: sync ~6.91, pred ~1.56 -> sync dominates
+                # After: both normalized to similar scale
+                sync_summary_norm = self.sync_summary_norm(sync_summary_proj_raw)
+                pred_summary_norm = self.pred_summary_norm(pred_summary_proj_raw)
+
+                # Embed scalars to higher dimension for comparable representation
+                # Before: scalars ~0.02-0.43 had negligible influence
+                # After: embedded to d_scalar_embed dims with GELU activation
+                surprise_embed = self.surprise_embed(surprise_scalar.reshape(1))  # (d_scalar_embed,)
+                confidence_embed = self.confidence_embed(confidence_scalar.reshape(1))  # (d_scalar_embed,)
+
                 self_state_input = torch.cat([
-                    sync_summary_proj,
-                    pred_summary_proj,
-                    surprise_scalar.reshape(1),
-                    confidence_scalar.reshape(1),
+                    sync_summary_norm,    # (d_feature_input,) - normalized
+                    pred_summary_norm,    # (d_feature_input,) - normalized
+                    surprise_embed,       # (d_scalar_embed,) - embedded
+                    confidence_embed,     # (d_scalar_embed,) - embedded
                 ], dim=0)
                 self_state = self.self_state_compressor(self_state_input)  # (d_self_state,)
 
                 # Track self-state metrics
                 with torch.no_grad():
                     # === INPUT DIAGNOSTICS ===
-                    # Track what goes INTO the compressor
-                    self._last_ss_input_sync_norm = sync_summary_proj.norm().item()
-                    self._last_ss_input_pred_norm = pred_summary_proj.norm().item()
+                    # Track RAW values (before normalization) for comparison
+                    self._last_ss_input_sync_norm = sync_summary_proj_raw.norm().item()
+                    self._last_ss_input_pred_norm = pred_summary_proj_raw.norm().item()
                     self._last_ss_input_surprise = surprise_scalar.item()
                     self._last_ss_input_confidence = confidence_scalar.item()
+
+                    # Track NORMALIZED values (after normalization/embedding)
+                    self._last_ss_normed_sync_norm = sync_summary_norm.norm().item()
+                    self._last_ss_normed_pred_norm = pred_summary_norm.norm().item()
+                    self._last_ss_normed_surprise_norm = surprise_embed.norm().item()
+                    self._last_ss_normed_confidence_norm = confidence_embed.norm().item()
                     self._last_ss_input_total_norm = self_state_input.norm().item()
 
                     # Track input step-to-step change
@@ -1396,10 +1456,16 @@ class GlobalSyncModule(nn.Module):
         # Track what goes INTO the compressor to diagnose low diversity
         if self._last_ss_input_sync_norm is not None:
             stats.update({
+                # Raw values (before normalization) - for comparison
                 'ss_input/sync_norm': self._last_ss_input_sync_norm,
                 'ss_input/pred_norm': self._last_ss_input_pred_norm,
                 'ss_input/surprise': self._last_ss_input_surprise,
                 'ss_input/confidence': self._last_ss_input_confidence,
+                # Normalized values (after LayerNorm/embedding) - what compressor sees
+                'ss_normed/sync_norm': self._last_ss_normed_sync_norm,
+                'ss_normed/pred_norm': self._last_ss_normed_pred_norm,
+                'ss_normed/surprise_norm': self._last_ss_normed_surprise_norm,
+                'ss_normed/confidence_norm': self._last_ss_normed_confidence_norm,
                 'ss_input/total_norm': self._last_ss_input_total_norm,
                 'ss_input/step_change': self._last_ss_input_step_change,
             })
