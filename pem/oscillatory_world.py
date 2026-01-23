@@ -221,6 +221,7 @@ class OscillatoryWorldState(nn.Module):
         self.register_buffer('_last_phase_mod', torch.zeros(N))
         self.register_buffer('_last_self_state_change', torch.tensor(0.0))
         self.register_buffer('_last_write_gate_self', torch.tensor(0.0))
+        self.register_buffer('_last_write_gate_world', torch.tensor(0.0))
         self.register_buffer('_last_self_gated_amp_mean', torch.tensor(0.0))
         self.register_buffer('_last_self_gated_amp_max', torch.tensor(0.0))
         self.register_buffer('_last_self_gated_amp_over_threshold', torch.tensor(0.0))
@@ -368,6 +369,7 @@ class OscillatoryWorldState(nn.Module):
                 device=features.device,
                 dtype=features.dtype
             ).sigmoid()
+        self._last_write_gate_world.copy_(write_gate_world.detach())
 
         # === SELF OSCILLATOR GATING (indices N_world:N) ===
         # Gate by relative self-state change (scale-invariant cognitive shift)
@@ -734,8 +736,8 @@ class OscillatoryWorldState(nn.Module):
         High coherence: self and world written together (integrated experience)
         Low coherence: self and world out of sync (dissociated processing)
 
-        This measures whether cognitive self-state and world content are
-        being processed in a coordinated way.
+        Uses write-strength-weighted phase vectors so the signal reflects
+        active memory writes rather than idle oscillators.
 
         Returns:
             Dict with coherence metrics.
@@ -748,11 +750,16 @@ class OscillatoryWorldState(nn.Module):
             world_phases = self.phases[:N_world]
             self_phases = self.phases[N_world:]
 
-            # Mean phase vectors (Kuramoto order parameter style)
-            world_cos = torch.cos(world_phases).mean()
-            world_sin = torch.sin(world_phases).mean()
-            self_cos = torch.cos(self_phases).mean()
-            self_sin = torch.sin(self_phases).mean()
+            # Mean phase vectors (Kuramoto order parameter style), weighted by write strength
+            world_w = self.write_strengths[:N_world]
+            self_w = self.write_strengths[N_world:]
+            world_w = world_w / (world_w.sum() + 1e-8)
+            self_w = self_w / (self_w.sum() + 1e-8)
+
+            world_cos = (torch.cos(world_phases) * world_w).sum()
+            world_sin = (torch.sin(world_phases) * world_w).sum()
+            self_cos = (torch.cos(self_phases) * self_w).sum()
+            self_sin = (torch.sin(self_phases) * self_w).sum()
 
             # World coherence: how synchronized are world oscillators with each other?
             world_coherence = torch.sqrt(world_cos**2 + world_sin**2)
@@ -760,23 +767,40 @@ class OscillatoryWorldState(nn.Module):
             # Self coherence: how synchronized are self oscillators with each other?
             self_coherence = torch.sqrt(self_cos**2 + self_sin**2)
 
-            # Self-world alignment: cos(world_mean_phase - self_mean_phase)
+            # Self-world alignment: dot product of mean phase vectors
             # High = self and world in phase, low = out of phase
             self_world_alignment = world_cos * self_cos + world_sin * self_sin
+            # Alignment quality: only trust alignment when both groups are coherent
+            alignment_quality = self_world_alignment * torch.min(world_coherence, self_coherence)
 
-            # Write timing coherence: are self and world being written at similar times?
-            world_threshold = self.config.phase_write_threshold
-            self_threshold = self.config.phase_write_threshold_self
-            world_write_active = (self.write_strengths[:N_world] > world_threshold).float()
-            self_write_active = (self.write_strengths[N_world:] > self_threshold).float()
-            # Measure overlap in write activity
-            write_timing_coherence = (world_write_active.mean() * self_write_active.mean()).sqrt()
+            # Write timing coherence: are self and world being written at the same time?
+            # Use the current-step write gates to capture co-occurrence.
+            write_timing_coherence = (
+                (self._last_write_gate_world * self._last_write_gate_self).sqrt()
+            )
+
+            # Write phase alignment: do self/world writes occur at similar phases?
+            world_write_phases = self.write_phases[:N_world]
+            self_write_phases = self.write_phases[N_world:]
+            world_write_cos = (torch.cos(world_write_phases) * world_w).sum()
+            world_write_sin = (torch.sin(world_write_phases) * world_w).sum()
+            self_write_cos = (torch.cos(self_write_phases) * self_w).sum()
+            self_write_sin = (torch.sin(self_write_phases) * self_w).sum()
+            world_write_norm = torch.sqrt(world_write_cos**2 + world_write_sin**2) + 1e-8
+            self_write_norm = torch.sqrt(self_write_cos**2 + self_write_sin**2) + 1e-8
+            write_phase_alignment = (
+                (world_write_cos * self_write_cos + world_write_sin * self_write_sin)
+                / (world_write_norm * self_write_norm)
+            )
+            write_phase_alignment = write_phase_alignment * torch.min(world_write_norm, self_write_norm)
 
             return {
                 'self_world_alignment': self_world_alignment,
+                'alignment_quality': alignment_quality,
                 'world_coherence': world_coherence,
                 'self_coherence': self_coherence,
                 'write_timing_coherence': write_timing_coherence,
+                'write_phase_alignment': write_phase_alignment,
             }
 
 

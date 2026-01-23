@@ -1447,9 +1447,11 @@ class GlobalSyncModule(nn.Module):
         coherence_stats = self.oscillatory_world.compute_self_world_coherence()
         stats.update({
             'temporal/self_world_alignment': coherence_stats['self_world_alignment'].item(),
+            'temporal/self_world_alignment_quality': coherence_stats['alignment_quality'].item(),
             'temporal/world_coherence': coherence_stats['world_coherence'].item(),
             'temporal/self_coherence': coherence_stats['self_coherence'].item(),
             'temporal/write_timing_coherence': coherence_stats['write_timing_coherence'].item(),
+            'temporal/write_phase_alignment': coherence_stats['write_phase_alignment'].item(),
         })
 
         # === SELF-STATE MECHANISM METRICS ===
