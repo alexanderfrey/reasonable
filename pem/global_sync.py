@@ -165,7 +165,12 @@ class SelfStateTransformerEncoder(nn.Module):
 
     Architecture:
         4 input components → project to d_token → N transformer layers → pool → d_self_state
+
+    Attention weights are stored for interpretability:
+        - pool_attn_weights: (4,) weights for [sync, pred, surprise, confidence]
     """
+
+    COMPONENT_NAMES = ['sync', 'pred', 'surprise', 'confidence']
 
     def __init__(
         self,
@@ -181,6 +186,7 @@ class SelfStateTransformerEncoder(nn.Module):
         super().__init__()
         self.d_token = d_token
         self.n_tokens = 4  # sync, pred, surprise, confidence
+        self.n_heads = n_heads
 
         # Project each component to token dimension
         self.sync_proj = nn.Linear(d_sync, d_token)
@@ -191,17 +197,11 @@ class SelfStateTransformerEncoder(nn.Module):
         # Learnable component type embeddings (like positional embeddings but for component identity)
         self.component_embeddings = nn.Parameter(torch.randn(4, d_token) * 0.02)
 
-        # Transformer encoder layers
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_token,
-            nhead=n_heads,
-            dim_feedforward=d_token * 4,
-            dropout=dropout,
-            activation='gelu',
-            batch_first=True,
-            norm_first=True,  # Pre-norm for stability
-        )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+        # Custom transformer layers with attention weight capture
+        self.layers = nn.ModuleList([
+            SelfStateTransformerLayer(d_token, n_heads, d_token * 4, dropout)
+            for _ in range(n_layers)
+        ])
 
         # Output projection: pool tokens and project to d_self_state
         # Use attention pooling over the 4 tokens
@@ -211,6 +211,10 @@ class SelfStateTransformerEncoder(nn.Module):
 
         self.output_proj = nn.Linear(d_token, d_output)
         self.output_norm = RMSNorm(d_output)
+
+        # Store attention weights for logging
+        self._last_pool_attn_weights = None  # (4,) weights for pooling
+        self._last_layer_attn_weights = None  # List of (4, 4) per layer
 
     def forward(
         self,
@@ -237,23 +241,31 @@ class SelfStateTransformerEncoder(nn.Module):
         # Add component type embeddings
         tokens = tokens + self.component_embeddings
 
-        # Add batch dimension for transformer: (1, 4, d_token)
+        # Add batch dimension: (1, 4, d_token)
         tokens = tokens.unsqueeze(0)
 
-        # Run transformer
-        encoded = self.transformer(tokens)  # (1, 4, d_token)
+        # Run through transformer layers, capturing attention
+        layer_attn_weights = []
+        for layer in self.layers:
+            tokens, attn_weights = layer(tokens)  # attn_weights: (1, n_heads, 4, 4)
+            # Average over heads for interpretability: (4, 4)
+            layer_attn_weights.append(attn_weights.squeeze(0).mean(dim=0).detach())
+
+        self._last_layer_attn_weights = layer_attn_weights
 
         # Attention pooling over the 4 tokens
-        # Query: learnable pooling query
-        # Keys/Values: encoded tokens
         q = self.pool_query  # (1, d_token)
-        k = self.pool_key(encoded)  # (1, 4, d_token)
-        v = self.pool_value(encoded)  # (1, 4, d_token)
+        k = self.pool_key(tokens)  # (1, 4, d_token)
+        v = self.pool_value(tokens)  # (1, 4, d_token)
 
         # Scaled dot-product attention
         scale = self.d_token ** -0.5
         attn_scores = torch.matmul(q.unsqueeze(1), k.transpose(-2, -1)) * scale  # (1, 1, 4)
         attn_weights = F.softmax(attn_scores, dim=-1)  # (1, 1, 4)
+
+        # Store pooling attention weights: (4,) = [sync, pred, surprise, confidence]
+        self._last_pool_attn_weights = attn_weights.squeeze().detach()
+
         pooled = torch.matmul(attn_weights, v).squeeze(1).squeeze(0)  # (d_token,)
 
         # Output projection
@@ -261,6 +273,97 @@ class SelfStateTransformerEncoder(nn.Module):
         output = self.output_norm(output)
 
         return output
+
+    def get_attention_summary(self) -> dict:
+        """Get human-readable attention weight summary."""
+        if self._last_pool_attn_weights is None:
+            return {}
+
+        pool_w = self._last_pool_attn_weights.cpu()
+        summary = {
+            'pool_sync': pool_w[0].item(),
+            'pool_pred': pool_w[1].item(),
+            'pool_surprise': pool_w[2].item(),
+            'pool_confidence': pool_w[3].item(),
+        }
+
+        # Add layer-wise attention (which component attends to which)
+        if self._last_layer_attn_weights:
+            for i, layer_attn in enumerate(self._last_layer_attn_weights):
+                # layer_attn is (4, 4): [query_idx, key_idx]
+                # Sum over queries to see total attention received by each key
+                attn_received = layer_attn.sum(dim=0).cpu()  # (4,)
+                summary[f'layer{i}_sync_received'] = attn_received[0].item()
+                summary[f'layer{i}_pred_received'] = attn_received[1].item()
+                summary[f'layer{i}_surprise_received'] = attn_received[2].item()
+                summary[f'layer{i}_confidence_received'] = attn_received[3].item()
+
+        return summary
+
+
+class SelfStateTransformerLayer(nn.Module):
+    """Single transformer layer that returns attention weights."""
+
+    def __init__(self, d_model: int, n_heads: int, d_ff: int, dropout: float = 0.0):
+        super().__init__()
+        self.n_heads = n_heads
+        self.d_model = d_model
+        self.head_dim = d_model // n_heads
+
+        # Self-attention
+        self.q_proj = nn.Linear(d_model, d_model)
+        self.k_proj = nn.Linear(d_model, d_model)
+        self.v_proj = nn.Linear(d_model, d_model)
+        self.out_proj = nn.Linear(d_model, d_model)
+
+        # FFN
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, d_ff),
+            nn.GELU(),
+            nn.Linear(d_ff, d_model),
+        )
+
+        # Norms (pre-norm)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor) -> tuple:
+        """
+        Args:
+            x: (batch, seq, d_model)
+        Returns:
+            output: (batch, seq, d_model)
+            attn_weights: (batch, n_heads, seq, seq)
+        """
+        B, S, D = x.shape
+
+        # Pre-norm self-attention
+        x_norm = self.norm1(x)
+
+        # Compute Q, K, V
+        q = self.q_proj(x_norm).view(B, S, self.n_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(x_norm).view(B, S, self.n_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(x_norm).view(B, S, self.n_heads, self.head_dim).transpose(1, 2)
+
+        # Attention
+        scale = self.head_dim ** -0.5
+        attn_scores = torch.matmul(q, k.transpose(-2, -1)) * scale  # (B, H, S, S)
+        attn_weights = F.softmax(attn_scores, dim=-1)
+        attn_out = torch.matmul(attn_weights, v)  # (B, H, S, head_dim)
+
+        # Reshape and project
+        attn_out = attn_out.transpose(1, 2).contiguous().view(B, S, D)
+        attn_out = self.out_proj(attn_out)
+        x = x + self.dropout(attn_out)
+
+        # Pre-norm FFN
+        x_norm = self.norm2(x)
+        ffn_out = self.ffn(x_norm)
+        x = x + self.dropout(ffn_out)
+
+        return x, attn_weights
 
 
 class ModuleSyncComputer(nn.Module):

@@ -2231,6 +2231,18 @@ def main():
                     write_r2 = probe_results.get('write_r2', 0)
                     print(f"   SS Probes | surprise_R2={surp_r2:.3f} confidence_R2={conf_r2:.3f} write_R2={write_r2:.3f}")
 
+            # Self-state transformer attention weights
+            if hasattr(model.global_sync, 'self_state_transformer') and model.global_sync.self_state_transformer is not None:
+                attn_summary = model.global_sync.self_state_transformer.get_attention_summary()
+                if attn_summary:
+                    # Pooling attention: how much each component contributes to output
+                    pool_sync = attn_summary.get('pool_sync', 0)
+                    pool_pred = attn_summary.get('pool_pred', 0)
+                    pool_surp = attn_summary.get('pool_surprise', 0)
+                    pool_conf = attn_summary.get('pool_confidence', 0)
+                    print(f"    SS Attn  | pool: sync={pool_sync:.2f} pred={pool_pred:.2f} "
+                          f"surp={pool_surp:.2f} conf={pool_conf:.2f}")
+
             # Full self-state analysis (probing and correlations)
             if self_state_analyzer is not None and global_step % config.analyze_self_state_every == 0:
                 if len(self_state_analyzer.buffer) >= 100:
