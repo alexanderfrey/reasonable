@@ -697,6 +697,9 @@ class GlobalSyncModule(nn.Module):
                 nn.GELU(),
                 nn.Linear(config.d_self_state_hidden, config.d_self_state),
             )
+            # Residual projection to preserve input variation
+            self.self_state_residual = nn.Linear(self_state_in_dim, config.d_self_state)
+            self.self_state_residual_scale = nn.Parameter(torch.tensor(0.1))
             # Buffer to store last prediction output for self-state computation
             self.register_buffer('_last_prediction_output', None)
             self._last_self_state = None  # Computed self-state (not a buffer, computed each forward)
@@ -726,6 +729,8 @@ class GlobalSyncModule(nn.Module):
             self.pred_scale = None
             self.surprise_scale = None
             self.confidence_scale = None
+            self.self_state_residual = None
+            self.self_state_residual_scale = None
             self._last_self_state = None
             self._last_osc_attn_out_norm = None
             self._last_osc_query_act_norm = None
@@ -1000,7 +1005,15 @@ class GlobalSyncModule(nn.Module):
                     surprise_embed,       # (d_scalar_embed,) - unit norm * scale
                     confidence_embed,     # (d_scalar_embed,) - unit norm * scale
                 ], dim=0)
-                self_state = self.self_state_compressor(self_state_input)  # (d_self_state,)
+                # Linear projection is main path (preserves variation)
+                # MLP adds learned refinement scaled by learnable parameter
+                if self.self_state_residual is not None:
+                    self_state = self.self_state_residual(self_state_input) + (
+                        self.self_state_residual_scale
+                        * self.self_state_compressor(self_state_input)
+                    )
+                else:
+                    self_state = self.self_state_compressor(self_state_input)
 
                 # Track self-state metrics
                 with torch.no_grad():
