@@ -50,6 +50,7 @@ Architecture:
 """
 
 import math
+from collections import deque
 from dataclasses import dataclass
 from typing import Optional, Dict, List, Tuple, NamedTuple
 
@@ -143,6 +144,22 @@ class GlobalSyncConfig:
     self_state_transformer_layers: int = 2  # Number of transformer layers
     self_state_transformer_heads: int = 4  # Attention heads
 
+    # Phase-Based Self-Synchronization (CTM-pure)
+    # Computes self-sync from oscillator phase relationships, not vector history
+    # The "self" is defined by synchronization patterns among self-oscillators
+    use_phase_self_sync: bool = True            # Enable phase-based self-sync
+    phase_self_sync_pairs: int = 64             # Number of (i,j) pairs for cos(φ_i-φ_j)
+    d_phase_self_sync: int = 64                 # Output dimension of phase sync
+
+    # Autobiographical Retrieval (CTM-pure)
+    # Query: phase-based self-sync, Keys/Values: stored self-states
+    # Retrieved memory IS the self-state - no explicit recurrence needed
+    use_autobiographical_retrieval: bool = True  # Enable autobio retrieval
+    autobio_n_heads: int = 4                     # Attention heads for retrieval
+    autobio_temperature: float = 0.1             # Low temp for sharp attention
+    autobio_top_k: Optional[int] = 16            # Only attend to top-k memories (None = all)
+    d_autobio_output: int = 64                   # Output dimension of retrieved context
+
 
 class RMSNorm(nn.Module):
     """Root Mean Square Layer Normalization."""
@@ -160,17 +177,20 @@ class SelfStateTransformerEncoder(nn.Module):
     """
     Small transformer encoder for self-state components.
 
-    Treats [sync, pred, surprise, confidence] as 4 tokens and runs self-attention
-    so components can interact and learn conditional relationships.
+    Treats [sync, pred, surprise, confidence, autobio] as up to 5 tokens and runs
+    self-attention so components can interact and learn conditional relationships.
 
     Architecture:
-        4 input components → project to d_token → N transformer layers → pool → d_self_state
+        5 input components → project to d_token → N transformer layers → pool → d_self_state
 
     Attention weights are stored for interpretability:
-        - pool_attn_weights: (4,) weights for [sync, pred, surprise, confidence]
+        - pool_attn_weights: (5,) weights for [sync, pred, surprise, confidence, autobio]
+
+    The autobiographical context token is optional - when not provided, the encoder
+    operates in 4-token mode for backward compatibility.
     """
 
-    COMPONENT_NAMES = ['sync', 'pred', 'surprise', 'confidence']
+    COMPONENT_NAMES = ['sync', 'pred', 'surprise', 'confidence', 'autobio']
 
     def __init__(
         self,
@@ -182,11 +202,15 @@ class SelfStateTransformerEncoder(nn.Module):
         n_layers: int = 2,
         n_heads: int = 4,
         dropout: float = 0.0,
+        d_autobio_input: Optional[int] = None,  # Dimension of autobio context (None = disabled)
     ):
         super().__init__()
         self.d_token = d_token
-        self.n_tokens = 4  # sync, pred, surprise, confidence
         self.n_heads = n_heads
+        self.use_autobio = d_autobio_input is not None
+
+        # Base tokens: sync, pred, surprise, confidence
+        self.n_tokens = 5 if self.use_autobio else 4
 
         # Project each component to token dimension
         self.sync_proj = nn.Linear(d_sync, d_token)
@@ -194,8 +218,14 @@ class SelfStateTransformerEncoder(nn.Module):
         self.surprise_proj = nn.Linear(d_scalar_embed, d_token)
         self.confidence_proj = nn.Linear(d_scalar_embed, d_token)
 
+        # Optional autobiographical context projection
+        if self.use_autobio:
+            self.autobio_proj = nn.Linear(d_autobio_input, d_token)
+        else:
+            self.autobio_proj = None
+
         # Learnable component type embeddings (like positional embeddings but for component identity)
-        self.component_embeddings = nn.Parameter(torch.randn(4, d_token) * 0.02)
+        self.component_embeddings = nn.Parameter(torch.randn(self.n_tokens, d_token) * 0.02)
 
         # Custom transformer layers with attention weight capture
         self.layers = nn.ModuleList([
@@ -222,9 +252,17 @@ class SelfStateTransformerEncoder(nn.Module):
         pred: torch.Tensor,       # (d_pred,)
         surprise: torch.Tensor,   # (d_scalar_embed,)
         confidence: torch.Tensor, # (d_scalar_embed,)
+        autobio_context: Optional[torch.Tensor] = None,  # (d_autobio_input,) optional
     ) -> torch.Tensor:
         """
         Encode self-state components through transformer.
+
+        Args:
+            sync: Synchronization summary
+            pred: Prediction summary
+            surprise: Surprise embedding
+            confidence: Confidence embedding
+            autobio_context: Optional autobiographical context from retrieval
 
         Returns:
             self_state: (d_output,) encoded self-state
@@ -235,35 +273,44 @@ class SelfStateTransformerEncoder(nn.Module):
         surp_tok = self.surprise_proj(surprise)   # (d_token,)
         conf_tok = self.confidence_proj(confidence)  # (d_token,)
 
-        # Stack into sequence: (4, d_token)
-        tokens = torch.stack([sync_tok, pred_tok, surp_tok, conf_tok], dim=0)
+        # Build token list
+        token_list = [sync_tok, pred_tok, surp_tok, conf_tok]
 
-        # Add component type embeddings
-        tokens = tokens + self.component_embeddings
+        # Add autobiographical context token if enabled and provided
+        if self.use_autobio and autobio_context is not None:
+            autobio_tok = self.autobio_proj(autobio_context)  # (d_token,)
+            token_list.append(autobio_tok)
 
-        # Add batch dimension: (1, 4, d_token)
+        # Stack into sequence: (n_tokens, d_token)
+        tokens = torch.stack(token_list, dim=0)
+        n_tokens_actual = tokens.shape[0]
+
+        # Add component type embeddings (use only the first n_tokens_actual embeddings)
+        tokens = tokens + self.component_embeddings[:n_tokens_actual]
+
+        # Add batch dimension: (1, n_tokens, d_token)
         tokens = tokens.unsqueeze(0)
 
         # Run through transformer layers, capturing attention
         layer_attn_weights = []
         for layer in self.layers:
-            tokens, attn_weights = layer(tokens)  # attn_weights: (1, n_heads, 4, 4)
-            # Average over heads for interpretability: (4, 4)
+            tokens, attn_weights = layer(tokens)  # attn_weights: (1, n_heads, n_tokens, n_tokens)
+            # Average over heads for interpretability: (n_tokens, n_tokens)
             layer_attn_weights.append(attn_weights.squeeze(0).mean(dim=0).detach())
 
         self._last_layer_attn_weights = layer_attn_weights
 
-        # Attention pooling over the 4 tokens
+        # Attention pooling over the tokens
         q = self.pool_query  # (1, d_token)
-        k = self.pool_key(tokens)  # (1, 4, d_token)
-        v = self.pool_value(tokens)  # (1, 4, d_token)
+        k = self.pool_key(tokens)  # (1, n_tokens, d_token)
+        v = self.pool_value(tokens)  # (1, n_tokens, d_token)
 
         # Scaled dot-product attention
         scale = self.d_token ** -0.5
-        attn_scores = torch.matmul(q.unsqueeze(1), k.transpose(-2, -1)) * scale  # (1, 1, 4)
-        attn_weights = F.softmax(attn_scores, dim=-1)  # (1, 1, 4)
+        attn_scores = torch.matmul(q.unsqueeze(1), k.transpose(-2, -1)) * scale  # (1, 1, n_tokens)
+        attn_weights = F.softmax(attn_scores, dim=-1)  # (1, 1, n_tokens)
 
-        # Store pooling attention weights: (4,) = [sync, pred, surprise, confidence]
+        # Store pooling attention weights: (n_tokens,) = [sync, pred, surprise, confidence, autobio?]
         self._last_pool_attn_weights = attn_weights.squeeze().detach()
 
         pooled = torch.matmul(attn_weights, v).squeeze(1).squeeze(0)  # (d_token,)
@@ -280,6 +327,8 @@ class SelfStateTransformerEncoder(nn.Module):
             return {}
 
         pool_w = self._last_pool_attn_weights.cpu()
+        n_tokens_actual = pool_w.shape[0]
+
         summary = {
             'pool_sync': pool_w[0].item(),
             'pool_pred': pool_w[1].item(),
@@ -287,16 +336,22 @@ class SelfStateTransformerEncoder(nn.Module):
             'pool_confidence': pool_w[3].item(),
         }
 
+        # Add autobio weight if we have 5 tokens
+        if n_tokens_actual >= 5:
+            summary['pool_autobio'] = pool_w[4].item()
+
         # Add layer-wise attention (which component attends to which)
         if self._last_layer_attn_weights:
             for i, layer_attn in enumerate(self._last_layer_attn_weights):
-                # layer_attn is (4, 4): [query_idx, key_idx]
+                # layer_attn is (n_tokens, n_tokens): [query_idx, key_idx]
                 # Sum over queries to see total attention received by each key
-                attn_received = layer_attn.sum(dim=0).cpu()  # (4,)
+                attn_received = layer_attn.sum(dim=0).cpu()  # (n_tokens,)
                 summary[f'layer{i}_sync_received'] = attn_received[0].item()
                 summary[f'layer{i}_pred_received'] = attn_received[1].item()
                 summary[f'layer{i}_surprise_received'] = attn_received[2].item()
                 summary[f'layer{i}_confidence_received'] = attn_received[3].item()
+                if attn_received.shape[0] >= 5:
+                    summary[f'layer{i}_autobio_received'] = attn_received[4].item()
 
         return summary
 
@@ -455,6 +510,358 @@ class ModuleSyncComputer(nn.Module):
         S_sync = self.norm(S_sync)
 
         return S_sync, S_full
+
+
+class PhaseSelfSyncComputer(nn.Module):
+    """
+    CTM-pure self-sync from oscillator phase relationships.
+
+    The 'self' is defined by synchronization patterns among self-oscillators,
+    not by a history of state vectors. This is the cleanest CTM-aligned approach.
+
+    Computes:
+    1. Phase-phase sync: cos(φ_i - φ_j) for subsampled oscillator pairs
+    2. Kuramoto coherence R_self: measures overall phase alignment
+    3. Write-phase spread: measures temporal diversity of memory writes
+    4. Write fraction: measures memory coverage
+
+    Robustness features:
+    - Sin/cos computation (no complex tensors)
+    - Normalized weights (sum to 1 to avoid scale drift)
+    - Phase_sync normalization before projection (zero-mean, unit-std)
+    - Returns R_self for gating downstream retrieval
+    """
+
+    def __init__(
+        self,
+        n_self_oscillators: int,
+        d_sync_output: int,
+        n_pairs: int = 64,
+    ):
+        """
+        Args:
+            n_self_oscillators: Number of self-oscillators (typically 16)
+            d_sync_output: Output dimension of sync representation
+            n_pairs: Number of (i,j) pairs to subsample from phase-phase matrix
+        """
+        super().__init__()
+        self.n_self = n_self_oscillators
+        self.d_sync_output = d_sync_output
+        self.n_pairs = n_pairs
+
+        # Register (i,j) pairs for phase-phase sync (upper triangle)
+        sync_indices = self._sample_pairs(n_self_oscillators, n_pairs)
+        self.register_buffer('sync_i', sync_indices[:, 0])
+        self.register_buffer('sync_j', sync_indices[:, 1])
+
+        # Projection: [normalized_phase_sync, R_self, write_spread, write_frac] → d_sync_output
+        input_dim = n_pairs + 3  # phase_sync + 3 scalar context signals
+        self.sync_proj = nn.Sequential(
+            nn.Linear(input_dim, d_sync_output),
+            nn.GELU(),
+            nn.Linear(d_sync_output, d_sync_output),
+        )
+        self.output_norm = RMSNorm(d_sync_output)
+
+        # Store last values for diagnostics
+        self._last_R_self = None
+        self._last_R_write = None
+        self._last_write_fraction = None
+        self._last_phase_sync_std = None
+
+        self._init_weights()
+
+    def _sample_pairs(self, n: int, n_pairs: int) -> torch.Tensor:
+        """Sample n_pairs (i,j) index pairs from upper triangle."""
+        pairs = [(i, j) for i in range(n) for j in range(i + 1, n)]
+        n_available = len(pairs)
+
+        if n_available == 0:
+            # Edge case: single oscillator, no pairs possible
+            return torch.zeros((n_pairs, 2), dtype=torch.long)
+
+        if n_pairs > n_available:
+            # Repeat pairs if needed
+            indices = list(range(n_available)) * (n_pairs // n_available + 1)
+            indices = indices[:n_pairs]
+        else:
+            indices = torch.randperm(n_available)[:n_pairs].tolist()
+
+        return torch.tensor([pairs[i] for i in indices], dtype=torch.long)
+
+    def _init_weights(self):
+        for m in self.sync_proj.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def forward(
+        self,
+        self_phases: torch.Tensor,      # (n_self,) current oscillator phases
+        write_phases: torch.Tensor,     # (n_self,) phase at write time
+        write_strengths: torch.Tensor,  # (n_self,) write intensity per oscillator
+        write_threshold: float = 0.05,  # Threshold for "active" oscillator
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Compute phase-based self-sync.
+
+        Args:
+            self_phases: Current phases of self-oscillators [0, 2π]
+            write_phases: Phase at which each oscillator was last written
+            write_strengths: Intensity of last write per oscillator
+            write_threshold: Minimum strength to count as "written"
+
+        Returns:
+            sync_vector: (d_sync_output,) phase synchronization representation
+            R_self: Scalar coherence [0, 1] for gating retriever
+        """
+        # === 1. NORMALIZE WEIGHTS (sum to 1, avoid scale drift) ===
+        weights = write_strengths / (write_strengths.sum() + 1e-8)
+
+        # === 2. PHASE-PHASE SYNC: cos(φ_i - φ_j) ===
+        phase_diffs = self_phases[self.sync_i] - self_phases[self.sync_j]
+        phase_sync = torch.cos(phase_diffs)  # (n_pairs,) in [-1, 1]
+
+        # Normalize phase_sync (zero-mean, unit-std) for stable projection
+        phase_sync_mean = phase_sync.mean()
+        phase_sync_std = phase_sync.std() + 1e-8
+        phase_sync_norm = (phase_sync - phase_sync_mean) / phase_sync_std
+
+        # === 3. KURAMOTO COHERENCE R_self (using sin/cos, no complex tensors) ===
+        # R = |Σ w_k * exp(i*φ_k)| = sqrt((Σ w*cos)² + (Σ w*sin)²)
+        cos_mean = (torch.cos(self_phases) * weights).sum()
+        sin_mean = (torch.sin(self_phases) * weights).sum()
+        R_self = torch.sqrt(cos_mean ** 2 + sin_mean ** 2)  # [0, 1]
+
+        # === 4. WRITE-PHASE COHERENCE R_write ===
+        # High R_write = all writes at similar phase (less temporal diversity)
+        # Low R_write = writes spread across phases (more temporal diversity)
+        write_cos_mean = (torch.cos(write_phases) * weights).sum()
+        write_sin_mean = (torch.sin(write_phases) * weights).sum()
+        R_write = torch.sqrt(write_cos_mean ** 2 + write_sin_mean ** 2)
+
+        # === 5. WRITE FRACTION (memory coverage) ===
+        write_fraction = (write_strengths > write_threshold).float().mean()
+
+        # === 6. STORE DIAGNOSTICS ===
+        with torch.no_grad():
+            self._last_R_self = R_self.item()
+            self._last_R_write = R_write.item()
+            self._last_write_fraction = write_fraction.item()
+            self._last_phase_sync_std = phase_sync_std.item()
+
+        # === 7. CONCATENATE AND PROJECT ===
+        # Include scalar temporal context signals
+        sync_features = torch.cat([
+            phase_sync_norm,                    # (n_pairs,) normalized phase relationships
+            R_self.unsqueeze(0),                # (1,) phase coherence
+            (1 - R_write).unsqueeze(0),         # (1,) write spread (inverted: high = diverse)
+            write_fraction.unsqueeze(0),        # (1,) memory coverage
+        ])
+
+        out = self.sync_proj(sync_features)
+        out = self.output_norm(out)
+
+        return out, R_self
+
+    def get_diagnostics(self) -> Dict[str, float]:
+        """Get diagnostic values for logging."""
+        return {
+            'R_self': self._last_R_self or 0.0,
+            'R_write': self._last_R_write or 0.0,
+            'write_fraction': self._last_write_fraction or 0.0,
+            'phase_sync_std': self._last_phase_sync_std or 0.0,
+        }
+
+
+class AutobiographicalRetriever(nn.Module):
+    """
+    Retrieval over autobiographical memory (write_self_states buffer) using attention.
+
+    Query: phase-based self-sync representation
+    Keys/Values: stored self-states from oscillators (what I was experiencing when I learned)
+
+    Robustness features:
+    - Temperature scaling for sharper attention (avoid blurring across all memories)
+    - Optional top-k filtering (only attend to k most relevant memories)
+    - Coherence gating (if R_self is low, output is suppressed)
+    - Memory weight bias (recency/strength weighting)
+    """
+
+    def __init__(
+        self,
+        d_query: int,
+        d_memory: int,
+        d_output: int,
+        n_heads: int = 4,
+        temperature: float = 0.1,       # Low temp for sharp attention
+        top_k: Optional[int] = None,    # Optional top-k filtering (None = use all)
+        dropout: float = 0.0,
+    ):
+        """
+        Args:
+            d_query: Dimension of query (self-sync representation)
+            d_memory: Dimension of memory entries (d_self_state)
+            d_output: Output dimension
+            n_heads: Number of attention heads
+            temperature: Softmax temperature (lower = sharper attention)
+            top_k: If set, only attend to top-k memories (None = all)
+            dropout: Attention dropout
+        """
+        super().__init__()
+        self.d_query = d_query
+        self.d_memory = d_memory
+        self.d_output = d_output
+        self.n_heads = n_heads
+        self.temperature = temperature
+        self.top_k = top_k
+
+        # Ensure divisibility
+        assert d_output % n_heads == 0, f"d_output ({d_output}) must be divisible by n_heads ({n_heads})"
+        self.head_dim = d_output // n_heads
+
+        # Query projection: self_sync -> Q
+        self.q_proj = nn.Linear(d_query, d_output)
+
+        # Key/Value projections: memory entries -> K, V
+        self.k_proj = nn.Linear(d_memory, d_output)
+        self.v_proj = nn.Linear(d_memory, d_output)
+
+        # Output projection
+        self.out_proj = nn.Linear(d_output, d_output)
+        self.norm = RMSNorm(d_output)
+
+        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+
+        # Store attention weights for logging
+        self._last_attn_weights = None
+        self._last_top_k_indices = None
+        self._last_coherence_gate = None
+
+        self._init_weights()
+
+    def _init_weights(self):
+        for proj in [self.q_proj, self.k_proj, self.v_proj, self.out_proj]:
+            nn.init.xavier_uniform_(proj.weight)
+            if proj.bias is not None:
+                nn.init.zeros_(proj.bias)
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        memory: torch.Tensor,
+        memory_weights: Optional[torch.Tensor] = None,
+        coherence_gate: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Retrieve autobiographical context from memory.
+
+        Args:
+            query: (d_query,) self-sync representation
+            memory: (num_osc, d_memory) stored self-states from oscillators
+            memory_weights: Optional (num_osc,) attention bias (e.g., write_strengths)
+                           Higher values = more accessible memories
+            coherence_gate: Optional scalar R_self [0, 1] for gating output
+                           If R_self is low (incoherent phases), output is suppressed
+
+        Returns:
+            autobio_context: (d_output,) retrieved autobiographical context
+        """
+        num_osc = memory.shape[0]
+
+        # Project query: (d_query,) -> (d_output,) -> (1, n_heads, head_dim)
+        q = self.q_proj(query)
+        q = q.view(1, self.n_heads, self.head_dim)
+
+        # Project keys and values: (num_osc, d_memory) -> (num_osc, d_output)
+        k = self.k_proj(memory)  # (num_osc, d_output)
+        v = self.v_proj(memory)  # (num_osc, d_output)
+
+        # Reshape for multi-head: (num_osc, n_heads, head_dim)
+        k = k.view(num_osc, self.n_heads, self.head_dim)
+        v = v.view(num_osc, self.n_heads, self.head_dim)
+
+        # Compute attention scores
+        k_t = k.permute(1, 2, 0)  # (n_heads, head_dim, num_osc)
+        q_t = q.permute(1, 0, 2)  # (n_heads, 1, head_dim)
+
+        scale = self.head_dim ** -0.5
+        attn_scores = torch.matmul(q_t, k_t) * scale  # (n_heads, 1, num_osc)
+
+        # Apply memory weights as attention bias if provided
+        if memory_weights is not None:
+            # memory_weights: (num_osc,) - higher = more accessible
+            # Add as bias (log space for multiplicative effect on softmax)
+            weight_bias = torch.log(memory_weights.clamp(min=1e-8))
+            attn_scores = attn_scores + weight_bias.unsqueeze(0).unsqueeze(0)
+
+        # === TEMPERATURE SCALING (sharper attention) ===
+        attn_scores = attn_scores / self.temperature
+
+        # === TOP-K FILTERING (optional) ===
+        if self.top_k is not None and self.top_k < num_osc:
+            # For each head, keep only top-k scores
+            _, topk_indices = attn_scores.topk(self.top_k, dim=-1)
+            self._last_top_k_indices = topk_indices.detach()
+
+            # Create mask: set non-top-k positions to -inf
+            mask = torch.zeros_like(attn_scores)
+            mask.scatter_(-1, topk_indices, 1.0)
+            attn_scores = attn_scores.masked_fill(mask == 0, float('-inf'))
+        else:
+            self._last_top_k_indices = None
+
+        attn_weights = F.softmax(attn_scores, dim=-1)  # (n_heads, 1, num_osc)
+        attn_weights = self.dropout(attn_weights)
+
+        # Store for logging (average over heads)
+        self._last_attn_weights = attn_weights.mean(dim=0).squeeze(0).detach()  # (num_osc,)
+
+        # Apply attention
+        v_t = v.permute(1, 0, 2)  # (n_heads, num_osc, head_dim)
+        attn_out = torch.matmul(attn_weights, v_t)  # (n_heads, 1, head_dim)
+
+        # Reshape and project
+        attn_out = attn_out.permute(1, 0, 2).reshape(-1)  # (d_output,)
+        out = self.out_proj(attn_out)
+        out = self.norm(out)
+
+        # === COHERENCE GATING ===
+        # If R_self is low (phases are incoherent), the query is noisy
+        # and the retrieved memory should be suppressed
+        if coherence_gate is not None:
+            self._last_coherence_gate = coherence_gate.item() if coherence_gate.numel() == 1 else coherence_gate.mean().item()
+            out = out * coherence_gate
+        else:
+            self._last_coherence_gate = None
+
+        return out
+
+    def get_attention_entropy(self) -> float:
+        """Get entropy of last attention weights for monitoring."""
+        if self._last_attn_weights is None:
+            return 0.0
+        w = self._last_attn_weights
+        # Handle -inf from top-k masking
+        w = w.clamp(min=0)
+        w = w + 1e-10  # Avoid log(0)
+        w = w / w.sum()  # Ensure normalized
+        return -(w * torch.log(w)).sum().item()
+
+    def get_diagnostics(self) -> Dict[str, float]:
+        """Get diagnostic values for logging."""
+        diagnostics = {
+            'attn_entropy': self.get_attention_entropy(),
+        }
+        if self._last_coherence_gate is not None:
+            diagnostics['coherence_gate'] = self._last_coherence_gate
+        if self._last_attn_weights is not None:
+            # Top-1 attention weight (sparsity indicator)
+            diagnostics['attn_top1'] = self._last_attn_weights.max().item()
+            # How many memories have non-negligible attention
+            diagnostics['attn_active_count'] = (self._last_attn_weights > 0.01).sum().item()
+        return diagnostics
 
 
 class SyncCrossModuleAttention(nn.Module):
@@ -903,8 +1310,37 @@ class GlobalSyncModule(nn.Module):
             self.surprise_scale = nn.Parameter(torch.tensor(init_scale))
             self.confidence_scale = nn.Parameter(torch.tensor(init_scale))
 
+            # === PHASE-BASED SELF-SYNC AND AUTOBIOGRAPHICAL RETRIEVAL (CTM-pure) ===
+            # The "self" is defined by synchronization patterns among self-oscillators,
+            # not by a history of state vectors. Recurrence happens through memory retrieval.
+            if config.use_phase_self_sync:
+                self.phase_self_sync_computer = PhaseSelfSyncComputer(
+                    n_self_oscillators=config.num_self_oscillators if hasattr(config, 'num_self_oscillators') else 16,
+                    d_sync_output=config.d_phase_self_sync,
+                    n_pairs=config.phase_self_sync_pairs,
+                )
+            else:
+                self.phase_self_sync_computer = None
+
+            # Autobiographical retrieval: query memory with phase-based self-sync
+            # Retrieved memory IS the self-state - no explicit recurrence needed
+            if config.use_autobiographical_retrieval and config.use_phase_self_sync:
+                self.autobio_retriever = AutobiographicalRetriever(
+                    d_query=config.d_phase_self_sync,
+                    d_memory=config.d_self_state,
+                    d_output=config.d_autobio_output,
+                    n_heads=config.autobio_n_heads,
+                    temperature=config.autobio_temperature,
+                    top_k=config.autobio_top_k,
+                    dropout=config.dropout,
+                )
+                d_autobio_for_transformer = config.d_autobio_output
+            else:
+                self.autobio_retriever = None
+                d_autobio_for_transformer = None
+
             # Transformer encoder for self-state (treats components as tokens)
-            # Components [sync, pred, surprise, confidence] attend to each other
+            # Components [sync, pred, surprise, confidence, autobio?] attend to each other
             self.self_state_transformer = SelfStateTransformerEncoder(
                 d_sync=config.d_feature_input,
                 d_pred=config.d_feature_input,
@@ -914,7 +1350,14 @@ class GlobalSyncModule(nn.Module):
                 n_layers=config.self_state_transformer_layers,
                 n_heads=config.self_state_transformer_heads,
                 dropout=config.dropout,
+                d_autobio_input=d_autobio_for_transformer,
             )
+
+            # Diagnostic attributes for phase-based self-sync and autobio
+            self._last_phase_self_sync = None
+            self._last_R_self = None  # Kuramoto coherence
+            self._last_autobio_context = None
+            self._last_autobio_attn_entropy = None
 
             # Buffer to store last prediction output for self-state computation
             self.register_buffer('_last_prediction_output', None)
@@ -980,6 +1423,13 @@ class GlobalSyncModule(nn.Module):
             self._last_surprise_std = None
             self._last_surprise_pos_frac = None
             self._last_write_gate = None
+            # Phase-based self-sync and autobiographical retrieval (None when oscillatory world disabled)
+            self.phase_self_sync_computer = None
+            self.autobio_retriever = None
+            self._last_phase_self_sync = None
+            self._last_R_self = None
+            self._last_autobio_context = None
+            self._last_autobio_attn_entropy = None
 
     def register_module(self, name: str, d_neurons: int) -> None:
         """
@@ -1213,14 +1663,62 @@ class GlobalSyncModule(nn.Module):
                 surprise_embed = F.normalize(surprise_raw, dim=0) * self.surprise_scale
                 confidence_embed = F.normalize(confidence_raw, dim=0) * self.confidence_scale
 
+                # === PHASE-BASED SELF-SYNC AND AUTOBIOGRAPHICAL RETRIEVAL (CTM-pure) ===
+                # The "self" is defined by synchronization patterns among self-oscillators.
+                # No explicit state history - recurrence happens through oscillator evolution + memory retrieval.
+                phase_self_sync = None
+                R_self = None
+                autobio_context = None
+
+                if self.phase_self_sync_computer is not None:
+                    # Get self-oscillator state from oscillatory world
+                    N = self.config.num_oscillators
+                    N_self = self.oscillatory_world.config.num_self_oscillators
+                    N_world = N - N_self
+
+                    # Extract self-oscillator phases and write info
+                    self_phases = self.oscillatory_world.phases[N_world:]  # (N_self,)
+                    write_phases_self = self.oscillatory_world.write_phases[N_world:]  # (N_self,)
+                    write_strengths_self = self.oscillatory_world.write_strengths[N_world:]  # (N_self,)
+
+                    # Compute phase-based self-sync
+                    phase_self_sync, R_self = self.phase_self_sync_computer(
+                        self_phases=self_phases,
+                        write_phases=write_phases_self,
+                        write_strengths=write_strengths_self,
+                    )
+                    self._last_phase_self_sync = phase_self_sync.detach()
+                    self._last_R_self = R_self.item()
+
+                    # Autobiographical retrieval: query memory with phase-based self-sync
+                    # Coherence gating: if R_self is low, suppress the retrieved memory
+                    if self.autobio_retriever is not None:
+                        write_self_states = self.oscillatory_world.write_self_states  # (num_osc, d_self_state)
+                        write_strengths = self.oscillatory_world.write_strengths  # (num_osc,)
+
+                        autobio_context = self.autobio_retriever(
+                            query=phase_self_sync,
+                            memory=write_self_states,
+                            memory_weights=write_strengths,
+                            coherence_gate=R_self,  # Gate output by phase coherence
+                        )
+                        self._last_autobio_context = autobio_context.detach()
+                        self._last_autobio_attn_entropy = self.autobio_retriever.get_attention_entropy()
+                else:
+                    self._last_phase_self_sync = None
+                    self._last_R_self = 0.0
+                    self._last_autobio_context = None
+                    self._last_autobio_attn_entropy = 0.0
+
                 # === SELF-STATE ENCODING ===
-                # Transformer encoder: [sync, pred, surprise, confidence] as tokens
+                # Transformer encoder: [sync, pred, surprise, confidence, autobio?] as tokens
                 # Components attend to each other and learn conditional relationships
                 self_state = self.self_state_transformer(
                     sync=sync_summary_norm,
                     pred=pred_summary_norm,
                     surprise=surprise_embed,
                     confidence=confidence_embed,
+                    autobio_context=autobio_context,
                 )
 
                 # Track self-state metrics
@@ -1699,6 +2197,32 @@ class GlobalSyncModule(nn.Module):
                 # Dynamics: is self-state changing between steps?
                 'self_state/step_change': self._last_self_state_step_change,
             })
+
+        # === PHASE-BASED SELF-SYNC AND AUTOBIOGRAPHICAL RETRIEVAL METRICS ===
+        # Track emerging self from phase synchronization and autobiographical memory
+        if hasattr(self, '_last_R_self') and self._last_R_self is not None:
+            stats['phase_self_sync/R_self'] = self._last_R_self
+
+        # Phase self-sync computer diagnostics
+        if hasattr(self, 'phase_self_sync_computer') and self.phase_self_sync_computer is not None:
+            pss_diag = self.phase_self_sync_computer.get_diagnostics()
+            for key, val in pss_diag.items():
+                stats[f'phase_self_sync/{key}'] = val
+
+        # Autobiographical retriever diagnostics
+        if hasattr(self, 'autobio_retriever') and self.autobio_retriever is not None:
+            autobio_diag = self.autobio_retriever.get_diagnostics()
+            for key, val in autobio_diag.items():
+                stats[f'autobio/{key}'] = val
+            # Track context norm
+            if hasattr(self, '_last_autobio_context') and self._last_autobio_context is not None:
+                stats['autobio/context_norm'] = self._last_autobio_context.norm().item()
+
+        # Self-state transformer attention weights (including autobio if enabled)
+        if self.self_state_transformer is not None:
+            ss_attn = self.self_state_transformer.get_attention_summary()
+            for key, val in ss_attn.items():
+                stats[f'ss_attn/{key}'] = val
 
         # === SELF-STATE INPUT DIAGNOSTICS ===
         # Track what goes INTO the compressor to diagnose low diversity

@@ -984,6 +984,35 @@ def print_diagnostic_report(
         if osc_top1 is not None:
             print(f"[OscXAttn] top1={osc_top1:.3f} kq_cos={osc_kq_cos:.3f}")
 
+        # Phase-based self-sync and autobiographical retrieval (emerging self - CTM-pure)
+        R_self = world_stats.get('phase_self_sync/R_self', None)
+        R_write = world_stats.get('phase_self_sync/R_write', None)
+        write_frac = world_stats.get('phase_self_sync/write_fraction', None)
+        autobio_entropy = world_stats.get('autobio/attn_entropy', None)
+        autobio_norm = world_stats.get('autobio/context_norm', None)
+        autobio_top1 = world_stats.get('autobio/attn_top1', None)
+        coherence_gate = world_stats.get('autobio/coherence_gate', None)
+        if R_self is not None:
+            write_spread = 1 - R_write if R_write is not None else 0
+            write_str = f" spread={write_spread:.2f}" if R_write is not None else ""
+            frac_str = f" wfrac={write_frac:.2f}" if write_frac is not None else ""
+            print(f"[PhaseSelfSync] R_self={R_self:.3f}{write_str}{frac_str}")
+        if autobio_entropy is not None:
+            norm_str = f" ctx_norm={autobio_norm:.3f}" if autobio_norm is not None else ""
+            top1_str = f" top1={autobio_top1:.2f}" if autobio_top1 is not None else ""
+            gate_str = f" gate={coherence_gate:.2f}" if coherence_gate is not None else ""
+            print(f"[Autobio] entropy={autobio_entropy:.2f}{top1_str}{norm_str}{gate_str}")
+
+        # Self-state transformer attention (which components are being used)
+        pool_autobio = world_stats.get('ss_attn/pool_autobio', None)
+        pool_sync = world_stats.get('ss_attn/pool_sync', None)
+        pool_pred = world_stats.get('ss_attn/pool_pred', None)
+        pool_surp = world_stats.get('ss_attn/pool_surprise', None)
+        pool_conf = world_stats.get('ss_attn/pool_confidence', None)
+        if pool_sync is not None:
+            autobio_str = f" autobio={pool_autobio:.2f}" if pool_autobio is not None else ""
+            print(f"[SS Attn] sync={pool_sync:.2f} pred={pool_pred:.2f} surp={pool_surp:.2f} conf={pool_conf:.2f}{autobio_str}")
+
     if metrics is not None:
         # Loop trajectory
         l0 = metrics.get('loop/loss_step0', None)
