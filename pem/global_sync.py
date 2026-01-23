@@ -1677,9 +1677,10 @@ class GlobalSyncModule(nn.Module):
                     N_world = N - N_self
 
                     # Extract self-oscillator phases and write info
-                    self_phases = self.oscillatory_world.phases[N_world:]  # (N_self,)
-                    write_phases_self = self.oscillatory_world.write_phases[N_world:]  # (N_self,)
-                    write_strengths_self = self.oscillatory_world.write_strengths[N_world:]  # (N_self,)
+                    # Clone to avoid issues with inplace buffer modifications during backward pass
+                    self_phases = self.oscillatory_world.phases[N_world:].clone()  # (N_self,)
+                    write_phases_self = self.oscillatory_world.write_phases[N_world:].clone()  # (N_self,)
+                    write_strengths_self = self.oscillatory_world.write_strengths[N_world:].clone()  # (N_self,)
 
                     # Compute phase-based self-sync
                     phase_self_sync, R_self = self.phase_self_sync_computer(
@@ -1693,8 +1694,9 @@ class GlobalSyncModule(nn.Module):
                     # Autobiographical retrieval: query memory with phase-based self-sync
                     # Coherence gating: if R_self is low, suppress the retrieved memory
                     if self.autobio_retriever is not None:
-                        write_self_states = self.oscillatory_world.write_self_states  # (num_osc, d_self_state)
-                        write_strengths = self.oscillatory_world.write_strengths  # (num_osc,)
+                        # Clone to avoid inplace modification issues
+                        write_self_states = self.oscillatory_world.write_self_states.clone()  # (num_osc, d_self_state)
+                        write_strengths = self.oscillatory_world.write_strengths.clone()  # (num_osc,)
 
                         autobio_context = self.autobio_retriever(
                             query=phase_self_sync,
