@@ -138,6 +138,7 @@ class GlobalSyncConfig:
     d_self_state: int = 64  # Dimension of self-state vector
     d_self_state_hidden: int = 256  # Hidden dimension in self-state compressor (wider = less compression)
     d_scalar_embed: int = 32  # Embedding dimension for surprise/confidence scalars
+    self_state_output_norm: float = 2.0  # Target L2 norm for self-state output (controls write gate sensitivity)
 
 
 class RMSNorm(nn.Module):
@@ -1014,6 +1015,10 @@ class GlobalSyncModule(nn.Module):
                     )
                 else:
                     self_state = self.self_state_compressor(self_state_input)
+
+                # Normalize output to target norm (controls magnitude for write gating)
+                # Without this, linear path produces large norms that saturate write gates
+                self_state = F.normalize(self_state, dim=0) * self.config.self_state_output_norm
 
                 # Track self-state metrics
                 with torch.no_grad():
