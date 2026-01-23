@@ -264,6 +264,11 @@ class OscillatoryWorldState(nn.Module):
             nn.Tanh(),
         )
 
+        # Learnable gain for self modulation (controls amplitude scale)
+        # Initialized < 1 to start with smaller self-oscillator writes
+        # Model can learn to increase if needed
+        self.self_mod_gain = nn.Parameter(torch.tensor(0.1))
+
         self._init_weights()
 
     def _init_weights(self):
@@ -404,8 +409,11 @@ class OscillatoryWorldState(nn.Module):
 
         # === SELF OSCILLATOR MODULATION (from self_state) ===
         if self_state is not None:
-            amp_mod_self = self.self_amp_modulator(self_state)  # (N_self,), in [-1, 1]
-            phase_mod_self = self.self_phase_modulator(self_state)  # (N_self,), in [-1, 1]
+            amp_mod_self_raw = self.self_amp_modulator(self_state)  # (N_self,), in [-1, 1]
+            phase_mod_self_raw = self.self_phase_modulator(self_state)  # (N_self,), in [-1, 1]
+            # Apply learnable gain to control self modulation scale
+            amp_mod_self = amp_mod_self_raw * self.self_mod_gain
+            phase_mod_self = phase_mod_self_raw * self.self_mod_gain
             gated_amp_mod_self = amp_mod_self * write_gate_self
             self_gated_abs = gated_amp_mod_self.abs()
             self._last_self_gated_amp_mean.copy_(self_gated_abs.mean().detach())
