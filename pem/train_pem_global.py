@@ -1775,12 +1775,9 @@ def main():
     print(f"  Oscillators: {n_world} world + {n_self} self = {n_osc} total (d_self_state={d_self_state})")
 
     # Self-state encoder info
-    if model.global_sync.self_state_transformer is not None:
-        ss_cfg = model.global_sync.config
-        print(f"  Self-state: Transformer encoder ({ss_cfg.self_state_transformer_layers} layers, "
-              f"{ss_cfg.self_state_transformer_heads} heads, d_token={ss_cfg.d_self_state_token})")
-    else:
-        print(f"  Self-state: Linear projection")
+    ss_cfg = model.global_sync.config
+    print(f"  Self-state: Transformer encoder ({ss_cfg.self_state_transformer_layers} layers, "
+          f"{ss_cfg.self_state_transformer_heads} heads, d_token={ss_cfg.d_self_state_token})")
 
     if args.diagnostic_every > 0:
         print(f"  [Diagnostic] Report every {args.diagnostic_every} steps")
@@ -2225,13 +2222,6 @@ def main():
                     f"surp={model.global_sync.surprise_scale.item():.1f} "
                     f"conf={model.global_sync.confidence_scale.item():.1f}"
                 )
-            # Show residual path gains (controls self-state output magnitude)
-            if hasattr(model.global_sync, 'self_state_residual_gain') and model.global_sync.self_state_residual_gain is not None:
-                print(
-                    f"    SS Paths  | linear_gain={model.global_sync.self_state_residual_gain.item():.3f} "
-                    f"mlp_scale={model.global_sync.self_state_residual_scale.item():.3f}"
-                )
-
             # Self-state probe results (compact, every log)
             if self_state_analyzer is not None and len(self_state_analyzer.buffer) >= 100:
                 probe_results = self_state_analyzer.probe_trainer.evaluate(self_state_analyzer.buffer)
