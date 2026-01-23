@@ -35,6 +35,7 @@ import numpy as np
 
 from .pem_loop_global import PEMLoopGlobal, PEMLoopGlobalConfig, create_pem_loop_global
 from .janus_pro_feature_extractor import JanusProFeatureExtractor, JanusProConfig
+from .self_state_analyzer import SelfStateAnalyzer
 
 
 def create_nlm_activation_grid(
@@ -405,6 +406,14 @@ class TrainingConfig:
 
     # Loop
     num_loop_steps: int = 2
+
+    # Auxiliary losses
+    diversity_loss_weight: float = 0.01  # Weight for self-state diversity loss (encourages unique states)
+
+    # Self-state analysis
+    enable_self_state_analysis: bool = True  # Enable self-state probing and correlation analysis
+    self_state_buffer_size: int = 5000       # How many self-states to keep for analysis
+    analyze_self_state_every: int = 500      # How often to print analysis summary
 
     # Logging
     log_every: int = 10
@@ -1171,6 +1180,15 @@ def train_step(
     # Compute loss
     loss, loss_dict = model.compute_loss(outputs, targets)
 
+    # Add self-state diversity loss (encourages unique autobiographical memories)
+    diversity_loss = torch.tensor(0.0, device=loss.device)
+    if config.diversity_loss_weight > 0 and hasattr(model, 'global_sync'):
+        osc_world = getattr(model.global_sync, 'oscillatory_world', None)
+        if osc_world is not None and hasattr(osc_world, 'compute_self_state_diversity_loss'):
+            diversity_loss = osc_world.compute_self_state_diversity_loss()
+            loss = loss + config.diversity_loss_weight * diversity_loss
+            loss_dict['diversity_loss'] = diversity_loss.item()
+
     # Backward pass
     loss.backward()
 
@@ -1756,9 +1774,27 @@ def main():
     d_self_state = model.global_sync.oscillatory_world.config.d_self_state
     print(f"  Oscillators: {n_world} world + {n_self} self = {n_osc} total (d_self_state={d_self_state})")
 
+    # Self-state encoder info
+    if model.global_sync.self_state_transformer is not None:
+        ss_cfg = model.global_sync.config
+        print(f"  Self-state: Transformer encoder ({ss_cfg.self_state_transformer_layers} layers, "
+              f"{ss_cfg.self_state_transformer_heads} heads, d_token={ss_cfg.d_self_state_token})")
+    else:
+        print(f"  Self-state: Linear projection")
+
     if args.diagnostic_every > 0:
         print(f"  [Diagnostic] Report every {args.diagnostic_every} steps")
     print()
+
+    # Self-state analyzer for probing and correlation analysis
+    self_state_analyzer = None
+    if config.enable_self_state_analysis:
+        self_state_analyzer = SelfStateAnalyzer(
+            d_self_state=d_self_state,
+            buffer_size=config.self_state_buffer_size,
+            enable_probes=True,
+        )
+        print(f"  Self-state analyzer enabled (buffer={config.self_state_buffer_size})")
 
     global_step = 0
     running_loss = 0.0
@@ -1857,6 +1893,31 @@ def main():
             print_diagnostic_report(outputs_for_diag, targets_for_diag, global_step + 1, model=model, metrics=metrics)
 
         scheduler.step()
+
+        # Record self-state for analysis
+        if self_state_analyzer is not None:
+            gs = model.global_sync
+            osc = gs.oscillatory_world
+            if gs._last_self_state is not None:
+                # Get metadata
+                surprise_val = gs._last_ss_input_surprise if gs._last_ss_input_surprise else 0.0
+                conf_val = gs._last_ss_input_confidence if gs._last_ss_input_confidence else 0.0
+                s_write_gate = osc._last_write_gate_self.item() if osc._last_write_gate_self is not None else 0.0
+                did_write = s_write_gate > 0.5
+
+                self_state_analyzer.record(
+                    self_state=gs._last_self_state,
+                    surprise=surprise_val,
+                    confidence=conf_val,
+                    s_write_gate=s_write_gate,
+                    did_write=did_write,
+                    sync_norm=gs._last_ss_input_sync_norm,
+                    pred_norm=gs._last_ss_input_pred_norm,
+                )
+
+                # Train probes periodically
+                if global_step % 10 == 0:
+                    self_state_analyzer.train_probes(batch_size=64)
 
         running_loss += metrics['loss']
         global_step += 1
@@ -2083,11 +2144,16 @@ def main():
             write_frac = world_stats.get('temporal/write_fraction')
             self_state_div = world_stats.get('temporal/self_state_diversity')
             self_world_align = world_stats.get('temporal/self_world_alignment')
+            self_world_quality = world_stats.get('temporal/self_world_alignment_quality')
+            write_phase_align = world_stats.get('temporal/write_phase_alignment')
             world_write_frac = world_stats.get('temporal/world_write_fraction')
             self_write_frac = world_stats.get('temporal/self_write_fraction')
             if phase_dist is not None:
                 print(f"     Temporal | phase_dist={phase_dist:.2f} write_frac={write_frac:.2f} self_div={self_state_div:.3f}")
-                print(f"   Self-World | align={self_world_align:.3f} w_write={world_write_frac:.0%} s_write={self_write_frac:.0%}")
+                print(
+                    f"   Self-World | align={self_world_align:.3f} qual={self_world_quality:.3f} "
+                    f"phase_align={write_phase_align:.3f} w_write={world_write_frac:.0%} s_write={self_write_frac:.0%}"
+                )
 
             # Self-state mechanism metrics (autobiographical memory health)
             ss_contrib = world_stats.get('self_state/contribution_norm')
@@ -2119,9 +2185,10 @@ def main():
             wt_uniqueness = world_stats.get('temporal/self_state_uniqueness')
             wt_similarity = world_stats.get('temporal/self_state_avg_similarity')
             if wt_spread is not None:
+                div_loss = metrics.get('loss/diversity_loss', 0)
                 print(
                     f"  Write Spread | phase_std={wt_spread:.3f} age_range={wt_age_range:.1f} "
-                    f"uniqueness={wt_uniqueness:.3f} similarity={wt_similarity:.3f}"
+                    f"uniqueness={wt_uniqueness:.3f} similarity={wt_similarity:.3f} div_loss={div_loss:.3f}"
                 )
 
             # Self-state INPUT diagnostics (why is diversity low?)
@@ -2158,6 +2225,26 @@ def main():
                     f"surp={model.global_sync.surprise_scale.item():.1f} "
                     f"conf={model.global_sync.confidence_scale.item():.1f}"
                 )
+            # Show residual path gains (controls self-state output magnitude)
+            if hasattr(model.global_sync, 'self_state_residual_gain') and model.global_sync.self_state_residual_gain is not None:
+                print(
+                    f"    SS Paths  | linear_gain={model.global_sync.self_state_residual_gain.item():.3f} "
+                    f"mlp_scale={model.global_sync.self_state_residual_scale.item():.3f}"
+                )
+
+            # Self-state probe results (compact, every log)
+            if self_state_analyzer is not None and len(self_state_analyzer.buffer) >= 100:
+                probe_results = self_state_analyzer.probe_trainer.evaluate(self_state_analyzer.buffer)
+                if probe_results:
+                    surp_r2 = probe_results.get('surprise_r2', 0)
+                    conf_r2 = probe_results.get('confidence_r2', 0)
+                    write_r2 = probe_results.get('write_r2', 0)
+                    print(f"   SS Probes | surprise_R2={surp_r2:.3f} confidence_R2={conf_r2:.3f} write_R2={write_r2:.3f}")
+
+            # Full self-state analysis (probing and correlations)
+            if self_state_analyzer is not None and global_step % config.analyze_self_state_every == 0:
+                if len(self_state_analyzer.buffer) >= 100:
+                    print("\n" + self_state_analyzer.get_summary() + "\n")
 
             # WandB logging (consolidated - only essential metrics)
             if config.wandb_project:

@@ -139,6 +139,12 @@ class GlobalSyncConfig:
     d_self_state_hidden: int = 256  # Hidden dimension in self-state compressor (wider = less compression)
     d_scalar_embed: int = 32  # Embedding dimension for surprise/confidence scalars
 
+    # Self-state transformer encoder (treats components as tokens with self-attention)
+    use_self_state_transformer: bool = True  # Use transformer instead of linear/MLP
+    d_self_state_token: int = 64  # Token dimension for transformer
+    self_state_transformer_layers: int = 2  # Number of transformer layers
+    self_state_transformer_heads: int = 4  # Attention heads
+
 
 class RMSNorm(nn.Module):
     """Root Mean Square Layer Normalization."""
@@ -150,6 +156,113 @@ class RMSNorm(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         rms = torch.sqrt(torch.mean(x ** 2, dim=-1, keepdim=True) + self.eps)
         return self.weight * (x / rms)
+
+
+class SelfStateTransformerEncoder(nn.Module):
+    """
+    Small transformer encoder for self-state components.
+
+    Treats [sync, pred, surprise, confidence] as 4 tokens and runs self-attention
+    so components can interact and learn conditional relationships.
+
+    Architecture:
+        4 input components → project to d_token → N transformer layers → pool → d_self_state
+    """
+
+    def __init__(
+        self,
+        d_sync: int,           # Dimension of sync input (typically d_feature_input)
+        d_pred: int,           # Dimension of pred input (typically d_feature_input)
+        d_scalar_embed: int,   # Dimension of surprise/confidence embeddings
+        d_token: int,          # Token dimension for transformer
+        d_output: int,         # Output dimension (d_self_state)
+        n_layers: int = 2,
+        n_heads: int = 4,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        self.d_token = d_token
+        self.n_tokens = 4  # sync, pred, surprise, confidence
+
+        # Project each component to token dimension
+        self.sync_proj = nn.Linear(d_sync, d_token)
+        self.pred_proj = nn.Linear(d_pred, d_token)
+        self.surprise_proj = nn.Linear(d_scalar_embed, d_token)
+        self.confidence_proj = nn.Linear(d_scalar_embed, d_token)
+
+        # Learnable component type embeddings (like positional embeddings but for component identity)
+        self.component_embeddings = nn.Parameter(torch.randn(4, d_token) * 0.02)
+
+        # Transformer encoder layers
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_token,
+            nhead=n_heads,
+            dim_feedforward=d_token * 4,
+            dropout=dropout,
+            activation='gelu',
+            batch_first=True,
+            norm_first=True,  # Pre-norm for stability
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+
+        # Output projection: pool tokens and project to d_self_state
+        # Use attention pooling over the 4 tokens
+        self.pool_query = nn.Parameter(torch.randn(1, d_token) * 0.02)
+        self.pool_key = nn.Linear(d_token, d_token)
+        self.pool_value = nn.Linear(d_token, d_token)
+
+        self.output_proj = nn.Linear(d_token, d_output)
+        self.output_norm = RMSNorm(d_output)
+
+    def forward(
+        self,
+        sync: torch.Tensor,       # (d_sync,)
+        pred: torch.Tensor,       # (d_pred,)
+        surprise: torch.Tensor,   # (d_scalar_embed,)
+        confidence: torch.Tensor, # (d_scalar_embed,)
+    ) -> torch.Tensor:
+        """
+        Encode self-state components through transformer.
+
+        Returns:
+            self_state: (d_output,) encoded self-state
+        """
+        # Project each component to token dimension
+        sync_tok = self.sync_proj(sync)           # (d_token,)
+        pred_tok = self.pred_proj(pred)           # (d_token,)
+        surp_tok = self.surprise_proj(surprise)   # (d_token,)
+        conf_tok = self.confidence_proj(confidence)  # (d_token,)
+
+        # Stack into sequence: (4, d_token)
+        tokens = torch.stack([sync_tok, pred_tok, surp_tok, conf_tok], dim=0)
+
+        # Add component type embeddings
+        tokens = tokens + self.component_embeddings
+
+        # Add batch dimension for transformer: (1, 4, d_token)
+        tokens = tokens.unsqueeze(0)
+
+        # Run transformer
+        encoded = self.transformer(tokens)  # (1, 4, d_token)
+
+        # Attention pooling over the 4 tokens
+        # Query: learnable pooling query
+        # Keys/Values: encoded tokens
+        q = self.pool_query  # (1, d_token)
+        k = self.pool_key(encoded)  # (1, 4, d_token)
+        v = self.pool_value(encoded)  # (1, 4, d_token)
+
+        # Scaled dot-product attention
+        scale = self.d_token ** -0.5
+        attn_scores = torch.matmul(q.unsqueeze(1), k.transpose(-2, -1)) * scale  # (1, 1, 4)
+        attn_weights = F.softmax(attn_scores, dim=-1)  # (1, 1, 4)
+        pooled = torch.matmul(attn_weights, v).squeeze(1).squeeze(0)  # (d_token,)
+
+        # Output projection
+        output = self.output_proj(pooled)  # (d_output,)
+        output = self.output_norm(output)
+
+        return output
 
 
 class ModuleSyncComputer(nn.Module):
@@ -699,7 +812,27 @@ class GlobalSyncModule(nn.Module):
             )
             # Residual projection to preserve input variation
             self.self_state_residual = nn.Linear(self_state_in_dim, config.d_self_state)
+            # Learnable gains for both paths:
+            # - residual_gain: controls linear path output (init 0.1 to prevent dominating)
+            # - residual_scale: controls MLP refinement (init 0.1 for small corrections)
+            self.self_state_residual_gain = nn.Parameter(torch.tensor(0.1))
             self.self_state_residual_scale = nn.Parameter(torch.tensor(0.1))
+
+            # Transformer encoder for self-state (treats components as tokens)
+            if config.use_self_state_transformer:
+                self.self_state_transformer = SelfStateTransformerEncoder(
+                    d_sync=config.d_feature_input,
+                    d_pred=config.d_feature_input,
+                    d_scalar_embed=config.d_scalar_embed,
+                    d_token=config.d_self_state_token,
+                    d_output=config.d_self_state,
+                    n_layers=config.self_state_transformer_layers,
+                    n_heads=config.self_state_transformer_heads,
+                    dropout=config.dropout,
+                )
+            else:
+                self.self_state_transformer = None
+
             # Buffer to store last prediction output for self-state computation
             self.register_buffer('_last_prediction_output', None)
             self._last_self_state = None  # Computed self-state (not a buffer, computed each forward)
@@ -730,7 +863,9 @@ class GlobalSyncModule(nn.Module):
             self.surprise_scale = None
             self.confidence_scale = None
             self.self_state_residual = None
+            self.self_state_residual_gain = None
             self.self_state_residual_scale = None
+            self.self_state_transformer = None
             self._last_self_state = None
             self._last_osc_attn_out_norm = None
             self._last_osc_query_act_norm = None
@@ -999,23 +1134,30 @@ class GlobalSyncModule(nn.Module):
                 surprise_embed = F.normalize(surprise_raw, dim=0) * self.surprise_scale
                 confidence_embed = F.normalize(confidence_raw, dim=0) * self.confidence_scale
 
-                self_state_input = torch.cat([
-                    sync_summary_norm,    # (d_feature_input,) - unit norm * scale
-                    pred_summary_norm,    # (d_feature_input,) - unit norm * scale
-                    surprise_embed,       # (d_scalar_embed,) - unit norm * scale
-                    confidence_embed,     # (d_scalar_embed,) - unit norm * scale
-                ], dim=0)
-                # Linear projection is main path (preserves variation + magnitude)
-                # MLP adds learned refinement scaled by learnable parameter
-                # Note: magnitude preserved for downstream use (self_state_to_value, write_self_states)
-                # The self-write gate is already scale-invariant (uses relative change)
-                if self.self_state_residual is not None:
-                    self_state = self.self_state_residual(self_state_input) + (
-                        self.self_state_residual_scale
-                        * self.self_state_compressor(self_state_input)
+                # === SELF-STATE ENCODING ===
+                # Option 1: Transformer encoder (components interact via self-attention)
+                # Option 2: Linear/MLP (simple concatenation and projection)
+                if self.self_state_transformer is not None:
+                    # Transformer treats [sync, pred, surprise, confidence] as tokens
+                    # Components can attend to each other and learn conditional relationships
+                    self_state = self.self_state_transformer(
+                        sync=sync_summary_norm,
+                        pred=pred_summary_norm,
+                        surprise=surprise_embed,
+                        confidence=confidence_embed,
                     )
                 else:
-                    self_state = self.self_state_compressor(self_state_input)
+                    # Fallback: concatenate and project (linear or MLP)
+                    self_state_input = torch.cat([
+                        sync_summary_norm,    # (d_feature_input,) - unit norm * scale
+                        pred_summary_norm,    # (d_feature_input,) - unit norm * scale
+                        surprise_embed,       # (d_scalar_embed,) - unit norm * scale
+                        confidence_embed,     # (d_scalar_embed,) - unit norm * scale
+                    ], dim=0)
+                    if self.self_state_residual is not None:
+                        self_state = self.self_state_residual_gain * self.self_state_residual(self_state_input)
+                    else:
+                        self_state = self.self_state_compressor(self_state_input)
 
                 # Track self-state metrics
                 with torch.no_grad():
@@ -1031,16 +1173,21 @@ class GlobalSyncModule(nn.Module):
                     self._last_ss_normed_pred_norm = pred_summary_norm.norm().item()
                     self._last_ss_normed_surprise_norm = surprise_embed.norm().item()
                     self._last_ss_normed_confidence_norm = confidence_embed.norm().item()
-                    self._last_ss_input_total_norm = self_state_input.norm().item()
+
+                    # Compute input for diagnostics (concatenate for tracking even if using transformer)
+                    self_state_input_for_diag = torch.cat([
+                        sync_summary_norm, pred_summary_norm, surprise_embed, confidence_embed
+                    ], dim=0)
+                    self._last_ss_input_total_norm = self_state_input_for_diag.norm().item()
 
                     # Track input step-to-step change
                     if self._prev_ss_input_for_change is not None:
                         self._last_ss_input_step_change = (
-                            self_state_input - self._prev_ss_input_for_change
+                            self_state_input_for_diag - self._prev_ss_input_for_change
                         ).norm().item()
                     else:
                         self._last_ss_input_step_change = 0.0
-                    self._prev_ss_input_for_change = self_state_input.detach().clone()
+                    self._prev_ss_input_for_change = self_state_input_for_diag.detach().clone()
 
                     # === OUTPUT DIAGNOSTICS ===
                     # Compressor output variation (is it producing varied self-states?)
